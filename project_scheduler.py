@@ -911,32 +911,303 @@ def export_mermaid_gantt(result_df, output_path, project_name="プロジェク�
     return output_path
 
 
-def _pack_lanes(df, group_col, start_col="Start_Date", end_col="End_Date"):
-    """
-    group_col（例: Job_ID）ごとに、時間的に重ならないタスクは同じレーン（行）に
-    詰め、重なるタスクだけ新しいレーンに割り当てる貪欲法（区間グラフの彩色）。
-    Mermaidの displayMode: compact と同じ考え方。
+_PLOTLY_GANTT_HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>__TITLE__</title>
+<style>
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    margin: 0; padding: 24px; background: #fcfcfb; color: #0b0b0b;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: #52514e; font-size: 13px; margin-bottom: 18px; }
+  #filter-panel {
+    border: 1px solid #e1e0d9; border-radius: 8px; padding: 12px 16px;
+    margin-bottom: 22px; background: #fff;
+  }
+  #filter-panel .filter-title { font-weight: 600; margin-bottom: 8px; font-size: 13px; }
+  #filter-panel .filter-actions { margin-bottom: 10px; }
+  #filter-panel .filter-actions button {
+    font-size: 12px; margin-right: 8px; padding: 4px 10px;
+    border: 1px solid #c3c2b7; border-radius: 4px; background: #fff; cursor: pointer;
+  }
+  #filter-panel .filter-actions button:hover { background: #f0efec; }
+  .team-list { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+  .team-item { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; user-select: none; }
+  .swatch { width: 12px; height: 12px; border-radius: 2px; display: inline-block; flex: none; }
+  .workflow-section { margin-bottom: 30px; }
+  .workflow-section h2 { font-size: 16px; margin: 0 0 2px; }
+  .workflow-meta { color: #898781; font-size: 12px; margin-bottom: 6px; }
+  .empty-note { color: #898781; font-size: 13px; padding: 16px 0; }
+</style>
+</head>
+<body>
+<h1>__TITLE__</h1>
+<div class="subtitle">
+  ジョブ単位で1行にまとめ（時間が重なるタスクだけ行を分ける）、作業開始が早い順に上から並べている。
+  チームのチェックを外すとそのチームのタスクを非表示にし、行の高さも詰めて再描画する。
+</div>
+<div id="filter-panel">
+  <div class="filter-title">チームで絞り込み</div>
+</div>
+<div id="charts"></div>
+<script>__PLOTLY_JS__</script>
+<script>
+const TASKS = __TASKS_JSON__;
+const TEAMS = __TEAMS_JSON__;
+const WORKFLOWS = __WORKFLOWS_JSON__;
+const MILESTONES = __MILESTONES_JSON__;
 
-    Returns:
-        (df.index -> lane番号 の Series, group_col値 -> 使用レーン数 の辞書)
-    """
-    lane_of = {}
-    lane_count = {}
-    for group_val, g in df.groupby(group_col):
-        lane_ends = []  # 各レーンの現在の終了日（exclusive）
-        for idx, row in g.sort_values(start_col).iterrows():
-            placed = False
-            for lane_idx, lane_end in enumerate(lane_ends):
-                if row[start_col] >= lane_end:
-                    lane_ends[lane_idx] = row[end_col]
-                    lane_of[idx] = lane_idx
-                    placed = True
-                    break
-            if not placed:
-                lane_ends.append(row[end_col])
-                lane_of[idx] = len(lane_ends) - 1
-        lane_count[group_val] = len(lane_ends)
-    return pd.Series(lane_of), lane_count
+const ROW_HEIGHT = 26;
+
+function teamColor(teamId) {
+  const t = TEAMS.find(function (t) { return t.id === teamId; });
+  return t ? t.color : "#898781";
+}
+
+function topMargin() {
+  var maxLen = 0;
+  MILESTONES.forEach(function (m) { maxLen = Math.max(maxLen, m.label.length); });
+  return 40 + maxLen * 9;
+}
+
+function overallDateRange() {
+  var dates = [];
+  TASKS.forEach(function (t) { dates.push(t.start, t.end); });
+  MILESTONES.forEach(function (m) { dates.push(m.date); });
+  dates.sort();
+  var pad = function (d, days) {
+    var dt = new Date(d + "T00:00:00");
+    dt.setDate(dt.getDate() + days);
+    return dt.toISOString().slice(0, 10);
+  };
+  return [pad(dates[0], -3), pad(dates[dates.length - 1], 3)];
+}
+const X_RANGE = overallDateRange();
+
+function packLanes(tasks) {
+  var sorted = tasks.slice().sort(function (a, b) { return a.start < b.start ? -1 : a.start > b.start ? 1 : 0; });
+  var laneEnds = [];
+  var assignments = [];
+  sorted.forEach(function (t) {
+    var lane = -1;
+    for (var i = 0; i < laneEnds.length; i++) {
+      if (t.start >= laneEnds[i]) { laneEnds[i] = t.end; lane = i; break; }
+    }
+    if (lane === -1) { laneEnds.push(t.end); lane = laneEnds.length - 1; }
+    assignments.push({ task: t, lane: lane });
+  });
+  return { assignments: assignments, laneCount: laneEnds.length };
+}
+
+function groupBy(arr, keyFn) {
+  var m = new Map();
+  arr.forEach(function (item) {
+    var k = keyFn(item);
+    if (!m.has(k)) m.set(k, []);
+    m.get(k).push(item);
+  });
+  return m;
+}
+
+function hoverText(t) {
+  var adj = t.adjusted ? "あり（リソース制約）" : "なし";
+  return "<b>" + t.job_name + " ＞ " + t.task_name + "</b><br>" +
+    "ワークフロー: " + t.workflow_name + "<br>" +
+    "チーム: " + t.team_name + "<br>" +
+    "優先度: " + t.priority + "<br>" +
+    "開始: " + t.start + " ／ 終了: " + t.end + "<br>" +
+    "リソース調整: " + adj;
+}
+
+function getSelectedTeamIds() {
+  var ids = new Set();
+  document.querySelectorAll('#filter-panel input[type=checkbox]').forEach(function (cb) {
+    if (cb.checked) ids.add(cb.dataset.teamId);
+  });
+  return ids;
+}
+
+function buildFilterPanel() {
+  var panel = document.getElementById('filter-panel');
+
+  var actions = document.createElement('div');
+  actions.className = 'filter-actions';
+  var allBtn = document.createElement('button');
+  allBtn.textContent = 'すべて表示';
+  allBtn.onclick = function () { setAll(true); };
+  var noneBtn = document.createElement('button');
+  noneBtn.textContent = 'すべて非表示';
+  noneBtn.onclick = function () { setAll(false); };
+  actions.appendChild(allBtn);
+  actions.appendChild(noneBtn);
+  panel.appendChild(actions);
+
+  var list = document.createElement('div');
+  list.className = 'team-list';
+  TEAMS.forEach(function (team) {
+    var label = document.createElement('label');
+    label.className = 'team-item';
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = true;
+    cb.dataset.teamId = team.id;
+    cb.addEventListener('change', renderAll);
+    var swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.background = team.color;
+    label.appendChild(cb);
+    label.appendChild(swatch);
+    label.appendChild(document.createTextNode(team.name));
+    list.appendChild(label);
+  });
+  panel.appendChild(list);
+}
+
+function setAll(checked) {
+  document.querySelectorAll('#filter-panel input[type=checkbox]').forEach(function (cb) { cb.checked = checked; });
+  renderAll();
+}
+
+function buildWorkflowSections() {
+  var root = document.getElementById('charts');
+  WORKFLOWS.forEach(function (wf) {
+    var section = document.createElement('div');
+    section.className = 'workflow-section';
+    var h2 = document.createElement('h2');
+    h2.textContent = wf.name;
+    section.appendChild(h2);
+    var meta = document.createElement('div');
+    meta.className = 'workflow-meta';
+    meta.id = 'meta-' + wf.id;
+    section.appendChild(meta);
+    var div = document.createElement('div');
+    div.id = 'chart-' + wf.id;
+    section.appendChild(div);
+    root.appendChild(section);
+  });
+}
+
+function renderWorkflow(wf) {
+  var container = document.getElementById('chart-' + wf.id);
+  var meta = document.getElementById('meta-' + wf.id);
+  var selected = getSelectedTeamIds();
+  var tasks = TASKS.filter(function (t) { return t.workflow_id === wf.id && selected.has(t.team_id); });
+
+  if (tasks.length === 0) {
+    Plotly.purge(container);
+    container.innerHTML = '<div class="empty-note">表示するタスクがありません（フィルタ条件に一致するタスクなし）</div>';
+    meta.textContent = '';
+    return;
+  }
+
+  var byJob = groupBy(tasks, function (t) { return t.job_id; });
+  var jobEntries = [];
+  byJob.forEach(function (jobTasks, jobId) {
+    var minStart = jobTasks.reduce(function (m, t) { return t.start < m ? t.start : m; }, jobTasks[0].start);
+    var packed = packLanes(jobTasks);
+    jobEntries.push({
+      jobId: jobId, jobName: jobTasks[0].job_name, minStart: minStart,
+      assignments: packed.assignments, laneCount: packed.laneCount,
+    });
+  });
+  jobEntries.sort(function (a, b) {
+    if (a.minStart !== b.minStart) return a.minStart < b.minStart ? -1 : 1;
+    return a.jobName.localeCompare(b.jobName);
+  });
+
+  meta.textContent = jobEntries.length + ' ジョブ ／ ' + tasks.length + ' タスク';
+
+  var cursor = 0;
+  var tickvals = [], ticktext = [], separators = [];
+  var bases = [], xs = [], ys = [], colors = [], texts = [], hovertexts = [];
+
+  jobEntries.forEach(function (job, jobIdx) {
+    if (jobIdx > 0) separators.push(cursor - 0.5);
+    var blockStart = cursor;
+    job.assignments.forEach(function (a) {
+      var t = a.task;
+      var rowIndex = blockStart + a.lane;
+      var startMs = new Date(t.start + "T00:00:00").getTime();
+      var endMs = new Date(t.end + "T00:00:00").getTime();
+      bases.push(t.start);
+      xs.push(endMs - startMs);
+      ys.push(rowIndex);
+      colors.push(teamColor(t.team_id));
+      texts.push(t.task_name);
+      hovertexts.push(hoverText(t));
+    });
+    tickvals.push(blockStart + (job.laneCount - 1) / 2);
+    ticktext.push(job.jobName);
+    cursor += job.laneCount;
+  });
+
+  var totalRows = cursor;
+  var height = Math.max(140, totalRows * ROW_HEIGHT + topMargin() + 50);
+
+  var trace = {
+    type: 'bar', orientation: 'h',
+    base: bases, x: xs, y: ys,
+    marker: { color: colors },
+    text: texts, textposition: 'inside', insidetextanchor: 'start',
+    textfont: { size: 11, color: '#0b0b0b' },
+    constraintext: 'both',
+    hovertext: hovertexts, hoverinfo: 'text',
+    width: 0.7,
+  };
+
+  var shapes = MILESTONES.map(function (m) {
+    return {
+      type: 'line', xref: 'x', x0: m.date, x1: m.date, yref: 'paper', y0: 0, y1: 1,
+      line: { color: '#52514e', width: 1.5, dash: 'dash' },
+    };
+  });
+  separators.forEach(function (y) {
+    shapes.push({
+      type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y', y0: y, y1: y,
+      line: { color: '#e1e0d9', width: 1 },
+    });
+  });
+
+  var annotations = MILESTONES.map(function (m) {
+    return {
+      x: m.date, y: 1, xref: 'x', yref: 'paper', text: '◆' + m.label,
+      showarrow: false, textangle: -90, xanchor: 'left', yanchor: 'bottom',
+      font: { size: 11, color: '#52514e' },
+    };
+  });
+
+  var layout = {
+    height: height,
+    margin: { l: 10, r: 10, t: topMargin(), b: 30 },
+    xaxis: { type: 'date', range: X_RANGE, gridcolor: '#e1e0d9' },
+    yaxis: {
+      range: [totalRows - 0.5, -0.5],
+      tickmode: 'array', tickvals: tickvals, ticktext: ticktext,
+      automargin: true, showgrid: false, zeroline: false,
+    },
+    shapes: shapes, annotations: annotations,
+    showlegend: false,
+    plot_bgcolor: '#fcfcfb', paper_bgcolor: '#fcfcfb',
+    font: { family: 'system-ui, -apple-system, "Segoe UI", sans-serif', color: '#0b0b0b' },
+  };
+
+  Plotly.react(container, [trace], layout, { displaylogo: false, responsive: true });
+}
+
+function renderAll() {
+  WORKFLOWS.forEach(renderWorkflow);
+}
+
+buildFilterPanel();
+buildWorkflowSections();
+renderAll();
+</script>
+</body>
+</html>
+"""
 
 
 def export_plotly_gantt(result_df, output_path, project_name="プロジェクトスケジュール",
@@ -946,19 +1217,27 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
     ブラウザで直接開けるインタラクティブなガントチャート（単一HTMLファイル、
     Plotly製）を書き出す。
 
-    - タスクごとに1行を割り当てるのではなく、Mermaid版のcompact表示と同様に
-      「ジョブ単位で1行にまとめ、時間的に重ならないタスクは同じ行に詰める」
-      レーンパッキングを行う（時間が重なるタスクだけ行を分ける）。これにより
-      縦方向を大幅に圧縮する。バー内にはタスク名を表示し、チーム別に色分けする
-      （凡例クリックでチーム単位の表示/非表示切り替え＝簡易フィルタリングが可能）。
-    - 行はワークフロー表示名 → ジョブ名 → レーンの順でソートし、関連タスクが
-      まとまって見えるようにする。
-    - ホバーで担当チーム・優先度・開始/終了日・リソース調整有無を表示する。
+    - **ワークフローごとに別々のガントチャートに分割**する（Mermaid版と同様）。
+    - 各チャート内は「ジョブ単位で1行」にまとめる。ジョブ名は1回だけ表示し、
+      時間的に重なるタスクがある場合だけレーン（行）を追加する（重ならない
+      タスクは同じ行に詰める、Mermaidのcompact表示と同じ考え方）。ジョブの
+      境界には横線を入れて区切る。バー内にはタスク名を表示する。
+    - 各チャート内のジョブは、そのジョブの最初のタスクの開始日が早い順に
+      上から並べる。
+    - 画面上部の「チームで絞り込み」パネルでチームのチェックを外すと、その
+      チームのタスクを全チャートから除外し、**レーンを詰め直して行の高さも
+      縮める**（Plotlyの凡例クリックによる表示/非表示とは異なり、非表示分の
+      余白が残らない）。チェックボックスの色見本がチーム別配色を兼ねる。
+    - バーにマウスを乗せるとジョブ名・タスク名・ワークフロー・優先度・
+      開始/終了日・リソース調整有無を表示する。
     - プロジェクト開始日と各マイルストーン（milestone_markers）を縦の破線として
-      全体に重ねる。
+      全チャート共通で重ねる（表示期間もチャート間で揃える）。
     - チーム色は固定8色のカテゴリカルパレット（team_order の登場順に割り当て）。
       9チーム目以降は無彩色にフォールドする（色は識別の補助であり、チーム名は
-      常に凡例・ホバーのテキストでも確認できる）。
+      常にチェックボックス・ホバーのテキストでも確認できる）。
+
+    実データはHTML内にJSON埋め込みし、レーンパッキングや再描画はブラウザ側の
+    JavaScriptで行う（フィルタ変更のたびにPython側で再生成する必要がない）。
 
     team_name_map / workflow_name_map: {ID: 表示名} の辞書。省略時はIDをそのまま表示する。
     team_order: 色を割り当てる順序を決めるチームIDのリスト（例: Teamsシートの行順）。
@@ -968,8 +1247,11 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
     Returns:
         書き出したファイルパス。
     """
+    import json as _json
+    from html import escape as _esc
+
     try:
-        import plotly.express as px
+        import plotly.offline as pyo
     except ImportError as e:
         raise ImportError(
             "export_plotly_gantt には plotly が必要です。`pip install plotly` を"
@@ -982,97 +1264,63 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
 
     if result_df.empty:
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write(f"<html><body><p>{project_name}: タスクなし</p></body></html>")
+            f.write(f"<html><body><p>{_esc(project_name)}: タスクなし</p></body></html>")
         logger.info(f"Plotlyガントチャートを書き出しました（タスクなし）: {output_path}")
         return output_path
 
     if team_order is None:
         team_order = list(dict.fromkeys(result_df["Team_ID"].tolist()))
+    # team_order に無いチームIDが result_df 側にだけ存在する場合に備えて末尾に補う
+    team_order = list(dict.fromkeys(list(team_order) + result_df["Team_ID"].tolist()))
     team_color_map = _build_team_color_map(team_order, team_name_map)
 
-    df = result_df.copy()
-    df["Team_Display"] = df["Team_ID"].map(lambda t: team_name_map.get(str(t), str(t)))
-    df["Workflow_Display"] = df["Workflow_ID"].map(lambda w: workflow_name_map.get(str(w), str(w)))
-    df["Adjustment_Label"] = df["Resource_Adjusted"].map(
-        {True: "あり（リソース制約）", False: "なし"}
+    teams_json = [
+        {"id": str(tid), "name": team_name_map.get(str(tid), str(tid)),
+         "color": team_color_map.get(team_name_map.get(str(tid), str(tid)), _TEAM_COLOR_OVERFLOW)}
+        for tid in team_order
+    ]
+
+    workflow_ids_in_order = list(dict.fromkeys(result_df["Workflow_ID"].tolist()))
+    workflows_json = [
+        {"id": str(wid), "name": workflow_name_map.get(str(wid), str(wid))}
+        for wid in workflow_ids_in_order
+    ]
+
+    tasks_json = [
+        {
+            "job_id": str(r["Job_ID"]),
+            "job_name": str(r["Job_Name"]),
+            "workflow_id": str(r["Workflow_ID"]),
+            "workflow_name": workflow_name_map.get(str(r["Workflow_ID"]), str(r["Workflow_ID"])),
+            "task_name": str(r["Task_Name"]),
+            "team_id": str(r["Team_ID"]),
+            "team_name": team_name_map.get(str(r["Team_ID"]), str(r["Team_ID"])),
+            "priority": r["Priority"],
+            "start": r["Start_Date"].strftime("%Y-%m-%d"),
+            "end": r["End_Date"].strftime("%Y-%m-%d"),
+            "adjusted": bool(r["Resource_Adjusted"]),
+        }
+        for _, r in result_df.iterrows()
+    ]
+
+    milestones_json = [
+        {"id": str(mid), "label": str(mlabel), "date": mdate.strftime("%Y-%m-%d")}
+        for mid, mlabel, mdate in milestone_markers
+    ]
+
+    title = f"{project_name} スケジュール"
+    html_out = (
+        _PLOTLY_GANTT_HTML_TEMPLATE
+        .replace("__TITLE__", _esc(title))
+        .replace("__PLOTLY_JS__", pyo.get_plotlyjs())
+        .replace("__TASKS_JSON__", _json.dumps(tasks_json, ensure_ascii=False))
+        .replace("__TEAMS_JSON__", _json.dumps(teams_json, ensure_ascii=False))
+        .replace("__WORKFLOWS_JSON__", _json.dumps(workflows_json, ensure_ascii=False))
+        .replace("__MILESTONES_JSON__", _json.dumps(milestones_json, ensure_ascii=False))
     )
 
-    # 同名Jobが複数Job_IDにまたがる場合のみ、行見出しにJob_IDを併記して区別する
-    name_to_ids = df.groupby("Job_Name")["Job_ID"].unique()
-    ambiguous_names = set(name_to_ids[name_to_ids.map(len) > 1].index)
-    df["Job_Display"] = df.apply(
-        lambda r: f"{r['Job_Name']}（{r['Job_ID']}）" if r["Job_Name"] in ambiguous_names else r["Job_Name"],
-        axis=1,
-    )
-
-    # ジョブ単位でレーンパッキング（時間的に重ならないタスクは同じ行にまとめる）。
-    # 重ならない限りは1ジョブ=1行になり、Mermaidのcompact表示と同様に縦を圧縮する。
-    lane_of, lane_count = _pack_lanes(df, "Job_ID")
-    df["Lane"] = lane_of
-    df["Row_Label"] = df.apply(
-        lambda r: r["Job_Display"] if lane_count[r["Job_ID"]] <= 1
-        else f"{r['Job_Display']} #{r['Lane'] + 1}",
-        axis=1,
-    )
-
-    df = df.sort_values(["Workflow_Display", "Job_Name", "Lane", "Start_Date"]).reset_index(drop=True)
-    row_order = df["Row_Label"].drop_duplicates().tolist()
-
-    fig = px.timeline(
-        df,
-        x_start="Start_Date",
-        x_end="End_Date",
-        y="Row_Label",
-        color="Team_Display",
-        color_discrete_map=team_color_map,
-        category_orders={"Row_Label": row_order},
-        text="Task_Name",
-        custom_data=["Workflow_Display", "Job_Name", "Task_Name", "Team_Display",
-                      "Priority", "Adjustment_Label"],
-    )
-    fig.update_traces(
-        textposition="inside",
-        insidetextanchor="start",
-        textfont_size=11,
-        textfont_color="#0b0b0b",
-        constraintext="both",
-        hovertemplate=(
-            "<b>%{customdata[1]} ＞ %{customdata[2]}</b><br>"
-            "ワークフロー: %{customdata[0]}<br>"
-            "チーム: %{customdata[3]}<br>"
-            "優先度: %{customdata[4]}<br>"
-            "開始: %{base|%Y-%m-%d} ／ 終了: %{x|%Y-%m-%d}<br>"
-            "リソース調整: %{customdata[5]}"
-            "<extra></extra>"
-        )
-    )
-
-    for ms_id, ms_label, ms_date in milestone_markers:
-        fig.add_vline(
-            x=ms_date.to_pydatetime(), line_width=1.5, line_dash="dash",
-            line_color="#52514e",
-            annotation_text=f"◆{ms_label}", annotation_position="top",
-            annotation_textangle=-90, annotation_font_size=11,
-            annotation_font_color="#52514e",
-        )
-
-    n_rows = df["Row_Label"].nunique()
-    # マイルストーンラベルは縦書き（-90度）で描画するため、最長ラベルに合わせて
-    # 上マージンを確保する（足りないと文字が上端で切れる）
-    max_label_len = max([len(str(m[1])) for m in milestone_markers], default=0)
-    top_margin = 90 + max_label_len * 9
-
-    fig.update_yaxes(autorange="reversed", title=None)
-    fig.update_xaxes(title="日付")
-    fig.update_layout(
-        title=f"{project_name} スケジュール",
-        legend_title_text="チーム（クリックで表示/非表示切り替え）",
-        template="plotly_white",
-        height=max(400, 26 * n_rows + top_margin + 110),
-        margin=dict(l=10, r=10, t=top_margin, b=10),
-    )
-
-    fig.write_html(output_path, include_plotlyjs=True, full_html=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html_out)
     logger.info(f"Plotlyガントチャートを書き出しました: {output_path}")
     return output_path
 
