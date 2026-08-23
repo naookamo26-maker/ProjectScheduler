@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -56,6 +56,9 @@ class MainWindow(QMainWindow):
     def dropEvent(self, event):
         path = self._pschedule_path_from_mime(event.mimeData())
         if path is None:
+            return
+        if not self._confirm_discard_unsaved():
+            event.acceptProposedAction()
             return
         try:
             self._open_database(ProjectDatabase.open_existing(path))
@@ -118,6 +121,8 @@ class MainWindow(QMainWindow):
         self.tabs.setEnabled(True)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.generate_action.setEnabled(True)
+        self.save_action.setEnabled(True)
+        self.save_as_action.setEnabled(True)
 
     def _on_tab_changed(self, index):
         """タブを切り替えるたびに、そのタブの表示をDBの最新状態へ合わせる
@@ -146,6 +151,20 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
+        self.save_action = QAction("保存(&S)", self)
+        self.save_action.setShortcut(QKeySequence.Save)  # 標準的にCtrl+S
+        self.save_action.triggered.connect(self.on_save)
+        self.save_action.setEnabled(False)
+        file_menu.addAction(self.save_action)
+
+        self.save_as_action = QAction("名前を付けて保存(&A)...", self)
+        self.save_as_action.setShortcut(QKeySequence.SaveAs)  # 標準的にCtrl+Shift+S
+        self.save_as_action.triggered.connect(self.on_save_as)
+        self.save_as_action.setEnabled(False)
+        file_menu.addAction(self.save_as_action)
+
+        file_menu.addSeparator()
+
         self.generate_action = QAction("ガントチャートを生成(&G)...", self)
         self.generate_action.triggered.connect(self.on_generate_gantt)
         self.generate_action.setEnabled(False)
@@ -158,6 +177,8 @@ class MainWindow(QMainWindow):
         file_menu.addAction(exit_action)
 
     def on_new_project(self):
+        if not self._confirm_discard_unsaved():
+            return
         path, _ = QFileDialog.getSaveFileName(
             self, "新規プロジェクトファイルの作成", "", FILE_FILTER
         )
@@ -171,6 +192,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "エラー", f"プロジェクトを作成できませんでした:\n{e}")
 
     def on_open_project(self):
+        if not self._confirm_discard_unsaved():
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "プロジェクトファイルを開く", "", FILE_FILTER
         )
@@ -180,6 +203,57 @@ class MainWindow(QMainWindow):
             self._open_database(ProjectDatabase.open_existing(path))
         except Exception as e:
             QMessageBox.critical(self, "エラー", f"プロジェクトを開けませんでした:\n{e}")
+
+    def on_save(self):
+        """保存（Ctrl+S）。ファイルへの書き込みはここで明示的に行うまで発生しない。"""
+        if self.db is None:
+            return False
+        try:
+            self.db.save()
+        except Exception as e:
+            QMessageBox.critical(self, "エラー", f"保存できませんでした:\n{e}")
+            return False
+        self._update_title()
+        self.statusBar().showMessage(f"保存しました: {self.db.path}", 5000)
+        return True
+
+    def on_save_as(self):
+        """名前を付けて保存（Ctrl+Shift+S）。"""
+        if self.db is None:
+            return False
+        default_path = self.db.path or ""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "名前を付けて保存", default_path, FILE_FILTER
+        )
+        if not path:
+            return False
+        if not path.endswith(f".{DEFAULT_SUFFIX}"):
+            path = f"{path}.{DEFAULT_SUFFIX}"
+        try:
+            self.db.save_as(path)
+        except Exception as e:
+            QMessageBox.critical(self, "エラー", f"保存できませんでした:\n{e}")
+            return False
+        self._update_title()
+        self.statusBar().showMessage(f"保存しました: {self.db.path}", 5000)
+        return True
+
+    def _confirm_discard_unsaved(self):
+        """未保存の変更がある場合、保存/破棄/キャンセルを確認する。
+        Returns True: 続行してよい（保存済み、または破棄を選択）。False: キャンセル。"""
+        if self.db is None or not self.db.is_dirty():
+            return True
+        reply = QMessageBox.question(
+            self, "未保存の変更",
+            "現在のプロジェクトに未保存の変更があります。保存しますか？",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save,
+        )
+        if reply == QMessageBox.Save:
+            return self.on_save()
+        if reply == QMessageBox.Discard:
+            return True
+        return False
 
     def on_generate_gantt(self):
         if self.db is None:
@@ -213,13 +287,30 @@ class MainWindow(QMainWindow):
 
     def _open_database(self, db):
         if self.db is not None:
+            self.db.on_change = None
             self.db.close()
         self.db = db
+        self.db.on_change = self._on_db_changed
         self._rebuild_tabs()
         self.statusBar().showMessage(f"開いているプロジェクト: {db.path}")
-        self.setWindowTitle(f"プロジェクトスケジューラー — {db.path}")
+        self._update_title()
+
+    def _on_db_changed(self):
+        """DB変更時のフック（保存以外の全てのCRUD操作後に呼ばれる）。
+        タイトルバーに未保存マークを反映する。"""
+        self._update_title()
+
+    def _update_title(self):
+        if self.db is None:
+            self.setWindowTitle("プロジェクトスケジューラー")
+            return
+        mark = "*" if self.db.is_dirty() else ""
+        self.setWindowTitle(f"プロジェクトスケジューラー — {mark}{self.db.path}")
 
     def closeEvent(self, event):
+        if self.db is not None and not self._confirm_discard_unsaved():
+            event.ignore()
+            return
         if self.db is not None:
             self.db.close()
         super().closeEvent(event)

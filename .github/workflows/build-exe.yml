@@ -41,5 +41,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ProjectSchedulerGUI-windows
-          path: dist/ProjectSchedulerGUI/
+          # --onefile構成のため、生成物は dist/ProjectSchedulerGUI.exe の1ファイルのみ。
+          path: dist/ProjectSchedulerGUI.exe
           if-no-files-found: error

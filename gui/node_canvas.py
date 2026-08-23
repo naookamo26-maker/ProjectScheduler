@@ -296,6 +296,7 @@ class WorkflowGraphScene(QGraphicsScene):
         pred_node.edges.append(edge)
         succ_node.edges.append(edge)
         self.adjacency.setdefault(pred_id, []).append(succ_id)
+        self.auto_arrange()
 
     def delete_edge(self, edge):
         self.db.delete_task_dependency(edge.dependency_id)
@@ -306,6 +307,7 @@ class WorkflowGraphScene(QGraphicsScene):
         edge.succ_node.edges.remove(edge)
         del self.edges[edge.dependency_id]
         self.removeItem(edge)
+        self.auto_arrange()
 
     def delete_node(self, node):
         usage = self.db.workflow_task_usage_count(node.workflow_task_id)
@@ -323,6 +325,7 @@ class WorkflowGraphScene(QGraphicsScene):
         self.db.delete_workflow_task(node.workflow_task_id)
         del self.nodes[node.workflow_task_id]
         self.removeItem(node)
+        self.auto_arrange()
 
     def add_task(self, name, team_id, days, x, y):
         task_id = self.db.add_workflow_task(self.workflow_id, name, team_id, days, x, y)
@@ -333,7 +336,23 @@ class WorkflowGraphScene(QGraphicsScene):
         node.setPos(x, y)
         self.addItem(node)
         self.nodes[task_id] = node
+        self.auto_arrange()
         return node
+
+    def auto_arrange(self):
+        """ノード情報（タスクの追加・編集・削除、依存関係の追加・削除）が
+        変わるたびに呼び出し、依存の深さに基づく自動レイアウトへ整列し直す
+        （compute_auto_layout、gui/node_canvas.py冒頭参照）。手動でドラッグした
+        位置は、次に何か編集するとリセットされる。"""
+        tasks = self.db.list_workflow_tasks(self.workflow_id)
+        deps = self.db.list_task_dependencies(self.workflow_id)
+        positions = compute_auto_layout(tasks, deps)
+        for task_id, (x, y) in positions.items():
+            node = self.nodes.get(task_id)
+            if node is None:
+                continue
+            node.setPos(x, y)
+            self.db.update_task_position(task_id, x, y)
 
     def refresh_colors(self):
         """チームマスタが変わった際、既存ノードの色を再計算する。"""
@@ -616,6 +635,7 @@ class WorkflowGraphView(QGraphicsView):
         node.update_labels(name, team["name"], days)
         node.set_color(colors.get(team_id, "#898781"))
         self._apply_predecessors(node, dialog.selected_predecessor_ids())
+        self.scene().auto_arrange()
 
     def _apply_predecessors(self, node, predecessor_task_ids):
         """タスク編集ダイアログで選択された先行タスク集合を、実際の

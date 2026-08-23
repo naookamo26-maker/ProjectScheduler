@@ -102,19 +102,24 @@ class CrudSection(QGroupBox):
     列やセルウィジェットの構成は各タブ側の責務とする（追加/削除の導線と
     見た目の一貫性だけをここで共通化する）。"""
 
-    def __init__(self, title, column_labels, on_add, on_delete, parent=None):
+    def __init__(self, title, column_labels, on_add, on_delete, on_edit=None, parent=None):
         super().__init__(title, parent)
         self.on_add = on_add
         self.on_delete = on_delete
+        self.on_edit = on_edit
 
         layout = QVBoxLayout(self)
 
         toolbar = QHBoxLayout()
         add_btn = QPushButton("＋ 追加")
         add_btn.clicked.connect(self._handle_add)
+        toolbar.addWidget(add_btn)
+        if on_edit is not None:
+            edit_btn = QPushButton("編集...")
+            edit_btn.clicked.connect(self._handle_edit)
+            toolbar.addWidget(edit_btn)
         del_btn = QPushButton("－ 削除")
         del_btn.clicked.connect(self._handle_delete)
-        toolbar.addWidget(add_btn)
         toolbar.addWidget(del_btn)
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
@@ -124,10 +129,19 @@ class CrudSection(QGroupBox):
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
+        if on_edit is not None:
+            self.table.itemDoubleClicked.connect(lambda _item: self._handle_edit())
         layout.addWidget(self.table)
 
     def _handle_add(self):
         self.on_add()
+
+    def _handle_edit(self):
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "編集", "編集する行を選択してください。")
+            return
+        self.on_edit(row)
 
     def _handle_delete(self):
         row = self.table.currentRow()

@@ -21,10 +21,10 @@ PyInstallerは**クロスコンパイルに対応していない**——ビル�
 - Actionsタブから手動実行（`workflow_dispatch`）
 
 ビルドが成功すると、ワークフローの実行結果ページから
-`ProjectSchedulerGUI-windows` という名前のArtifact（zip、`dist/
-ProjectSchedulerGUI/` 一式）をダウンロードできる。展開して
-`ProjectSchedulerGUI.exe` を実行する（同フォルダの `_internal/` は
-実行に必要な同梱ファイル一式なので、`.exe` と同じ場所に置いたまま使う）。
+`ProjectSchedulerGUI-windows` という名前のArtifact（zip）をダウンロードできる。
+展開すると `ProjectSchedulerGUI.exe` の単一ファイルが得られる
+（依存ライブラリ・plotly.min.js等はすべて実行ファイル内に埋め込まれており、
+他に配布するファイルは無い）。
 
 ## 方法2: 手元のWindows環境でビルド
 
@@ -34,13 +34,11 @@ pip install pyinstaller
 pyinstaller packaging\ProjectSchedulerGUI.spec
 ```
 
-`dist\ProjectSchedulerGUI\` に `ProjectSchedulerGUI.exe` と `_internal\`
-（依存ライブラリ・plotly.min.js等の同梱データ）が生成される。フォルダごと
-配布する（`--onedir` 形式、既定）。
-
-単一の `.exe` ファイルにまとめたい場合は、`packaging/ProjectSchedulerGUI.spec`
-内のコメントに従い `EXE(...)` の呼び出しを1ファイル版に差し替える
-（起動がわずかに遅くなる代わりに配布物が1ファイルになる）。
+`dist\ProjectSchedulerGUI.exe` の1ファイルのみが生成される
+（`--onefile` 構成。依存ライブラリ・plotly.min.js等の同梱データも実行ファイル
+内に埋め込まれ、フォルダごと配布する必要はない）。この `.exe` 1つを配布・
+コピーするだけで実行できる（起動時に一時フォルダへ自己展開するぶん、
+複数ファイル構成の `--onedir` よりわずかに起動が遅くなる）。
 
 ## spec ファイルの構成（`packaging/ProjectSchedulerGUI.spec`）
 
@@ -56,6 +54,11 @@ pyinstaller packaging\ProjectSchedulerGUI.spec
   一部の開発環境で検出される破損／非互換なシステム版 `cryptography` が
   ビルドを失敗させることがあったため（Windows上のクリーンな環境では
   通常発生しない）。
+- `onefile=True`（`EXE(...)` に `a.binaries`/`a.zipfiles`/`a.datas` を直接
+  渡し、`COLLECT(...)` を使わない構成）により、単一の `.exe` にすべてを
+  埋め込む。フォルダ配布（`--onedir`）に戻したい場合は、`EXE(...)` の
+  `onefile=True` を外して `exclude_binaries=True` にし、`COLLECT(exe,
+  a.binaries, a.zipfiles, a.datas, ...)` を追加すればよい。
 
 ## 開発時の検証内容
 

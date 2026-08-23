@@ -8,8 +8,11 @@
 #   pip install -r requirements.txt pyinstaller
 #   pyinstaller packaging/ProjectSchedulerGUI.spec
 #
-# 生成物は dist/ProjectSchedulerGUI/ 配下（--onedir、既定）に出力される。
-# 単一.exeにまとめたい場合は本ファイルの EXE(...) のコメントを参照。
+# 単一ファイル（--onefile）としてビルドする。生成物は
+# dist/ProjectSchedulerGUI.exe の1ファイルのみ（依存ライブラリ・plotly.min.js
+# 等も実行ファイル内に埋め込まれる）。起動時に一時フォルダへ自己展開するため、
+# --onedir構成（フォルダ配布）よりわずかに起動が遅くなるが、配布・受け渡しは
+# この1ファイルをコピーするだけでよい。
 
 import os
 
@@ -44,51 +47,22 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     [],
-    exclude_binaries=True,
     name="ProjectSchedulerGUI",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
     console=False,  # GUIアプリなのでコンソールウィンドウを表示しない
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    onefile=True,
 )
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name="ProjectSchedulerGUI",
-)
-
-# --- 単一.exeにまとめたい場合 -----------------------------------------------
-# 上記の EXE(...) の exclude_binaries=True と COLLECT(...) を、代わりに
-# 以下のように単一バイナリ版へ置き換える（起動がわずかに遅くなる代わりに
-# 配布物が1ファイルになる）:
-#
-# exe = EXE(
-#     pyz,
-#     a.scripts,
-#     a.binaries,
-#     a.zipfiles,
-#     a.datas,
-#     [],
-#     name="ProjectSchedulerGUI",
-#     debug=False,
-#     bootloader_ignore_signals=False,
-#     strip=False,
-#     upx=True,
-#     upx_exclude=[],
-#     runtime_tmpdir=None,
-#     console=False,
-#     onefile=True,
-# )
