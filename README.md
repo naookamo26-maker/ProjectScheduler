@@ -22,6 +22,14 @@ python project_scheduler.py [Excelファイル] -o output/schedule_gantt.md --ht
 引数を省略すると `data/Project_Schedule_Sample_GameDev_v22.xlsx`
 （ゲーム開発案件のサンプルデータ）を使ってスケジューリングを実行する。
 
+サンプルデータを実行した出力例は `samples/` 配下にコミット済み:
+
+- [`samples/schedule_gantt.md`](samples/schedule_gantt.md) — Mermaidガントチャート
+  （GitHub上でそのままレンダリングされる）
+- [`samples/schedule_gantt.html`](samples/schedule_gantt.html) — インタラクティブHTML
+  ガントチャート（ダウンロードしてブラウザで開く。GitHubのファイルビューでは
+  ソースのまま表示される点に注意）
+
 主なオプション:
 
 - `--html-output`: インタラクティブなHTMLガントチャートの出力先
