@@ -14,7 +14,7 @@ project_scheduler.py の _build_scheduling_order() が採用しているトポ�
 ワークフロー内の単純な整数グラフに対する専用の事前チェックとして別実装する。
 """
 
-from PySide6.QtCore import QPointF, Qt
+from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QBrush, QColor, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QComboBox,
@@ -31,6 +31,8 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QInputDialog,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMenu,
     QMessageBox,
     QSpinBox,
@@ -40,7 +42,7 @@ from gui.db import DuplicateNameError, ProjectDatabaseError
 
 NODE_WIDTH = 170
 NODE_HEIGHT = 64
-ANCHOR_RADIUS = 6
+ANCHOR_RADIUS = 8
 
 _ADD_TEAM_SENTINEL = "__add_new_team__"
 
@@ -347,7 +349,8 @@ class TaskNodeEditDialog(QDialog):
     """タスクの追加・編集用モーダルダイアログ。チーム未登録時や、既存チームに
     無い担当を割り当てたい場合に備え、コンボの末尾から即席でチームを追加できる。"""
 
-    def __init__(self, db, title, name="", team_id=None, days=1, parent=None):
+    def __init__(self, db, title, name="", team_id=None, days=1,
+                 workflow_id=None, task_id=None, parent=None):
         super().__init__(parent)
         self.db = db
         self.setWindowTitle(title)
@@ -366,6 +369,25 @@ class TaskNodeEditDialog(QDialog):
         self.days_spin.setRange(1, 9999)
         self.days_spin.setValue(days)
         form.addRow("所要日数", self.days_spin)
+
+        self.predecessor_list = QListWidget()
+        self.predecessor_list.setSelectionMode(QListWidget.MultiSelection)
+        self.predecessor_list.setMaximumHeight(120)
+        if workflow_id is not None:
+            deps = db.list_task_dependencies(workflow_id)
+            current_preds = (
+                {d["predecessor_task_id"] for d in deps if d["successor_task_id"] == task_id}
+                if task_id is not None else set()
+            )
+            for t in db.list_workflow_tasks(workflow_id):
+                if task_id is not None and t["id"] == task_id:
+                    continue  # 自分自身は先行タスクにできない
+                item = QListWidgetItem(t["name"])
+                item.setData(Qt.UserRole, t["id"])
+                self.predecessor_list.addItem(item)
+                if t["id"] in current_preds:
+                    item.setSelected(True)
+        form.addRow("先行タスク（このタスクの前に完了が必要）", self.predecessor_list)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -404,6 +426,9 @@ class TaskNodeEditDialog(QDialog):
     def values(self):
         return self.name_edit.text().strip(), self.team_combo.currentData(), self.days_spin.value()
 
+    def selected_predecessor_ids(self):
+        return {item.data(Qt.UserRole) for item in self.predecessor_list.selectedItems()}
+
 
 class WorkflowGraphView(QGraphicsView):
     def __init__(self, parent=None):
@@ -416,6 +441,47 @@ class WorkflowGraphView(QGraphicsView):
     def wheelEvent(self, event):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.scale(factor, factor)
+
+    def fit_all(self):
+        """シーン上の全ノードが収まるように表示を合わせる（Aキー、初期表示時）。"""
+        if self.scene() is None:
+            return
+        rect = self.scene().itemsBoundingRect()
+        if rect.isEmpty():
+            return
+        margin = 40
+        rect = rect.adjusted(-margin, -margin, margin, margin)
+        self.fitInView(rect, Qt.KeepAspectRatio)
+
+    def fit_selected(self):
+        """選択中のノードだけが収まるように表示を合わせる（Fキー）。
+        選択が無ければ全体表示にフォールバックする。"""
+        if self.scene() is None:
+            return
+        selected = self.scene().selectedItems()
+        if not selected:
+            self.fit_all()
+            return
+        rect = QRectF()
+        for item in selected:
+            rect = rect.united(item.sceneBoundingRect())
+        margin = 60
+        rect = rect.adjusted(-margin, -margin, margin, margin)
+        self.fitInView(rect, Qt.KeepAspectRatio)
+
+    def mouseDoubleClickEvent(self, event):
+        scene_pos = self.mapToScene(event.pos())
+        item = self.scene().itemAt(scene_pos, self.transform()) if self.scene() else None
+        node = None
+        if isinstance(item, TaskNodeItem):
+            node = item
+        elif item is not None and isinstance(item.parentItem(), TaskNodeItem):
+            node = item.parentItem()
+        if node is not None:
+            self._edit_node(node)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
@@ -444,6 +510,10 @@ class WorkflowGraphView(QGraphicsView):
     def mouseReleaseEvent(self, event):
         if self._connecting_from is not None:
             scene_pos = self.mapToScene(event.pos())
+            # ドラッグ中の仮の破線（_temp_edge）はリリース位置ちょうどに終端を持つ
+            # 上、zValueも高いため、隠さずにitemAtを呼ぶと自分自身がヒットして
+            # しまい、本来の接続先ノード/アンカーを検出できない。判定前に必ず隠す。
+            self._temp_edge.hide()
             item = self.scene().itemAt(scene_pos, self.transform())
             target_node = None
             if isinstance(item, AnchorItem):
@@ -468,6 +538,14 @@ class WorkflowGraphView(QGraphicsView):
                     self.scene().delete_node(item)
                 elif isinstance(item, EdgeItem):
                     self.scene().delete_edge(item)
+            event.accept()
+            return
+        if event.key() == Qt.Key_A:
+            self.fit_all()
+            event.accept()
+            return
+        if event.key() == Qt.Key_F:
+            self.fit_selected()
             event.accept()
             return
         super().keyPressEvent(event)
@@ -503,14 +581,15 @@ class WorkflowGraphView(QGraphicsView):
                 self, "チーム未登録",
                 "先にチームを1つ以上登録してください（このダイアログからも追加できます）。",
             )
-        dialog = TaskNodeEditDialog(db, "タスクを追加")
+        dialog = TaskNodeEditDialog(db, "タスクを追加", workflow_id=self.scene().workflow_id)
         if dialog.exec() != QDialog.Accepted:
             return
         name, team_id, days = dialog.values()
         if not name or team_id is None or team_id == _ADD_TEAM_SENTINEL:
             QMessageBox.warning(self, "入力エラー", "タスク名とチームを指定してください。")
             return
-        self.scene().add_task(name, team_id, days, scene_pos.x(), scene_pos.y())
+        node = self.scene().add_task(name, team_id, days, scene_pos.x(), scene_pos.y())
+        self._apply_predecessors(node, dialog.selected_predecessor_ids())
 
     def _edit_node(self, node):
         db = self.scene().db
@@ -518,7 +597,8 @@ class WorkflowGraphView(QGraphicsView):
                         if t["id"] == node.workflow_task_id)
         dialog = TaskNodeEditDialog(
             db, "タスクを編集", name=current["name"], team_id=current["team_id"],
-            days=current["default_days"],
+            days=current["default_days"], workflow_id=self.scene().workflow_id,
+            task_id=node.workflow_task_id,
         )
         if dialog.exec() != QDialog.Accepted:
             return
@@ -535,3 +615,25 @@ class WorkflowGraphView(QGraphicsView):
         team = next(t for t in db.list_teams() if t["id"] == team_id)
         node.update_labels(name, team["name"], days)
         node.set_color(colors.get(team_id, "#898781"))
+        self._apply_predecessors(node, dialog.selected_predecessor_ids())
+
+    def _apply_predecessors(self, node, predecessor_task_ids):
+        """タスク編集ダイアログで選択された先行タスク集合を、実際の
+        task_dependencies行に反映する（追加分・削除分の差分のみ処理）。
+        循環依存になる追加は scene.try_add_edge が警告して拒否する。"""
+        scene = self.scene()
+        current_pred_ids = {
+            edge.pred_node.workflow_task_id for edge in node.edges if edge.succ_node is node
+        }
+        for pred_id in predecessor_task_ids - current_pred_ids:
+            pred_node = scene.nodes.get(pred_id)
+            if pred_node is not None:
+                scene.try_add_edge(pred_node, node)
+        for pred_id in current_pred_ids - predecessor_task_ids:
+            edge = next(
+                (e for e in node.edges
+                 if e.succ_node is node and e.pred_node.workflow_task_id == pred_id),
+                None,
+            )
+            if edge is not None:
+                scene.delete_edge(edge)

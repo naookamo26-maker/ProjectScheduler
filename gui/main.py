@@ -1,8 +1,9 @@
 """
 GUIエントリポイント（MainWindow）。
 
-4タブ（基本情報設定・ワークフロー設計・ジョブ・依存関係）を束ね、
+3タブ（基本情報設定・ワークフロー設計・ジョブ）を束ね、
 File メニューでプロジェクトファイル（.pschedule）の新規作成/オープンを行う。
+プロジェクトファイルをウィンドウにドラッグ&ドロップして開くこともできる。
 """
 
 import sys
@@ -24,7 +25,6 @@ from PySide6.QtWidgets import (
 from gui.db import ProjectDatabase
 from gui.gantt_generator import generate_gantt, validate_for_generation
 from gui.tab_basic_info import BasicInfoTab
-from gui.tab_dependencies import DependenciesTab
 from gui.tab_jobs import JobsTab
 from gui.tab_workflows import WorkflowsTab
 from project_scheduler import SchedulingError
@@ -39,7 +39,8 @@ class MainWindow(QMainWindow):
         self.db: ProjectDatabase | None = None
 
         self.setWindowTitle("プロジェクトスケジューラー")
-        self.resize(1200, 800)
+        self.resize(1500, 900)
+        self.setAcceptDrops(True)
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -47,6 +48,28 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self.statusBar().showMessage("プロジェクトファイルを新規作成するか、開いてください")
+
+    def dragEnterEvent(self, event):
+        if self._pschedule_path_from_mime(event.mimeData()) is not None:
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        path = self._pschedule_path_from_mime(event.mimeData())
+        if path is None:
+            return
+        try:
+            self._open_database(ProjectDatabase.open_existing(path))
+        except Exception as e:
+            QMessageBox.critical(self, "エラー", f"プロジェクトを開けませんでした:\n{e}")
+        event.acceptProposedAction()
+
+    def _pschedule_path_from_mime(self, mime_data):
+        if not mime_data.hasUrls():
+            return None
+        for url in mime_data.urls():
+            if url.isLocalFile() and url.toLocalFile().endswith(f".{DEFAULT_SUFFIX}"):
+                return url.toLocalFile()
+        return None
 
     def _placeholder_tab(self, message):
         widget = QWidget()
@@ -66,10 +89,17 @@ class MainWindow(QMainWindow):
             "基本情報設定",
         )
         self.tabs.addTab(
-            self._placeholder_tab("ワークフローとタスクの依存関係をここで設計します。"), "ワークフロー設計"
+            self._placeholder_tab(
+                "ワークフローとタスクの依存関係、およびワークフロー間の依存テンプレートをここで設計します。"
+            ),
+            "ワークフロー設計",
         )
-        self.tabs.addTab(self._placeholder_tab("ジョブ（ワークフローの実体化）をここで作成します。"), "ジョブ")
-        self.tabs.addTab(self._placeholder_tab("ジョブをまたぐ依存関係をここで設定します。"), "依存関係")
+        self.tabs.addTab(
+            self._placeholder_tab(
+                "ジョブ（ワークフローの実体化）と、ジョブをまたぐ依存関係をここで作成します。"
+            ),
+            "ジョブ",
+        )
         self.tabs.setEnabled(False)
 
     def _rebuild_tabs(self):
@@ -84,9 +114,6 @@ class MainWindow(QMainWindow):
 
         self.tab_jobs = JobsTab(self.db)
         self.tabs.addTab(self.tab_jobs, "ジョブ")
-
-        self.tab_dependencies = DependenciesTab(self.db)
-        self.tabs.addTab(self.tab_dependencies, "依存関係")
 
         self.tabs.setEnabled(True)
         self.tabs.currentChanged.connect(self._on_tab_changed)

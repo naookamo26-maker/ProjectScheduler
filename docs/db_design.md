@@ -29,7 +29,9 @@ GUI（`gui/`）の入力データは、1プロジェクト＝1ファイルのSQL
 | `task_dependencies` | ワークフロー内のタスク依存（Internal_Depends相当、predecessor→successor） |
 | `jobs` | ジョブ（ワークフローの実体化。名前・使用ワークフロー・既定マイルストーン・優先度） |
 | `job_task_overrides` | ジョブ単位でのタスク上書き（有効/無効・日数・マイルストーン・チームの差分のみ保持） |
-| `job_external_dependencies` | ジョブをまたぐタスク依存（External_Dependencies相当） |
+| `job_dependency_links` | ジョブ単位の依存リンク（「このジョブは、あのジョブに依存する」）。追加時に`workflow_dependency_templates`を参照し、タスク単位の依存を自動展開する |
+| `job_external_dependencies` | ジョブをまたぐタスク依存（External_Dependencies相当）。`source_link_id`で`job_dependency_links`からの自動生成分か手動追加分かを区別する |
+| `workflow_dependency_templates` | ワークフローペア単位の既定タスク対応（例: ワークフローAがワークフローBに依存する場合、Aのどのタスクが、Bのどのタスクの完了を待つか） |
 
 DDLの正本は `gui/db.py` の `_SCHEMA_SQL` を参照（このドキュメントは概要説明用で、
 列の追加・変更が生じた場合は `_SCHEMA_SQL` 側を先に直し、本ドキュメントを追随させる）。
@@ -68,6 +70,31 @@ AUTOINCREMENT` を持ち、GUIのあらゆる参照（コンボボックス等�
 | マイルストーン | 参照するJob/上書きがあれば警告（削除は許可、参照はNULLになる） |
 | ジョブ | 他ジョブからの外部依存があれば警告（削除は許可、依存も連鎖削除） |
 | ワークフロー内タスク | Job側の上書き/外部依存/内部依存があれば件数を警告 |
+
+### 依存テンプレートとジョブ依存リンクの自動展開（`source_link_id`）
+
+タブ4「依存関係」を廃止し、タブ3「ジョブ」に統合した際、ジョブをまたぐ
+依存の入力をタスク単位からジョブ単位に簡素化する仕組みを追加した。
+
+1. `workflow_dependency_templates` に、ワークフローペア単位で「Aワークフロー
+   のこのタスクは、Bワークフローのこのタスクの完了を待つ」という既定ルールを
+   タブ2「ワークフロー設計」で登録しておく。
+2. タブ3「ジョブ」で、あるジョブが別のジョブに依存することを
+   `job_dependency_links` に1行追加すると（`ProjectDatabase.
+   add_job_dependency_link`）、2ジョブそれぞれのワークフローの組み合わせに
+   該当する `workflow_dependency_templates` の行を検索し、対応する
+   `job_external_dependencies` 行を自動生成する。生成された行には、元になった
+   リンクの `id` を `source_link_id` として記録する。
+3. `job_dependency_links` の行を削除すると、`source_link_id` がそれを指す
+   `job_external_dependencies` 行は `ON DELETE CASCADE` により連動して削除
+   される。ユーザーが個別に手動追加した依存（`source_link_id IS NULL`）は
+   影響を受けない。
+
+`source_link_id IS NULL` ＝ユーザーが個別に追加した例外的な依存、
+`source_link_id`が非NULL＝テンプレートから自動生成された依存、という区別が
+常に成り立つ。ガントチャート生成（`gui/gantt_generator.py`）は
+`job_external_dependencies` テーブルをそのまま読むため、自動生成行・手動行の
+区別なくスケジューリングに反映される。
 
 ### 休業日の一意性
 

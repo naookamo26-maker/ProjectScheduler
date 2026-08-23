@@ -93,13 +93,32 @@ CREATE TABLE job_task_overrides (
     UNIQUE(job_id, workflow_task_id)
 );
 
+CREATE TABLE job_dependency_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    depends_on_job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    UNIQUE(job_id, depends_on_job_id),
+    CHECK (job_id != depends_on_job_id)
+);
+
 CREATE TABLE job_external_dependencies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
     depends_on_job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     depends_on_workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
+    source_link_id INTEGER REFERENCES job_dependency_links(id) ON DELETE CASCADE,
     UNIQUE(job_id, workflow_task_id, depends_on_job_id, depends_on_workflow_task_id)
+);
+
+CREATE TABLE workflow_dependency_templates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
+    depends_on_workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    depends_on_workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
+    UNIQUE(workflow_id, workflow_task_id, depends_on_workflow_id, depends_on_workflow_task_id),
+    CHECK (workflow_id != depends_on_workflow_id)
 );
 """
 
@@ -384,8 +403,10 @@ class ProjectDatabase:
             "(SELECT COUNT(*) FROM job_external_dependencies WHERE workflow_task_id = ? "
             " OR depends_on_workflow_task_id = ?) + "
             "(SELECT COUNT(*) FROM task_dependencies WHERE predecessor_task_id = ? "
-            " OR successor_task_id = ?) AS n",
-            (task_id, task_id, task_id, task_id, task_id),
+            " OR successor_task_id = ?) + "
+            "(SELECT COUNT(*) FROM workflow_dependency_templates WHERE workflow_task_id = ? "
+            " OR depends_on_workflow_task_id = ?) AS n",
+            (task_id, task_id, task_id, task_id, task_id, task_id, task_id),
         ).fetchone()
         return row["n"]
 
@@ -458,10 +479,13 @@ class ProjectDatabase:
         self._conn.commit()
 
     def job_usage_count(self, job_id):
-        """他のジョブがこのジョブのタスクに外部依存している数（削除時の警告用）"""
+        """他のジョブがこのジョブに外部依存している数（削除時の警告用）"""
         row = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM job_external_dependencies WHERE depends_on_job_id = ?",
-            (job_id,),
+            "SELECT "
+            "(SELECT COUNT(*) FROM job_external_dependencies WHERE depends_on_job_id = ?) + "
+            "(SELECT COUNT(*) FROM job_dependency_links WHERE depends_on_job_id = ? "
+            " OR job_id = ?) AS n",
+            (job_id, job_id, job_id),
         ).fetchone()
         return row["n"]
 
@@ -523,19 +547,27 @@ class ProjectDatabase:
 
     # -- job_external_dependencies ----------------------------------------------
 
-    def list_external_dependencies(self):
-        rows = self._conn.execute(
+    def list_external_dependencies(self, job_id=None):
+        """job_id を指定すると、そのジョブが依存する側の行だけに絞り込む
+        （タブ3の「個別のタスク依存」セクション用）。省略時は全件。"""
+        sql = (
             "SELECT d.id, "
             "d.job_id, j.name AS job_name, "
             "d.workflow_task_id, wt.name AS task_name, "
             "d.depends_on_job_id, dj.name AS depends_on_job_name, "
-            "d.depends_on_workflow_task_id, dwt.name AS depends_on_task_name "
+            "d.depends_on_workflow_task_id, dwt.name AS depends_on_task_name, "
+            "d.source_link_id "
             "FROM job_external_dependencies d "
             "JOIN jobs j ON j.id = d.job_id "
             "JOIN workflow_tasks wt ON wt.id = d.workflow_task_id "
             "JOIN jobs dj ON dj.id = d.depends_on_job_id "
             "JOIN workflow_tasks dwt ON dwt.id = d.depends_on_workflow_task_id"
-        ).fetchall()
+        )
+        params = ()
+        if job_id is not None:
+            sql += " WHERE d.job_id = ?"
+            params = (job_id,)
+        rows = self._conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
     def add_external_dependency(self, job_id, workflow_task_id, depends_on_job_id,
@@ -556,5 +588,97 @@ class ProjectDatabase:
     def delete_external_dependency(self, dependency_id):
         self._conn.execute(
             "DELETE FROM job_external_dependencies WHERE id = ?", (dependency_id,)
+        )
+        self._conn.commit()
+
+    # -- job_dependency_links（ジョブ単位の依存リンク。追加時に依存テンプレートを -----
+    # -- 参照してタスク単位の job_external_dependencies を自動展開する） -----------
+
+    def list_job_dependency_links(self, job_id):
+        rows = self._conn.execute(
+            "SELECT l.id, l.job_id, l.depends_on_job_id, dj.name AS depends_on_job_name "
+            "FROM job_dependency_links l JOIN jobs dj ON dj.id = l.depends_on_job_id "
+            "WHERE l.job_id = ? ORDER BY dj.name",
+            (job_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_job_dependency_link(self, job_id, depends_on_job_id):
+        if job_id == depends_on_job_id:
+            raise ProjectDatabaseError("同じジョブへの自己依存は設定できません")
+        try:
+            cur = self._conn.execute(
+                "INSERT INTO job_dependency_links(job_id, depends_on_job_id) VALUES (?, ?)",
+                (job_id, depends_on_job_id),
+            )
+        except sqlite3.IntegrityError as e:
+            raise ProjectDatabaseError("このジョブへの依存は既に登録されています") from e
+        link_id = cur.lastrowid
+
+        job = self._conn.execute(
+            "SELECT workflow_id FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        depends_on_job = self._conn.execute(
+            "SELECT workflow_id FROM jobs WHERE id = ?", (depends_on_job_id,)
+        ).fetchone()
+        templates = self._conn.execute(
+            "SELECT workflow_task_id, depends_on_workflow_task_id "
+            "FROM workflow_dependency_templates "
+            "WHERE workflow_id = ? AND depends_on_workflow_id = ?",
+            (job["workflow_id"], depends_on_job["workflow_id"]),
+        ).fetchall()
+        for t in templates:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO job_external_dependencies "
+                "(job_id, workflow_task_id, depends_on_job_id, depends_on_workflow_task_id, "
+                "source_link_id) VALUES (?, ?, ?, ?, ?)",
+                (job_id, t["workflow_task_id"], depends_on_job_id,
+                 t["depends_on_workflow_task_id"], link_id),
+            )
+        self._conn.commit()
+        return link_id
+
+    def delete_job_dependency_link(self, link_id):
+        """CASCADEにより、このリンクから自動生成された job_external_dependencies
+        行（source_link_id が一致する行）も同時に削除される。手動追加行
+        （source_link_id が NULL）は影響を受けない。"""
+        self._conn.execute("DELETE FROM job_dependency_links WHERE id = ?", (link_id,))
+        self._conn.commit()
+
+    # -- workflow_dependency_templates（ワークフローペア単位の既定タスク対応） -------
+
+    def list_dependency_templates(self, workflow_id):
+        rows = self._conn.execute(
+            "SELECT tpl.id, tpl.workflow_id, tpl.workflow_task_id, wt.name AS task_name, "
+            "tpl.depends_on_workflow_id, dw.name AS depends_on_workflow_name, "
+            "tpl.depends_on_workflow_task_id, dwt.name AS depends_on_task_name "
+            "FROM workflow_dependency_templates tpl "
+            "JOIN workflow_tasks wt ON wt.id = tpl.workflow_task_id "
+            "JOIN workflows dw ON dw.id = tpl.depends_on_workflow_id "
+            "JOIN workflow_tasks dwt ON dwt.id = tpl.depends_on_workflow_task_id "
+            "WHERE tpl.workflow_id = ? ORDER BY wt.name",
+            (workflow_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_dependency_template(self, workflow_id, workflow_task_id,
+                                 depends_on_workflow_id, depends_on_workflow_task_id):
+        if workflow_id == depends_on_workflow_id:
+            raise ProjectDatabaseError("同じワークフローへのテンプレートは設定できません")
+        try:
+            cur = self._conn.execute(
+                "INSERT INTO workflow_dependency_templates "
+                "(workflow_id, workflow_task_id, depends_on_workflow_id, "
+                "depends_on_workflow_task_id) VALUES (?, ?, ?, ?)",
+                (workflow_id, workflow_task_id, depends_on_workflow_id, depends_on_workflow_task_id),
+            )
+        except sqlite3.IntegrityError as e:
+            raise ProjectDatabaseError("このテンプレートは既に登録されています") from e
+        self._conn.commit()
+        return cur.lastrowid
+
+    def delete_dependency_template(self, template_id):
+        self._conn.execute(
+            "DELETE FROM workflow_dependency_templates WHERE id = ?", (template_id,)
         )
         self._conn.commit()

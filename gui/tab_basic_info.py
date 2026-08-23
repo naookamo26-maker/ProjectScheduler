@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 from gui.db import DuplicateNameError, ReferencedEntityError
 from gui.widgets_common import (
     CrudSection,
+    auto_size_columns,
     confirm_or_block_delete,
     make_fk_combo,
     row_id,
@@ -139,6 +140,7 @@ class BasicInfoTab(QWidget):
             )
             table.setCellWidget(row, 1, date_edit)
         table.blockSignals(False)
+        auto_size_columns(table)
 
     def _add_milestone(self):
         existing = {ms["name"] for ms in self.db.list_milestones()}
@@ -201,6 +203,7 @@ class BasicInfoTab(QWidget):
             )
             table.setCellWidget(row, 1, spin)
         table.blockSignals(False)
+        auto_size_columns(table)
 
     def _add_team(self):
         existing = {t["name"] for t in self.db.list_teams()}
@@ -282,6 +285,7 @@ class BasicInfoTab(QWidget):
             )
             table.setCellWidget(row, 1, combo)
         table.blockSignals(False)
+        auto_size_columns(table)
 
     def _add_holiday(self):
         # 「追加」連打で全社共通・同日の重複エラーが出ないよう、空いている日付を

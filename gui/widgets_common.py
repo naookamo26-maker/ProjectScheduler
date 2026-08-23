@@ -2,7 +2,7 @@
 タブ横断で使う共通UI部品。
 
 - CrudSection: 「タイトル + 追加/削除ボタン + 表」の1セクション。
-  基本情報設定・ジョブ・依存関係タブで繰り返し使う型。
+  基本情報設定・ワークフロー設計・ジョブタブで繰り返し使う型。
 - make_fk_combo: 外部キー選択用のQComboBox（表示は名前、内部値はDBの整数ID）。
 - confirm_or_block_delete: 削除前の参照整合性チェック用ダイアログ。
 """
@@ -60,6 +60,15 @@ def make_fk_combo(options, current_id=None, allow_blank=False, blank_label="（�
         if idx >= 0:
             combo.setCurrentIndex(idx)
     return combo
+
+
+def auto_size_columns(table, min_width=90):
+    """データ読み込み後に呼び出し、列幅を内容に合わせて自動調整する。
+    列が狭くなりすぎないよう min_width で下限を設ける。"""
+    table.resizeColumnsToContents()
+    for col in range(table.columnCount()):
+        if table.columnWidth(col) < min_width:
+            table.setColumnWidth(col, min_width)
 
 
 def confirm_or_block_delete(parent, usage_count, entity_label, hard_block):

@@ -14,13 +14,15 @@ project_scheduler.py ──────────┤  スケジューリング
 
 gui/ ───────────────────────────  PySide6デスクトップアプリ（.pschedule編集用）
   ├ db.py            SQLiteスキーマ + CRUD（Qt非依存）
-  ├ main.py           MainWindow・4タブ組み立て・Fileメニュー
+  ├ main.py           MainWindow・3タブ組み立て・Fileメニュー・D&Dで開く
   ├ tab_basic_info.py  タブ1「基本情報設定」
-  ├ tab_workflows.py    タブ2「ワークフロー設計」（node_canvas.pyをホスト）
-  ├ node_canvas.py       ノードグラフエディタ（タスク依存関係の視覚編集）
-  ├ tab_jobs.py            タブ3「ジョブ」
-  ├ tab_dependencies.py     タブ4「依存関係」
-  ├ widgets_common.py        タブ横断の共通UI部品
+  ├ tab_workflows.py    タブ2「ワークフロー設計」（node_canvas.pyをホスト、
+  │                       依存テンプレート編集セクションも持つ）
+  ├ node_canvas.py       ノードグラフエディタ（タスク依存関係の視覚編集、
+  │                       先行タスク複数選択、フィット表示）
+  ├ tab_jobs.py            タブ3「ジョブ」（ワークフロー絞り込み、依存ジョブ
+  │                          セクションを含む。旧タブ4はここに統合済み）
+  ├ widgets_common.py        タブ横断の共通UI部品（列幅自動調整含む）
   └ gantt_generator.py        DB → project_scheduler.py 呼び出し → ガントチャート出力
 ```
 
@@ -98,7 +100,22 @@ GUIの画面上にこの文字列IDが表示されることはない。
 ような事前チェックは行わず、ガントチャート生成時に
 `_build_scheduling_order()`が検出する`CircularDependencyError`をそのまま
 GUI側でダイアログ表示する（プロジェクト全体の依存グラフを都度読み直す
-コストが見合わないため）。
+コストが見合わないため）。この方針は、依存テンプレートから自動生成された
+行（`source_link_id`が非NULL）にも、手動で追加した行にも等しく適用される
+——`gantt_generator.py`は`job_external_dependencies`テーブルを区別なく読む
+ため、生成元による特別扱いは発生しない。
+
+## 依存テンプレートの自動展開
+
+`gui/tab_jobs.py`でジョブ単位の依存リンク（`job_dependency_links`）を
+追加する際、`ProjectDatabase.add_job_dependency_link`が2ジョブそれぞれの
+`workflow_id`を引き、`workflow_dependency_templates`から該当するペアの
+テンプレート行を検索して`job_external_dependencies`へ`source_link_id`付きで
+一括挿入する。これはキャンバスの循環検出とは別軸の処理で、循環になるか
+どうかのチェックは行わない（テンプレートの追加はワークフロー設計タブで
+`_would_create_cycle`と独立に管理されるため、ジョブ間の実際の循環は他の
+外部依存と同様にガントチャート生成時に検出される）。詳細な自動展開の
+ルールは`docs/db_design.md`を参照。
 
 ## DBの書き込みタイミング
 

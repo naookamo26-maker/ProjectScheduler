@@ -5,8 +5,12 @@
 ノードグラフキャンバス（gui/node_canvas.py）を表示する。
 """
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -15,13 +19,14 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QStackedWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from gui.db import DuplicateNameError, ReferencedEntityError
+from gui.db import DuplicateNameError, ProjectDatabaseError, ReferencedEntityError
 from gui.node_canvas import WorkflowGraphScene, WorkflowGraphView
-from gui.widgets_common import confirm_or_block_delete
+from gui.widgets_common import CrudSection, auto_size_columns, confirm_or_block_delete, row_id, set_row_id
 
 _HELP_TEXT = (
     "左のリストからワークフローを選択するか、「＋追加」で新規作成してください。\n\n"
@@ -32,11 +37,64 @@ _HELP_TEXT = (
 )
 
 
+class DependencyTemplateDialog(QDialog):
+    """依存テンプレート（ワークフローペア単位の既定タスク対応）の追加ダイアログ。
+    「このワークフローのタスク」は現在選択中のワークフロー内のタスクに固定し、
+    依存先ワークフロー→依存先タスクをカスケードで選ばせる。"""
+
+    def __init__(self, db, workflow_id, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.workflow_id = workflow_id
+        self.setWindowTitle("依存テンプレートを追加")
+
+        form = QFormLayout(self)
+
+        self.task_combo = QComboBox()
+        for t in db.list_workflow_tasks(workflow_id):
+            self.task_combo.addItem(t["name"], t["id"])
+        form.addRow("このワークフローのタスク", self.task_combo)
+
+        self.target_workflow_combo = QComboBox()
+        for wf in db.list_workflows():
+            if wf["id"] != workflow_id:
+                self.target_workflow_combo.addItem(wf["name"], wf["id"])
+        self.target_workflow_combo.currentIndexChanged.connect(self._reload_target_tasks)
+
+        self.target_task_combo = QComboBox()
+
+        form.addRow("依存先ワークフロー", self.target_workflow_combo)
+        form.addRow("依存先タスク", self.target_task_combo)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+        self._reload_target_tasks()
+
+    def _reload_target_tasks(self):
+        self.target_task_combo.clear()
+        target_workflow_id = self.target_workflow_combo.currentData()
+        if target_workflow_id is None:
+            return
+        for t in self.db.list_workflow_tasks(target_workflow_id):
+            self.target_task_combo.addItem(t["name"], t["id"])
+
+    def values(self):
+        return (
+            self.task_combo.currentData(),
+            self.target_workflow_combo.currentData(),
+            self.target_task_combo.currentData(),
+        )
+
+
 class WorkflowsTab(QWidget):
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.db = db
         self.current_scene = None
+        self.current_workflow_id = None
 
         layout = QHBoxLayout(self)
 
@@ -60,6 +118,10 @@ class WorkflowsTab(QWidget):
         self.workflow_list.currentItemChanged.connect(self._on_selection_changed)
         left_layout.addWidget(self.workflow_list)
 
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
         self.view = WorkflowGraphView()
 
         self.empty_label = QLabel(_HELP_TEXT)
@@ -69,9 +131,17 @@ class WorkflowsTab(QWidget):
         self.right_stack = QStackedWidget()
         self.right_stack.addWidget(self.empty_label)
         self.right_stack.addWidget(self.view)
+        right_layout.addWidget(self.right_stack, 3)
+
+        self.template_section = CrudSection(
+            "依存テンプレート（このワークフローが他のワークフローに依存する場合の既定タスク対応）",
+            ["このワークフローのタスク", "依存先ワークフロー", "依存先タスク"],
+            on_add=self._add_template, on_delete=self._delete_template,
+        )
+        right_layout.addWidget(self.template_section, 1)
 
         layout.addWidget(left)
-        layout.addWidget(self.right_stack, 1)
+        layout.addWidget(right, 1)
 
         self.refresh_workflows()
 
@@ -99,11 +169,69 @@ class WorkflowsTab(QWidget):
         if current is None:
             self.right_stack.setCurrentWidget(self.empty_label)
             self.current_scene = None
+            self.current_workflow_id = None
+            self.template_section.setEnabled(False)
+            self.template_section.table.setRowCount(0)
             return
         workflow_id = current.data(Qt.UserRole)
+        self.current_workflow_id = workflow_id
         self.current_scene = WorkflowGraphScene(self.db, workflow_id, self)
         self.view.setScene(self.current_scene)
         self.right_stack.setCurrentWidget(self.view)
+        # シーン切替直後はビューポートサイズが未確定な場合があるため、
+        # レイアウト確定後（次のイベントループ）にフィットさせる。
+        QTimer.singleShot(0, self.view.fit_all)
+        self.template_section.setEnabled(True)
+        self.refresh_templates()
+
+    # -- 依存テンプレート ----------------------------------------------------------
+
+    def refresh_templates(self):
+        table = self.template_section.table
+        table.setRowCount(0)
+        if self.current_workflow_id is None:
+            return
+        for tpl in self.db.list_dependency_templates(self.current_workflow_id):
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(tpl["task_name"]))
+            table.setItem(row, 1, QTableWidgetItem(tpl["depends_on_workflow_name"]))
+            table.setItem(row, 2, QTableWidgetItem(tpl["depends_on_task_name"]))
+            for col in range(3):
+                table.item(row, col).setFlags(table.item(row, col).flags() & ~Qt.ItemIsEditable)
+            set_row_id(table, row, tpl["id"])
+        auto_size_columns(table)
+
+    def _add_template(self):
+        if self.current_workflow_id is None:
+            return
+        other_workflows = [w for w in self.db.list_workflows() if w["id"] != self.current_workflow_id]
+        if not self.db.list_workflow_tasks(self.current_workflow_id):
+            QMessageBox.information(self, "タスク未登録", "先にこのワークフローにタスクを1つ以上追加してください。")
+            return
+        if not other_workflows:
+            QMessageBox.information(self, "依存先ワークフローがありません", "他のワークフローを先に作成してください。")
+            return
+        dialog = DependencyTemplateDialog(self.db, self.current_workflow_id, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        task_id, target_workflow_id, target_task_id = dialog.values()
+        if None in (task_id, target_workflow_id, target_task_id):
+            QMessageBox.warning(self, "入力エラー", "すべての項目を選択してください。")
+            return
+        try:
+            self.db.add_dependency_template(
+                self.current_workflow_id, task_id, target_workflow_id, target_task_id
+            )
+        except ProjectDatabaseError as e:
+            QMessageBox.warning(self, "追加できません", str(e))
+            return
+        self.refresh_templates()
+
+    def _delete_template(self, row):
+        template_id = row_id(self.template_section.table, row)
+        self.db.delete_dependency_template(template_id)
+        self.refresh_templates()
 
     def _add_workflow(self):
         name, ok = QInputDialog.getText(self, "ワークフローを追加", "ワークフロー名:")

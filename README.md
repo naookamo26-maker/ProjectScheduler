@@ -33,7 +33,8 @@ python run_gui.py
 [`data/Project_Schedule_Sample_GameDev_v22.pschedule`](data/Project_Schedule_Sample_GameDev_v22.pschedule)
 を開く（既存のExcelサンプルを`scripts/migrate_excel_to_db.py`で変換したもの）。
 
-4タブ（基本情報設定／ワークフロー設計／ジョブ／依存関係）でデータを入力し、
+3タブ（基本情報設定／ワークフロー設計／ジョブ）でデータを入力し、
+`.pschedule`ファイルをウィンドウにドラッグ&ドロップして開くこともできる。
 「ファイル → ガントチャートを生成...」から出力先フォルダを選べば、CLI版と
 同じ Mermaid Markdown / インタラクティブHTML の2形式が書き出される。
 保存は各操作のたびに自動で行われる（明示的な保存ボタンはない）。

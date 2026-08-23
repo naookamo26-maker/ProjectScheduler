@@ -11,8 +11,14 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QMessageBox,
+    QPushButton,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -20,9 +26,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.db import DuplicateNameError
+from gui.db import DuplicateNameError, ProjectDatabaseError
 from gui.widgets_common import (
     CrudSection,
+    auto_size_columns,
     confirm_or_block_delete,
     make_fk_combo,
     row_id,
@@ -37,13 +44,99 @@ def _readonly_item(text):
     return item
 
 
+class JobDependencyLinkDialog(QDialog):
+    """「依存先ジョブ」を1件選ぶだけのシンプルなダイアログ。タスク単位の対応は
+    ワークフロー設計タブの依存テンプレートから自動展開されるため、ここでは
+    ジョブを選ぶだけでよい。"""
+
+    def __init__(self, db, job_id, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("依存先ジョブを追加")
+        form = QFormLayout(self)
+
+        self.job_combo = QComboBox()
+        existing = {link["depends_on_job_id"] for link in db.list_job_dependency_links(job_id)}
+        for j in db.list_jobs():
+            if j["id"] != job_id and j["id"] not in existing:
+                self.job_combo.addItem(j["name"], j["id"])
+        form.addRow("依存先ジョブ（先に終わっている必要がある）", self.job_combo)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def value(self):
+        return self.job_combo.currentData()
+
+
+class ManualTaskDependencyDialog(QDialog):
+    """個別のタスク依存（手動）を追加するダイアログ。依存する側のジョブは
+    現在選択中のジョブに固定し、そのタスク→依存先ジョブ→依存先タスクを選ぶ。"""
+
+    def __init__(self, db, job, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.setWindowTitle("個別のタスク依存を追加")
+        form = QFormLayout(self)
+
+        self.task_combo = QComboBox()
+        for t in db.list_workflow_tasks(job["workflow_id"]):
+            self.task_combo.addItem(t["name"], t["id"])
+        form.addRow("このジョブのタスク", self.task_combo)
+
+        self.dep_job_combo = QComboBox()
+        for j in db.list_jobs():
+            if j["id"] != job["id"]:
+                self.dep_job_combo.addItem(j["name"], j["id"])
+        self.dep_job_combo.currentIndexChanged.connect(self._reload_dep_tasks)
+        form.addRow("依存先ジョブ", self.dep_job_combo)
+
+        self.dep_task_combo = QComboBox()
+        form.addRow("依存先タスク", self.dep_task_combo)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+        self._reload_dep_tasks()
+
+    def _reload_dep_tasks(self):
+        self.dep_task_combo.clear()
+        dep_job_id = self.dep_job_combo.currentData()
+        if dep_job_id is None:
+            return
+        dep_job = next(j for j in self.db.list_jobs() if j["id"] == dep_job_id)
+        for t in self.db.list_workflow_tasks(dep_job["workflow_id"]):
+            self.dep_task_combo.addItem(t["name"], t["id"])
+
+    def values(self):
+        return self.task_combo.currentData(), self.dep_job_combo.currentData(), self.dep_task_combo.currentData()
+
+
 class JobsTab(QWidget):
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.db = db
         self.current_job_id = None
+        self._workflow_checks = {}  # workflow_id -> QCheckBox（ジョブ一覧の絞り込み用）
 
         layout = QVBoxLayout(self)
+
+        filter_group = QGroupBox("ワークフローで絞り込み")
+        self.filter_layout = QHBoxLayout(filter_group)
+        select_all_btn = QPushButton("すべて表示")
+        select_all_btn.clicked.connect(lambda: self._set_all_filters(True))
+        select_none_btn = QPushButton("すべて解除")
+        select_none_btn.clicked.connect(lambda: self._set_all_filters(False))
+        self.filter_layout.addWidget(select_all_btn)
+        self.filter_layout.addWidget(select_none_btn)
+        self.filter_layout.addSpacing(16)
+        self.filter_checks_layout = QHBoxLayout()
+        self.filter_layout.addLayout(self.filter_checks_layout)
+        self.filter_layout.addStretch(1)
+        layout.addWidget(filter_group)
 
         self.jobs_section = CrudSection(
             "ジョブ", ["ジョブ名", "ワークフロー", "既定マイルストーン", "優先度"],
@@ -65,11 +158,68 @@ class JobsTab(QWidget):
         override_layout.addWidget(self.override_table)
         layout.addWidget(override_group, 1)
 
+        dep_layout = QHBoxLayout()
+        self.dep_links_section = CrudSection(
+            "依存先ジョブ（このジョブが依存するジョブ。テンプレートに基づき\nタスク単位の依存を自動的に生成する）",
+            ["依存先ジョブ"],
+            on_add=self._add_dependency_link, on_delete=self._delete_dependency_link,
+        )
+        dep_layout.addWidget(self.dep_links_section, 1)
+
+        self.manual_deps_section = CrudSection(
+            "個別のタスク依存（手動追加分、および自動生成分の一覧）",
+            ["タスク", "依存先ジョブ", "依存先タスク", "種別"],
+            on_add=self._add_manual_dependency, on_delete=self._delete_manual_dependency,
+        )
+        dep_layout.addWidget(self.manual_deps_section, 2)
+        layout.addLayout(dep_layout, 1)
+
         self.refresh_jobs()
+
+    # -- ワークフロー絞り込み ------------------------------------------------------
+
+    def _rebuild_workflow_filter(self):
+        """ワークフロー一覧に合わせて絞り込み用チェックボックスを再構築する。
+        既存のチェック状態はワークフロー名で可能な限り維持し、新規ワークフローは
+        既定で表示（チェック済み）にする。"""
+        previous_checked = {
+            wf_id for wf_id, cb in self._workflow_checks.items() if cb.isChecked()
+        }
+        previous_unchecked = {
+            wf_id for wf_id, cb in self._workflow_checks.items() if not cb.isChecked()
+        }
+        while self.filter_checks_layout.count():
+            item = self.filter_checks_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._workflow_checks = {}
+        for wf in self.db.list_workflows():
+            checked = wf["id"] not in previous_unchecked or wf["id"] in previous_checked
+            checkbox = QCheckBox(wf["name"])
+            checkbox.setChecked(checked)  # connect前に設定し、構築時のstateChangedを発火させない
+            checkbox.stateChanged.connect(lambda _state: self.refresh_jobs(select_id=self.current_job_id))
+            self.filter_checks_layout.addWidget(checkbox)
+            self._workflow_checks[wf["id"]] = checkbox
+
+    def _set_all_filters(self, checked):
+        # 一括変更中に途中でrefresh_jobs（＝チェックボックス再構築）が走ると
+        # ループ中のウィジェットが差し替わってしまうため、シグナルを止めてから
+        # 最後にまとめて一度だけ反映する。
+        for checkbox in self._workflow_checks.values():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(checked)
+            checkbox.blockSignals(False)
+        self.refresh_jobs(select_id=self.current_job_id)
+
+    def _visible_workflow_ids(self):
+        return {wf_id for wf_id, cb in self._workflow_checks.items() if cb.isChecked()}
 
     # -- ジョブ一覧 --------------------------------------------------------------
 
     def refresh_jobs(self, select_id=None):
+        self._rebuild_workflow_filter()
+        visible_workflow_ids = self._visible_workflow_ids()
+
         table = self.jobs_section.table
         table.blockSignals(True)
         table.setRowCount(0)
@@ -77,6 +227,8 @@ class JobsTab(QWidget):
         milestone_options = [(m["id"], m["name"]) for m in self.db.list_milestones()]
         select_row = -1
         for job in self.db.list_jobs():
+            if job["workflow_id"] not in visible_workflow_ids:
+                continue
             row = table.rowCount()
             table.insertRow(row)
             table.setItem(row, 0, QTableWidgetItem(job["name"]))
@@ -104,6 +256,7 @@ class JobsTab(QWidget):
             )
             table.setCellWidget(row, 3, priority_spin)
         table.blockSignals(False)
+        auto_size_columns(table)
 
         if select_row >= 0:
             table.setCurrentCell(select_row, 0)
@@ -170,9 +323,12 @@ class JobsTab(QWidget):
         if current_row is None or current_row < 0:
             self.current_job_id = None
             self.override_table.setRowCount(0)
+            self.dep_links_section.table.setRowCount(0)
+            self.manual_deps_section.table.setRowCount(0)
             return
         self.current_job_id = row_id(self.jobs_section.table, current_row)
         self._refresh_overrides()
+        self._refresh_dependencies()
 
     def _refresh_overrides(self):
         table = self.override_table
@@ -225,6 +381,7 @@ class JobsTab(QWidget):
             )
             table.setCellWidget(row, 6, team_combo)
         table.blockSignals(False)
+        auto_size_columns(table)
 
     def _on_override_changed(self, workflow_task_id):
         table = self.override_table
@@ -244,6 +401,102 @@ class JobsTab(QWidget):
                 else:
                     self.db.clear_job_task_override(self.current_job_id, workflow_task_id)
                 return
+
+    # -- 依存ジョブ ----------------------------------------------------------------
+
+    def _refresh_dependencies(self):
+        self._refresh_dependency_links()
+        self._refresh_manual_dependencies()
+
+    def _refresh_dependency_links(self):
+        table = self.dep_links_section.table
+        table.setRowCount(0)
+        if self.current_job_id is None:
+            return
+        for link in self.db.list_job_dependency_links(self.current_job_id):
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, _readonly_item(link["depends_on_job_name"]))
+            set_row_id(table, row, link["id"])
+        auto_size_columns(table)
+
+    def _add_dependency_link(self):
+        if self.current_job_id is None:
+            QMessageBox.information(self, "ジョブ未選択", "先にジョブを選択してください。")
+            return
+        others = [j for j in self.db.list_jobs() if j["id"] != self.current_job_id]
+        if not others:
+            QMessageBox.information(self, "依存先ジョブがありません", "他のジョブを先に作成してください。")
+            return
+        dialog = JobDependencyLinkDialog(self.db, self.current_job_id, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        depends_on_job_id = dialog.value()
+        if depends_on_job_id is None:
+            QMessageBox.warning(self, "入力エラー", "依存先ジョブを選択してください。")
+            return
+        try:
+            self.db.add_job_dependency_link(self.current_job_id, depends_on_job_id)
+        except ProjectDatabaseError as e:
+            QMessageBox.warning(self, "追加できません", str(e))
+            return
+        self._refresh_dependencies()
+
+    def _delete_dependency_link(self, row):
+        link_id = row_id(self.dep_links_section.table, row)
+        self.db.delete_job_dependency_link(link_id)
+        self._refresh_dependencies()
+
+    def _refresh_manual_dependencies(self):
+        table = self.manual_deps_section.table
+        table.setRowCount(0)
+        if self.current_job_id is None:
+            return
+        for d in self.db.list_external_dependencies(job_id=self.current_job_id):
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, _readonly_item(d["task_name"]))
+            table.setItem(row, 1, _readonly_item(d["depends_on_job_name"]))
+            table.setItem(row, 2, _readonly_item(d["depends_on_task_name"]))
+            kind = "自動（テンプレート）" if d["source_link_id"] is not None else "手動"
+            table.setItem(row, 3, _readonly_item(kind))
+            set_row_id(table, row, d["id"])
+        auto_size_columns(table)
+
+    def _add_manual_dependency(self):
+        if self.current_job_id is None:
+            QMessageBox.information(self, "ジョブ未選択", "先にジョブを選択してください。")
+            return
+        job = next(j for j in self.db.list_jobs() if j["id"] == self.current_job_id)
+        others = [j for j in self.db.list_jobs() if j["id"] != self.current_job_id]
+        if not others:
+            QMessageBox.information(self, "依存先ジョブがありません", "他のジョブを先に作成してください。")
+            return
+        dialog = ManualTaskDependencyDialog(self.db, job, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        task_id, dep_job_id, dep_task_id = dialog.values()
+        if None in (task_id, dep_job_id, dep_task_id):
+            QMessageBox.warning(self, "入力エラー", "すべての項目を選択してください。")
+            return
+        try:
+            self.db.add_external_dependency(self.current_job_id, task_id, dep_job_id, dep_task_id)
+        except ProjectDatabaseError as e:
+            QMessageBox.warning(self, "追加できません", str(e))
+            return
+        self._refresh_manual_dependencies()
+
+    def _delete_manual_dependency(self, row):
+        table = self.manual_deps_section.table
+        dep_id = row_id(table, row)
+        if table.item(row, 3).text().startswith("自動"):
+            QMessageBox.information(
+                self, "削除できません",
+                "自動生成された依存です。削除するには「依存先ジョブ」欄から該当のリンクを削除してください。",
+            )
+            return
+        self.db.delete_external_dependency(dep_id)
+        self._refresh_manual_dependencies()
 
     # -- 他タブからの通知 ----------------------------------------------------------
 
