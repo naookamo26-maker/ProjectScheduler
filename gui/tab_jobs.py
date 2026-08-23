@@ -8,7 +8,7 @@
 既定値のままの行はDBに保存しない（差分のみ保持、gui/db.py参照）。
 """
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -73,7 +73,7 @@ class JobDependencyLinkDialog(QDialog):
         form.addRow("ワークフローで絞り込み", self.workflow_filter_combo)
         layout.addLayout(form)
 
-        layout.addWidget(QLabel("依存先ジョブ（先に終わっている必要がある。複数選択可）"))
+        layout.addWidget(QLabel("依存先ジョブ"))
         self.job_list = QListWidget()
         self.job_list.setSelectionMode(QListWidget.ExtendedSelection)
         layout.addWidget(self.job_list, 1)
@@ -100,13 +100,15 @@ class JobDependencyLinkDialog(QDialog):
 
 
 class ManualTaskDependencyDialog(QDialog):
-    """個別のタスク依存（手動）を追加するダイアログ。依存する側のジョブは
-    現在選択中のジョブに固定し、そのタスク→依存先ジョブ→依存先タスクを選ぶ。"""
+    """個別のタスク依存（手動）を追加・編集するダイアログ。依存する側のジョブは
+    現在選択中のジョブに固定し、そのタスク→依存先ジョブ→依存先タスクを選ぶ。
+    編集時は initial（現在の値）を渡すと、追加時と同じ3段階のドロップダウンに
+    現在の選択状態を反映した状態で開く。"""
 
-    def __init__(self, db, job, parent=None):
+    def __init__(self, db, job, parent=None, initial=None):
         super().__init__(parent)
         self.db = db
-        self.setWindowTitle("個別のタスク依存を追加")
+        self.setWindowTitle("個別のタスク依存を編集" if initial else "個別のタスク依存を追加")
         form = QFormLayout(self)
 
         self.task_combo = QComboBox()
@@ -129,7 +131,19 @@ class ManualTaskDependencyDialog(QDialog):
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
 
+        if initial is not None:
+            task_id, dep_job_id, dep_task_id = initial
+            idx = self.task_combo.findData(task_id)
+            if idx >= 0:
+                self.task_combo.setCurrentIndex(idx)
+            idx = self.dep_job_combo.findData(dep_job_id)
+            if idx >= 0:
+                self.dep_job_combo.setCurrentIndex(idx)
         self._reload_dep_tasks()
+        if initial is not None:
+            idx = self.dep_task_combo.findData(initial[2])
+            if idx >= 0:
+                self.dep_task_combo.setCurrentIndex(idx)
 
     def _reload_dep_tasks(self):
         self.dep_task_combo.clear()
@@ -144,12 +158,22 @@ class ManualTaskDependencyDialog(QDialog):
         return self.task_combo.currentData(), self.dep_job_combo.currentData(), self.dep_task_combo.currentData()
 
 
+_JOB_SORT_KEYS = {
+    0: lambda j: j["name"],
+    1: lambda j: j["workflow_name"],
+    2: lambda j: (j["milestone_name"] is None, j["milestone_name"] or ""),
+    3: lambda j: j["priority"],
+}
+
+
 class JobsTab(QWidget):
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.db = db
         self.current_job_id = None
         self._workflow_checks = {}  # workflow_id -> QCheckBox（ジョブ一覧の絞り込み用）
+        self._sort_column = 0
+        self._sort_ascending = True
 
         layout = QVBoxLayout(self)
 
@@ -173,6 +197,12 @@ class JobsTab(QWidget):
         )
         self.jobs_section.table.itemChanged.connect(self._on_job_name_changed)
         self.jobs_section.table.currentCellChanged.connect(self._on_job_selection_changed)
+        # 列見出しをクリックするとその列で並び替えられる（同じ列を再クリックで昇順/降順切替）。
+        jobs_header = self.jobs_section.table.horizontalHeader()
+        jobs_header.setSectionsClickable(True)
+        jobs_header.setSortIndicatorShown(True)
+        jobs_header.setSortIndicator(self._sort_column, Qt.AscendingOrder)
+        jobs_header.sectionClicked.connect(self._on_job_header_clicked)
         layout.addWidget(self.jobs_section, 1)
 
         override_group = QGroupBox("タスク上書き（選択中のジョブ）")
@@ -189,7 +219,7 @@ class JobsTab(QWidget):
 
         dep_layout = QHBoxLayout()
         self.dep_links_section = CrudSection(
-            "依存先ジョブ（このジョブが依存するジョブ。テンプレートに基づき\nタスク単位の依存を自動的に生成する）",
+            "依存先ジョブ",
             ["依存先ジョブ"],
             on_add=self._add_dependency_link, on_delete=self._delete_dependency_link,
         )
@@ -199,6 +229,7 @@ class JobsTab(QWidget):
             "個別のタスク依存（手動追加分、および自動生成分の一覧）",
             ["タスク", "依存先ジョブ", "依存先タスク", "種別"],
             on_add=self._add_manual_dependency, on_delete=self._delete_manual_dependency,
+            on_edit=self._edit_manual_dependency,
         )
         dep_layout.addWidget(self.manual_deps_section, 2)
         layout.addLayout(dep_layout, 1)
@@ -245,6 +276,19 @@ class JobsTab(QWidget):
 
     # -- ジョブ一覧 --------------------------------------------------------------
 
+    def _on_job_header_clicked(self, column):
+        if column not in _JOB_SORT_KEYS:
+            return
+        if column == self._sort_column:
+            self._sort_ascending = not self._sort_ascending
+        else:
+            self._sort_column = column
+            self._sort_ascending = True
+        self.jobs_section.table.horizontalHeader().setSortIndicator(
+            self._sort_column, Qt.AscendingOrder if self._sort_ascending else Qt.DescendingOrder
+        )
+        self.refresh_jobs(select_id=self.current_job_id)
+
     def refresh_jobs(self, select_id=None):
         self._rebuild_workflow_filter()
         visible_workflow_ids = self._visible_workflow_ids()
@@ -255,7 +299,9 @@ class JobsTab(QWidget):
         workflow_options = [(w["id"], w["name"]) for w in self.db.list_workflows()]
         milestone_options = [(m["id"], m["name"]) for m in self.db.list_milestones()]
         select_row = -1
-        for job in self.db.list_jobs():
+        sort_key = _JOB_SORT_KEYS[self._sort_column]
+        jobs = sorted(self.db.list_jobs(), key=sort_key, reverse=not self._sort_ascending)
+        for job in jobs:
             if job["workflow_id"] not in visible_workflow_ids:
                 continue
             row = table.rowCount()
@@ -340,7 +386,7 @@ class JobsTab(QWidget):
                     self.db.update_job(job_id, name, workflow_id, milestone_id, priority)
                 except DuplicateNameError as e:
                     QMessageBox.warning(self, "変更できません", str(e))
-                    self.refresh_jobs()
+                    self.refresh_jobs(select_id=job_id)
                     return
                 if job_id == self.current_job_id:
                     self._refresh_overrides()
@@ -367,7 +413,9 @@ class JobsTab(QWidget):
             table.blockSignals(False)
             return
 
-        milestone_options = [(m["id"], m["name"]) for m in self.db.list_milestones()]
+        job = next(j for j in self.db.list_jobs() if j["id"] == self.current_job_id)
+        default_ms_label = job["milestone_name"] or "未設定"
+        all_milestones = self.db.list_milestones()
         team_options = [(t["id"], t["name"]) for t in self.db.list_teams()]
 
         for r in self.db.list_job_tasks_with_overrides(self.current_job_id):
@@ -394,8 +442,18 @@ class JobsTab(QWidget):
             )
             table.setCellWidget(row, 4, days_spin)
 
+            # 先行タスク（同一ワークフロー内）の実効マイルストーンより早い締切の
+            # マイルストーンは、後継タスクが前倒しになってしまうため選択肢から外す。
+            min_end_date = self.db.minimum_milestone_end_date(
+                self.current_job_id, r["workflow_task_id"]
+            )
+            milestone_options = [
+                (m["id"], m["name"]) for m in all_milestones
+                if min_end_date is None or m["end_date"] >= min_end_date
+            ]
             ms_combo = make_fk_combo(
-                milestone_options, r["override_milestone_id"], allow_blank=True, blank_label="（既定を使用）"
+                milestone_options, r["override_milestone_id"], allow_blank=True,
+                blank_label=f"（既定を使用: {default_ms_label}）",
             )
             ms_combo.currentIndexChanged.connect(
                 lambda _idx, tid=r["workflow_task_id"]: self._on_override_changed(tid)
@@ -429,6 +487,24 @@ class JobsTab(QWidget):
                     )
                 else:
                     self.db.clear_job_task_override(self.current_job_id, workflow_task_id)
+
+                # マイルストーンを変更した場合、後継タスク（同一ワークフロー内、
+                # transitively）が前のタスクより早いマイルストーンのままだと
+                # 前倒しの矛盾が生じるため、必要なら自動的に繰り下げる。
+                changed = self.db.cascade_milestone_to_successors(
+                    self.current_job_id, workflow_task_id
+                )
+                if changed:
+                    QMessageBox.information(
+                        self, "マイルストーンを自動調整しました",
+                        f"後継タスク{len(changed)}件のマイルストーンが、変更後のマイルストーン"
+                        "より早かったため、整合性を保つよう自動的に合わせました。",
+                    )
+                # このタスク自身の上書き入力に加え、後継タスクの選択肢・表示も
+                # 変わりうるため、テーブル全体を作り直す（シグナル発火元セルの
+                # ウィジェットを直接コールバック内で破棄しないよう次のイベント
+                # ループへ遅延させる）。
+                QTimer.singleShot(0, self._refresh_overrides)
                 return
 
     # -- 依存ジョブ ----------------------------------------------------------------
@@ -515,6 +591,36 @@ class JobsTab(QWidget):
             self.db.add_external_dependency(self.current_job_id, task_id, dep_job_id, dep_task_id)
         except ProjectDatabaseError as e:
             QMessageBox.warning(self, "追加できません", str(e))
+            return
+        self._refresh_manual_dependencies()
+
+    def _edit_manual_dependency(self, row):
+        table = self.manual_deps_section.table
+        dep_id = row_id(table, row)
+        if table.item(row, 3).text().startswith("自動"):
+            QMessageBox.information(
+                self, "編集できません",
+                "自動生成された依存です。変更するには「依存先ジョブ」欄から該当のリンクを削除・再追加してください。",
+            )
+            return
+        current = next(
+            d for d in self.db.list_external_dependencies(job_id=self.current_job_id) if d["id"] == dep_id
+        )
+        job = next(j for j in self.db.list_jobs() if j["id"] == self.current_job_id)
+        dialog = ManualTaskDependencyDialog(
+            self.db, job, self,
+            initial=(current["workflow_task_id"], current["depends_on_job_id"], current["depends_on_workflow_task_id"]),
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        task_id, dep_job_id, dep_task_id = dialog.values()
+        if None in (task_id, dep_job_id, dep_task_id):
+            QMessageBox.warning(self, "入力エラー", "すべての項目を選択してください。")
+            return
+        try:
+            self.db.update_external_dependency(dep_id, task_id, dep_job_id, dep_task_id)
+        except ProjectDatabaseError as e:
+            QMessageBox.warning(self, "変更できません", str(e))
             return
         self._refresh_manual_dependencies()
 

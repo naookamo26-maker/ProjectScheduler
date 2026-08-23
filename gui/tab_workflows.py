@@ -7,6 +7,7 @@
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -26,7 +27,14 @@ from PySide6.QtWidgets import (
 
 from gui.db import DuplicateNameError, ProjectDatabaseError, ReferencedEntityError
 from gui.node_canvas import WorkflowGraphScene, WorkflowGraphView
-from gui.widgets_common import CrudSection, auto_size_columns, confirm_or_block_delete, row_id, set_row_id
+from gui.widgets_common import (
+    CrudSection,
+    auto_size_columns,
+    confirm_or_block_delete,
+    keep_selection_visible,
+    row_id,
+    set_row_id,
+)
 
 _HELP_TEXT = (
     "左のリストからワークフローを選択するか、「＋追加」で新規作成してください。\n\n"
@@ -129,6 +137,11 @@ class WorkflowsTab(QWidget):
 
         self.workflow_list = QListWidget()
         self.workflow_list.currentItemChanged.connect(self._on_selection_changed)
+        # ドラッグで上下の表示順を入れ替えられるようにする（並び順はDBの
+        # workflows.sort_orderに保存し、次回開いた時も同じ順序で表示する）。
+        self.workflow_list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.workflow_list.model().rowsMoved.connect(self._on_workflow_reordered)
+        keep_selection_visible(self.workflow_list)
         left_layout.addWidget(self.workflow_list)
 
         right = QWidget()
@@ -178,6 +191,15 @@ class WorkflowsTab(QWidget):
         else:
             self.workflow_list.setCurrentRow(-1)
         self._on_selection_changed(self.workflow_list.currentItem(), None)
+
+    def _on_workflow_reordered(self, *_args):
+        """ワークフロー一覧をドラッグで並び替えた直後（QListWidgetModelの
+        rowsMoved）に呼ばれ、新しい表示順をDBに保存する。"""
+        ordered_ids = [
+            self.workflow_list.item(i).data(Qt.UserRole)
+            for i in range(self.workflow_list.count())
+        ]
+        self.db.reorder_workflows(ordered_ids)
 
     def _on_selection_changed(self, current, _previous):
         if current is None:

@@ -22,7 +22,7 @@ ID方針: 全テーブルは整数の自動採番PKを持ち、GUI上はこのID
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 _SCHEMA_SQL = """
 CREATE TABLE schema_meta (
@@ -57,7 +57,8 @@ CREATE UNIQUE INDEX ux_holidays_team ON holidays(date, team_id) WHERE team_id IS
 
 CREATE TABLE workflows (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE
+    name TEXT NOT NULL UNIQUE,
+    sort_order INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE workflow_tasks (
@@ -186,8 +187,35 @@ class ProjectDatabase:
             disk_conn.backup(db._conn)
         finally:
             disk_conn.close()
+        db._migrate_schema()
         db._dirty = False
         return db
+
+    def _migrate_schema(self):
+        """旧バージョンの.pscheduleファイルを開いた際、不足しているカラム等を
+        後から追加する（既存データはそのまま維持し、schema_versionだけ進める）。"""
+        row = self._conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        version = row["value"] if row else "1"
+
+        if version == "1":
+            # v2: workflows.sort_order を追加し、既存の並び順（従来の表示順である
+            # 名前順）に基づいて連番を振る。
+            self._conn.execute(
+                "ALTER TABLE workflows ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"
+            )
+            rows = self._conn.execute("SELECT id FROM workflows ORDER BY name").fetchall()
+            for i, r in enumerate(rows):
+                self._conn.execute(
+                    "UPDATE workflows SET sort_order = ? WHERE id = ?", (i, r["id"])
+                )
+            version = "2"
+
+        self._conn.execute(
+            "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)
+        )
+        self._conn.commit()
 
     # -- 保存（明示的） -----------------------------------------------------
 
@@ -372,17 +400,31 @@ class ProjectDatabase:
 
     def list_workflows(self):
         rows = self._conn.execute(
-            "SELECT id, name FROM workflows ORDER BY name"
+            "SELECT id, name, sort_order FROM workflows ORDER BY sort_order, id"
         ).fetchall()
         return [dict(r) for r in rows]
 
     def add_workflow(self, name):
+        next_order = self._conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM workflows"
+        ).fetchone()["n"]
         try:
-            cur = self._conn.execute("INSERT INTO workflows(name) VALUES (?)", (name,))
+            cur = self._conn.execute(
+                "INSERT INTO workflows(name, sort_order) VALUES (?, ?)", (name, next_order)
+            )
         except sqlite3.IntegrityError as e:
             raise DuplicateNameError(f"ワークフロー名 '{name}' は既に使用されています") from e
         self._commit()
         return cur.lastrowid
+
+    def reorder_workflows(self, ordered_workflow_ids):
+        """左のワークフロー一覧をドラッグで並び替えた結果を反映する。
+        ordered_workflow_ids は表示させたい順のワークフローIDの並び。"""
+        for i, workflow_id in enumerate(ordered_workflow_ids):
+            self._conn.execute(
+                "UPDATE workflows SET sort_order = ? WHERE id = ?", (i, workflow_id)
+            )
+        self._commit()
 
     def rename_workflow(self, workflow_id, name):
         try:
@@ -602,6 +644,98 @@ class ProjectDatabase:
         )
         self._commit()
 
+    # -- マイルストーンの整合性（先行/後続タスク間） -----------------------------------
+    # 「後継タスクが先行タスクのマイルストーンより早まらないようにする」ための
+    # ヘルパー群。先行/後続の対象は同一ワークフロー内のtask_dependenciesのみ
+    # （ジョブをまたぐ依存 job_external_dependencies は対象外）。
+
+    def effective_milestone(self, job_id, workflow_task_id):
+        """あるジョブの特定タスクが実際に使うマイルストーンを返す
+        （{"milestone_id":.., "end_date":..}、上書きがあればそれ、無ければ
+        ジョブの既定マイルストーン。どちらも未設定ならNone）。"""
+        row = self._conn.execute(
+            "SELECT COALESCE(o.milestone_id, j.default_milestone_id) AS milestone_id "
+            "FROM jobs j LEFT JOIN job_task_overrides o "
+            "ON o.job_id = j.id AND o.workflow_task_id = ? "
+            "WHERE j.id = ?",
+            (workflow_task_id, job_id),
+        ).fetchone()
+        if row is None or row["milestone_id"] is None:
+            return None
+        ms = self._conn.execute(
+            "SELECT id, end_date FROM milestones WHERE id = ?", (row["milestone_id"],)
+        ).fetchone()
+        if ms is None:
+            return None
+        return {"milestone_id": ms["id"], "end_date": ms["end_date"]}
+
+    def _task_predecessors_map(self, workflow_id):
+        """{successor_task_id: [predecessor_task_id, ...]}"""
+        m = {}
+        for d in self.list_task_dependencies(workflow_id):
+            m.setdefault(d["successor_task_id"], []).append(d["predecessor_task_id"])
+        return m
+
+    def _task_successors_map(self, workflow_id):
+        """{predecessor_task_id: [successor_task_id, ...]}"""
+        m = {}
+        for d in self.list_task_dependencies(workflow_id):
+            m.setdefault(d["predecessor_task_id"], []).append(d["successor_task_id"])
+        return m
+
+    def minimum_milestone_end_date(self, job_id, workflow_task_id):
+        """このタスクに設定してよいマイルストーンのend_dateの下限
+        （＝直接の先行タスクの実効マイルストーンend_dateのうち最も遅いもの）を
+        返す。先行タスクが無い、またはどの先行タスクにもマイルストーンが
+        未設定なら None（下限なし）。"""
+        job = self._conn.execute("SELECT workflow_id FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        preds = self._task_predecessors_map(job["workflow_id"]).get(workflow_task_id, [])
+        end_dates = []
+        for pred_id in preds:
+            ms = self.effective_milestone(job_id, pred_id)
+            if ms is not None:
+                end_dates.append(ms["end_date"])
+        return max(end_dates) if end_dates else None
+
+    def cascade_milestone_to_successors(self, job_id, workflow_task_id):
+        """workflow_task_idのマイルストーンを変更した直後に呼ぶ。後続タスク
+        （transitively）の実効マイルストーンが、このタスクの実効マイルストーン
+        より早い場合、後続タスクのマイルストーン上書きをこのタスクと同じ
+        マイルストーンに自動的に合わせる。変更した後続タスクのworkflow_task_id
+        一覧を返す（GUI側の通知用。空リストなら調整不要だった）。"""
+        job = self._conn.execute("SELECT workflow_id FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        this_ms = self.effective_milestone(job_id, workflow_task_id)
+        if this_ms is None:
+            return []
+
+        succ_map = self._task_successors_map(job["workflow_id"])
+        changed = []
+        queue = list(succ_map.get(workflow_task_id, []))
+        seen = set()
+        while queue:
+            succ_id = queue.pop(0)
+            if succ_id in seen:
+                continue
+            seen.add(succ_id)
+            succ_ms = self.effective_milestone(job_id, succ_id)
+            if succ_ms is None or succ_ms["end_date"] < this_ms["end_date"]:
+                existing = self._conn.execute(
+                    "SELECT is_active, override_days, team_id FROM job_task_overrides "
+                    "WHERE job_id = ? AND workflow_task_id = ?",
+                    (job_id, succ_id),
+                ).fetchone()
+                self.upsert_job_task_override(
+                    job_id, succ_id,
+                    is_active=bool(existing["is_active"]) if existing else True,
+                    override_days=existing["override_days"] if existing else None,
+                    milestone_id=this_ms["milestone_id"],
+                    team_id=existing["team_id"] if existing else None,
+                )
+                changed.append(succ_id)
+                queue.extend(succ_map.get(succ_id, []))
+        return changed
+        self._commit()
+
     # -- job_external_dependencies ----------------------------------------------
 
     def list_external_dependencies(self, job_id=None):
@@ -641,6 +775,28 @@ class ProjectDatabase:
             raise ProjectDatabaseError("この依存関係は既に登録されています") from e
         self._commit()
         return cur.lastrowid
+
+    def update_external_dependency(self, dependency_id, workflow_task_id, depends_on_job_id,
+                                    depends_on_workflow_task_id):
+        """手動追加した個別のタスク依存の内容を選び直す（自動生成分＝
+        source_link_idがNULLでない行は呼び出し側で編集不可にガードする想定）。"""
+        row = self._conn.execute(
+            "SELECT job_id FROM job_external_dependencies WHERE id = ?", (dependency_id,)
+        ).fetchone()
+        if row is None:
+            raise ProjectDatabaseError("この依存関係は存在しません")
+        job_id = row["job_id"]
+        if (job_id, workflow_task_id) == (depends_on_job_id, depends_on_workflow_task_id):
+            raise ProjectDatabaseError("同じタスクへの自己依存は設定できません")
+        try:
+            self._conn.execute(
+                "UPDATE job_external_dependencies SET workflow_task_id = ?, "
+                "depends_on_job_id = ?, depends_on_workflow_task_id = ? WHERE id = ?",
+                (workflow_task_id, depends_on_job_id, depends_on_workflow_task_id, dependency_id),
+            )
+        except sqlite3.IntegrityError as e:
+            raise ProjectDatabaseError("この依存関係は既に登録されています") from e
+        self._commit()
 
     def delete_external_dependency(self, dependency_id):
         self._conn.execute(
