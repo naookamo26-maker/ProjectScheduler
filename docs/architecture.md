@@ -71,6 +71,16 @@ Mermaid Markdown (.md) / インタラクティブHTML (.html)
 変換は、`build_frames`の中で一度だけ、ガントチャート生成の直前に行う。
 GUIの画面上にこの文字列IDが表示されることはない。
 
+`gui/gantt_generator.py`の`validate_for_generation(db)`は、生成前に
+「プロジェクト名/開始日が未設定」「チーム/マイルストーン/ワークフロー/
+ジョブが0件」等の未完成な状態を検出し、エラー文字列のリストを返す
+（空リストなら生成可能）。これを先にチェックすることで、必須列を持たない
+空のDataFrameがそのまま`_load_data_from_frames`に渡って分かりにくい例外に
+なる事態を防ぐ。`gui/main.py`のFileメニュー「ガントチャートを生成...」は、
+このチェック→出力フォルダ選択（既定は開いている`.pschedule`と同じ
+フォルダ）→`generate_gantt()`呼び出しの順で動作し、`SchedulingError`系の
+例外はダイアログに変換して表示する。
+
 ## ノードグラフの循環依存検出
 
 `gui/node_canvas.py`の`WorkflowGraphScene`は、ワークフロー内のタスク依存を

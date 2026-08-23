@@ -6,6 +6,7 @@ File メニューでプロジェクトファイル（.pschedule）の新規作�
 """
 
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
@@ -21,10 +22,12 @@ from PySide6.QtWidgets import (
 )
 
 from gui.db import ProjectDatabase
+from gui.gantt_generator import generate_gantt, validate_for_generation
 from gui.tab_basic_info import BasicInfoTab
 from gui.tab_dependencies import DependenciesTab
 from gui.tab_jobs import JobsTab
 from gui.tab_workflows import WorkflowsTab
+from project_scheduler import SchedulingError
 
 FILE_FILTER = "Project Scheduler Files (*.pschedule);;All Files (*)"
 DEFAULT_SUFFIX = "pschedule"
@@ -87,6 +90,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.setEnabled(True)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.generate_action.setEnabled(True)
 
     def _on_tab_changed(self, index):
         """タブを切り替えるたびに、そのタブの表示をDBの最新状態へ合わせる
@@ -112,6 +116,13 @@ class MainWindow(QMainWindow):
         open_action = QAction("プロジェクトを開く(&O)...", self)
         open_action.triggered.connect(self.on_open_project)
         file_menu.addAction(open_action)
+
+        file_menu.addSeparator()
+
+        self.generate_action = QAction("ガントチャートを生成(&G)...", self)
+        self.generate_action.triggered.connect(self.on_generate_gantt)
+        self.generate_action.setEnabled(False)
+        file_menu.addAction(self.generate_action)
 
         file_menu.addSeparator()
 
@@ -142,6 +153,36 @@ class MainWindow(QMainWindow):
             self._open_database(ProjectDatabase.open_existing(path))
         except Exception as e:
             QMessageBox.critical(self, "エラー", f"プロジェクトを開けませんでした:\n{e}")
+
+    def on_generate_gantt(self):
+        if self.db is None:
+            return
+        errors = validate_for_generation(self.db)
+        if errors:
+            QMessageBox.warning(
+                self, "生成できません",
+                "以下を解決してから再度お試しください:\n\n- " + "\n- ".join(errors),
+            )
+            return
+
+        default_dir = str(Path(self.db.path).resolve().parent)
+        out_dir = QFileDialog.getExistingDirectory(self, "ガントチャートの出力先フォルダ", default_dir)
+        if not out_dir:
+            return
+
+        md_path = str(Path(out_dir) / "schedule_gantt.md")
+        html_path = str(Path(out_dir) / "schedule_gantt.html")
+        try:
+            generate_gantt(
+                self.db, mermaid_output_path=md_path, plotly_output_path=html_path, verbose=False,
+            )
+        except SchedulingError as e:
+            QMessageBox.critical(self, "生成に失敗しました", str(e))
+            return
+
+        QMessageBox.information(
+            self, "生成完了", f"ガントチャートを書き出しました:\n\n{md_path}\n{html_path}",
+        )
 
     def _open_database(self, db):
         if self.db is not None:
