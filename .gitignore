@@ -2,4 +2,5 @@ __pycache__/
 *.pyc
 .venv/
 output/*.md
+output/*.html
 !output/.gitkeep

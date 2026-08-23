@@ -99,6 +99,26 @@ class ResourceOverflowError(SchedulingError):
 
 DEFAULT_LOW_PRIORITY = 999  # Priority未指定タスクのフォールバック（最後に処理＝押し出されやすい）
 
+# チーム別色分け（Plotlyガントチャート）用の固定カテゴリカルパレット（8色、順序固定）。
+# CVD（色覚多様性）シミュレーション下でも隣接色を判別できるよう検証済みの順序のため、
+# 並び替えたり色を追加したりしない。9チーム目以降は _TEAM_COLOR_OVERFLOW（無彩色）に
+# 折りたたむ（色だけに頼らず、凡例・ホバーのチーム名表示と併用する前提）。
+_TEAM_COLOR_PALETTE = [
+    "#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+    "#e87ba4", "#008300", "#4a3aa7", "#e34948",
+]
+_TEAM_COLOR_OVERFLOW = "#898781"
+
+
+def _build_team_color_map(team_ids_in_order, team_name_map):
+    """チームID（登場順・固定）から表示名 -> 色 の辞書を作る。"""
+    color_map = {}
+    for i, team_id in enumerate(team_ids_in_order):
+        display = team_name_map.get(str(team_id), str(team_id))
+        color = _TEAM_COLOR_PALETTE[i] if i < len(_TEAM_COLOR_PALETTE) else _TEAM_COLOR_OVERFLOW
+        color_map.setdefault(display, color)
+    return color_map
+
 
 # ---------------------------------------------------------------------------
 # 日本の祝日を自動計算する（Holidaysシートへの手入力なしで土日祝日を休業日にするため）
@@ -891,12 +911,123 @@ def export_mermaid_gantt(result_df, output_path, project_name="プロジェク�
     return output_path
 
 
+def export_plotly_gantt(result_df, output_path, project_name="プロジェクトスケジュール",
+                         team_name_map=None, workflow_name_map=None, team_order=None,
+                         milestone_markers=None):
+    """result_df（run_resource_constrained_schedulerの戻り値）から、サーバー不要で
+    ブラウザで直接開けるインタラクティブなガントチャート（単一HTMLファイル、
+    Plotly製）を書き出す。
+
+    - タスク単位で1行のバーとして描画し、チーム別に色分けする（凡例クリックで
+      チーム単位の表示/非表示切り替え＝簡易フィルタリングが可能）。
+    - 行はワークフロー表示名 → ジョブ名 → 開始日の順でソートし、関連タスクが
+      まとまって見えるようにする。
+    - ホバーで担当チーム・優先度・開始/終了日・リソース調整有無を表示する。
+    - プロジェクト開始日と各マイルストーン（milestone_markers）を縦の破線として
+      全体に重ねる。
+    - チーム色は固定8色のカテゴリカルパレット（team_order の登場順に割り当て）。
+      9チーム目以降は無彩色にフォールドする（色は識別の補助であり、チーム名は
+      常に凡例・ホバーのテキストでも確認できる）。
+
+    team_name_map / workflow_name_map: {ID: 表示名} の辞書。省略時はIDをそのまま表示する。
+    team_order: 色を割り当てる順序を決めるチームIDのリスト（例: Teamsシートの行順）。
+        省略時は result_df 内の初出順を使う。
+    milestone_markers: [(id, label, date), ...] のリスト。
+
+    Returns:
+        書き出したファイルパス。
+    """
+    try:
+        import plotly.express as px
+    except ImportError as e:
+        raise ImportError(
+            "export_plotly_gantt には plotly が必要です。`pip install plotly` を"
+            "実行するか、requirements.txt から依存関係をインストールしてください。"
+        ) from e
+
+    team_name_map = team_name_map or {}
+    workflow_name_map = workflow_name_map or {}
+    milestone_markers = milestone_markers or []
+
+    if result_df.empty:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(f"<html><body><p>{project_name}: タスクなし</p></body></html>")
+        logger.info(f"Plotlyガントチャートを書き出しました（タスクなし）: {output_path}")
+        return output_path
+
+    if team_order is None:
+        team_order = list(dict.fromkeys(result_df["Team_ID"].tolist()))
+    team_color_map = _build_team_color_map(team_order, team_name_map)
+
+    df = result_df.copy()
+    df["Team_Display"] = df["Team_ID"].map(lambda t: team_name_map.get(str(t), str(t)))
+    df["Workflow_Display"] = df["Workflow_ID"].map(lambda w: workflow_name_map.get(str(w), str(w)))
+    df["Row_Label"] = df["Job_Name"] + " ＞ " + df["Task_Name"]
+    df["Adjustment_Label"] = df["Resource_Adjusted"].map(
+        {True: "あり（リソース制約）", False: "なし"}
+    )
+    df = df.sort_values(["Workflow_Display", "Job_Name", "Start_Date"]).reset_index(drop=True)
+
+    fig = px.timeline(
+        df,
+        x_start="Start_Date",
+        x_end="End_Date",
+        y="Row_Label",
+        color="Team_Display",
+        color_discrete_map=team_color_map,
+        category_orders={"Row_Label": df["Row_Label"].tolist()},
+        custom_data=["Workflow_Display", "Job_Name", "Task_Name", "Team_Display",
+                      "Priority", "Adjustment_Label"],
+    )
+    fig.update_traces(
+        hovertemplate=(
+            "<b>%{customdata[1]} ＞ %{customdata[2]}</b><br>"
+            "ワークフロー: %{customdata[0]}<br>"
+            "チーム: %{customdata[3]}<br>"
+            "優先度: %{customdata[4]}<br>"
+            "開始: %{base|%Y-%m-%d} ／ 終了: %{x|%Y-%m-%d}<br>"
+            "リソース調整: %{customdata[5]}"
+            "<extra></extra>"
+        )
+    )
+
+    for ms_id, ms_label, ms_date in milestone_markers:
+        fig.add_vline(
+            x=ms_date.to_pydatetime(), line_width=1.5, line_dash="dash",
+            line_color="#52514e",
+            annotation_text=f"◆{ms_label}", annotation_position="top",
+            annotation_textangle=-90, annotation_font_size=11,
+            annotation_font_color="#52514e",
+        )
+
+    n_rows = df["Row_Label"].nunique()
+    # マイルストーンラベルは縦書き（-90度）で描画するため、最長ラベルに合わせて
+    # 上マージンを確保する（足りないと文字が上端で切れる）
+    max_label_len = max([len(str(m[1])) for m in milestone_markers], default=0)
+    top_margin = 90 + max_label_len * 9
+
+    fig.update_yaxes(autorange="reversed", title=None)
+    fig.update_xaxes(title="日付")
+    fig.update_layout(
+        title=f"{project_name} スケジュール",
+        legend_title_text="チーム（クリックで表示/非表示切り替え）",
+        template="plotly_white",
+        height=max(400, 26 * n_rows + top_margin + 110),
+        margin=dict(l=10, r=10, t=top_margin, b=10),
+    )
+
+    fig.write_html(output_path, include_plotlyjs=True, full_html=True)
+    logger.info(f"Plotlyガントチャートを書き出しました: {output_path}")
+    return output_path
+
+
 def run_resource_constrained_scheduler(excel_file, verbose=True,
                                         auto_exclude_weekends=True,
                                         auto_exclude_jp_holidays=True,
                                         mermaid_output_path=None,
                                         mermaid_tick_interval="1week",
                                         mermaid_label_wrap_width=14,
+                                        plotly_output_path=None,
                                         project_name=None,
                                         highlight_resource_adjusted=False,
                                         distribution_ratio=0.7):
@@ -926,6 +1057,11 @@ def run_resource_constrained_scheduler(excel_file, verbose=True,
             "2week", "1month"）。既定は "1week"。
         mermaid_label_wrap_width: この文字数を超えるタスク名は <br/> でベストエフォートに
             折り返す（Mermaid側のレンダラー対応状況によっては効かない場合がある）。
+        plotly_output_path: 指定すると、サーバー不要でブラウザから直接開ける
+            インタラクティブなガントチャート（単一HTMLファイル、Plotly製）を
+            書き出す（例: "schedule_gantt.html"）。チーム別に色分けし、凡例
+            クリックでチーム単位の表示/非表示切り替え（簡易フィルタリング）が
+            できる。省略時はファイル出力を行わない。
         project_name: Markdown冒頭の見出しに使うプロジェクト名。
             省略時は Project シートの Project_Name を使う。
         highlight_resource_adjusted: True の場合、リソース制約により前倒しされた
@@ -1003,6 +1139,12 @@ def run_resource_constrained_scheduler(excel_file, verbose=True,
                                   team_name_map=team_name_map,
                                   highlight_resource_adjusted=highlight_resource_adjusted,
                                   milestone_markers=milestone_markers)
+        if plotly_output_path:
+            export_plotly_gantt(result_df, plotly_output_path, project_name,
+                                 team_name_map=team_name_map,
+                                 workflow_name_map=workflow_name_map,
+                                 team_order=list(df_teams["Team_ID"]),
+                                 milestone_markers=milestone_markers)
         return result_df
 
     jp_holidays = set()
@@ -1066,6 +1208,13 @@ def run_resource_constrained_scheduler(excel_file, verbose=True,
                               highlight_resource_adjusted=highlight_resource_adjusted,
                               milestone_markers=milestone_markers)
 
+    if plotly_output_path:
+        export_plotly_gantt(result_df, plotly_output_path, project_name,
+                             team_name_map=team_name_map,
+                             workflow_name_map=workflow_name_map,
+                             team_order=list(df_teams["Team_ID"]),
+                             milestone_markers=milestone_markers)
+
     return result_df
 
 
@@ -1081,6 +1230,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "-o", "--output", default="output/schedule_gantt.md",
         help="Mermaidガントチャートの出力先Markdownパス",
+    )
+    parser.add_argument(
+        "--html-output", default="output/schedule_gantt.html",
+        help="サーバー不要で開けるPlotly製インタラクティブガントチャート"
+             "（チーム別色分け）の出力先HTMLパス。空文字を指定すると出力しない",
     )
     parser.add_argument(
         "--tick-interval", default="1week",
@@ -1101,6 +1255,7 @@ if __name__ == "__main__":
             args.excel_file,
             mermaid_output_path=args.output,
             mermaid_tick_interval=args.tick_interval,
+            plotly_output_path=args.html_output or None,
             distribution_ratio=args.distribution_ratio,
             highlight_resource_adjusted=args.highlight_resource_adjusted,
         )

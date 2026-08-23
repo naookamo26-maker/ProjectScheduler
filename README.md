@@ -3,8 +3,9 @@
 リソース制約付きプロジェクトスケジューラー。Excelで管理する
 プロジェクト/マイルストーン/チーム/ワークフロー/ジョブ定義から、
 チームのライン数（同時並行キャパシティ）と休業日を考慮した
-現実的なスケジュールを算出し、Mermaidガントチャート（Markdown）として
-出力する。
+現実的なスケジュールを算出し、Mermaidガントチャート（Markdown）と、
+サーバー不要でブラウザから直接開けるインタラクティブなガントチャート
+（単一HTMLファイル、Plotly製・チーム別色分け）として出力する。
 
 ## セットアップ
 
@@ -15,7 +16,7 @@ pip install -r requirements.txt
 ## 使い方
 
 ```bash
-python project_scheduler.py [Excelファイル] -o output/schedule_gantt.md
+python project_scheduler.py [Excelファイル] -o output/schedule_gantt.md --html-output output/schedule_gantt.html
 ```
 
 引数を省略すると `data/Project_Schedule_Sample_GameDev_v22.xlsx`
@@ -23,14 +24,34 @@ python project_scheduler.py [Excelファイル] -o output/schedule_gantt.md
 
 主なオプション:
 
-- `--tick-interval`: ガントチャートの目盛り粒度（既定 `1week`）
+- `--html-output`: インタラクティブなHTMLガントチャートの出力先
+  （既定 `output/schedule_gantt.html`。空文字を指定すると出力しない）
+- `--tick-interval`: Mermaidガントチャートの目盛り粒度（既定 `1week`）
 - `--distribution-ratio`: 各タスクをASAP(0.0)〜ALAP(1.0)のどのあたりに
   配置するかの基準点（既定 `0.7`）
 - `--highlight-resource-adjusted`: リソース制約により前倒しされたタスクを
-  赤色（crit）表示する
+  赤色（crit）表示する（Mermaid版のみ）
 
 コードから直接呼び出す場合は `run_resource_constrained_scheduler()` を使う
 （詳細は `project_scheduler.py` のdocstringを参照）。
+
+### インタラクティブHTMLガントチャート（`--html-output`）
+
+`output/schedule_gantt.html` はブラウザにドラッグ&ドロップするだけで開ける
+単一ファイル（Plotly.jsを埋め込み済みでオフラインでも動作、サーバー不要）。
+
+- タスクごとに1行のバーとして表示し、**担当チームごとに色分け**する
+- 凡例をクリックするとそのチームのタスクだけ表示/非表示を切り替えられる
+  （簡易フィルタリング）
+- バーにマウスを乗せるとジョブ名・タスク名・ワークフロー・優先度・開始/終了日・
+  リソース調整の有無をツールチップ表示する
+- ズーム・パンで期間を絞り込める
+- プロジェクト開始日と各マイルストーンを縦の破線で表示する
+
+チーム色は固定8色のカテゴリカルパレット（色覚多様性シミュレーション下でも
+隣接色を判別できるよう検証済みの配色）を `Teams` シートの行順に割り当てる。
+9チーム目以降は無彩色にフォールドする（色は識別の補助であり、チーム名は
+常に凡例・ツールチップのテキストでも確認できるため実用上問題ない）。
 
 ## 入力フォーマット
 
