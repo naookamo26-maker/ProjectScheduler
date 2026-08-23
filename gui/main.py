@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from gui.db import ProjectDatabase
 from gui.tab_basic_info import BasicInfoTab
+from gui.tab_workflows import WorkflowsTab
 
 FILE_FILTER = "Project Scheduler Files (*.pschedule);;All Files (*)"
 DEFAULT_SUFFIX = "pschedule"
@@ -73,11 +74,10 @@ class MainWindow(QMainWindow):
         self.tab_basic_info = BasicInfoTab(self.db, on_teams_changed=self._on_teams_changed)
         self.tabs.addTab(self.tab_basic_info, "基本情報設定")
 
-        # ワークフロー設計・ジョブ・依存関係タブはPhase 4/5で実装予定。
-        self.tabs.addTab(
-            self._placeholder_tab("ワークフローとタスクの依存関係をここで設計します。（実装予定）"),
-            "ワークフロー設計",
-        )
+        self.tab_workflows = WorkflowsTab(self.db)
+        self.tabs.addTab(self.tab_workflows, "ワークフロー設計")
+
+        # ジョブ・依存関係タブはPhase 5で実装予定。
         self.tabs.addTab(
             self._placeholder_tab("ジョブ（ワークフローの実体化）をここで作成します。（実装予定）"), "ジョブ"
         )
@@ -88,10 +88,11 @@ class MainWindow(QMainWindow):
         self.tabs.setEnabled(True)
 
     def _on_teams_changed(self):
-        """チームマスタが変更された際に他タブへ反映するためのフック
-        （ワークフロー設計タブ実装後、そのタスクノード編集ダイアログの
-        チーム候補を更新する）。"""
-        pass
+        """チームマスタが変更された際、ワークフロー設計タブの表示中キャンバスの
+        色・ラベルを更新する（タスクノード編集ダイアログ自体は開くたびに
+        DBから最新のチーム一覧を読むため、ここでは表示更新のみでよい）。"""
+        if hasattr(self, "tab_workflows"):
+            self.tab_workflows.refresh_team_choices()
 
     def _build_menu(self):
         file_menu = self.menuBar().addMenu("ファイル(&F)")

@@ -22,6 +22,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from gui.db import ProjectDatabase  # noqa: E402
+from gui.node_canvas import compute_auto_layout  # noqa: E402
 from project_scheduler import _load_data  # noqa: E402
 
 
@@ -111,6 +112,17 @@ def migrate(xlsx_path, db_path):
                     print(f"警告: 依存先タスク '{dep}' が見つかりません（WF={wf_str_id}）。スキップします")
                     continue
                 db.add_task_dependency(wf_pk, pred_pk, succ_pk)
+
+    # -- ノードグラフの初期レイアウト ---------------------------------------------------
+    # Excelは座標情報を持たないため、全タスクが (0, 0) に重なって配置されてしまう。
+    # 依存の深さに基づく簡易レイアウトで初期座標を与える。
+    for wf_str_id, wf_pk in workflow_id_map.items():
+        tasks = db.list_workflow_tasks(wf_pk)
+        deps = db.list_task_dependencies(wf_pk)
+        positions = compute_auto_layout(tasks, deps)
+        for t in tasks:
+            x, y = positions[t["id"]]
+            db.update_task_position(t["id"], x, y)
 
     # -- Jobs -----------------------------------------------------------------------
     job_id_map = {}
