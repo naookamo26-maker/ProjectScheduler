@@ -1,0 +1,43 @@
+name: Build Windows exe
+
+# PyInstallerはクロスコンパイル非対応のため、Windows用.exeはwindows-latest
+# ランナー上でビルドする。開発環境（Linuxコンテナ）ではこのspecの妥当性を
+# ビルドが通ることまでは確認できるが、実際の.exeバイナリはここでのみ生成される。
+# 詳細は docs/packaging.md を参照。
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "gui/**"
+      - "project_scheduler.py"
+      - "run_gui.py"
+      - "requirements.txt"
+      - "packaging/**"
+      - ".github/workflows/build-exe.yml"
+  workflow_dispatch: {}
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller packaging/ProjectSchedulerGUI.spec
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProjectSchedulerGUI-windows
+          path: dist/ProjectSchedulerGUI/
+          if-no-files-found: error
