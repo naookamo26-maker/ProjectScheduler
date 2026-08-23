@@ -1,0 +1,89 @@
+# DB設計
+
+## 概要
+
+GUI（`gui/`）の入力データは、1プロジェクト＝1ファイルのSQLiteデータベースに保存する。
+保存ファイルの拡張子は `.pschedule` を使う。中身は標準的なSQLiteファイルであり、
+拡張子だけこのツール専用にしている（`file` コマンドや一般的なSQLiteビューアで
+中身を確認できる。既定のブラウザ関連付けやファイル選択ダイアログでの見分けやすさ
+のためだけの命名で、フォーマット上の特別な処理は一切ない）。
+
+スキーマとCRUD一式は `gui/db.py` の `ProjectDatabase` クラスに実装する。
+このモジュールはPySide6（Qt）に一切依存しないため、GUIを起動せずに
+単体でテストできる（`tests/test_gui_gantt_smoke.py` 等）。
+
+接続のたびに `PRAGMA foreign_keys = ON` を明示的に設定する（SQLiteは
+既定で外部キー制約が無効なため）。
+
+## テーブル一覧
+
+| テーブル | 役割 |
+|---|---|
+| `schema_meta` | スキーマバージョン管理用（将来のマイグレーションに備える） |
+| `project` | プロジェクト名・開始日（常に1行、`id=1`固定） |
+| `milestones` | マイルストーン（名前・締切日） |
+| `teams` | チーム（名前・同時ライン数） |
+| `holidays` | 休業日（日付、任意でチームを指定。未指定は全社共通） |
+| `workflows` | ワークフロー（テンプレートの名前のみ） |
+| `workflow_tasks` | ワークフロー内のタスク（名前・担当チーム・所要日数・ノードグラフ上の座標） |
+| `task_dependencies` | ワークフロー内のタスク依存（Internal_Depends相当、predecessor→successor） |
+| `jobs` | ジョブ（ワークフローの実体化。名前・使用ワークフロー・既定マイルストーン・優先度） |
+| `job_task_overrides` | ジョブ単位でのタスク上書き（有効/無効・日数・マイルストーン・チームの差分のみ保持） |
+| `job_external_dependencies` | ジョブをまたぐタスク依存（External_Dependencies相当） |
+
+DDLの正本は `gui/db.py` の `_SCHEMA_SQL` を参照（このドキュメントは概要説明用で、
+列の追加・変更が生じた場合は `_SCHEMA_SQL` 側を先に直し、本ドキュメントを追随させる）。
+
+## 主要な設計判断
+
+### IDはすべて内部の整数連番PK
+
+`Workflow_ID`（例: `WF_CHAR`）のような、元のExcelフォーマットが使っていた
+文字列IDはGUI上には一切登場しない。全てのテーブルは `INTEGER PRIMARY KEY
+AUTOINCREMENT` を持ち、GUIのあらゆる参照（コンボボックス等）は名前で
+表示・選択する。文字列ID形式への変換は `gui/gantt_generator.py` が
+ガントチャート生成の直前にのみ、一時的に行う（後述）。
+
+### 差分のみ保持する `job_task_overrides`
+
+ジョブが使うワークフローの全タスクは自動的にそのジョブのタスクになる
+（`workflow_tasks` から導出）。既定値（有効・標準日数・チーム）のままの
+タスクについては `job_task_overrides` に行を作らない。ユーザーが
+「このジョブだけ日数を変える」「このタスクを無効化する」等、既定から
+外れる操作をしたときだけ1行作られる（`UNIQUE(job_id, workflow_task_id)`）。
+既定に戻した場合は行を削除する（`ProjectDatabase.clear_job_task_override`）。
+
+### 削除時の参照整合性はアプリ層で守る
+
+`ON DELETE CASCADE/RESTRICT/SET NULL` はDB制約として設定しているが、
+生の `sqlite3.IntegrityError` をユーザーに見せないよう、`ProjectDatabase`
+の削除系メソッド（`delete_team`/`delete_workflow`等）が先に使用件数を
+調べ、参照が残っている場合は `ReferencedEntityError` を送出してブロック
+する。GUI側はこれを捕捉して分かりやすいダイアログに変換する。
+
+| 削除対象 | 挙動 |
+|---|---|
+| チーム | `workflow_tasks`/`job_task_overrides`から参照があれば削除不可 |
+| ワークフロー | `jobs`から参照があれば削除不可 |
+| マイルストーン | 参照するJob/上書きがあれば警告（削除は許可、参照はNULLになる） |
+| ジョブ | 他ジョブからの外部依存があれば警告（削除は許可、依存も連鎖削除） |
+| ワークフロー内タスク | Job側の上書き/外部依存/内部依存があれば件数を警告 |
+
+### 休業日の一意性
+
+全社共通休業日（`team_id IS NULL`）同士の重複は、SQLiteの`UNIQUE`制約では
+（`NULL`同士は別物として扱われるため）捕捉できない。`add_holiday`/
+`update_holiday` 内で事前に `SELECT ... WHERE team_id IS ?` によるチェックを
+行い、`DuplicateNameError` を送出する。チーム別休業日は
+`CREATE UNIQUE INDEX ux_holidays_team ... WHERE team_id IS NOT NULL` で
+DB制約として保証している。
+
+## 例外クラス
+
+`gui/db.py` は以下の業務例外を定義する（いずれも `ProjectDatabaseError` を継承）:
+
+- `DuplicateNameError` — 一意性制約違反（名前の重複等）
+- `ReferencedEntityError` — 参照が残っている行を削除しようとした場合
+
+GUI側はこれらをキャッチして `QMessageBox` に変換し、生のSQLite例外を
+ユーザーに見せない。
