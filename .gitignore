@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
 .venv/
+.pytest_cache/
+build/
+dist/
+*.spec.bak
 output/*.md
 output/*.html
 !output/.gitkeep
