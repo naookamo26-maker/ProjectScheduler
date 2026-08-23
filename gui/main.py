@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (
 
 from gui.db import ProjectDatabase
 from gui.tab_basic_info import BasicInfoTab
+from gui.tab_dependencies import DependenciesTab
+from gui.tab_jobs import JobsTab
 from gui.tab_workflows import WorkflowsTab
 
 FILE_FILTER = "Project Scheduler Files (*.pschedule);;All Files (*)"
@@ -77,15 +79,21 @@ class MainWindow(QMainWindow):
         self.tab_workflows = WorkflowsTab(self.db)
         self.tabs.addTab(self.tab_workflows, "ワークフロー設計")
 
-        # ジョブ・依存関係タブはPhase 5で実装予定。
-        self.tabs.addTab(
-            self._placeholder_tab("ジョブ（ワークフローの実体化）をここで作成します。（実装予定）"), "ジョブ"
-        )
-        self.tabs.addTab(
-            self._placeholder_tab("ジョブをまたぐ依存関係をここで設定します。（実装予定）"), "依存関係"
-        )
+        self.tab_jobs = JobsTab(self.db)
+        self.tabs.addTab(self.tab_jobs, "ジョブ")
+
+        self.tab_dependencies = DependenciesTab(self.db)
+        self.tabs.addTab(self.tab_dependencies, "依存関係")
 
         self.tabs.setEnabled(True)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+    def _on_tab_changed(self, index):
+        """タブを切り替えるたびに、そのタブの表示をDBの最新状態へ合わせる
+        （他タブでの変更—ワークフロー名の変更やジョブの追加等—を反映するため）。"""
+        widget = self.tabs.widget(index)
+        if hasattr(widget, "refresh_choices"):
+            widget.refresh_choices()
 
     def _on_teams_changed(self):
         """チームマスタが変更された際、ワークフロー設計タブの表示中キャンバスの

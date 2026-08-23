@@ -36,6 +36,17 @@ def set_row_id(table, row, entity_id):
     item.setData(ROW_ID_ROLE, entity_id)
 
 
+def unique_default_name(existing_names, base):
+    """「追加」ボタン連打で名前が衝突しエラーダイアログが出る事態を避けるため、
+    既存名と衝突しない既定名を自動生成する（例: 新しいジョブ, 新しいジョブ (2), ...）。"""
+    if base not in existing_names:
+        return base
+    n = 2
+    while f"{base} ({n})" in existing_names:
+        n += 1
+    return f"{base} ({n})"
+
+
 def make_fk_combo(options, current_id=None, allow_blank=False, blank_label="（未設定）"):
     """options: [(id, display_name), ...]。選択中の値はコンボの currentData() で
     取得できる（未設定/空欄の場合は None）。"""

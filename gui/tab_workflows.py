@@ -150,3 +150,10 @@ class WorkflowsTab(QWidget):
         """チームマスタ変更時、表示中キャンバスの色・ラベルを再計算する。"""
         if self.current_scene is not None:
             self.current_scene.refresh_colors()
+
+    def refresh_choices(self):
+        """MainWindowのタブ切り替え時フックから呼ばれる共通インターフェース。
+        選択中のワークフローを維持したまま一覧・キャンバスを最新化する。"""
+        current = self.workflow_list.currentItem()
+        select_id = current.data(Qt.UserRole) if current else None
+        self.refresh_workflows(select_id=select_id)

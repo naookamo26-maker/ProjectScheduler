@@ -28,7 +28,14 @@ from PySide6.QtWidgets import (
 )
 
 from gui.db import DuplicateNameError, ReferencedEntityError
-from gui.widgets_common import CrudSection, confirm_or_block_delete, make_fk_combo, row_id, set_row_id
+from gui.widgets_common import (
+    CrudSection,
+    confirm_or_block_delete,
+    make_fk_combo,
+    row_id,
+    set_row_id,
+    unique_default_name,
+)
 
 
 def _to_qdate(iso_str):
@@ -38,17 +45,6 @@ def _to_qdate(iso_str):
 
 def _to_iso(qdate):
     return qdate.toString("yyyy-MM-dd")
-
-
-def _unique_default_name(existing_names, base):
-    """「追加」ボタン連打で名前が衝突しエラーダイアログが出る事態を避けるため、
-    既存名と衝突しない既定名を自動生成する（例: 新しいチーム, 新しいチーム (2), ...）。"""
-    if base not in existing_names:
-        return base
-    n = 2
-    while f"{base} ({n})" in existing_names:
-        n += 1
-    return f"{base} ({n})"
 
 
 class BasicInfoTab(QWidget):
@@ -146,7 +142,7 @@ class BasicInfoTab(QWidget):
 
     def _add_milestone(self):
         existing = {ms["name"] for ms in self.db.list_milestones()}
-        name = _unique_default_name(existing, "新しいマイルストーン")
+        name = unique_default_name(existing, "新しいマイルストーン")
         default_date = date.today().isoformat()
         try:
             self.db.add_milestone(name, default_date)
@@ -208,7 +204,7 @@ class BasicInfoTab(QWidget):
 
     def _add_team(self):
         existing = {t["name"] for t in self.db.list_teams()}
-        name = _unique_default_name(existing, "新しいチーム")
+        name = unique_default_name(existing, "新しいチーム")
         try:
             self.db.add_team(name, 1)
         except DuplicateNameError as e:
@@ -323,3 +319,8 @@ class BasicInfoTab(QWidget):
         self.refresh_milestones()
         self.refresh_teams()
         self.refresh_holidays()
+
+    def refresh_choices(self):
+        """他タブの変更（現状なし）に合わせて表示を更新する共通インターフェース。
+        MainWindowのタブ切り替え時フックから呼ばれる。"""
+        self.refresh_all()
