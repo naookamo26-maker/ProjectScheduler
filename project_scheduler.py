@@ -1,0 +1,1109 @@
+"""
+リソース制約付きプロジェクトスケジューラー（新フォーマット対応版）
+
+対応フォーマット:
+  Project (1行) / Milestones(End_Dateのみ) / Teams / Holidays /
+  Workflows / Jobs(Priority列あり) / Job_Tasks(External_Depends廃止) /
+  External_Dependencies(新設)
+
+前バージョンからの主な変更点:
+1. マイルストーン単位のStart_Dateを廃止し、Projectシートの単一Start_Dateを
+   全タスク共通の絶対下限として使用。リソース不足で前倒しを続けてもこの日を
+   超えられない場合は ResourceOverflowError にする（恣意的な日数上限は廃止）。
+2. External_Depends（コロン区切り文字列）を廃止し、External_Dependencies
+   シート（1依存=1行、列で構造化）に変更。入力ミスやパースミスを構造的に防止。
+3. Jobs シートに Priority 列を追加。リソース競合時、優先度の高いジョブの
+   タスクを先に処理してその分ぎりぎりの日程を確保し、優先度の低い方を
+   前倒しさせる。
+4. Holidays シート（全社共通日 or チーム別）を追加。休業日はそのチームの
+   ライン数を実質0として扱い、その日をまたぐ配置を避ける。
+5. スケジューリング順序を「後続タスクが先」というトポロジカル制約 +
+   「同じ準備完了状態ならPriority優先」という優先度付きKahn法に統一。
+   （前バージョンの raw日付ソートは、真のトポロジカル順序を保証しなかった）
+6. 循環依存は明示的に検出してエラーにする。
+
+v5での変更点:
+7. Mermaidガントチャートの `title` 行を廃止（チャート上部にタイトルを表示しない）。
+8. リソース制約による前倒しタスクの赤色強調（crit）表示は既定でOFFに変更。
+   必要な場合のみ highlight_resource_adjusted=True で有効化する。
+9. ワークフロー単位のガントチャートに加え、チーム単位のガントチャートも
+   同じMarkdownファイル内に生成する（担当チームの稼働状況を横断的に見せる）。
+10. ワークフローIDだけでは何の制作物か分かりづらいため、Excel側に任意の
+    "Workflow_Names" シート（Workflow_ID / Workflow_Name）を追加できるように
+    対応。指定があればガントチャートの見出しにその名前を使う（未指定時はID）。
+    同様に Teams シートの Team_Name 列があればチーム別チャートの見出しに使う。
+
+v6での変更点:
+11. すべてのガントチャート（ワークフロー別・チーム別いずれも）の冒頭に
+    「マイルストーン」セクションを追加し、プロジェクト開始日と各マイルストーン
+    （Milestonesシート）を milestone（◆マーク）として表示するようにした。
+12. 上記のマイルストーン群はプロジェクト全体で共通（同じID・同じ日付）なので、
+    すべてのチャートに同じマイルストーンを含めることで、Mermaid側が自動計算する
+    表示期間（軸の範囲）もチャート間で揃うようにした（横並び比較がしやすい）。
+
+v7での変更点:
+13. 従来の「ALAP（締切から逆算した最遅日程）でリソース平準化した後、依存元が
+    終わり次第すぐ着手するASAP方向へ前倒しする」という2段階方式を廃止した。
+    このASAP前倒しパスが、締切までまだ余裕があるタスクまで軒並みプロジェクト
+    開始直後に詰め込んでしまい、非現実的な偏りを生む原因になっていたため。
+14. 代わりに、各タスクの「依存関係のみを考慮した最速日程（ASAP）」と
+    「締切から逆算した最遅日程（ALAP）」の両方を求め、その間（スラック）の
+    どこに配置するかを distribution_ratio（既定0.5）で制御する方式にした。
+    基準点にチームの空きが無い場合は締切側まで自動的に探索範囲を広げるため、
+    マイルストーンの締切には必ず間に合う。結果として、締切に間に合わせつつ
+    プロジェクト全体期間になるべく分散した日程になる。
+15. ログ出力のレベル名（INFO/WARNING/ERROR等）を日本語（情報/警告/エラー等）に
+    変更した。
+"""
+
+import heapq
+import logging
+from datetime import date as date_cls, timedelta
+
+import pandas as pd
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+# ログレベル名（INFO/WARNING/ERROR等）を日本語表示にする。
+_LEVEL_NAME_JA = {
+    "DEBUG": "デバッグ",
+    "INFO": "情報",
+    "WARNING": "警告",
+    "ERROR": "エラー",
+    "CRITICAL": "重大",
+}
+for _lvl, _ja in _LEVEL_NAME_JA.items():
+    logging.addLevelName(getattr(logging, _lvl), _ja)
+
+
+class SchedulingError(Exception):
+    """スケジューリング処理全般の基底エラー"""
+
+
+class MissingSheetOrColumnError(SchedulingError):
+    pass
+
+
+class MissingMilestoneError(SchedulingError):
+    pass
+
+
+class CircularDependencyError(SchedulingError):
+    pass
+
+
+class ResourceOverflowError(SchedulingError):
+    pass
+
+
+DEFAULT_LOW_PRIORITY = 999  # Priority未指定タスクのフォールバック（最後に処理＝押し出されやすい）
+
+
+# ---------------------------------------------------------------------------
+# 日本の祝日を自動計算する（Holidaysシートへの手入力なしで土日祝日を休業日にするため）
+#
+# 制約・既知の限界:
+# - 春分の日・秋分の日は 1980〜2099 年の範囲で成立する近似式を使用（国立天文台公表の
+#   計算式に基づく一般的な近似で、実際の官報確定日とまれにズレる可能性がある）
+# - 2020年（オリンピック開催に伴う海の日・体育の日・山の日の特例移動）と
+#   2021年（同様の特例）は未対応。対象期間にこれらの年を含む場合は要注意
+# - 1999年以前の制度（成人の日が1/15固定 等、ハッピーマンデー導入前）は未対応
+# ---------------------------------------------------------------------------
+
+def _vernal_equinox_day(year):
+    return int(20.8431 + 0.242194 * (year - 1980) - int((year - 1980) / 4))
+
+
+def _autumnal_equinox_day(year):
+    return int(23.2488 + 0.242194 * (year - 1980) - int((year - 1980) / 4))
+
+
+def _nth_weekday(year, month, weekday, n):
+    """指定月内の第n weekday（月曜=0）の date を返す"""
+    d = date_cls(year, month, 1)
+    add = (weekday - d.weekday()) % 7
+    return date_cls(year, month, 1 + add + 7 * (n - 1))
+
+
+def _fixed_and_moving_jp_holidays(year):
+    """振替休日・国民の休日を適用する前の、その年の祝日 {date: 名称}"""
+    h = {}
+    h[date_cls(year, 1, 1)] = "元日"
+    h[_nth_weekday(year, 1, 0, 2)] = "成人の日"
+    h[date_cls(year, 2, 11)] = "建国記念の日"
+    if year >= 2020:
+        h[date_cls(year, 2, 23)] = "天皇誕生日"
+    h[date_cls(year, 3, _vernal_equinox_day(year))] = "春分の日"
+    h[date_cls(year, 4, 29)] = "昭和の日" if year >= 2007 else "みどりの日"
+    h[date_cls(year, 5, 3)] = "憲法記念日"
+    if year >= 2007:
+        h[date_cls(year, 5, 4)] = "みどりの日"
+    h[date_cls(year, 5, 5)] = "こどもの日"
+    h[_nth_weekday(year, 7, 0, 3)] = "海の日"
+    if year >= 2016:
+        h[date_cls(year, 8, 11)] = "山の日"
+    h[_nth_weekday(year, 9, 0, 3)] = "敬老の日"
+    h[date_cls(year, 9, _autumnal_equinox_day(year))] = "秋分の日"
+    h[_nth_weekday(year, 10, 0, 2)] = "スポーツの日" if year >= 2020 else "体育の日"
+    h[date_cls(year, 11, 3)] = "文化の日"
+    h[date_cls(year, 11, 23)] = "勤労感謝の日"
+    return h
+
+
+def generate_jp_holidays(start_year, end_year):
+    """
+    start_year〜end_year（両端含む）の日本の祝日を、振替休日・国民の休日の
+    適用まで含めて計算し、pd.Timestamp の set で返す。
+    """
+    base = {}
+    # 振替休日が年をまたぐケースに備えて前後1年分を含めて計算する
+    for y in range(start_year - 1, end_year + 2):
+        base.update(_fixed_and_moving_jp_holidays(y))
+
+    holiday_set = set(base.keys())
+
+    # 振替休日: 日曜にあたる祝日の翌日以降で最初の非祝日を休日にする
+    for d in sorted(base.keys()):
+        if d.weekday() == 6:  # Sunday
+            nd = d + timedelta(days=1)
+            while nd in holiday_set:
+                nd += timedelta(days=1)
+            holiday_set.add(nd)
+
+    # 国民の休日: 前後を祝日に挟まれた非祝日（日曜を除く）を休日にする
+    range_start = date_cls(start_year - 1, 1, 1)
+    range_end = date_cls(end_year + 1, 12, 31)
+    to_add = set()
+    day = range_start
+    while day <= range_end:
+        if day not in holiday_set and day.weekday() != 6:
+            if (day - timedelta(days=1)) in holiday_set and (day + timedelta(days=1)) in holiday_set:
+                to_add.add(day)
+        day += timedelta(days=1)
+    holiday_set |= to_add
+
+    return {pd.Timestamp(d) for d in holiday_set if start_year <= d.year <= end_year}
+
+
+def _require_columns(df, required_cols, sheet_name):
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise MissingSheetOrColumnError(
+            f"シート '{sheet_name}' に必須列が不足しています: {missing}"
+        )
+
+
+def _load_data(excel_file):
+    try:
+        xls = pd.ExcelFile(excel_file)
+    except Exception as e:
+        raise MissingSheetOrColumnError(f"Excelファイルを開けませんでした: {excel_file} ({e})")
+
+    for required_sheet in ["Project", "Teams", "Milestones", "Workflows", "Jobs"]:
+        if required_sheet not in xls.sheet_names:
+            raise MissingSheetOrColumnError(f"必須シート '{required_sheet}' が見つかりません")
+
+    df_project = pd.read_excel(xls, sheet_name="Project")
+    df_teams = pd.read_excel(xls, sheet_name="Teams")
+    df_ms = pd.read_excel(xls, sheet_name="Milestones")
+    df_wf = pd.read_excel(xls, sheet_name="Workflows")
+    df_jobs = pd.read_excel(xls, sheet_name="Jobs")
+
+    _require_columns(df_project, ["Project_ID", "Project_Name", "Start_Date"], "Project")
+    _require_columns(df_teams, ["Team_ID", "Max_Lines"], "Teams")
+    _require_columns(df_ms, ["Milestone_ID", "End_Date"], "Milestones")
+    _require_columns(df_wf, ["Workflow_ID", "Task_ID", "Task_Name", "Default_Days"], "Workflows")
+    _require_columns(df_jobs, ["Job_ID", "Job_Name", "Workflow_ID", "Priority"], "Jobs")
+
+    if df_project.empty:
+        raise MissingSheetOrColumnError("Project シートが空です（1行必要）")
+    if len(df_project) > 1:
+        logger.warning("Project シートに複数行あります。1行目のみ使用します")
+
+    df_ms = df_ms.set_index("Milestone_ID")
+
+    if "Job_Tasks" in xls.sheet_names:
+        df_jtasks = pd.read_excel(xls, sheet_name="Job_Tasks")
+        _require_columns(df_jtasks, ["Job_ID", "Task_ID"], "Job_Tasks")
+        df_jtasks = df_jtasks.set_index(["Job_ID", "Task_ID"])
+    else:
+        df_jtasks = pd.DataFrame()
+
+    if "Holidays" in xls.sheet_names:
+        df_holidays = pd.read_excel(xls, sheet_name="Holidays")
+        if not df_holidays.empty:
+            _require_columns(df_holidays, ["Date"], "Holidays")
+    else:
+        df_holidays = pd.DataFrame(columns=["Date", "Team_ID"])
+
+    if "External_Dependencies" in xls.sheet_names:
+        df_extdeps = pd.read_excel(xls, sheet_name="External_Dependencies")
+        if not df_extdeps.empty:
+            _require_columns(
+                df_extdeps,
+                ["Job_ID", "Task_ID", "Depends_On_Job_ID", "Depends_On_Task_ID"],
+                "External_Dependencies",
+            )
+    else:
+        df_extdeps = pd.DataFrame(columns=["Job_ID", "Task_ID", "Depends_On_Job_ID", "Depends_On_Task_ID"])
+
+    # Workflow_Names（任意）: Workflow_ID だけでは何の制作物か分かりづらいので、
+    # ガントチャートの見出しに使う表示名を別シートで定義できるようにする。
+    if "Workflow_Names" in xls.sheet_names:
+        df_wf_names = pd.read_excel(xls, sheet_name="Workflow_Names")
+        if not df_wf_names.empty:
+            _require_columns(df_wf_names, ["Workflow_ID", "Workflow_Name"], "Workflow_Names")
+    else:
+        df_wf_names = pd.DataFrame(columns=["Workflow_ID", "Workflow_Name"])
+
+    return df_project, df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_holidays, df_extdeps, df_wf_names
+
+
+def _load_project_start(df_project):
+    start = pd.to_datetime(df_project.iloc[0]["Start_Date"])
+    if pd.isna(start):
+        raise MissingSheetOrColumnError("Project シートの Start_Date が空です")
+    return start
+
+
+def _load_holidays(df_holidays):
+    """休業日を (全社共通の set, チーム別 dict[team_id -> set]) に変換する"""
+    holidays_all = set()
+    holidays_by_team = {}
+    for _, row in df_holidays.iterrows():
+        d = pd.to_datetime(row.get("Date"))
+        if pd.isna(d):
+            continue
+        team = row.get("Team_ID")
+        if not pd.notna(team) or str(team).strip() == "":
+            holidays_all.add(d)
+        else:
+            holidays_by_team.setdefault(str(team).strip(), set()).add(d)
+    return holidays_all, holidays_by_team
+
+
+def _build_external_dep_map(df_extdeps):
+    """(Job_ID, Task_ID) -> ["Depends_On_Job_ID:Depends_On_Task_ID", ...] のマップを作る"""
+    dep_map = {}
+    for _, row in df_extdeps.iterrows():
+        job_id, task_id = row.get("Job_ID"), row.get("Task_ID")
+        dep_job, dep_task = row.get("Depends_On_Job_ID"), row.get("Depends_On_Task_ID")
+        if not (pd.notna(job_id) and pd.notna(task_id) and pd.notna(dep_job) and pd.notna(dep_task)):
+            logger.warning(f"External_Dependencies に不完全な行があります（スキップ）: {row.to_dict()}")
+            continue
+        key = (job_id, task_id)
+        dep_map.setdefault(key, []).append(f"{dep_job}:{dep_task}")
+    return dep_map
+
+
+def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps):
+    teams_dict = df_teams.set_index("Team_ID")["Max_Lines"].to_dict()
+    ext_dep_map = _build_external_dep_map(df_extdeps)
+    active_tasks = {}
+
+    for _, job in df_jobs.iterrows():
+        job_id, job_name = job["Job_ID"], job["Job_Name"]
+        wf_id = job["Workflow_ID"]
+        job_default_ms = job.get("Default_Milestone_ID", "")
+
+        priority = job.get("Priority")
+        if not pd.notna(priority):
+            logger.warning(f"Job '{job_id}' の Priority が未指定です。既定値 {DEFAULT_LOW_PRIORITY}（最低優先）を使用します")
+            priority = DEFAULT_LOW_PRIORITY
+        else:
+            priority = float(priority)
+
+        wf_tasks = df_wf[df_wf["Workflow_ID"] == wf_id]
+        if wf_tasks.empty:
+            logger.warning(f"Job '{job_id}' の Workflow_ID '{wf_id}' に該当するタスクが Workflows に見つかりません")
+
+        for _, t in wf_tasks.iterrows():
+            t_id = t["Task_ID"]
+            g_id = f"{job_id}:{t_id}"
+
+            override = (
+                df_jtasks.loc[(job_id, t_id)].to_dict()
+                if not df_jtasks.empty and (job_id, t_id) in df_jtasks.index
+                else {}
+            )
+
+            if str(override.get("Is_Active", "Y")).strip().upper() == "N":
+                continue
+
+            override_days = override.get("Override_Days")
+            days = int(override_days) if pd.notna(override_days) else int(t["Default_Days"])
+            if days <= 0:
+                raise SchedulingError(f"タスク '{g_id}' の所要日数が不正です（{days}日）")
+
+            task_ms = override.get("Milestone_ID")
+            if not pd.notna(task_ms) or str(task_ms).strip() == "":
+                task_ms = job_default_ms
+
+            team_id = override.get("Team_ID")
+            if not pd.notna(team_id) or str(team_id).strip() == "":
+                team_id = t.get("Team_ID", "")
+
+            if team_id not in teams_dict:
+                logger.warning(
+                    f"タスク '{g_id}' の担当チーム '{team_id}' は Teams シートに未定義です。"
+                    f"ライン制限なし（無制限）として扱います。"
+                )
+
+            if task_ms not in df_ms.index:
+                raise MissingMilestoneError(
+                    f"タスク '{g_id}' が参照するマイルストーン '{task_ms}' が Milestones シートに見つかりません"
+                )
+            ms_end = pd.to_datetime(df_ms.loc[task_ms]["End_Date"])
+            if pd.isna(ms_end):
+                raise MissingMilestoneError(
+                    f"マイルストーン '{task_ms}'（タスク '{g_id}' が参照）の End_Date が空です"
+                )
+
+            int_deps = [
+                f"{job_id}:{d.strip()}"
+                for d in str(t.get("Internal_Depends", "")).split(",")
+                if d.strip() and pd.notna(t.get("Internal_Depends"))
+            ]
+            ext_deps = ext_dep_map.get((job_id, t_id), [])
+
+            active_tasks[g_id] = {
+                "job_id": job_id, "job_name": job_name, "task_id": t_id,
+                "task_name": t["Task_Name"], "days": days,
+                "deps": int_deps + list(ext_deps), "milestone": task_ms,
+                "team_id": team_id, "ms_end": ms_end, "priority": priority,
+                "workflow_id": wf_id,
+            }
+
+    active_ids = set(active_tasks.keys())
+    for g_id, t_data in active_tasks.items():
+        dropped = [d for d in t_data["deps"] if d not in active_ids]
+        if dropped:
+            logger.warning(f"タスク '{g_id}' の依存先 {dropped} は存在しない、または非アクティブなため無視します")
+        t_data["deps"] = [d for d in t_data["deps"] if d in active_ids]
+
+    return teams_dict, active_tasks, active_ids
+
+
+def _build_scheduling_order(active_tasks, active_ids):
+    """
+    「後続タスクは必ず先」というトポロジカル制約を満たしつつ、
+    複数タスクが同時に準備完了となった場合は Priority（小さいほど優先）で
+    処理順を決める、優先度付き逆方向Kahnアルゴリズム。
+
+    戻り値: (successors辞書, スケジューリング順のg_idリスト)
+    循環依存があれば CircularDependencyError を送出する。
+    """
+    successors = {g_id: [] for g_id in active_ids}
+    for g_id, t_data in active_tasks.items():
+        for dep in t_data["deps"]:
+            successors[dep].append(g_id)
+
+    # 逆方向グラフ（task -> dep）での入次数 = 後続タスク数
+    remaining_successors = {g_id: len(successors[g_id]) for g_id in active_ids}
+
+    def sort_key(g_id):
+        t = active_tasks[g_id]
+        # Priority昇順（小さいほど先）、同値ならMilestone締切が遅い方を先に処理、
+        # さらに同値ならg_idで安定化
+        return (t["priority"], -t["ms_end"].value, g_id)
+
+    heap = [(*sort_key(g_id), g_id) for g_id in active_ids if remaining_successors[g_id] == 0]
+    heapq.heapify(heap)
+
+    scheduling_order = []
+    while heap:
+        *_key, g_id = heapq.heappop(heap)
+        scheduling_order.append(g_id)
+        for dep in active_tasks[g_id]["deps"]:
+            remaining_successors[dep] -= 1
+            if remaining_successors[dep] == 0:
+                heapq.heappush(heap, (*sort_key(dep), dep))
+
+    if len(scheduling_order) != len(active_ids):
+        remaining = active_ids - set(scheduling_order)
+        raise CircularDependencyError(
+            f"循環依存が検出されました。関係するタスク: {sorted(remaining)}"
+        )
+
+    return successors, scheduling_order
+
+
+def _make_is_holiday_checker(holidays_all, holidays_by_team, jp_holidays,
+                              auto_exclude_weekends, auto_exclude_jp_holidays):
+    """
+    (date, team_id) -> bool を返す休日判定関数を作る。
+    土日・日本の祝日は「その日は誰も稼働しない」という前提で、Days（所要日数）の
+    カウントには含めず読み飛ばす。Holidaysシートの休日（全社/チーム別）も同様に扱う。
+    """
+    def is_holiday(date, team_id):
+        if auto_exclude_weekends and date.weekday() >= 5:  # 5=土, 6=日
+            return True
+        if auto_exclude_jp_holidays and date in jp_holidays:
+            return True
+        return date in holidays_all or date in holidays_by_team.get(team_id, set())
+
+    return is_holiday
+
+
+def _business_start(curr_end, days, team_id, is_holiday_fn):
+    """
+    curr_end（終了日、exclusive）から遡って、休日を日数にカウントせずに
+    スキップしながら、営業日ベースで days 日分の開始日を求める。
+    """
+    d = curr_end
+    count = 0
+    while count < days:
+        d -= timedelta(days=1)
+        if not is_holiday_fn(d, team_id):
+            count += 1
+    return d
+
+
+def _calc_raw_dates(active_tasks, successors, scheduling_order, is_holiday_fn):
+    """リソース制約（チームのライン数）を無視した仮の理想日程（ALAP：締切から逆算した最遅日程）。
+    休日はスキップする。"""
+    raw_dates = {}
+    for g_id in scheduling_order:
+        t_info = active_tasks[g_id]
+        succs = successors[g_id]
+        if not succs:
+            t_end = t_info["ms_end"]
+        else:
+            succ_starts = [raw_dates[s]["start"] for s in succs]
+            t_end = min(min(succ_starts), t_info["ms_end"])
+        t_start = _business_start(t_end, t_info["days"], t_info["team_id"], is_holiday_fn)
+        raw_dates[g_id] = {"start": t_start, "end": t_end}
+    return raw_dates
+
+
+def _calc_asap_dates(active_tasks, scheduling_order, project_start, is_holiday_fn):
+    """
+    リソース制約を無視した、依存関係のみを考慮した最速（ASAP）の理想日程。
+    プロジェクト開始日・依存タスク（Internal/External Depends）の完了日のうち
+    遅い方を起点に、できるだけ早く着手する前提で計算する。
+
+    _calc_raw_dates（ALAP＝締切から逆算した最遅日程）とセットで使うことで、
+    各タスクの「動かせる幅（スラック）」＝ ASAP〜ALAP の範囲が分かる。
+    """
+    asap_dates = {}
+    # 依存元（predecessor）を先に確定させる必要があるため、
+    # scheduling_order（successorが先）とは逆順に処理する。
+    forward_order = list(reversed(scheduling_order))
+    for g_id in forward_order:
+        t_info = active_tasks[g_id]
+        deps = t_info["deps"]
+        dep_ends = [asap_dates[d]["end"] for d in deps if d in asap_dates]
+        t_start = max([project_start] + dep_ends)
+        t_start = _advance_to_working_day(t_start, t_info["team_id"], is_holiday_fn)
+        t_end = _business_end(t_start, t_info["days"], t_info["team_id"], is_holiday_fn)
+        asap_dates[g_id] = {"start": t_start, "end": t_end}
+    return asap_dates
+
+
+def _run_leveling(active_tasks, scheduling_order, teams_dict, project_start, is_holiday_fn,
+                   asap_dates, raw_dates, distribution_ratio=1.0):
+    """
+    リソース制約（チームのライン数・休日）を考慮して各タスクの日程を確定する。
+
+    predecessor（依存元）を先に確定させる順（scheduling_orderの逆順）で処理する
+    「前進（ASAP方向）型」のリソース平準化。各タスクの下限は「依存タスクの実際の
+    終了日」、上限は「そのタスク自身の締切から逆算した最遅日程（raw_dates、鎖全体の
+    残り所要日数を織り込み済みの静的な値）」とする。
+
+    前進型にしている理由: 後続タスクを先に確定させる方式（締切からの逆算＝ALAP）だと、
+    分散のために後続タスクを早めに動かした分だけ、前工程の締切（上限）も連鎖的に
+    早まり続けてしまい、鎖が長い/枝分かれが多いワークフローで雪だるま式に前倒しされて
+    ResourceOverflowError になりやすい。前進型なら「前工程が早く終わるほど後工程の
+    自由度が増える」向きにしか作用しないため、この問題が起きない。
+
+    distribution_ratio（0.0〜1.0）で、各タスクを自身の [ASAP開始, 締切から逆算した
+    最遅開始] の範囲内のどこに配置するかの基準点を調整する:
+      - 0.0: 依存関係が満たされ次第すぐ着手（最速側）
+      - 1.0: 締切ギリギリまで待つ（最遅側、従来のALAP的挙動）
+      - 0.7（既定）: 締切寄り7割の位置を基準にする ＝ 締切に間に合わせつつ
+        全体期間をなるべく広く使って分散させる（0.5だと前半に偏りやすい）
+
+    基準点で空きが無い場合は、まず基準点から締切側（後ろ）へ、それでも無ければ
+    基準点から着手可能日側（前）へと探索範囲を広げるため、間に合う日程が
+    存在する限りは必ず見つかる。
+
+    Returns:
+        (scheduled, adjusted) のタプル。
+        scheduled: {g_id: {"start": ..., "end": ...}}
+        adjusted: {g_id: bool}。実際の配置が分散の基準点(target_start)からずれた
+            場合（＝チームのライン数不足で動かさざるを得なかった場合）に True。
+    """
+    scheduled = {}
+    adjusted = {}
+    team_usage = {team_id: {} for team_id in teams_dict.keys()}
+
+    def is_available(team_id, start_dt, end_dt):
+        max_lines = teams_dict.get(team_id, None)
+        curr = start_dt
+        while curr < end_dt:
+            if is_holiday_fn(curr, team_id):
+                curr += timedelta(days=1)
+                continue
+            if max_lines is not None:
+                d_str = curr.strftime("%Y-%m-%d")
+                if team_usage.get(team_id, {}).get(d_str, 0) >= max_lines:
+                    return False
+            curr += timedelta(days=1)
+        return True
+
+    def book(team_id, start_dt, end_dt):
+        if team_id not in team_usage:
+            team_usage[team_id] = {}
+        curr = start_dt
+        while curr < end_dt:
+            if is_holiday_fn(curr, team_id):
+                curr += timedelta(days=1)
+                continue
+            d_str = curr.strftime("%Y-%m-%d")
+            team_usage[team_id][d_str] = team_usage[team_id].get(d_str, 0) + 1
+            curr += timedelta(days=1)
+
+    # predecessor（依存元）が先に確定するよう、逆順（predecessor -> successor）で処理する
+    forward_order = list(reversed(scheduling_order))
+
+    import hashlib
+
+    def _job_ratio_jitter(job_id, amplitude=0.5):
+        """
+        同じワークフロー・同じマイルストーンのジョブは理想シフト量がほぼ重なるため、
+        ジョブ単位で決定的な微小オフセットを distribution_ratio に加える。
+        """
+        h = int(hashlib.md5(job_id.encode("utf-8")).hexdigest(), 16)
+        return ((h % 1000) / 1000.0 - 0.5) * amplitude
+
+    # ジョブ単位で「鎖全体をどれだけ後ろにずらすか」を一度だけ決める。
+    # 各タスクを個別に [ASAP,ALAP] 内で独立にずらすと、鎖の前段（例: デザイン）が
+    # 自分の広い枠の中で大きく後ろに動いた分だけ、後段タスクの実際の下限
+    # （＝前工程の実際の終了日）も連鎖的に押し下げられ続け、鎖の終盤で
+    # 余裕がゼロになってしまう（雪だるま式のシフト）。
+    # ジョブ内で最もタイトな経路（クリティカルパス）のスラック幅を基準に、
+    # ジョブ全体に同一のシフト量を適用することでこれを防ぐ。
+    job_tasks = {}
+    for g_id, t_info in active_tasks.items():
+        job_tasks.setdefault(t_info.get("job_id", g_id), []).append(g_id)
+
+    job_shift_days = {}
+    if 0.0 < distribution_ratio < 1.0:
+        for job_id, g_ids in job_tasks.items():
+            min_slack = min(
+                (raw_dates[g]["start"] - asap_dates[g]["start"]).days for g in g_ids
+            )
+            min_slack = max(0, min_slack)
+            effective_ratio = min(1.0, max(0.0, distribution_ratio + _job_ratio_jitter(job_id)))
+            job_shift_days[job_id] = round(min_slack * effective_ratio)
+
+    for g_id in forward_order:
+        t_info = active_tasks[g_id]
+        team_id = t_info["team_id"]
+        days = t_info["days"]
+        deps = t_info["deps"]
+        job_id = t_info.get("job_id", g_id)
+
+        dep_ends = [scheduled[d]["end"] for d in deps if d in scheduled]
+        earliest_start = max([project_start] + dep_ends)
+        earliest_start = _advance_to_working_day(earliest_start, team_id, is_holiday_fn)
+
+        # 締切から逆算した、このタスク自身の最遅開始日（鎖全体の残り所要日数を
+        # 織り込み済みの静的な値）。依存元の実際の終了が想定より遅れた場合に
+        # 備えて、下限（earliest_start）を下回らないようクリップする。
+        latest_start = max(raw_dates[g_id]["start"], earliest_start)
+
+        if distribution_ratio >= 1.0:
+            target_start = latest_start
+        elif distribution_ratio <= 0.0 or job_id not in job_shift_days:
+            target_start = earliest_start
+        else:
+            # ジョブ単位で決めた一律のシフト量を、このタスクのASAP開始日に加える
+            # （鎖全体が同じ量だけ後ろにずれるだけなので、内部の間隔は保たれる）。
+            static_target = asap_dates[g_id]["start"] + timedelta(days=job_shift_days[job_id])
+            # 実際の依存元完了（earliest_start）が静的な想定より遅れていた場合は
+            # そちらを優先する（安全側のクリップ）。上限は締切から逆算した最遅開始日。
+            target_start = min(max(static_target, earliest_start), latest_start)
+        target_start = _advance_to_working_day(target_start, team_id, is_holiday_fn)
+
+        placed = None
+
+        # 1) target_start を起点に、締切側（後ろ）へ向かって空きを探す
+        curr_start = target_start
+        while curr_start <= latest_start:
+            curr_end = _business_end(curr_start, days, team_id, is_holiday_fn)
+            if is_available(team_id, curr_start, curr_end):
+                placed = (curr_start, curr_end)
+                break
+            curr_start += timedelta(days=1)
+
+        # 2) 見つからなければ target_start より前（着手可能日側）にも空きを探す
+        if placed is None:
+            curr_start = target_start - timedelta(days=1)
+            while curr_start >= earliest_start:
+                curr_end = _business_end(curr_start, days, team_id, is_holiday_fn)
+                if is_available(team_id, curr_start, curr_end):
+                    placed = (curr_start, curr_end)
+                    break
+                curr_start -= timedelta(days=1)
+
+        # 3) それでも見つからなければ、このタスク自身の締切（ms_end）まで
+        #    探索範囲を広げる（依存元の実際の終了が想定より遅れた場合の保険）
+        if placed is None:
+            hard_cap_start = _business_start(t_info["ms_end"], days, team_id, is_holiday_fn)
+            curr_start = latest_start + timedelta(days=1)
+            while curr_start <= hard_cap_start:
+                curr_end = _business_end(curr_start, days, team_id, is_holiday_fn)
+                if curr_start >= earliest_start and is_available(team_id, curr_start, curr_end):
+                    placed = (curr_start, curr_end)
+                    break
+                curr_start += timedelta(days=1)
+
+        if placed is None:
+            raise ResourceOverflowError(
+                f"タスク '{g_id}'（チーム '{team_id}'）はマイルストーンの締切までに "
+                f"空きラインが確保できません。チームのライン数不足、休業日の設定、"
+                f"または依存関係・締切を見直してください。"
+            )
+
+        curr_start, curr_end = placed
+        book(team_id, curr_start, curr_end)
+        scheduled[g_id] = {"start": curr_start, "end": curr_end}
+        # 実際の配置が「分散の基準点(target_start)」からずれた場合は、
+        # チームのライン数不足（リソース制約）によって動かさざるを得なかったことを示す
+        adjusted[g_id] = (curr_start != target_start)
+
+    return scheduled, adjusted
+
+
+def _business_end(curr_start, days, team_id, is_holiday_fn):
+    """
+    curr_start（開始日、inclusive、必ず稼働日であること）から進めて、
+    休日を日数にカウントせずにスキップしながら、営業日ベースで days 日分の
+    終了日（exclusive）を求める。_business_start の逆方向版。
+    """
+    d = curr_start
+    count = 0
+    while count < days:
+        if not is_holiday_fn(d, team_id):
+            count += 1
+        if count < days:
+            d += timedelta(days=1)
+    return d + timedelta(days=1)
+
+
+def _advance_to_working_day(d, team_id, is_holiday_fn):
+    while is_holiday_fn(d, team_id):
+        d += timedelta(days=1)
+    return d
+
+
+def _wrap_label(text, width):
+    """
+    Mermaidのgantt task labelは現状 <br/> や \\n による改行に対応していない
+    （2023年時点でMermaid本体の未解決issue）。将来的なレンダラー側の対応や、
+    表示環境によっては効く場合もあるためベストエフォートで <br/> を挿入する。
+    効かない場合でも、Mermaidはバーからテキストがはみ出す形で全文表示するため
+    テキスト自体が読めなくなることはない。
+    """
+    if not width or len(text) <= width:
+        return text
+    chunks = [text[i:i + width] for i in range(0, len(text), width)]
+    return "<br/>".join(chunks)
+
+
+def _generate_mermaid_gantt_blocks(result_df, group_col, group_name_map, tick_interval,
+                                    label_wrap_width, highlight_resource_adjusted, id_prefix,
+                                    milestone_markers=None):
+    """
+    result_df を group_col（"Workflow_ID" または "Team_ID"）でグルーピングし、
+    グループごとに1つのMermaid ganttブロックを生成する（見出し行のリストを返す）。
+
+    各ブロックの先頭に「マイルストーン」セクションを差し込み、続けて Job_ID で
+    セクション分けしたタスクを並べる。重ならないタスクは displayMode: compact
+    により同じ行にまとめられる。
+
+    milestone_markers: [(id, label, date), ...] のリスト。全ブロックに同じものを
+    差し込むことで、Mermaidが自動計算する表示期間（軸の範囲）をブロック間で
+    揃える役割も兼ねる（比較しやすくするため）。
+    """
+    milestone_markers = milestone_markers or []
+    lines = []
+    weekday_line = ["    weekday monday"] if "week" in tick_interval else []
+
+    group_order = result_df.groupby(group_col)["Start_Date"].min().sort_values().index.tolist()
+    for group_id in group_order:
+        group_df = result_df[result_df[group_col] == group_id]
+        display_name = group_name_map.get(str(group_id), str(group_id))
+        lines.append(f"## {display_name}")
+        lines.append("")
+        lines.append("```mermaid")
+        lines.append("---")
+        lines.append("displayMode: compact")
+        lines.append("---")
+        lines.append("gantt")
+        lines.append("    dateFormat YYYY-MM-DD")
+        lines.append(f"    tickInterval {tick_interval}")
+        lines += weekday_line
+        lines.append("")
+
+        used_ids = set()
+
+        def _unique_id(raw_id):
+            uid = "".join(c if c.isalnum() else "_" for c in raw_id)
+            base_id, i = uid, 2
+            while uid in used_ids:
+                uid = f"{base_id}_{i}"
+                i += 1
+            used_ids.add(uid)
+            return uid
+
+        if milestone_markers:
+            # 全ブロック共通のマイルストーン群を先頭セクションとして表示する。
+            # プロジェクト全体で同じ日付集合を含めることで、チャート間の
+            # 表示期間（軸の範囲）が揃う。
+            lines.append("    section マイルストーン")
+            for ms_id, ms_label, ms_date in milestone_markers:
+                m_id = _unique_id(f"{id_prefix}_MS_{ms_id}")
+                m_label = str(ms_label).replace(":", "-")
+                m_date = ms_date.strftime("%Y-%m-%d")
+                lines.append(f"    {m_label} :milestone, {m_id}, {m_date}, 0d")
+            lines.append("")
+
+        job_order = group_df.groupby("Job_ID")["Start_Date"].min().sort_values().index.tolist()
+        for job_id in job_order:
+            job_group = group_df[group_df["Job_ID"] == job_id].sort_values("Start_Date")
+            job_name = str(job_group.iloc[0]["Job_Name"]).replace(":", "-")
+            lines.append(f"    section {job_name}")
+            for _, r in job_group.iterrows():
+                task_id = _unique_id(f"{id_prefix}_{r['Job_ID']}_{r['Task_ID']}")
+                status = "crit, " if (highlight_resource_adjusted and r["Resource_Adjusted"]) else ""
+                task_label = _wrap_label(str(r["Task_Name"]).replace(":", "-"), label_wrap_width)
+                start = r["Start_Date"].strftime("%Y-%m-%d")
+                end = r["End_Date"].strftime("%Y-%m-%d")
+                lines.append(f"    {task_label} :{status}{task_id}, {start}, {end}")
+            lines.append("")
+
+        lines.append("```")
+        lines.append("")
+
+    return lines
+
+
+def _generate_mermaid_gantt(result_df, project_name, tick_interval="1week", label_wrap_width=14,
+                             workflow_name_map=None, team_name_map=None,
+                             highlight_resource_adjusted=False, milestone_markers=None):
+    """
+    スケジュール結果のDataFrameから、Mermaid記法のガントチャートを
+    含んだMarkdown文字列を生成する。
+
+    - まず「ワークフロー別」セクションで、ワークフロー（キャラクター/背景/
+      カットシーン等）ごとにガントチャートのMermaidブロックを分割する。
+      続けて「チーム別」セクションで、担当チームごとにも同様に分割する
+      （1ファイル内に複数の```mermaid```ブロック）。
+    - 見出しには Workflow_Name / Team_Name（任意の表示名）があればそれを使い、
+      なければ ID をそのまま使う。
+    - 各ブロックの先頭には「マイルストーン」セクションを差し込み、プロジェクト
+      開始日と各マイルストーン（Milestonesシート）を milestone（◆マーク）として
+      表示する。全ブロックに同じマイルストーン集合を含めることで、Mermaidが
+      自動計算する表示期間（軸の範囲）がブロック間で揃い、比較しやすくなる。
+    - 各ブロック内はJobごとにセクション分けする（1ジョブ=1系統の流れとして
+      タスクを追いやすい）
+    - displayMode: compact を有効化し、同じセクション（Job）内で重ならない
+      タスクは自動的に同じ行へ詰めて縦の長さを抑える
+      （例: Internal_Dependsで並行着手できるタスク同士が重ならなければ1行にまとまる）
+    - tick_interval で目盛りの粒度を指定できる（例: "1week", "2week", "1month"）
+    - highlight_resource_adjusted=True の場合のみ、リソース制約により前倒しされた
+      タスク（Resource_Adjusted=True）を crit（赤色強調）にする（既定はOFF）
+    - label_wrap_width 文字を超えるタスク名は <br/> でベストエフォートに折り返す
+      （Mermaid側の対応状況によっては効かない場合がある。詳細は _wrap_label 参照）
+    - チャート自体にタイトル（title行）は付けない。プロジェクト名は
+      Markdown冒頭の見出しにのみ表示する。
+    """
+    workflow_name_map = workflow_name_map or {}
+    team_name_map = team_name_map or {}
+    milestone_markers = milestone_markers or []
+
+    lines = [
+        f"# {project_name} スケジュール",
+        "",
+        "ワークフロー別・チーム別の2種類のガントチャートを掲載している。",
+        "各チャート内はJobごとにセクション分けしたうえで、重ならないタスクは",
+        "同じ行にまとめて表示している。",
+        "◆マークはマイルストーン（プロジェクト開始日・各締切日）を示す。",
+        "すべてのチャートに同じマイルストーンを含めているため、表示期間は",
+        "チャート間で揃っている（比較しやすいように統一）。",
+    ]
+    if highlight_resource_adjusted:
+        lines += [
+            "赤色（crit）表示は、リソース制約（チームのライン数不足）により、",
+            "本来の理想日程より前倒しされたタスクを示す。",
+        ]
+    lines.append("")
+
+    if result_df.empty:
+        lines += ["（タスクなし）"]
+        return "\n".join(lines)
+
+    lines.append("# ワークフロー別")
+    lines.append("")
+    lines += _generate_mermaid_gantt_blocks(
+        result_df, "Workflow_ID", workflow_name_map, tick_interval,
+        label_wrap_width, highlight_resource_adjusted, id_prefix="WF",
+        milestone_markers=milestone_markers,
+    )
+
+    lines.append("# チーム別")
+    lines.append("")
+    lines += _generate_mermaid_gantt_blocks(
+        result_df, "Team_ID", team_name_map, tick_interval,
+        label_wrap_width, highlight_resource_adjusted, id_prefix="TEAM",
+        milestone_markers=milestone_markers,
+    )
+
+    return "\n".join(lines)
+
+
+def export_mermaid_gantt(result_df, output_path, project_name="プロジェクトスケジュール",
+                          tick_interval="1week", label_wrap_width=14,
+                          workflow_name_map=None, team_name_map=None,
+                          highlight_resource_adjusted=False, milestone_markers=None):
+    """result_df（run_resource_constrained_schedulerの戻り値）からMermaidガントチャートの
+    Markdownファイルを書き出す（ワークフロー別・チーム別それぞれに分割し、
+    各チャート内はJobごとにセクション分け、compact表示）。
+
+    workflow_name_map / team_name_map: {ID: 表示名} の辞書。省略時はIDをそのまま表示する。
+    highlight_resource_adjusted: Trueならリソース制約による前倒しタスクを赤色（crit）表示する（既定False）。
+    milestone_markers: [(id, label, date), ...] のリスト。各チャートの先頭に
+        マイルストーンとして表示し、全チャート共通で含めることで表示期間を揃える。
+    """
+    content = _generate_mermaid_gantt(
+        result_df, project_name, tick_interval=tick_interval,
+        label_wrap_width=label_wrap_width,
+        workflow_name_map=workflow_name_map, team_name_map=team_name_map,
+        highlight_resource_adjusted=highlight_resource_adjusted,
+        milestone_markers=milestone_markers,
+    )
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    logger.info(f"Mermaidガントチャートを書き出しました: {output_path}")
+    return output_path
+
+
+def run_resource_constrained_scheduler(excel_file, verbose=True,
+                                        auto_exclude_weekends=True,
+                                        auto_exclude_jp_holidays=True,
+                                        mermaid_output_path=None,
+                                        mermaid_tick_interval="1week",
+                                        mermaid_label_wrap_width=14,
+                                        project_name=None,
+                                        highlight_resource_adjusted=False,
+                                        distribution_ratio=0.7):
+    """
+    リソース制約付きスケジューリングを実行し、結果を DataFrame で返す。
+
+    スケジューリングの考え方:
+    1. 依存関係のみを考慮した最速日程（ASAP）と、締切（マイルストーン）から
+       逆算した最遅日程（ALAP）の両方を計算し、各タスクが「動かせる幅
+       （スラック）」を把握する。
+    2. distribution_ratio に応じて、ASAP〜ALAPの間に探索の基準点を置き、
+       そこを起点にチームの空きラインを探す（見つからなければ締切側へも
+       探索範囲を広げる）。これにより、マイルストーンには間に合わせつつ、
+       特定の時期にタスクが偏らないよう全体期間に分散させる。
+
+    Args:
+        auto_exclude_weekends: True の場合、土日を全チーム共通の休業日として自動的に除外する。
+        auto_exclude_jp_holidays: True の場合、日本の祝日（振替休日含む）を自動的に除外する。
+            土日・祝日以外の休業日（年末年始休業、チーム独自の研修日等）は、
+            従来通り Holidays シートに明記する。
+        mermaid_output_path: 指定すると、その日程を Mermaid ガントチャート形式の
+            Markdown ファイルとして書き出す（例: "schedule_gantt.md"）。
+            ワークフローごとにガントチャートを分割し、各チャート内はJobごとに
+            セクション分けしたうえで、displayMode: compact で重ならないタスクは
+            同じ行に詰めて表示する。省略時はファイル出力を行わない。
+        mermaid_tick_interval: Mermaidガントチャートの目盛り粒度（例: "1day", "1week",
+            "2week", "1month"）。既定は "1week"。
+        mermaid_label_wrap_width: この文字数を超えるタスク名は <br/> でベストエフォートに
+            折り返す（Mermaid側のレンダラー対応状況によっては効かない場合がある）。
+        project_name: Markdown冒頭の見出しに使うプロジェクト名。
+            省略時は Project シートの Project_Name を使う。
+        highlight_resource_adjusted: True の場合、リソース制約により前倒しされた
+            タスク（Resource_Adjusted=True）を crit（赤色強調）表示する。
+            既定は False（赤色表示なし）。
+        distribution_ratio: 0.0〜1.0。各タスクをASAP（最速）〜ALAP（締切ギリギリ）の
+            どのあたりに配置するかの基準点。
+              - 0.0: 依存関係が満たされ次第すぐ着手（従来のASAP前倒しに近い、前に詰まりやすい）
+              - 1.0: 締切から逆算した最遅日程を基準にする（締切ギリギリに偏りやすい）
+              - 0.7（既定）: 締切寄り7割の位置を基準にし、締切に間に合わせながら
+                全体期間をなるべく広く使って分散させる
+            いずれの値でも、マイルストーンの締切に間に合わなくなることはない
+            （基準点で空きが無い場合は締切側まで自動的に探索範囲を広げるため）。
+
+    生成されるガントチャートには、プロジェクト開始日と各マイルストーン
+    （Milestonesシート）が「マイルストーン」セクションに milestone（◆）として
+    自動的に含まれる。すべてのチャートに同じマイルストーン集合を含めるため、
+    Mermaidが自動計算する表示期間（軸の範囲）もチャート間で揃う。
+
+    Raises:
+        MissingSheetOrColumnError: シート/列が不足している場合
+        MissingMilestoneError: マイルストーン参照が不正な場合
+        CircularDependencyError: 循環依存がある場合
+        ResourceOverflowError: リソース不足でプロジェクト開始日より前にしかスケジュールできない場合
+        SchedulingError: その他のスケジューリング不整合
+    """
+    (df_project, df_teams, df_ms, df_wf, df_jobs, df_jtasks,
+     df_holidays, df_extdeps, df_wf_names) = _load_data(excel_file)
+
+    project_start = _load_project_start(df_project)
+    if project_name is None:
+        project_name = str(df_project.iloc[0].get("Project_Name", "プロジェクトスケジュール"))
+    holidays_all, holidays_by_team = _load_holidays(df_holidays)
+
+    # ガントチャート見出し用の表示名マップ（未指定なら ID をそのまま使う）
+    workflow_name_map = {
+        str(r["Workflow_ID"]): str(r["Workflow_Name"])
+        for _, r in df_wf_names.iterrows()
+        if pd.notna(r.get("Workflow_ID")) and pd.notna(r.get("Workflow_Name"))
+    }
+    team_name_map = {}
+    if "Team_Name" in df_teams.columns:
+        team_name_map = {
+            str(r["Team_ID"]): str(r["Team_Name"])
+            for _, r in df_teams.iterrows()
+            if pd.notna(r.get("Team_ID")) and pd.notna(r.get("Team_Name"))
+        }
+
+    # ガントチャートに表示するマイルストーン群（プロジェクト開始日 + 各マイルストーン）。
+    # 全チャートに同じ集合を差し込むことで、Mermaidが自動計算する表示期間（軸の範囲）を
+    # チャート間で揃える（比較しやすくするため）。
+    milestone_markers = [("PROJECT_START", "プロジェクト開始", project_start)]
+    for ms_id, ms_row in df_ms.iterrows():
+        ms_name = ms_row.get("Milestone_Name")
+        if not pd.notna(ms_name) or str(ms_name).strip() == "":
+            ms_name = ms_id
+        ms_end = pd.to_datetime(ms_row.get("End_Date"))
+        if pd.notna(ms_end):
+            milestone_markers.append((str(ms_id), str(ms_name), ms_end))
+    milestone_markers.sort(key=lambda m: m[2])
+
+    teams_dict, active_tasks, active_ids = _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps)
+
+    if not active_ids:
+        logger.warning("アクティブなタスクがありません")
+        result_df = pd.DataFrame(columns=[
+            "Job_ID", "Task_ID", "Job_Name", "Task_Name", "Team_ID", "Priority",
+            "Workflow_ID", "Start_Date", "End_Date", "Resource_Adjusted"
+        ])
+        if mermaid_output_path:
+            export_mermaid_gantt(result_df, mermaid_output_path, project_name,
+                                  tick_interval=mermaid_tick_interval,
+                                  label_wrap_width=mermaid_label_wrap_width,
+                                  workflow_name_map=workflow_name_map,
+                                  team_name_map=team_name_map,
+                                  highlight_resource_adjusted=highlight_resource_adjusted,
+                                  milestone_markers=milestone_markers)
+        return result_df
+
+    jp_holidays = set()
+    if auto_exclude_jp_holidays:
+        year_start = project_start.year
+        year_end = max([t["ms_end"].year for t in active_tasks.values()] + [year_start])
+        jp_holidays = generate_jp_holidays(year_start, year_end)
+
+    is_holiday_fn = _make_is_holiday_checker(
+        holidays_all, holidays_by_team, jp_holidays,
+        auto_exclude_weekends, auto_exclude_jp_holidays,
+    )
+
+    successors, scheduling_order = _build_scheduling_order(active_tasks, active_ids)
+    raw_dates = _calc_raw_dates(active_tasks, successors, scheduling_order, is_holiday_fn)
+    asap_dates = _calc_asap_dates(active_tasks, scheduling_order, project_start, is_holiday_fn)
+    leveled, adjusted_flags = _run_leveling(
+        active_tasks, scheduling_order, teams_dict, project_start, is_holiday_fn,
+        asap_dates=asap_dates, raw_dates=raw_dates, distribution_ratio=distribution_ratio,
+    )
+    scheduled = leveled
+
+    rows = []
+    for g_id, dates in scheduled.items():
+        t = active_tasks[g_id]
+        # 分散配置の基準点(target_start)からチームのライン数不足によりずれた
+        # 場合に True になる（distribution_ratio による意図的な分散配置そのものは
+        # 「調整あり」に含めない）
+        resource_adjusted = adjusted_flags.get(g_id, False)
+        rows.append({
+            "Job_ID": t["job_id"],
+            "Task_ID": t["task_id"],
+            "Job_Name": t["job_name"],
+            "Task_Name": t["task_name"],
+            "Team_ID": t["team_id"],
+            "Priority": t["priority"],
+            "Workflow_ID": t["workflow_id"],
+            "Start_Date": dates["start"],
+            "End_Date": dates["end"],
+            "Resource_Adjusted": resource_adjusted,
+        })
+
+    result_df = pd.DataFrame(rows).sort_values(["Start_Date", "Job_ID", "Task_ID"]).reset_index(drop=True)
+
+    if verbose:
+        print("=== リソース制約考慮スケジューリング結果 ===")
+        for _, r in result_df.iterrows():
+            mark = " ⚠️ [リソース制約により前倒し]" if r["Resource_Adjusted"] else ""
+            print(
+                f"[{r['Team_ID']}] {r['Job_Name']} > {r['Task_Name']} "
+                f"(優先度{r['Priority']}): "
+                f"{r['Start_Date'].strftime('%Y-%m-%d')} ～ {r['End_Date'].strftime('%Y-%m-%d')}{mark}"
+            )
+
+    if mermaid_output_path:
+        export_mermaid_gantt(result_df, mermaid_output_path, project_name,
+                              tick_interval=mermaid_tick_interval,
+                              label_wrap_width=mermaid_label_wrap_width,
+                              workflow_name_map=workflow_name_map,
+                              team_name_map=team_name_map,
+                              highlight_resource_adjusted=highlight_resource_adjusted,
+                              milestone_markers=milestone_markers)
+
+    return result_df
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="リソース制約付きプロジェクトスケジューラー")
+    parser.add_argument(
+        "excel_file", nargs="?",
+        default="data/Project_Schedule_Sample_GameDev_v22.xlsx",
+        help="入力Excelファイルのパス（既定: サンプルデータ）",
+    )
+    parser.add_argument(
+        "-o", "--output", default="output/schedule_gantt.md",
+        help="Mermaidガントチャートの出力先Markdownパス",
+    )
+    parser.add_argument(
+        "--tick-interval", default="1week",
+        help="ガントチャートの目盛り粒度（例: 1day, 1week, 2week, 1month）",
+    )
+    parser.add_argument(
+        "--distribution-ratio", type=float, default=0.7,
+        help="ASAP(0.0)〜ALAP(1.0)間の配置基準点（既定0.7）",
+    )
+    parser.add_argument(
+        "--highlight-resource-adjusted", action="store_true",
+        help="リソース制約により前倒しされたタスクを赤色（crit）表示する",
+    )
+    args = parser.parse_args()
+
+    try:
+        run_resource_constrained_scheduler(
+            args.excel_file,
+            mermaid_output_path=args.output,
+            mermaid_tick_interval=args.tick_interval,
+            distribution_ratio=args.distribution_ratio,
+            highlight_resource_adjusted=args.highlight_resource_adjusted,
+        )
+    except SchedulingError as e:
+        logger.error(f"スケジューリングに失敗しました: {e}")
+        raise
