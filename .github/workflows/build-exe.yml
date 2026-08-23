@@ -7,7 +7,9 @@ name: Build Windows exe
 
 on:
   push:
-    branches: [main, master]
+    # このリポジトリはまだ main/master ブランチを持たないため、現在の開発
+    # ブランチも明示しておく（今後 main へ統合した場合もそのまま動作する）。
+    branches: [main, master, claude/dev-continuation-uudn2p]
     paths:
       - "gui/**"
       - "project_scheduler.py"
