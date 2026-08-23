@@ -1,11 +1,19 @@
 # ProjectScheduler
 
-リソース制約付きプロジェクトスケジューラー。Excelで管理する
-プロジェクト/マイルストーン/チーム/ワークフロー/ジョブ定義から、
-チームのライン数（同時並行キャパシティ）と休業日を考慮した
-現実的なスケジュールを算出し、Mermaidガントチャート（Markdown）と、
-サーバー不要でブラウザから直接開けるインタラクティブなガントチャート
-（単一HTMLファイル、Plotly製・チーム別色分け）として出力する。
+リソース制約付きプロジェクトスケジューラー。プロジェクト/マイルストーン/
+チーム/ワークフロー/ジョブ定義から、チームのライン数（同時並行キャパシティ）
+と休業日を考慮した現実的なスケジュールを算出し、Mermaidガントチャート
+（Markdown）と、サーバー不要でブラウザから直接開けるインタラクティブな
+ガントチャート（単一HTMLファイル、Plotly製・チーム別色分け）として出力する。
+
+入力データの作成には2通りの方法がある:
+
+- **GUI（推奨）**: PySide6製のデスクトップアプリ（`gui/`）。IDを一切意識せず、
+  名前のドロップダウン選択とノードグラフでの依存関係編集だけでデータを組み立て
+  られる。保存形式はSQLite（`.pschedule`）で、GUIから直接ガントチャートを生成
+  できる（Excelを経由しない）。詳しくは [GUIの使い方](#guiプロジェクトスケジューラーgui) を参照。
+- **Excel + CLI**: 多シート構成のExcelを直接編集し、`project_scheduler.py`を
+  コマンドラインから実行する（下記「使い方」）。
 
 ## セットアップ
 
@@ -13,7 +21,40 @@
 pip install -r requirements.txt
 ```
 
-## 使い方
+## GUI（プロジェクトスケジューラーGUI）
+
+```bash
+python run_gui.py
+```
+
+起動したら「ファイル → 新規プロジェクト...」で `.pschedule` ファイルを新規作成
+するか、「ファイル → プロジェクトを開く...」で既存のファイルを開く。
+サンプルデータをすぐ試したい場合は、リポジトリに同梱の
+[`data/Project_Schedule_Sample_GameDev_v22.pschedule`](data/Project_Schedule_Sample_GameDev_v22.pschedule)
+を開く（既存のExcelサンプルを`scripts/migrate_excel_to_db.py`で変換したもの）。
+
+4タブ（基本情報設定／ワークフロー設計／ジョブ／依存関係）でデータを入力し、
+「ファイル → ガントチャートを生成...」から出力先フォルダを選べば、CLI版と
+同じ Mermaid Markdown / インタラクティブHTML の2形式が書き出される。
+保存は各操作のたびに自動で行われる（明示的な保存ボタンはない）。
+
+詳細な要件・画面仕様・アーキテクチャ・DB設計は [`docs/`](docs/) を参照:
+
+- [`docs/requirements.md`](docs/requirements.md) — 要件定義
+- [`docs/screens.md`](docs/screens.md) — 画面仕様（各タブの操作・バリデーション）
+- [`docs/architecture.md`](docs/architecture.md) — アーキテクチャ
+- [`docs/db_design.md`](docs/db_design.md) — DB設計（`.pschedule`のテーブル定義）
+- [`docs/packaging.md`](docs/packaging.md) — Windows `.exe` パッケージング手順
+
+### Windows向け `.exe`
+
+GitHub Actions（`.github/workflows/build-exe.yml`）が `windows-latest` 上で
+自動ビルドする。Actionsの実行結果から `ProjectSchedulerGUI-windows`
+Artifactをダウンロードすれば、Pythonのインストール無しで実行できる。
+手元のWindows環境でビルドする手順も含め、詳細は
+[`docs/packaging.md`](docs/packaging.md) を参照。
+
+## 使い方（Excel + CLI）
 
 ```bash
 python project_scheduler.py [Excelファイル] -o output/schedule_gantt.md --html-output output/schedule_gantt.html
