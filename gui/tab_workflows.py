@@ -38,15 +38,16 @@ _HELP_TEXT = (
 
 
 class DependencyTemplateDialog(QDialog):
-    """依存テンプレート（ワークフローペア単位の既定タスク対応）の追加ダイアログ。
+    """依存テンプレート（ワークフローペア単位の既定タスク対応）の追加・編集ダイアログ。
     「このワークフローのタスク」は現在選択中のワークフロー内のタスクに固定し、
-    依存先ワークフロー→依存先タスクをカスケードで選ばせる。"""
+    依存先ワークフロー→依存先タスクをカスケードのドロップダウンで選ばせる
+    （追加・編集のいずれも同じ3つのドロップダウンから後から選び直せる）。"""
 
-    def __init__(self, db, workflow_id, parent=None):
+    def __init__(self, db, workflow_id, parent=None, initial=None):
         super().__init__(parent)
         self.db = db
         self.workflow_id = workflow_id
-        self.setWindowTitle("依存テンプレートを追加")
+        self.setWindowTitle("依存テンプレートを編集" if initial else "依存テンプレートを追加")
 
         form = QFormLayout(self)
 
@@ -71,7 +72,19 @@ class DependencyTemplateDialog(QDialog):
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
 
+        if initial is not None:
+            task_id, target_workflow_id, target_task_id = initial
+            idx = self.task_combo.findData(task_id)
+            if idx >= 0:
+                self.task_combo.setCurrentIndex(idx)
+            idx = self.target_workflow_combo.findData(target_workflow_id)
+            if idx >= 0:
+                self.target_workflow_combo.setCurrentIndex(idx)
         self._reload_target_tasks()
+        if initial is not None:
+            idx = self.target_task_combo.findData(initial[2])
+            if idx >= 0:
+                self.target_task_combo.setCurrentIndex(idx)
 
     def _reload_target_tasks(self):
         self.target_task_combo.clear()
@@ -137,6 +150,7 @@ class WorkflowsTab(QWidget):
             "依存テンプレート（このワークフローが他のワークフローに依存する場合の既定タスク対応）",
             ["このワークフローのタスク", "依存先ワークフロー", "依存先タスク"],
             on_add=self._add_template, on_delete=self._delete_template,
+            on_edit=self._edit_template,
         )
         right_layout.addWidget(self.template_section, 1)
 
@@ -225,6 +239,33 @@ class WorkflowsTab(QWidget):
             )
         except ProjectDatabaseError as e:
             QMessageBox.warning(self, "追加できません", str(e))
+            return
+        self.refresh_templates()
+
+    def _edit_template(self, row):
+        template_id = row_id(self.template_section.table, row)
+        current = next(
+            t for t in self.db.list_dependency_templates(self.current_workflow_id)
+            if t["id"] == template_id
+        )
+        dialog = DependencyTemplateDialog(
+            self.db, self.current_workflow_id, self,
+            initial=(
+                current["workflow_task_id"],
+                current["depends_on_workflow_id"],
+                current["depends_on_workflow_task_id"],
+            ),
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        task_id, target_workflow_id, target_task_id = dialog.values()
+        if None in (task_id, target_workflow_id, target_task_id):
+            QMessageBox.warning(self, "入力エラー", "すべての項目を選択してください。")
+            return
+        try:
+            self.db.update_dependency_template(template_id, task_id, target_workflow_id, target_task_id)
+        except ProjectDatabaseError as e:
+            QMessageBox.warning(self, "変更できません", str(e))
             return
         self.refresh_templates()
 

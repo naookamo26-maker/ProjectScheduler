@@ -17,6 +17,9 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -45,29 +48,55 @@ def _readonly_item(text):
 
 
 class JobDependencyLinkDialog(QDialog):
-    """「依存先ジョブ」を1件選ぶだけのシンプルなダイアログ。タスク単位の対応は
-    ワークフロー設計タブの依存テンプレートから自動展開されるため、ここでは
-    ジョブを選ぶだけでよい。"""
+    """「依存先ジョブ」を選ぶダイアログ。ワークフローで絞り込んでから、
+    候補ジョブを複数選択してまとめて追加できる。タスク単位の対応はワークフロー
+    設計タブの依存テンプレートから自動展開されるため、ここではジョブを選ぶだけでよい。"""
 
     def __init__(self, db, job_id, parent=None):
         super().__init__(parent)
+        self.db = db
+        self.job_id = job_id
         self.setWindowTitle("依存先ジョブを追加")
-        form = QFormLayout(self)
+        self.resize(360, 420)
 
-        self.job_combo = QComboBox()
-        existing = {link["depends_on_job_id"] for link in db.list_job_dependency_links(job_id)}
-        for j in db.list_jobs():
-            if j["id"] != job_id and j["id"] not in existing:
-                self.job_combo.addItem(j["name"], j["id"])
-        form.addRow("依存先ジョブ（先に終わっている必要がある）", self.job_combo)
+        self._existing = {link["depends_on_job_id"] for link in db.list_job_dependency_links(job_id)}
+        self._candidates = [j for j in db.list_jobs() if j["id"] != job_id and j["id"] not in self._existing]
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.workflow_filter_combo = QComboBox()
+        self.workflow_filter_combo.addItem("（すべてのワークフロー）", None)
+        for wf in db.list_workflows():
+            self.workflow_filter_combo.addItem(wf["name"], wf["id"])
+        self.workflow_filter_combo.currentIndexChanged.connect(self._reload_job_list)
+        form.addRow("ワークフローで絞り込み", self.workflow_filter_combo)
+        layout.addLayout(form)
+
+        layout.addWidget(QLabel("依存先ジョブ（先に終わっている必要がある。複数選択可）"))
+        self.job_list = QListWidget()
+        self.job_list.setSelectionMode(QListWidget.ExtendedSelection)
+        layout.addWidget(self.job_list, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
+        layout.addWidget(buttons)
 
-    def value(self):
-        return self.job_combo.currentData()
+        self._reload_job_list()
+
+    def _reload_job_list(self):
+        workflow_id = self.workflow_filter_combo.currentData()
+        self.job_list.clear()
+        for j in self._candidates:
+            if workflow_id is not None and j["workflow_id"] != workflow_id:
+                continue
+            item = QListWidgetItem(f'{j["name"]}（{j["workflow_name"]}）')
+            item.setData(Qt.UserRole, j["id"])
+            self.job_list.addItem(item)
+
+    def values(self):
+        return [item.data(Qt.UserRole) for item in self.job_list.selectedItems()]
 
 
 class ManualTaskDependencyDialog(QDialog):
@@ -431,15 +460,18 @@ class JobsTab(QWidget):
         dialog = JobDependencyLinkDialog(self.db, self.current_job_id, self)
         if dialog.exec() != QDialog.Accepted:
             return
-        depends_on_job_id = dialog.value()
-        if depends_on_job_id is None:
-            QMessageBox.warning(self, "入力エラー", "依存先ジョブを選択してください。")
+        depends_on_job_ids = dialog.values()
+        if not depends_on_job_ids:
+            QMessageBox.warning(self, "入力エラー", "依存先ジョブを1つ以上選択してください。")
             return
-        try:
-            self.db.add_job_dependency_link(self.current_job_id, depends_on_job_id)
-        except ProjectDatabaseError as e:
-            QMessageBox.warning(self, "追加できません", str(e))
-            return
+        errors = []
+        for depends_on_job_id in depends_on_job_ids:
+            try:
+                self.db.add_job_dependency_link(self.current_job_id, depends_on_job_id)
+            except ProjectDatabaseError as e:
+                errors.append(str(e))
+        if errors:
+            QMessageBox.warning(self, "一部追加できませんでした", "\n".join(errors))
         self._refresh_dependencies()
 
     def _delete_dependency_link(self, row):
