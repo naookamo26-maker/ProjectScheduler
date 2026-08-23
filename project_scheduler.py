@@ -214,7 +214,69 @@ def _require_columns(df, required_cols, sheet_name):
         )
 
 
+def _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
+                            df_jtasks=None, df_holidays=None, df_extdeps=None,
+                            df_wf_names=None):
+    """
+    既に読み込み済みのDataFrame群を検証・整形する（列チェック・インデックス設定・
+    任意データの既定値補完）。Excel由来（_load_data経由）・DB由来（GUIの
+    gui/gantt_generator.py経由）を問わない共通の入口。
+
+    df_project/df_teams/df_ms/df_wf/df_jobs は必須。
+    df_jtasks/df_holidays/df_extdeps/df_wf_names は、Noneなら「対応するデータが
+    そもそも存在しない」ことを表し既定の空DataFrameを使う。DataFrame（0行でも可）を
+    渡した場合は「存在する」ことを表し、Excelで対応シートが存在する場合と同じ
+    列検証を行う（Excel側の「シートが存在するかどうか」と1対1に対応する）。
+    """
+    _require_columns(df_project, ["Project_ID", "Project_Name", "Start_Date"], "Project")
+    _require_columns(df_teams, ["Team_ID", "Max_Lines"], "Teams")
+    _require_columns(df_ms, ["Milestone_ID", "End_Date"], "Milestones")
+    _require_columns(df_wf, ["Workflow_ID", "Task_ID", "Task_Name", "Default_Days"], "Workflows")
+    _require_columns(df_jobs, ["Job_ID", "Job_Name", "Workflow_ID", "Priority"], "Jobs")
+
+    if df_project.empty:
+        raise MissingSheetOrColumnError("Project シートが空です（1行必要）")
+    if len(df_project) > 1:
+        logger.warning("Project シートに複数行あります。1行目のみ使用します")
+
+    df_ms = df_ms.set_index("Milestone_ID")
+
+    if df_jtasks is not None:
+        _require_columns(df_jtasks, ["Job_ID", "Task_ID"], "Job_Tasks")
+        df_jtasks = df_jtasks.set_index(["Job_ID", "Task_ID"])
+    else:
+        df_jtasks = pd.DataFrame()
+
+    if df_holidays is not None:
+        if not df_holidays.empty:
+            _require_columns(df_holidays, ["Date"], "Holidays")
+    else:
+        df_holidays = pd.DataFrame(columns=["Date", "Team_ID"])
+
+    if df_extdeps is not None:
+        if not df_extdeps.empty:
+            _require_columns(
+                df_extdeps,
+                ["Job_ID", "Task_ID", "Depends_On_Job_ID", "Depends_On_Task_ID"],
+                "External_Dependencies",
+            )
+    else:
+        df_extdeps = pd.DataFrame(columns=["Job_ID", "Task_ID", "Depends_On_Job_ID", "Depends_On_Task_ID"])
+
+    # Workflow_Names（任意）: Workflow_ID だけでは何の制作物か分かりづらいので、
+    # ガントチャートの見出しに使う表示名を別途定義できるようにする。
+    if df_wf_names is not None:
+        if not df_wf_names.empty:
+            _require_columns(df_wf_names, ["Workflow_ID", "Workflow_Name"], "Workflow_Names")
+    else:
+        df_wf_names = pd.DataFrame(columns=["Workflow_ID", "Workflow_Name"])
+
+    return df_project, df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_holidays, df_extdeps, df_wf_names
+
+
 def _load_data(excel_file):
+    """Excelファイル（またはExcel形式のバイト列/バッファ）を読み込み、
+    _load_data_from_frames に検証・整形を委譲する。"""
     try:
         xls = pd.ExcelFile(excel_file)
     except Exception as e:
@@ -230,54 +292,16 @@ def _load_data(excel_file):
     df_wf = pd.read_excel(xls, sheet_name="Workflows")
     df_jobs = pd.read_excel(xls, sheet_name="Jobs")
 
-    _require_columns(df_project, ["Project_ID", "Project_Name", "Start_Date"], "Project")
-    _require_columns(df_teams, ["Team_ID", "Max_Lines"], "Teams")
-    _require_columns(df_ms, ["Milestone_ID", "End_Date"], "Milestones")
-    _require_columns(df_wf, ["Workflow_ID", "Task_ID", "Task_Name", "Default_Days"], "Workflows")
-    _require_columns(df_jobs, ["Job_ID", "Job_Name", "Workflow_ID", "Priority"], "Jobs")
+    df_jtasks = pd.read_excel(xls, sheet_name="Job_Tasks") if "Job_Tasks" in xls.sheet_names else None
+    df_holidays = pd.read_excel(xls, sheet_name="Holidays") if "Holidays" in xls.sheet_names else None
+    df_extdeps = (
+        pd.read_excel(xls, sheet_name="External_Dependencies")
+        if "External_Dependencies" in xls.sheet_names else None
+    )
+    df_wf_names = pd.read_excel(xls, sheet_name="Workflow_Names") if "Workflow_Names" in xls.sheet_names else None
 
-    if df_project.empty:
-        raise MissingSheetOrColumnError("Project シートが空です（1行必要）")
-    if len(df_project) > 1:
-        logger.warning("Project シートに複数行あります。1行目のみ使用します")
-
-    df_ms = df_ms.set_index("Milestone_ID")
-
-    if "Job_Tasks" in xls.sheet_names:
-        df_jtasks = pd.read_excel(xls, sheet_name="Job_Tasks")
-        _require_columns(df_jtasks, ["Job_ID", "Task_ID"], "Job_Tasks")
-        df_jtasks = df_jtasks.set_index(["Job_ID", "Task_ID"])
-    else:
-        df_jtasks = pd.DataFrame()
-
-    if "Holidays" in xls.sheet_names:
-        df_holidays = pd.read_excel(xls, sheet_name="Holidays")
-        if not df_holidays.empty:
-            _require_columns(df_holidays, ["Date"], "Holidays")
-    else:
-        df_holidays = pd.DataFrame(columns=["Date", "Team_ID"])
-
-    if "External_Dependencies" in xls.sheet_names:
-        df_extdeps = pd.read_excel(xls, sheet_name="External_Dependencies")
-        if not df_extdeps.empty:
-            _require_columns(
-                df_extdeps,
-                ["Job_ID", "Task_ID", "Depends_On_Job_ID", "Depends_On_Task_ID"],
-                "External_Dependencies",
-            )
-    else:
-        df_extdeps = pd.DataFrame(columns=["Job_ID", "Task_ID", "Depends_On_Job_ID", "Depends_On_Task_ID"])
-
-    # Workflow_Names（任意）: Workflow_ID だけでは何の制作物か分かりづらいので、
-    # ガントチャートの見出しに使う表示名を別シートで定義できるようにする。
-    if "Workflow_Names" in xls.sheet_names:
-        df_wf_names = pd.read_excel(xls, sheet_name="Workflow_Names")
-        if not df_wf_names.empty:
-            _require_columns(df_wf_names, ["Workflow_ID", "Workflow_Name"], "Workflow_Names")
-    else:
-        df_wf_names = pd.DataFrame(columns=["Workflow_ID", "Workflow_Name"])
-
-    return df_project, df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_holidays, df_extdeps, df_wf_names
+    return _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
+                                   df_jtasks, df_holidays, df_extdeps, df_wf_names)
 
 
 def _load_project_start(df_project):
@@ -1392,9 +1416,70 @@ def run_resource_constrained_scheduler(excel_file, verbose=True,
         ResourceOverflowError: リソース不足でプロジェクト開始日より前にしかスケジュールできない場合
         SchedulingError: その他のスケジューリング不整合
     """
-    (df_project, df_teams, df_ms, df_wf, df_jobs, df_jtasks,
-     df_holidays, df_extdeps, df_wf_names) = _load_data(excel_file)
+    frames = _load_data(excel_file)
+    return _run_scheduler_on_frames(
+        *frames, verbose=verbose,
+        auto_exclude_weekends=auto_exclude_weekends,
+        auto_exclude_jp_holidays=auto_exclude_jp_holidays,
+        mermaid_output_path=mermaid_output_path,
+        mermaid_tick_interval=mermaid_tick_interval,
+        mermaid_label_wrap_width=mermaid_label_wrap_width,
+        plotly_output_path=plotly_output_path,
+        project_name=project_name,
+        highlight_resource_adjusted=highlight_resource_adjusted,
+        distribution_ratio=distribution_ratio,
+    )
 
+
+def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
+                                                     df_jtasks=None, df_holidays=None,
+                                                     df_extdeps=None, df_wf_names=None,
+                                                     verbose=True,
+                                                     auto_exclude_weekends=True,
+                                                     auto_exclude_jp_holidays=True,
+                                                     mermaid_output_path=None,
+                                                     mermaid_tick_interval="1week",
+                                                     mermaid_label_wrap_width=14,
+                                                     plotly_output_path=None,
+                                                     project_name=None,
+                                                     highlight_resource_adjusted=False,
+                                                     distribution_ratio=0.7):
+    """
+    run_resource_constrained_scheduler() のDataFrame直接指定版。Excel読み込みを
+    一切経由せず、既にDataFrameとして構築済みのデータ（例: GUIのSQLiteデータベース
+    から組み立てたもの）から直接スケジューリングする。
+
+    各引数は run_resource_constrained_scheduler() と同じ意味・既定値を持つ
+    （df_project 以降 df_wf_names までが Excel の各シートに相当するDataFrame、
+    df_jtasks/df_holidays/df_extdeps/df_wf_names は None なら「データなし」を表す）。
+    それ以外のキーワード引数・戻り値・送出しうる例外は run_resource_constrained_scheduler()
+    のdocstringを参照。
+    """
+    frames = _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
+                                     df_jtasks, df_holidays, df_extdeps, df_wf_names)
+    return _run_scheduler_on_frames(
+        *frames, verbose=verbose,
+        auto_exclude_weekends=auto_exclude_weekends,
+        auto_exclude_jp_holidays=auto_exclude_jp_holidays,
+        mermaid_output_path=mermaid_output_path,
+        mermaid_tick_interval=mermaid_tick_interval,
+        mermaid_label_wrap_width=mermaid_label_wrap_width,
+        plotly_output_path=plotly_output_path,
+        project_name=project_name,
+        highlight_resource_adjusted=highlight_resource_adjusted,
+        distribution_ratio=distribution_ratio,
+    )
+
+
+def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jtasks,
+                              df_holidays, df_extdeps, df_wf_names, verbose=True,
+                              auto_exclude_weekends=True, auto_exclude_jp_holidays=True,
+                              mermaid_output_path=None, mermaid_tick_interval="1week",
+                              mermaid_label_wrap_width=14, plotly_output_path=None,
+                              project_name=None, highlight_resource_adjusted=False,
+                              distribution_ratio=0.7):
+    """run_resource_constrained_scheduler() / run_resource_constrained_scheduler_from_frames()
+    が共有するスケジューリング本体（_load_data* による検証・整形済みのDataFrameを受け取る）。"""
     project_start = _load_project_start(df_project)
     if project_name is None:
         project_name = str(df_project.iloc[0].get("Project_Name", "プロジェクトスケジュール"))
