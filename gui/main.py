@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.db import ProjectDatabase
+from gui.tab_basic_info import BasicInfoTab
 
 FILE_FILTER = "Project Scheduler Files (*.pschedule);;All Files (*)"
 DEFAULT_SUFFIX = "pschedule"
@@ -35,18 +36,8 @@ class MainWindow(QMainWindow):
         self.resize(1200, 800)
 
         self.tabs = QTabWidget()
-        self.tab_basic_info = self._placeholder_tab("プロジェクト名・開始日・マイルストーン・チーム・休業日をここで設定します。")
-        self.tab_workflows = self._placeholder_tab("ワークフローとタスクの依存関係をここで設計します。")
-        self.tab_jobs = self._placeholder_tab("ジョブ（ワークフローの実体化）をここで作成します。")
-        self.tab_dependencies = self._placeholder_tab("ジョブをまたぐ依存関係をここで設定します。")
-
-        self.tabs.addTab(self.tab_basic_info, "基本情報設定")
-        self.tabs.addTab(self.tab_workflows, "ワークフロー設計")
-        self.tabs.addTab(self.tab_jobs, "ジョブ")
-        self.tabs.addTab(self.tab_dependencies, "依存関係")
-
         self.setCentralWidget(self.tabs)
-        self._set_tabs_enabled(False)
+        self._build_empty_state_tabs()
 
         self._build_menu()
         self.statusBar().showMessage("プロジェクトファイルを新規作成するか、開いてください")
@@ -60,8 +51,47 @@ class MainWindow(QMainWindow):
         layout.addWidget(label)
         return widget
 
-    def _set_tabs_enabled(self, enabled):
-        self.tabs.setEnabled(enabled)
+    def _build_empty_state_tabs(self):
+        """プロジェクト未オープン時のプレースホルダー（DB操作を必要とする
+        実タブは開いた後に _rebuild_tabs() で差し替える）。"""
+        self.tabs.clear()
+        self.tabs.addTab(
+            self._placeholder_tab("プロジェクト名・開始日・マイルストーン・チーム・休業日をここで設定します。"),
+            "基本情報設定",
+        )
+        self.tabs.addTab(
+            self._placeholder_tab("ワークフローとタスクの依存関係をここで設計します。"), "ワークフロー設計"
+        )
+        self.tabs.addTab(self._placeholder_tab("ジョブ（ワークフローの実体化）をここで作成します。"), "ジョブ")
+        self.tabs.addTab(self._placeholder_tab("ジョブをまたぐ依存関係をここで設定します。"), "依存関係")
+        self.tabs.setEnabled(False)
+
+    def _rebuild_tabs(self):
+        """DBオープン後、実際に機能するタブへ差し替える。"""
+        self.tabs.clear()
+
+        self.tab_basic_info = BasicInfoTab(self.db, on_teams_changed=self._on_teams_changed)
+        self.tabs.addTab(self.tab_basic_info, "基本情報設定")
+
+        # ワークフロー設計・ジョブ・依存関係タブはPhase 4/5で実装予定。
+        self.tabs.addTab(
+            self._placeholder_tab("ワークフローとタスクの依存関係をここで設計します。（実装予定）"),
+            "ワークフロー設計",
+        )
+        self.tabs.addTab(
+            self._placeholder_tab("ジョブ（ワークフローの実体化）をここで作成します。（実装予定）"), "ジョブ"
+        )
+        self.tabs.addTab(
+            self._placeholder_tab("ジョブをまたぐ依存関係をここで設定します。（実装予定）"), "依存関係"
+        )
+
+        self.tabs.setEnabled(True)
+
+    def _on_teams_changed(self):
+        """チームマスタが変更された際に他タブへ反映するためのフック
+        （ワークフロー設計タブ実装後、そのタスクノード編集ダイアログの
+        チーム候補を更新する）。"""
+        pass
 
     def _build_menu(self):
         file_menu = self.menuBar().addMenu("ファイル(&F)")
@@ -108,7 +138,7 @@ class MainWindow(QMainWindow):
         if self.db is not None:
             self.db.close()
         self.db = db
-        self._set_tabs_enabled(True)
+        self._rebuild_tabs()
         self.statusBar().showMessage(f"開いているプロジェクト: {db.path}")
         self.setWindowTitle(f"プロジェクトスケジューラー — {db.path}")
 
