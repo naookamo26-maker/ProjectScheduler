@@ -96,6 +96,11 @@ GUIの画面上にこの文字列IDが表示されることはない。
 ワークフロー内の単純な整数グラフに対する専用の事前チェックとして別実装して
 いる。
 
+同じ`WorkflowGraphScene`の`auto_arrange()`は、タスクの追加・編集・削除や
+依存エッジの追加・削除のたびに呼ばれ、`compute_auto_layout`（依存の深さで
+レイヤー分けする純粋関数）で全ノードの座標を再計算し直す。手動でドラッグした
+位置は、次に何か編集すると上書きされる。
+
 ジョブをまたぐ外部依存（`job_external_dependencies`）については、キャンバスの
 ような事前チェックは行わず、ガントチャート生成時に
 `_build_scheduling_order()`が検出する`CircularDependencyError`をそのまま
@@ -111,16 +116,30 @@ GUI側でダイアログ表示する（プロジェクト全体の依存グラ�
 追加する際、`ProjectDatabase.add_job_dependency_link`が2ジョブそれぞれの
 `workflow_id`を引き、`workflow_dependency_templates`から該当するペアの
 テンプレート行を検索して`job_external_dependencies`へ`source_link_id`付きで
-一括挿入する。これはキャンバスの循環検出とは別軸の処理で、循環になるか
-どうかのチェックは行わない（テンプレートの追加はワークフロー設計タブで
-`_would_create_cycle`と独立に管理されるため、ジョブ間の実際の循環は他の
-外部依存と同様にガントチャート生成時に検出される）。詳細な自動展開の
-ルールは`docs/db_design.md`を参照。
+一括挿入する。
 
-## DBの書き込みタイミング
+テンプレート自体（`workflow_dependency_templates`）は、ワークフロー間で
+循環（WF1→WF2→WF3→WF1のような間接的なものも含む）にならないよう
+`ProjectDatabase.add_dependency_template`/`update_dependency_template`が
+`_would_create_workflow_template_cycle`で事前にチェックし拒否する
+（キャンバス側の`_would_create_cycle`＝ワークフロー内タスクの循環検出とは
+別軸・別グラフのチェック）。ただし、ジョブ単位の依存リンクそのもの
+（`job_dependency_links`/`job_external_dependencies`）についてはこの
+事前チェックの対象外で、他の外部依存と同様にガントチャート生成時の
+`CircularDependencyError`検出に委ねる。詳細な自動展開のルールは
+`docs/db_design.md`を参照。
 
-`gui/widgets_common.py`の`CrudTableWidget`をはじめ、GUIの入力系ウィジェットは
-明示的な「保存」ボタンを持たない。セル編集・コンボボックス選択・ノードの
-ドラッグ確定などのイベントごとに、その場で`ProjectDatabase`のメソッドを呼んで
-即座にコミットする（write-through方式）。`.pschedule`ファイルが常に唯一の
-正となる。
+## DBの書き込みタイミング（メモリ上のDB＋明示的な保存）
+
+`gui/widgets_common.py`の`CrudSection`をはじめ、GUIの入力系ウィジェットは
+セル編集・コンボボックス選択・ノードのドラッグ確定などのイベントごとに、
+その場で`ProjectDatabase`のメソッドを呼ぶ。ただし`ProjectDatabase`自体が
+`:memory:`のSQLite接続に対して即座にコミットするだけで、実ファイル
+（`.pschedule`）への書き込みは行わない。
+
+ファイルへの書き込みは`ProjectDatabase.save()`/`save_as()`を呼んだ時にのみ
+発生する。`gui/main.py`がCtrl+S（上書き保存）・Ctrl+Shift+S（名前を付けて
+保存）およびFileメニューにこれらを割り当て、`ProjectDatabase.on_change`
+コールバック経由で未保存の変更（`is_dirty()`）をタイトルバーに反映する。
+新規作成／プロジェクトを開く／ウィンドウを閉じる際に未保存の変更があれば、
+保存するか破棄するかを確認するダイアログを出す。

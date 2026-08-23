@@ -87,6 +87,70 @@ def test_save_as_writes_to_new_path_and_updates_path(tmp_path):
     reopened.close()
 
 
+# -- workflows: 並び替え・旧スキーマからの自動マイグレーション -----------------------
+
+def test_workflows_default_order_is_creation_order(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    wf1 = db.add_workflow("WF1")
+    wf2 = db.add_workflow("WF2")
+    wf3 = db.add_workflow("WF3")
+    assert [w["id"] for w in db.list_workflows()] == [wf1, wf2, wf3]
+    db.close()
+
+
+def test_reorder_workflows_persists_across_reopen(tmp_path):
+    path = tmp_path / "project.pschedule"
+    db = ProjectDatabase.create_new(str(path))
+    wf1 = db.add_workflow("WF1")
+    wf2 = db.add_workflow("WF2")
+    wf3 = db.add_workflow("WF3")
+
+    db.reorder_workflows([wf3, wf1, wf2])
+    assert [w["id"] for w in db.list_workflows()] == [wf3, wf1, wf2]
+
+    db.save()
+    db.close()
+
+    reopened = ProjectDatabase.open_existing(str(path))
+    assert [w["id"] for w in reopened.list_workflows()] == [wf3, wf1, wf2]
+    reopened.close()
+
+
+def test_opening_pre_sort_order_schema_migrates_and_keeps_name_order(tmp_path):
+    """sort_order列が存在しない旧バージョンの.pscheduleファイルを模して、
+    open_existing()が自動的にマイグレーションし、既存の並び順（名前順）を
+    保ったままsort_orderを振ることを確認する。"""
+    import sqlite3
+
+    path = tmp_path / "legacy.pschedule"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE project (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            project_name TEXT NOT NULL DEFAULT '',
+            start_date TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE workflows (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+        """
+    )
+    conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '1')")
+    conn.execute("INSERT INTO project(id, project_name, start_date) VALUES (1, '', '')")
+    conn.execute("INSERT INTO workflows(name) VALUES ('Zワークフロー')")
+    conn.execute("INSERT INTO workflows(name) VALUES ('Aワークフロー')")
+    conn.commit()
+    conn.close()
+
+    db = ProjectDatabase.open_existing(str(path))
+    names = [w["name"] for w in db.list_workflows()]
+    assert names == ["Aワークフロー", "Zワークフロー"]  # 旧仕様の名前順を踏襲
+
+    new_id = db.add_workflow("新規ワークフロー")
+    assert [w["name"] for w in db.list_workflows()][-1] == "新規ワークフロー"
+    db.close()
+
+
 def test_duplicate_names_are_rejected(tmp_path):
     db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
     db.add_team("チームA", 1)
@@ -167,6 +231,105 @@ def test_dependency_template_rejects_direct_and_transitive_cycles(tmp_path):
     with pytest.raises(ProjectDatabaseError):
         db.update_dependency_template(tpl2, t2, wf1, t1)  # editing into a cycle
 
+    db.close()
+
+
+# -- job_task_overrides: マイルストーンの整合性（先行/後続タスク間） -----------------
+
+def _build_linear_workflow_job(db):
+    """タスク1 -> タスク2 -> タスク3（この順に依存）を持つワークフローと、
+    既定マイルストーンを中期MSに設定したジョブ1件を組み立てる。"""
+    team_id = db.add_team("チームA", 1)
+    ms_early = db.add_milestone("早期MS", "2026-01-31")
+    ms_mid = db.add_milestone("中期MS", "2026-03-31")
+    ms_late = db.add_milestone("後期MS", "2026-06-30")
+    wf = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf, "タスク1", team_id, 3)
+    t2 = db.add_workflow_task(wf, "タスク2", team_id, 3)
+    t3 = db.add_workflow_task(wf, "タスク3", team_id, 3)
+    db.add_task_dependency(wf, t1, t2)
+    db.add_task_dependency(wf, t2, t3)
+    job = db.add_job("ジョブ1", wf, ms_mid, 100)
+    return {
+        "job": job, "t1": t1, "t2": t2, "t3": t3,
+        "ms_early": ms_early, "ms_mid": ms_mid, "ms_late": ms_late,
+    }
+
+
+def test_minimum_milestone_end_date_follows_predecessor(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    ids = _build_linear_workflow_job(db)
+
+    # 先行タスクが無いタスク1には下限が無い
+    assert db.minimum_milestone_end_date(ids["job"], ids["t1"]) is None
+
+    # タスク2は先行タスク1（既定＝中期MS）に合わせて中期MS以降が下限になる
+    assert db.minimum_milestone_end_date(ids["job"], ids["t2"]) == "2026-03-31"
+
+    # タスク1を後期MSへ上書きすると、タスク2の下限もそれに追随する
+    db.upsert_job_task_override(ids["job"], ids["t1"], milestone_id=ids["ms_late"])
+    assert db.minimum_milestone_end_date(ids["job"], ids["t2"]) == "2026-06-30"
+    db.close()
+
+
+def test_cascade_milestone_to_successors_pushes_back_transitively(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    ids = _build_linear_workflow_job(db)
+
+    db.upsert_job_task_override(ids["job"], ids["t1"], milestone_id=ids["ms_late"])
+    changed = db.cascade_milestone_to_successors(ids["job"], ids["t1"])
+
+    assert set(changed) == {ids["t2"], ids["t3"]}
+    assert db.effective_milestone(ids["job"], ids["t2"])["milestone_id"] == ids["ms_late"]
+    assert db.effective_milestone(ids["job"], ids["t3"])["milestone_id"] == ids["ms_late"]
+    db.close()
+
+
+def test_cascade_milestone_does_nothing_when_already_consistent(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    ids = _build_linear_workflow_job(db)
+
+    # タスク1を早期MSに前倒ししても、後続（既定＝中期MS）はより遅いので調整不要
+    db.upsert_job_task_override(ids["job"], ids["t1"], milestone_id=ids["ms_early"])
+    changed = db.cascade_milestone_to_successors(ids["job"], ids["t1"])
+    assert changed == []
+    db.close()
+
+
+# -- job_external_dependencies: 個別のタスク依存の編集 ---------------------------------
+
+def test_external_dependency_can_be_updated_in_place(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    team_id = db.add_team("チームA", 1)
+    wf1 = db.add_workflow("WF1")
+    wf2 = db.add_workflow("WF2")
+    t1 = db.add_workflow_task(wf1, "A", team_id, 1)
+    t2 = db.add_workflow_task(wf2, "B", team_id, 1)
+    t3 = db.add_workflow_task(wf2, "C", team_id, 1)
+    j1 = db.add_job("J1", wf1, None, 100)
+    j2 = db.add_job("J2", wf2, None, 100)
+
+    dep_id = db.add_external_dependency(j1, t1, j2, t2)
+    db.update_external_dependency(dep_id, t1, j2, t3)
+
+    rows = db.list_external_dependencies(job_id=j1)
+    assert len(rows) == 1
+    assert rows[0]["depends_on_workflow_task_id"] == t3
+    db.close()
+
+
+def test_external_dependency_update_rejects_self_dependency(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    team_id = db.add_team("チームA", 1)
+    wf1 = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf1, "A", team_id, 1)
+    t2 = db.add_workflow_task(wf1, "B", team_id, 1)
+    j1 = db.add_job("J1", wf1, None, 100)
+    j2 = db.add_job("J2", wf1, None, 100)
+
+    dep_id = db.add_external_dependency(j1, t1, j2, t2)
+    with pytest.raises(ProjectDatabaseError):
+        db.update_external_dependency(dep_id, t1, j1, t1)  # 自己依存になる変更
     db.close()
 
 

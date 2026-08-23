@@ -19,12 +19,12 @@ GUI（`gui/`）の入力データは、1プロジェクト＝1ファイルのSQL
 
 | テーブル | 役割 |
 |---|---|
-| `schema_meta` | スキーマバージョン管理用（将来のマイグレーションに備える） |
+| `schema_meta` | スキーマバージョン管理用。`ProjectDatabase.open_existing`が旧バージョンの`.pschedule`を検出すると`_migrate_schema`で自動的に不足カラム等を追加する（例: v1→v2で`workflows.sort_order`を追加） |
 | `project` | プロジェクト名・開始日（常に1行、`id=1`固定） |
 | `milestones` | マイルストーン（名前・締切日） |
 | `teams` | チーム（名前・同時ライン数） |
 | `holidays` | 休業日（日付、任意でチームを指定。未指定は全社共通） |
-| `workflows` | ワークフロー（テンプレートの名前のみ） |
+| `workflows` | ワークフロー（テンプレートの名前と、一覧での表示順`sort_order`） |
 | `workflow_tasks` | ワークフロー内のタスク（名前・担当チーム・所要日数・ノードグラフ上の座標） |
 | `task_dependencies` | ワークフロー内のタスク依存（Internal_Depends相当、predecessor→successor） |
 | `jobs` | ジョブ（ワークフローの実体化。名前・使用ワークフロー・既定マイルストーン・優先度） |
@@ -54,6 +54,18 @@ AUTOINCREMENT` を持ち、GUIのあらゆる参照（コンボボックス等�
 「このジョブだけ日数を変える」「このタスクを無効化する」等、既定から
 外れる操作をしたときだけ1行作られる（`UNIQUE(job_id, workflow_task_id)`）。
 既定に戻した場合は行を削除する（`ProjectDatabase.clear_job_task_override`）。
+
+### マイルストーンの整合性はアプリ層（`gui/tab_jobs.py`）で維持する
+
+`job_task_overrides.milestone_id`にはDB制約上の順序チェックは無い
+（`task_dependencies`をまたいだ順序はSQLで表現しにくいため）。代わりに
+`ProjectDatabase.minimum_milestone_end_date`（先行タスクの実効マイルストーン
+より前は選択肢に出さない）と`cascade_milestone_to_successors`（先行タスクの
+マイルストーンを変えた際、後続タスクが前倒しにならないよう自動的に揃える）
+をGUI側（タブ3のマイルストーン上書き）が組み合わせて呼び出すことで、
+「後継タスクが先行タスクより早いマイルストーンを持たない」という不変条件を
+保つ。対象は同一ワークフロー内の`task_dependencies`のみ（ジョブをまたぐ
+`job_external_dependencies`は対象外）。
 
 ### 削除時の参照整合性はアプリ層で守る
 

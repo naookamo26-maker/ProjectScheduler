@@ -8,6 +8,7 @@
 """
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QComboBox,
     QGroupBox,
@@ -20,6 +21,24 @@ from PySide6.QtWidgets import (
 )
 
 ROW_ID_ROLE = Qt.UserRole
+
+
+def keep_selection_visible(view):
+    """フォーカスが他のウィジェット（別テーブルのセルウィジェット等）に移っても、
+    選択中の行がグレーアウトして見えなくならないようにする。
+
+    Qtの既定パレットは、ウィジェットが非アクティブ（フォーカスを持たない）な
+    間、選択色（Highlight）を薄いグレーに変える。タスク上書き欄のコンボ等を
+    操作するとジョブ一覧からフォーカスが離れるため、この既定動作のせいで
+    「選択していたジョブが分からなくなった（選択が解除された）」ように見える
+    ことがある。アクティブ時と同じ色を非アクティブ時にも使うことで、選択状態を
+    常に視認できるようにする。"""
+    palette = view.palette()
+    palette.setColor(QPalette.Inactive, QPalette.Highlight, palette.color(QPalette.Active, QPalette.Highlight))
+    palette.setColor(
+        QPalette.Inactive, QPalette.HighlightedText, palette.color(QPalette.Active, QPalette.HighlightedText)
+    )
+    view.setPalette(palette)
 
 
 def row_id(table, row):
@@ -129,6 +148,7 @@ class CrudSection(QGroupBox):
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
+        keep_selection_visible(self.table)
         if on_edit is not None:
             self.table.itemDoubleClicked.connect(lambda _item: self._handle_edit())
         layout.addWidget(self.table)
