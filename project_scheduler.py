@@ -911,6 +911,34 @@ def export_mermaid_gantt(result_df, output_path, project_name="プロジェク�
     return output_path
 
 
+def _pack_lanes(df, group_col, start_col="Start_Date", end_col="End_Date"):
+    """
+    group_col（例: Job_ID）ごとに、時間的に重ならないタスクは同じレーン（行）に
+    詰め、重なるタスクだけ新しいレーンに割り当てる貪欲法（区間グラフの彩色）。
+    Mermaidの displayMode: compact と同じ考え方。
+
+    Returns:
+        (df.index -> lane番号 の Series, group_col値 -> 使用レーン数 の辞書)
+    """
+    lane_of = {}
+    lane_count = {}
+    for group_val, g in df.groupby(group_col):
+        lane_ends = []  # 各レーンの現在の終了日（exclusive）
+        for idx, row in g.sort_values(start_col).iterrows():
+            placed = False
+            for lane_idx, lane_end in enumerate(lane_ends):
+                if row[start_col] >= lane_end:
+                    lane_ends[lane_idx] = row[end_col]
+                    lane_of[idx] = lane_idx
+                    placed = True
+                    break
+            if not placed:
+                lane_ends.append(row[end_col])
+                lane_of[idx] = len(lane_ends) - 1
+        lane_count[group_val] = len(lane_ends)
+    return pd.Series(lane_of), lane_count
+
+
 def export_plotly_gantt(result_df, output_path, project_name="プロジェクトスケジュール",
                          team_name_map=None, workflow_name_map=None, team_order=None,
                          milestone_markers=None):
@@ -918,9 +946,12 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
     ブラウザで直接開けるインタラクティブなガントチャート（単一HTMLファイル、
     Plotly製）を書き出す。
 
-    - タスク単位で1行のバーとして描画し、チーム別に色分けする（凡例クリックで
-      チーム単位の表示/非表示切り替え＝簡易フィルタリングが可能）。
-    - 行はワークフロー表示名 → ジョブ名 → 開始日の順でソートし、関連タスクが
+    - タスクごとに1行を割り当てるのではなく、Mermaid版のcompact表示と同様に
+      「ジョブ単位で1行にまとめ、時間的に重ならないタスクは同じ行に詰める」
+      レーンパッキングを行う（時間が重なるタスクだけ行を分ける）。これにより
+      縦方向を大幅に圧縮する。バー内にはタスク名を表示し、チーム別に色分けする
+      （凡例クリックでチーム単位の表示/非表示切り替え＝簡易フィルタリングが可能）。
+    - 行はワークフロー表示名 → ジョブ名 → レーンの順でソートし、関連タスクが
       まとまって見えるようにする。
     - ホバーで担当チーム・優先度・開始/終了日・リソース調整有無を表示する。
     - プロジェクト開始日と各マイルストーン（milestone_markers）を縦の破線として
@@ -962,11 +993,30 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
     df = result_df.copy()
     df["Team_Display"] = df["Team_ID"].map(lambda t: team_name_map.get(str(t), str(t)))
     df["Workflow_Display"] = df["Workflow_ID"].map(lambda w: workflow_name_map.get(str(w), str(w)))
-    df["Row_Label"] = df["Job_Name"] + " ＞ " + df["Task_Name"]
     df["Adjustment_Label"] = df["Resource_Adjusted"].map(
         {True: "あり（リソース制約）", False: "なし"}
     )
-    df = df.sort_values(["Workflow_Display", "Job_Name", "Start_Date"]).reset_index(drop=True)
+
+    # 同名Jobが複数Job_IDにまたがる場合のみ、行見出しにJob_IDを併記して区別する
+    name_to_ids = df.groupby("Job_Name")["Job_ID"].unique()
+    ambiguous_names = set(name_to_ids[name_to_ids.map(len) > 1].index)
+    df["Job_Display"] = df.apply(
+        lambda r: f"{r['Job_Name']}（{r['Job_ID']}）" if r["Job_Name"] in ambiguous_names else r["Job_Name"],
+        axis=1,
+    )
+
+    # ジョブ単位でレーンパッキング（時間的に重ならないタスクは同じ行にまとめる）。
+    # 重ならない限りは1ジョブ=1行になり、Mermaidのcompact表示と同様に縦を圧縮する。
+    lane_of, lane_count = _pack_lanes(df, "Job_ID")
+    df["Lane"] = lane_of
+    df["Row_Label"] = df.apply(
+        lambda r: r["Job_Display"] if lane_count[r["Job_ID"]] <= 1
+        else f"{r['Job_Display']} #{r['Lane'] + 1}",
+        axis=1,
+    )
+
+    df = df.sort_values(["Workflow_Display", "Job_Name", "Lane", "Start_Date"]).reset_index(drop=True)
+    row_order = df["Row_Label"].drop_duplicates().tolist()
 
     fig = px.timeline(
         df,
@@ -975,11 +1025,17 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
         y="Row_Label",
         color="Team_Display",
         color_discrete_map=team_color_map,
-        category_orders={"Row_Label": df["Row_Label"].tolist()},
+        category_orders={"Row_Label": row_order},
+        text="Task_Name",
         custom_data=["Workflow_Display", "Job_Name", "Task_Name", "Team_Display",
                       "Priority", "Adjustment_Label"],
     )
     fig.update_traces(
+        textposition="inside",
+        insidetextanchor="start",
+        textfont_size=11,
+        textfont_color="#0b0b0b",
+        constraintext="both",
         hovertemplate=(
             "<b>%{customdata[1]} ＞ %{customdata[2]}</b><br>"
             "ワークフロー: %{customdata[0]}<br>"
