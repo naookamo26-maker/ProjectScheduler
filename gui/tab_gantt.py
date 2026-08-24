@@ -29,7 +29,7 @@ HTML出力が両方の粒度でチャートを作るのと同じ考え方）。�
 マイルストーンは縦線として表示する。
 """
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.gantt_generator import compute_schedule, validate_for_generation
-from gui.gantt_view import GanttGraphicsView, build_gantt_scene
+from gui.gantt_view import FrozenGanttPane, build_gantt_scenes
 from gui.widgets_common import NoWheelComboBox
 from project_scheduler import SchedulingError
 
@@ -70,10 +70,10 @@ class GanttTab(QWidget):
         self.group_combo.currentIndexChanged.connect(self._refresh_chart)
         toolbar.addWidget(self.group_combo)
         toolbar.addSpacing(16)
-        fit_btn = QPushButton("全体表示")
-        fit_btn.clicked.connect(self._fit_chart_view)
-        toolbar.addWidget(fit_btn)
-        toolbar.addWidget(QLabel("（ホイールでズーム、Ctrl+ホイールで横のみ、Shift+ホイールで縦のみ、中ボタンドラッグでパン）"))
+        toolbar.addWidget(QLabel(
+            "（ホイールでズーム、Ctrl+ホイールで横のみ、Shift+ホイールで縦のみ、中ボタンドラッグでパン、"
+            "Aキーで全体表示、Fキーで選択中のタスクにズーム）"
+        ))
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
 
@@ -96,7 +96,7 @@ class GanttTab(QWidget):
         legend_toolbar.addStretch(1)
         layout.addLayout(legend_toolbar)
 
-        self.view = GanttGraphicsView()
+        self.view = FrozenGanttPane()
         layout.addWidget(self.view, 1)
 
     def refresh_choices(self):
@@ -124,11 +124,7 @@ class GanttTab(QWidget):
         if self._result_df.empty:
             self.status_label.setText("有効なタスクがありません。")
         else:
-            adjusted = int(self._result_df["Resource_Adjusted"].sum())
-            self.status_label.setText(
-                f"{len(self._result_df)}件のタスクを生成しました"
-                f"（うちリソース制約による前倒し ⚠ {adjusted}件、赤枠のバーで表示）。"
-            )
+            self.status_label.setText(f"{len(self._result_df)}件のタスクを生成しました。")
 
     def _clear_chart_state(self, status_message):
         """スケジューリングに失敗した場合に、前回の生成結果（チャート・凡例・
@@ -250,21 +246,13 @@ class GanttTab(QWidget):
             df = self._result_df[self._result_df["Workflow_ID"] == group_id]
             df = df[df["Team_ID"].isin(self._visible_filter_ids())]
             color_by = "team"
-        scene = build_gantt_scene(df, self._display, color_by=color_by)
-        self.view.setScene(scene)
-        if scene is not None:
+        scenes = build_gantt_scenes(df, self._display, color_by=color_by)
+        self.view.setScene(scenes)
+        if scenes is not None:
             # setScene直後はビューポートのジオメトリがまだ確定していないことが
             # あるため、次のイベントループでスケジュール全体が収まるようズームを
             # 合わせる（gui/node_canvas.py の fit_all() と同じ考え方）。
             QTimer.singleShot(0, self._fit_chart_view)
 
     def _fit_chart_view(self):
-        scene = self.view.scene()
-        if scene is None:
-            return
-        rect = scene.itemsBoundingRect()
-        if not rect.isEmpty():
-            # ガントチャートは横（時間軸）と縦（行数）で必要な縮尺が大きく異なる
-            # ことが多い。KeepAspectRatioだと縦横比を保つために片方が余ってしまう
-            # ため、IgnoreAspectRatioで縦横それぞれ独立にビューいっぱいへ広げる。
-            self.view.fitInView(rect, Qt.IgnoreAspectRatio)
+        self.view.fit_all()
