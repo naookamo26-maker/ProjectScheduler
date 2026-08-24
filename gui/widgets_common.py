@@ -10,6 +10,7 @@
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QComboBox,
     QDateEdit,
     QGroupBox,
@@ -57,6 +58,34 @@ class NoWheelSpinBox(QSpinBox):
             super().wheelEvent(event)
         else:
             event.ignore()
+
+
+class DefaultAwareSpinBox(NoWheelSpinBox):
+    """最小値（0）を「既定値を使用」という特殊値として扱うQSpinBox。
+    setSpecialValueTextで見た目は「既定（n日）」のようにできるが、素の0から
+    ▲▼で増減すると1やマイナスからしか始まらず使い勝手が悪い。この特殊値の
+    状態から増減した場合は、既定値を起点に増減させる（0の状態で▲を押すと
+    既定値+1、▼を押すと既定値-1になる）。DB保存時の「0＝既定を使用」という
+    意味はそのまま変えない（0に戻ればまた「既定（n日）」の表示に戻る）。"""
+
+    def __init__(self, default_value, parent=None):
+        super().__init__(parent)
+        self.default_value = default_value
+
+    def stepBy(self, steps):
+        if self.value() == self.minimum() and steps != 0:
+            self.setValue(max(self.minimum() + 1, self.default_value + steps))
+        else:
+            super().stepBy(steps)
+
+    def stepEnabled(self):
+        # QAbstractSpinBoxは既定で「value == minimum() なら▼を無効化」するため、
+        # 特殊値（0＝既定を使用）の状態から▼を押しても何も起きなくなってしまう。
+        # 上のstepByで0からの▼を「既定値-1」として扱えるよう、常に両方向を
+        # 有効にする（数値としての下限自体は0のままなので範囲外にはならない）。
+        if not self.isEnabled():
+            return QAbstractSpinBox.StepNone
+        return QAbstractSpinBox.StepUpEnabled | QAbstractSpinBox.StepDownEnabled
 
 
 class NoWheelDateEdit(QDateEdit):
