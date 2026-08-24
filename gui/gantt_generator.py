@@ -39,7 +39,7 @@ def validate_for_generation(db):
     elif not any(db.list_workflow_tasks(w["id"]) for w in workflows):
         errors.append("タスクを持つワークフローが1件もありません（ワークフロー設計タブ）")
     if not db.list_jobs():
-        errors.append("ジョブが1件も登録されていません（ジョブタブ）")
+        errors.append("ジョブが1件も登録されていません（ジョブ作成タブ）")
     return errors
 
 

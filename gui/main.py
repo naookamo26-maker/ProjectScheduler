@@ -102,7 +102,7 @@ class MainWindow(QMainWindow):
             self._placeholder_tab(
                 "ジョブ（ワークフローの実体化）と、ジョブをまたぐ依存関係をここで作成します。"
             ),
-            "ジョブ",
+            "ジョブ作成",
         )
         self.tabs.addTab(
             self._placeholder_tab(
@@ -123,7 +123,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_workflows, "ワークフロー設計")
 
         self.tab_jobs = JobsTab(self.db)
-        self.tabs.addTab(self.tab_jobs, "ジョブ")
+        self.tabs.addTab(self.tab_jobs, "ジョブ作成")
 
         self.tab_gantt = GanttTab(self.db)
         self.tabs.addTab(self.tab_gantt, "ガントチャート")

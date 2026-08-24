@@ -1,5 +1,5 @@
 """
-タブ3「ジョブ」。
+タブ3「ジョブ作成」。
 
 左右2分割（QSplitter、既定50/50でユーザーがドラッグ調整可）。
 - 左: ジョブ一覧（名前・ワークフロー・既定マイルストーン・優先度）を縦全体に表示。
@@ -512,6 +512,24 @@ class JobsTab(QWidget):
         table.blockSignals(False)
         auto_size_columns(table, min_width=50)
         table.setColumnWidth(1, 44)  # 「有効」列はチェックボックスのみなので詰める
+        self._ensure_job_selection()
+
+    def _ensure_job_selection(self):
+        """タスク上書き欄のセルウィジェット（スピンボックス/コンボ）をクリックして
+        すぐ離す操作をした直後、そのウィジェットが破棄・再構築される
+        （_refresh_overrides）のに伴うフォーカス遷移の影響で、ジョブ一覧側の
+        選択（現在セル）が意図せず解除されてしまうことがある（左ボタンを
+        押したまま値を変える分には発生しない＝クリックの解放タイミングに
+        起因する）。current_job_id自体は保持されるため実害は無いが、見た目上
+        「ジョブの選択が消えた」ように見えて紛らわしいため、対応する行を
+        明示的に選び直す。"""
+        if self.current_job_id is None:
+            return
+        table = self.jobs_section.table
+        for row in range(table.rowCount()):
+            if row_id(table, row) == self.current_job_id and table.currentRow() != row:
+                table.setCurrentCell(row, max(table.currentColumn(), 0))
+                return
 
     def _on_override_changed(self, workflow_task_id):
         table = self.override_table
