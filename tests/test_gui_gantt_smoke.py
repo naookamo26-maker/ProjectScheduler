@@ -23,8 +23,8 @@ from gui.db import (  # noqa: E402
     ProjectDatabaseError,
     ReferencedEntityError,
 )
-from gui.gantt_generator import generate_gantt, validate_for_generation  # noqa: E402
-from project_scheduler import SchedulingError  # noqa: E402
+from gui.gantt_generator import build_frames, generate_gantt, validate_for_generation  # noqa: E402
+from project_scheduler import ResourceOverflowError, SchedulingError  # noqa: E402
 
 SAMPLE_DB = Path(__file__).resolve().parent.parent / "data" / "Project_Schedule_Sample_GameDev_v22.pschedule"
 
@@ -151,6 +151,54 @@ def test_opening_pre_sort_order_schema_migrates_and_keeps_name_order(tmp_path):
     db.close()
 
 
+def test_opening_pre_is_active_schema_migrates_and_defaults_to_active(tmp_path):
+    """job_external_dependencies.is_active列が無い旧バージョン(v2)の
+    .pscheduleファイルを開いた際、自動的に列が追加され、既存行はすべて
+    有効（is_active=1）として扱われることを確認する。"""
+    import sqlite3
+
+    from gui.db import _SCHEMA_SQL
+
+    path = tmp_path / "legacy_v2.pschedule"
+    conn = sqlite3.connect(str(path))
+    # 現行スキーマから is_active 列だけを取り除いた v2 相当のテーブルを再現する。
+    legacy_sql = _SCHEMA_SQL.replace("    is_active INTEGER NOT NULL DEFAULT 1,\n", "")
+    conn.executescript(legacy_sql)
+    conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '2')")
+    conn.execute("INSERT INTO project(id, project_name, start_date) VALUES (1, '', '')")
+    team_id = conn.execute("INSERT INTO teams(name, max_lines) VALUES ('チームA', 1)").lastrowid
+    wf1 = conn.execute("INSERT INTO workflows(name, sort_order) VALUES ('WF1', 0)").lastrowid
+    wf2 = conn.execute("INSERT INTO workflows(name, sort_order) VALUES ('WF2', 1)").lastrowid
+    t1 = conn.execute(
+        "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days) VALUES (?, 'A', ?, 1)",
+        (wf1, team_id),
+    ).lastrowid
+    t2 = conn.execute(
+        "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days) VALUES (?, 'B', ?, 1)",
+        (wf2, team_id),
+    ).lastrowid
+    j1 = conn.execute(
+        "INSERT INTO jobs(name, workflow_id, priority) VALUES ('J1', ?, 100)", (wf1,)
+    ).lastrowid
+    j2 = conn.execute(
+        "INSERT INTO jobs(name, workflow_id, priority) VALUES ('J2', ?, 100)", (wf2,)
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO job_external_dependencies"
+        "(job_id, workflow_task_id, depends_on_job_id, depends_on_workflow_task_id) "
+        "VALUES (?, ?, ?, ?)",
+        (j1, t1, j2, t2),
+    )
+    conn.commit()
+    conn.close()
+
+    db = ProjectDatabase.open_existing(str(path))
+    rows = db.list_external_dependencies(job_id=j1)
+    assert len(rows) == 1
+    assert rows[0]["is_active"] == 1
+    db.close()
+
+
 def test_duplicate_names_are_rejected(tmp_path):
     db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
     db.add_team("チームA", 1)
@@ -166,6 +214,41 @@ def test_referenced_team_cannot_be_deleted(tmp_path):
     db.add_workflow_task(wf_id, "タスク1", team_id, 3)
     with pytest.raises(ReferencedEntityError):
         db.delete_team(team_id)
+    db.close()
+
+
+# -- team_capacity_changes: チームの同時ライン数の期間変動 --------------------------
+
+def test_team_capacity_changes_crud_and_ordering(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    team_id = db.add_team("チームA", 1)
+    assert db.list_team_capacity_changes(team_id) == []
+
+    c2 = db.add_team_capacity_change(team_id, "2026-06-01", 4)
+    c1 = db.add_team_capacity_change(team_id, "2026-03-01", 2)  # 後から早い日付を追加
+
+    rows = db.list_team_capacity_changes(team_id)
+    assert [r["id"] for r in rows] == [c1, c2]  # 開始日昇順で返る
+    assert [r["lines"] for r in rows] == [2, 4]
+
+    with pytest.raises(DuplicateNameError):
+        db.add_team_capacity_change(team_id, "2026-03-01", 5)  # 同じ開始日は重複
+
+    db.update_team_capacity_change(c1, "2026-03-01", 3)
+    assert db.list_team_capacity_changes(team_id)[0]["lines"] == 3
+
+    db.delete_team_capacity_change(c1)
+    remaining = db.list_team_capacity_changes(team_id)
+    assert [r["id"] for r in remaining] == [c2]
+    db.close()
+
+
+def test_deleting_team_cascades_capacity_changes(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    team_id = db.add_team("チームA", 1)
+    db.add_team_capacity_change(team_id, "2026-03-01", 2)
+    db.delete_team(team_id)  # 参照なしなので削除でき、変更点もCASCADEで消える
+    assert db.list_teams() == []
     db.close()
 
 
@@ -189,6 +272,26 @@ def test_job_task_override_is_diff_only(tmp_path):
     db.clear_job_task_override(job_id, task_id)
     rows = db.list_job_tasks_with_overrides(job_id)
     assert rows[0]["override_id"] is None
+    db.close()
+
+
+def test_job_task_overrides_are_ordered_upstream_first(tmp_path):
+    """タスクの登録順に関わらず、依存関係上の先行タスクが上に来ること。
+    あえて依存とは逆順（後続タスクを先）に登録し、登録順のままでは並びが
+    崩れることを確認したうえでチェックする。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    team_id = db.add_team("チームA", 1)
+    wf_id = db.add_workflow("WF1")
+    # 登録順: タスク3, タスク1, タスク2（IDもこの順）だが、依存はタスク1->タスク2->タスク3
+    t3 = db.add_workflow_task(wf_id, "タスク3", team_id, 1)
+    t1 = db.add_workflow_task(wf_id, "タスク1", team_id, 1)
+    t2 = db.add_workflow_task(wf_id, "タスク2", team_id, 1)
+    db.add_task_dependency(wf_id, t1, t2)
+    db.add_task_dependency(wf_id, t2, t3)
+    job_id = db.add_job("ジョブ1", wf_id, None, 100)
+
+    rows = db.list_job_tasks_with_overrides(job_id)
+    assert [r["workflow_task_id"] for r in rows] == [t1, t2, t3]
     db.close()
 
 
@@ -296,6 +399,42 @@ def test_cascade_milestone_does_nothing_when_already_consistent(tmp_path):
     db.close()
 
 
+def test_enforce_milestone_floor_fixes_reversal_when_successor_reverted_to_default(tmp_path):
+    """バグ回帰テスト: タスク1を後期MSへ上書きすると、cascadeによりタスク2も
+    後期MSへ自動的に合わせられる。その後タスク2の上書きを解除して既定
+    （中期MS）に戻すと、上書きを再度クリアしただけでは先行タスク1（後期MS）
+    より早いマイルストーンに逆転してしまう——enforce_milestone_floorが
+    これを検出し、タスク2を先行タスクに合わせて再度引き上げること。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    ids = _build_linear_workflow_job(db)
+
+    db.upsert_job_task_override(ids["job"], ids["t1"], milestone_id=ids["ms_late"])
+    db.cascade_milestone_to_successors(ids["job"], ids["t1"])
+    assert db.effective_milestone(ids["job"], ids["t2"])["milestone_id"] == ids["ms_late"]
+
+    # タスク2の上書きを解除（既定＝中期MSに戻す）。解除直後は先行タスク1
+    # （後期MS）より早くなってしまっている。
+    db.clear_job_task_override(ids["job"], ids["t2"])
+    assert db.effective_milestone(ids["job"], ids["t2"])["milestone_id"] == ids["ms_mid"]
+
+    raised = db.enforce_milestone_floor(ids["job"], ids["t2"])
+    assert raised is True
+    assert db.effective_milestone(ids["job"], ids["t2"])["milestone_id"] == ids["ms_late"]
+    db.close()
+
+
+def test_enforce_milestone_floor_noop_without_predecessors_or_when_consistent(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    ids = _build_linear_workflow_job(db)
+
+    # タスク1には先行タスクが無いので常にFalse
+    assert db.enforce_milestone_floor(ids["job"], ids["t1"]) is False
+
+    # タスク2は既定のまま（中期MS）で先行タスク1の既定（中期MS）と同じなので調整不要
+    assert db.enforce_milestone_floor(ids["job"], ids["t2"]) is False
+    db.close()
+
+
 # -- job_external_dependencies: 個別のタスク依存の編集 ---------------------------------
 
 def test_external_dependency_can_be_updated_in_place(tmp_path):
@@ -330,6 +469,55 @@ def test_external_dependency_update_rejects_self_dependency(tmp_path):
     dep_id = db.add_external_dependency(j1, t1, j2, t2)
     with pytest.raises(ProjectDatabaseError):
         db.update_external_dependency(dep_id, t1, j1, t1)  # 自己依存になる変更
+    db.close()
+
+
+def test_external_dependency_can_be_toggled_active_without_deleting(tmp_path):
+    """自動生成分は「依存先ジョブ」から削除するまで一覧から消えないため、
+    一時的に外したいだけの場合は削除ではなく無効化で対応できること。
+    無効化してもDB上の行（および依存先の指定）はそのまま残る。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    team_id = db.add_team("チームA", 1)
+    wf1 = db.add_workflow("WF1")
+    wf2 = db.add_workflow("WF2")
+    t1 = db.add_workflow_task(wf1, "A", team_id, 1)
+    t2 = db.add_workflow_task(wf2, "B", team_id, 1)
+    j1 = db.add_job("J1", wf1, None, 100)
+    j2 = db.add_job("J2", wf2, None, 100)
+
+    dep_id = db.add_external_dependency(j1, t1, j2, t2)
+    assert db.list_external_dependencies(job_id=j1)[0]["is_active"] == 1
+
+    db.set_external_dependency_active(dep_id, False)
+    rows = db.list_external_dependencies(job_id=j1)
+    assert len(rows) == 1  # 削除されず残っている
+    assert rows[0]["is_active"] == 0
+
+    db.set_external_dependency_active(dep_id, True)
+    assert db.list_external_dependencies(job_id=j1)[0]["is_active"] == 1
+    db.close()
+
+
+def test_build_frames_excludes_inactive_external_dependencies(tmp_path):
+    """無効化した個別のタスク依存は、スケジューリングに渡すDataFrameから
+    除外される（＝そのタスクの依存として扱われない）こと。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    team_id = db.add_team("チームA", 1)
+    wf1 = db.add_workflow("WF1")
+    wf2 = db.add_workflow("WF2")
+    t1 = db.add_workflow_task(wf1, "A", team_id, 1)
+    t2 = db.add_workflow_task(wf2, "B", team_id, 1)
+    j1 = db.add_job("J1", wf1, None, 100)
+    j2 = db.add_job("J2", wf2, None, 100)
+
+    dep_id = db.add_external_dependency(j1, t1, j2, t2)
+    frames = build_frames(db)
+    assert frames["external_dependencies"] is not None
+    assert len(frames["external_dependencies"]) == 1
+
+    db.set_external_dependency_active(dep_id, False)
+    frames = build_frames(db)
+    assert frames["external_dependencies"] is None
     db.close()
 
 
@@ -396,6 +584,42 @@ def test_generate_gantt_rejects_circular_dependency(tmp_path):
 
     with pytest.raises(SchedulingError):
         generate_gantt(db, verbose=False)
+    db.close()
+
+
+def _build_tight_single_team_project(db_path, team_max_lines):
+    """1チーム・独立した3ジョブ（各2日タスク1つ）・共通の厳しい締切（開始日を
+    含む1週間）という構成を組み立てる。チームの同時ライン数が1のままでは
+    3タスク×2日＝6team-daysを5営業日に収められず必ずResourceOverflowErrorに
+    なるが、同時ライン数が十分（3以上）あれば並行実行でき、必ず間に合う。"""
+    db = ProjectDatabase.create_new(str(db_path))
+    db.set_project("同時ライン数変動テスト", "2026-01-05")  # 月曜（祝日等と重ならない週）
+    team_id = db.add_team("チームA", team_max_lines)
+    ms_id = db.add_milestone("マイルストーン1", "2026-01-09")  # 同じ週の金曜（5営業日）
+    for i in range(3):
+        wf_id = db.add_workflow(f"WF{i}")
+        t_id = db.add_workflow_task(wf_id, "タスク", team_id, 2)
+        db.add_job(f"ジョブ{i}", wf_id, ms_id, 100)
+    return db, team_id
+
+
+def test_constant_low_team_capacity_overflows_tight_deadline(tmp_path):
+    db, _team_id = _build_tight_single_team_project(tmp_path / "project.pschedule", team_max_lines=1)
+    with pytest.raises(ResourceOverflowError):
+        generate_gantt(db, verbose=False)
+    db.close()
+
+
+def test_team_capacity_change_relieves_overflow_from_its_start_date(tmp_path):
+    """同時ライン数が最初は1のままでも、開発開始日からライン数3に変更する
+    team_capacity_changes を追加すれば、同じ締切でも間に合うようになること
+    （＝project_scheduler.py側のスケジューリングが日付ごとのライン数を
+    実際に考慮していることの回帰テスト）。"""
+    db, team_id = _build_tight_single_team_project(tmp_path / "project.pschedule", team_max_lines=1)
+    db.add_team_capacity_change(team_id, "2026-01-05", 3)
+
+    result_df = generate_gantt(db, verbose=False)
+    assert len(result_df) == 3
     db.close()
 
 

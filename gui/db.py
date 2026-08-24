@@ -19,10 +19,11 @@ ID方針: 全テーブルは整数の自動採番PKを持ち、GUI上はこのID
 直前にのみ行う。
 """
 
+import heapq
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "4"
 
 _SCHEMA_SQL = """
 CREATE TABLE schema_meta (
@@ -46,6 +47,14 @@ CREATE TABLE teams (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
     max_lines INTEGER NOT NULL CHECK (max_lines >= 1)
+);
+
+CREATE TABLE team_capacity_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+    start_date TEXT NOT NULL,
+    lines INTEGER NOT NULL CHECK (lines >= 1),
+    UNIQUE(team_id, start_date)
 );
 
 CREATE TABLE holidays (
@@ -115,6 +124,7 @@ CREATE TABLE job_external_dependencies (
     depends_on_job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     depends_on_workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
     source_link_id INTEGER REFERENCES job_dependency_links(id) ON DELETE CASCADE,
+    is_active INTEGER NOT NULL DEFAULT 1,
     UNIQUE(job_id, workflow_task_id, depends_on_job_id, depends_on_workflow_task_id)
 );
 
@@ -211,6 +221,41 @@ class ProjectDatabase:
                     "UPDATE workflows SET sort_order = ? WHERE id = ?", (i, r["id"])
                 )
             version = "2"
+
+        if version == "2":
+            # v3: job_external_dependencies.is_active を追加（個別のタスク依存を
+            # 削除せず一時的に無効化できるようにするため）。既存行はすべて有効。
+            # テーブル自体が無い（テスト用の簡略化した旧スキーマ等）場合は何もしない。
+            cols = [
+                r["name"] for r in
+                self._conn.execute("PRAGMA table_info(job_external_dependencies)").fetchall()
+            ]
+            if cols and "is_active" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE job_external_dependencies ADD COLUMN is_active "
+                    "INTEGER NOT NULL DEFAULT 1"
+                )
+            version = "3"
+
+        if version == "3":
+            # v4: team_capacity_changes を追加（チームの同時ライン数を、
+            # 開発開始日からの既定値（teams.max_lines）に加えて、途中の日付から
+            # 変動させられるようにするため）。旧ファイルには変更点が無い
+            # （＝全期間 teams.max_lines のまま）ものとして扱う。
+            exists = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'team_capacity_changes'"
+            ).fetchone()
+            if not exists:
+                self._conn.execute(
+                    "CREATE TABLE team_capacity_changes ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE, "
+                    "start_date TEXT NOT NULL, "
+                    "lines INTEGER NOT NULL CHECK (lines >= 1), "
+                    "UNIQUE(team_id, start_date))"
+                )
+            version = "4"
 
         self._conn.execute(
             "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)
@@ -355,6 +400,50 @@ class ProjectDatabase:
         if self.team_usage_count(team_id) > 0:
             raise ReferencedEntityError("このチームはタスクに使用されているため削除できません")
         self._conn.execute("DELETE FROM teams WHERE id = ?", (team_id,))
+        self._commit()
+
+    # -- team_capacity_changes（チームの同時ライン数の期間変動） ------------------------
+    #
+    # teams.max_lines は「開発開始日からの既定値」。それ以降、ライン数が変わる
+    # 日付があれば、この表に (start_date, lines) の変更点として追加する
+    # （teams.max_lines 自体はいつまでも「最初の期間」の値として残る）。
+
+    def list_team_capacity_changes(self, team_id):
+        rows = self._conn.execute(
+            "SELECT id, team_id, start_date, lines FROM team_capacity_changes "
+            "WHERE team_id = ? ORDER BY start_date",
+            (team_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_team_capacity_change(self, team_id, start_date, lines):
+        try:
+            cur = self._conn.execute(
+                "INSERT INTO team_capacity_changes(team_id, start_date, lines) "
+                "VALUES (?, ?, ?)",
+                (team_id, start_date, lines),
+            )
+        except sqlite3.IntegrityError as e:
+            raise DuplicateNameError(
+                f"この日付（{start_date}）の変更点は既に登録されています"
+            ) from e
+        self._commit()
+        return cur.lastrowid
+
+    def update_team_capacity_change(self, change_id, start_date, lines):
+        try:
+            self._conn.execute(
+                "UPDATE team_capacity_changes SET start_date = ?, lines = ? WHERE id = ?",
+                (start_date, lines, change_id),
+            )
+        except sqlite3.IntegrityError as e:
+            raise DuplicateNameError(
+                f"この日付（{start_date}）の変更点は既に登録されています"
+            ) from e
+        self._commit()
+
+    def delete_team_capacity_change(self, change_id):
+        self._conn.execute("DELETE FROM team_capacity_changes WHERE id = ?", (change_id,))
         self._commit()
 
     # -- holidays --------------------------------------------------------------
@@ -594,9 +683,46 @@ class ProjectDatabase:
 
     # -- job_task_overrides -------------------------------------------------------
 
+    def _topological_task_order(self, workflow_id):
+        """ワークフロー内のタスクIDを、依存関係上で先行タスクが必ず前に来る順
+        （トポロジカル順）に並べたリストで返す。依存関係の無いタスク同士は
+        タスクID順（＝登録順）を保つ（優先度付きKahn法、ヒープのタイブレークに
+        タスクIDそのものを使う）。循環依存は他所（node_canvas.py側）で事前に
+        防止されている前提だが、万一取りこぼした場合も元のID順で末尾に補う。"""
+        task_ids = [
+            r["id"] for r in self._conn.execute(
+                "SELECT id FROM workflow_tasks WHERE workflow_id = ? ORDER BY id",
+                (workflow_id,),
+            ).fetchall()
+        ]
+        preds_map = self._task_predecessors_map(workflow_id)
+        succ_map = self._task_successors_map(workflow_id)
+        indegree = {tid: len(preds_map.get(tid, [])) for tid in task_ids}
+
+        heap = [tid for tid in task_ids if indegree[tid] == 0]
+        heapq.heapify(heap)
+        order = []
+        while heap:
+            tid = heapq.heappop(heap)
+            order.append(tid)
+            for succ in succ_map.get(tid, []):
+                indegree[succ] -= 1
+                if indegree[succ] == 0:
+                    heapq.heappush(heap, succ)
+
+        ordered_set = set(order)
+        order.extend(tid for tid in task_ids if tid not in ordered_set)
+        return order
+
     def list_job_tasks_with_overrides(self, job_id):
         """選択ジョブのワークフローが持つ全タスクを、上書き情報（あれば）付きで返す。
-        タスクの並びはワークフロー内のid順（登録順）。"""
+        タスクの並びは依存関係上のトポロジカル順（先行タスクが上に来る）。"""
+        job = self._conn.execute("SELECT workflow_id FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if job is None:
+            return []
+        order = self._topological_task_order(job["workflow_id"])
+        order_index = {tid: i for i, tid in enumerate(order)}
+
         rows = self._conn.execute(
             "SELECT wt.id AS workflow_task_id, wt.name AS task_name, "
             "wt.team_id AS default_team_id, t.name AS default_team_name, "
@@ -611,10 +737,12 @@ class ProjectDatabase:
             "LEFT JOIN job_task_overrides o ON o.job_id = j.id AND o.workflow_task_id = wt.id "
             "LEFT JOIN milestones om ON om.id = o.milestone_id "
             "LEFT JOIN teams ot ON ot.id = o.team_id "
-            "WHERE j.id = ? ORDER BY wt.id",
+            "WHERE j.id = ?",
             (job_id,),
         ).fetchall()
-        return [dict(r) for r in rows]
+        result = [dict(r) for r in rows]
+        result.sort(key=lambda r: order_index.get(r["workflow_task_id"], len(order)))
+        return result
 
     def upsert_job_task_override(self, job_id, workflow_task_id, is_active=True,
                                   override_days=None, milestone_id=None, team_id=None):
@@ -734,7 +862,42 @@ class ProjectDatabase:
                 changed.append(succ_id)
                 queue.extend(succ_map.get(succ_id, []))
         return changed
-        self._commit()
+
+    def enforce_milestone_floor(self, job_id, workflow_task_id):
+        """workflow_task_idの上書きを変更・解除した直後に呼ぶ。先行タスク
+        （同一ワークフロー内、直接のみ）の実効マイルストーンより、このタスク
+        自身の実効マイルストーンが早くなってしまった場合（既定に戻した結果
+        早いマイルストーンに戻った場合を含む）、先行タスクのうち最も遅い
+        実効マイルストーンに自動的に引き上げる。実際に引き上げた場合は
+        Trueを返す（GUI側の通知用）。先行タスクが無い、またはどの先行タスクにも
+        マイルストーンが未設定なら何もせず False。"""
+        job = self._conn.execute("SELECT workflow_id FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        preds = self._task_predecessors_map(job["workflow_id"]).get(workflow_task_id, [])
+        floor = None
+        for pred_id in preds:
+            pred_ms = self.effective_milestone(job_id, pred_id)
+            if pred_ms is not None and (floor is None or pred_ms["end_date"] > floor["end_date"]):
+                floor = pred_ms
+        if floor is None:
+            return False
+
+        this_ms = self.effective_milestone(job_id, workflow_task_id)
+        if this_ms is not None and this_ms["end_date"] >= floor["end_date"]:
+            return False
+
+        existing = self._conn.execute(
+            "SELECT is_active, override_days, team_id FROM job_task_overrides "
+            "WHERE job_id = ? AND workflow_task_id = ?",
+            (job_id, workflow_task_id),
+        ).fetchone()
+        self.upsert_job_task_override(
+            job_id, workflow_task_id,
+            is_active=bool(existing["is_active"]) if existing else True,
+            override_days=existing["override_days"] if existing else None,
+            milestone_id=floor["milestone_id"],
+            team_id=existing["team_id"] if existing else None,
+        )
+        return True
 
     # -- job_external_dependencies ----------------------------------------------
 
@@ -747,7 +910,7 @@ class ProjectDatabase:
             "d.workflow_task_id, wt.name AS task_name, "
             "d.depends_on_job_id, dj.name AS depends_on_job_name, "
             "d.depends_on_workflow_task_id, dwt.name AS depends_on_task_name, "
-            "d.source_link_id "
+            "d.source_link_id, d.is_active "
             "FROM job_external_dependencies d "
             "JOIN jobs j ON j.id = d.job_id "
             "JOIN workflow_tasks wt ON wt.id = d.workflow_task_id "
@@ -796,6 +959,17 @@ class ProjectDatabase:
             )
         except sqlite3.IntegrityError as e:
             raise ProjectDatabaseError("この依存関係は既に登録されています") from e
+        self._commit()
+
+    def set_external_dependency_active(self, dependency_id, is_active):
+        """個別のタスク依存（自動生成分・手動追加分いずれも）を、削除せずに
+        有効/無効だけ切り替える。無効化した依存はスケジューリング時に無視される
+        （gui/gantt_generator.py参照）が、行自体はDBに残るため、自動生成分でも
+        後から元に戻せる。"""
+        self._conn.execute(
+            "UPDATE job_external_dependencies SET is_active = ? WHERE id = ?",
+            (int(is_active), dependency_id),
+        )
         self._commit()
 
     def delete_external_dependency(self, dependency_id):

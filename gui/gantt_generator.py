@@ -60,6 +60,14 @@ def build_frames(db):
         "Team_ID": team_str[t["id"]], "Max_Lines": t["max_lines"], "Team_Name": t["name"],
     } for t in teams])
 
+    capacity_rows = []
+    for t in teams:
+        for c in db.list_team_capacity_changes(t["id"]):
+            capacity_rows.append({
+                "Team_ID": team_str[t["id"]], "Start_Date": c["start_date"], "Lines": c["lines"],
+            })
+    df_team_capacity = pd.DataFrame(capacity_rows) if capacity_rows else None
+
     milestones = db.list_milestones()
     ms_str = {m["id"]: _fmt("MS", m["id"]) for m in milestones}
     df_ms = pd.DataFrame([{
@@ -125,7 +133,7 @@ def build_frames(db):
         "Date": h["date"], "Team_ID": team_str.get(h["team_id"]),
     } for h in holidays]) if holidays else None
 
-    ext_deps = db.list_external_dependencies()
+    ext_deps = [e for e in db.list_external_dependencies() if e["is_active"]]
     df_extdeps = pd.DataFrame([{
         "Job_ID": job_str[e["job_id"]],
         "Task_ID": task_str[e["workflow_task_id"]],
@@ -137,6 +145,7 @@ def build_frames(db):
         "project": df_project, "teams": df_teams, "milestones": df_ms, "workflows": df_wf,
         "workflow_names": df_wf_names, "jobs": df_jobs, "job_tasks": df_jtasks,
         "holidays": df_holidays, "external_dependencies": df_extdeps,
+        "team_capacity": df_team_capacity,
     }
 
 
@@ -148,7 +157,7 @@ def generate_gantt(db, mermaid_output_path=None, plotly_output_path=None, **sche
     return run_resource_constrained_scheduler_from_frames(
         frames["project"], frames["teams"], frames["milestones"], frames["workflows"],
         frames["jobs"], frames["job_tasks"], frames["holidays"], frames["external_dependencies"],
-        frames["workflow_names"],
+        frames["workflow_names"], df_team_capacity=frames["team_capacity"],
         mermaid_output_path=mermaid_output_path, plotly_output_path=plotly_output_path,
         **scheduler_kwargs,
     )

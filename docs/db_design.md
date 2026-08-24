@@ -22,7 +22,8 @@ GUI（`gui/`）の入力データは、1プロジェクト＝1ファイルのSQL
 | `schema_meta` | スキーマバージョン管理用。`ProjectDatabase.open_existing`が旧バージョンの`.pschedule`を検出すると`_migrate_schema`で自動的に不足カラム等を追加する（例: v1→v2で`workflows.sort_order`を追加） |
 | `project` | プロジェクト名・開始日（常に1行、`id=1`固定） |
 | `milestones` | マイルストーン（名前・締切日） |
-| `teams` | チーム（名前・同時ライン数） |
+| `teams` | チーム（名前・開発開始日からの既定の同時ライン数） |
+| `team_capacity_changes` | チームの同時ライン数が期間の途中で変わる場合の変更点（適用開始日・その日以降のライン数）。`teams.max_lines`はいつまでも「最初の期間」の値として残る |
 | `holidays` | 休業日（日付、任意でチームを指定。未指定は全社共通） |
 | `workflows` | ワークフロー（テンプレートの名前と、一覧での表示順`sort_order`） |
 | `workflow_tasks` | ワークフロー内のタスク（名前・担当チーム・所要日数・ノードグラフ上の座標） |
@@ -30,7 +31,7 @@ GUI（`gui/`）の入力データは、1プロジェクト＝1ファイルのSQL
 | `jobs` | ジョブ（ワークフローの実体化。名前・使用ワークフロー・既定マイルストーン・優先度） |
 | `job_task_overrides` | ジョブ単位でのタスク上書き（有効/無効・日数・マイルストーン・チームの差分のみ保持） |
 | `job_dependency_links` | ジョブ単位の依存リンク（「このジョブは、あのジョブに依存する」）。追加時に`workflow_dependency_templates`を参照し、タスク単位の依存を自動展開する |
-| `job_external_dependencies` | ジョブをまたぐタスク依存（External_Dependencies相当）。`source_link_id`で`job_dependency_links`からの自動生成分か手動追加分かを区別する |
+| `job_external_dependencies` | ジョブをまたぐタスク依存（External_Dependencies相当）。`source_link_id`で`job_dependency_links`からの自動生成分か手動追加分かを区別する。`is_active`で（自動生成分も含め）削除せず一時的に無効化できる |
 | `workflow_dependency_templates` | ワークフローペア単位の既定タスク対応（例: ワークフローAがワークフローBに依存する場合、Aのどのタスクが、Bのどのタスクの完了を待つか） |
 
 DDLの正本は `gui/db.py` の `_SCHEMA_SQL` を参照（このドキュメントは概要説明用で、
