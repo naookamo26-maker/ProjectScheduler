@@ -11,16 +11,72 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QComboBox,
+    QDateEdit,
     QGroupBox,
     QHBoxLayout,
+    QListWidget,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
 )
 
 ROW_ID_ROLE = Qt.UserRole
+
+
+# -- ホイールスクロールの誤操作防止 ---------------------------------------------------
+#
+# QComboBox/QSpinBox/QDateEdit/QListWidgetは、マウスカーソルが乗っているだけで
+# （クリックしてフォーカスしていなくても）ホイール操作を自分の値変更/スクロールと
+# して奪ってしまう。テーブルや画面全体をホイールでスクロールしようとした際、
+# たまたまカーソルがこれらのウィジェット上を通過しただけで値が変わってしまう
+# 事故を防ぐため、フォーカスを持っている（＝クリックやTabで明示的に選択した）
+# 間だけホイール操作を受け付け、それ以外は無視して親ビュー（テーブルの
+# スクロールバーやQScrollArea）側にホイールイベントを渡す。
+
+
+class NoWheelComboBox(QComboBox):
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class NoWheelSpinBox(QSpinBox):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 既定のWheelFocus（ホイールを回しただけでフォーカスを奪う）は「選択した
+        # 状態でのみ」という意図に反するため、クリック/Tabでのみフォーカスさせる。
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class NoWheelDateEdit(QDateEdit):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class NoWheelListWidget(QListWidget):
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
 
 
 def keep_selection_visible(view):
@@ -69,7 +125,7 @@ def unique_default_name(existing_names, base):
 def make_fk_combo(options, current_id=None, allow_blank=False, blank_label="（未設定）"):
     """options: [(id, display_name), ...]。選択中の値はコンボの currentData() で
     取得できる（未設定/空欄の場合は None）。"""
-    combo = QComboBox()
+    combo = NoWheelComboBox()
     if allow_blank:
         combo.addItem(blank_label, None)
     for entity_id, name in options:

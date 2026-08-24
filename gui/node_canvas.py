@@ -17,7 +17,6 @@ project_scheduler.py の _build_scheduling_order() が採用しているトポ�
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QBrush, QColor, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import (
-    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -31,14 +30,13 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QInputDialog,
     QLineEdit,
-    QListWidget,
     QListWidgetItem,
     QMenu,
     QMessageBox,
-    QSpinBox,
 )
 
 from gui.db import DuplicateNameError, ProjectDatabaseError
+from gui.widgets_common import NoWheelComboBox, NoWheelListWidget, NoWheelSpinBox
 
 NODE_WIDTH = 170
 NODE_HEIGHT = 64
@@ -209,8 +207,12 @@ class EdgeItem(QGraphicsPathItem):
         path = QPainterPath(start)
         path.cubicTo(c1, c2, end)
         self.setPath(path)
-        direction = end - c2
-        self.arrow_item.setPolygon(_arrow_polygon(end, direction))
+        # 矢印は接続線の末端（入力ポート付近）だとアンカーの丸と重なって
+        # 分かりづらいため、線の中央（曲線上の進行方向）に表示する。
+        mid = path.pointAtPercent(0.5)
+        ahead = path.pointAtPercent(0.51)
+        direction = ahead - mid
+        self.arrow_item.setPolygon(_arrow_polygon(mid, direction))
 
 
 class WorkflowGraphScene(QGraphicsScene):
@@ -379,18 +381,18 @@ class TaskNodeEditDialog(QDialog):
         self.name_edit = QLineEdit(name)
         form.addRow("タスク名", self.name_edit)
 
-        self.team_combo = QComboBox()
+        self.team_combo = NoWheelComboBox()
         self._reload_teams(team_id)
         self.team_combo.activated.connect(self._on_team_activated)
         form.addRow("担当チーム", self.team_combo)
 
-        self.days_spin = QSpinBox()
+        self.days_spin = NoWheelSpinBox()
         self.days_spin.setRange(1, 9999)
         self.days_spin.setValue(days)
         form.addRow("所要日数", self.days_spin)
 
-        self.predecessor_list = QListWidget()
-        self.predecessor_list.setSelectionMode(QListWidget.MultiSelection)
+        self.predecessor_list = NoWheelListWidget()
+        self.predecessor_list.setSelectionMode(NoWheelListWidget.MultiSelection)
         self.predecessor_list.setMaximumHeight(120)
         if workflow_id is not None:
             deps = db.list_task_dependencies(workflow_id)
@@ -456,6 +458,8 @@ class WorkflowGraphView(QGraphicsView):
         self.setDragMode(QGraphicsView.RubberBandDrag)
         self._connecting_from = None
         self._temp_edge = None
+        self._panning = False
+        self._pan_last_pos = None
 
     def wheelEvent(self, event):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
@@ -503,6 +507,14 @@ class WorkflowGraphView(QGraphicsView):
         super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.MiddleButton:
+            # 中ボタンドラッグでキャンバスを平行移動（パン）できるようにする。
+            # ノードのクリック/選択やルバーバンド選択（左ボタン）とは独立した操作。
+            self._panning = True
+            self._pan_last_pos = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
         scene_pos = self.mapToScene(event.pos())
         item = self.scene().itemAt(scene_pos, self.transform()) if self.scene() else None
         if isinstance(item, AnchorItem) and item.role == "output":
@@ -516,6 +528,15 @@ class WorkflowGraphView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._panning:
+            delta = event.pos() - self._pan_last_pos
+            self._pan_last_pos = event.pos()
+            h_bar = self.horizontalScrollBar()
+            v_bar = self.verticalScrollBar()
+            h_bar.setValue(h_bar.value() - delta.x())
+            v_bar.setValue(v_bar.value() - delta.y())
+            event.accept()
+            return
         if self._connecting_from is not None:
             start = self._connecting_from.output_anchor_scene_pos()
             end = self.mapToScene(event.pos())
@@ -527,6 +548,12 @@ class WorkflowGraphView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MiddleButton and self._panning:
+            self._panning = False
+            self._pan_last_pos = None
+            self.setCursor(Qt.ArrowCursor)
+            event.accept()
+            return
         if self._connecting_from is not None:
             scene_pos = self.mapToScene(event.pos())
             # ドラッグ中の仮の破線（_temp_edge）はリリース位置ちょうどに終端を持つ

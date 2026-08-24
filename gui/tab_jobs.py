@@ -11,18 +11,15 @@
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QListWidget,
     QListWidgetItem,
     QMessageBox,
     QPushButton,
-    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -32,6 +29,9 @@ from PySide6.QtWidgets import (
 from gui.db import DuplicateNameError, ProjectDatabaseError
 from gui.widgets_common import (
     CrudSection,
+    NoWheelComboBox,
+    NoWheelListWidget,
+    NoWheelSpinBox,
     auto_size_columns,
     confirm_or_block_delete,
     make_fk_combo,
@@ -65,7 +65,7 @@ class JobDependencyLinkDialog(QDialog):
         layout = QVBoxLayout(self)
         form = QFormLayout()
 
-        self.workflow_filter_combo = QComboBox()
+        self.workflow_filter_combo = NoWheelComboBox()
         self.workflow_filter_combo.addItem("（すべてのワークフロー）", None)
         for wf in db.list_workflows():
             self.workflow_filter_combo.addItem(wf["name"], wf["id"])
@@ -74,8 +74,8 @@ class JobDependencyLinkDialog(QDialog):
         layout.addLayout(form)
 
         layout.addWidget(QLabel("依存先ジョブ"))
-        self.job_list = QListWidget()
-        self.job_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.job_list = NoWheelListWidget()
+        self.job_list.setSelectionMode(NoWheelListWidget.ExtendedSelection)
         layout.addWidget(self.job_list, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -111,19 +111,19 @@ class ManualTaskDependencyDialog(QDialog):
         self.setWindowTitle("個別のタスク依存を編集" if initial else "個別のタスク依存を追加")
         form = QFormLayout(self)
 
-        self.task_combo = QComboBox()
+        self.task_combo = NoWheelComboBox()
         for t in db.list_workflow_tasks(job["workflow_id"]):
             self.task_combo.addItem(t["name"], t["id"])
         form.addRow("このジョブのタスク", self.task_combo)
 
-        self.dep_job_combo = QComboBox()
+        self.dep_job_combo = NoWheelComboBox()
         for j in db.list_jobs():
             if j["id"] != job["id"]:
                 self.dep_job_combo.addItem(j["name"], j["id"])
         self.dep_job_combo.currentIndexChanged.connect(self._reload_dep_tasks)
         form.addRow("依存先ジョブ", self.dep_job_combo)
 
-        self.dep_task_combo = QComboBox()
+        self.dep_task_combo = NoWheelComboBox()
         form.addRow("依存先タスク", self.dep_task_combo)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -227,7 +227,7 @@ class JobsTab(QWidget):
 
         self.manual_deps_section = CrudSection(
             "個別のタスク依存（手動追加分、および自動生成分の一覧）",
-            ["タスク", "依存先ジョブ", "依存先タスク", "種別"],
+            ["タスク", "依存先ジョブ", "依存先タスク", "種別", "有効"],
             on_add=self._add_manual_dependency, on_delete=self._delete_manual_dependency,
             on_edit=self._edit_manual_dependency,
         )
@@ -323,7 +323,7 @@ class JobsTab(QWidget):
             )
             table.setCellWidget(row, 2, ms_combo)
 
-            priority_spin = QSpinBox()
+            priority_spin = NoWheelSpinBox()
             priority_spin.setRange(1, 999)
             priority_spin.setValue(job["priority"])
             priority_spin.valueChanged.connect(
@@ -433,7 +433,7 @@ class JobsTab(QWidget):
             )
             table.setCellWidget(row, 3, active_checkbox)
 
-            days_spin = QSpinBox()
+            days_spin = NoWheelSpinBox()
             days_spin.setRange(0, 9999)
             days_spin.setSpecialValueText("既定通り")
             days_spin.setValue(r["override_days"] or 0)
@@ -488,18 +488,29 @@ class JobsTab(QWidget):
                 else:
                     self.db.clear_job_task_override(self.current_job_id, workflow_task_id)
 
+                # このタスク自身が、先行タスクの実効マイルストーンより早くなって
+                # しまった場合（既定に戻した結果、前倒しの矛盾が生じた場合を含む）、
+                # 先行タスクに合わせて自動的に引き上げる。
+                raised = self.db.enforce_milestone_floor(self.current_job_id, workflow_task_id)
                 # マイルストーンを変更した場合、後継タスク（同一ワークフロー内、
                 # transitively）が前のタスクより早いマイルストーンのままだと
                 # 前倒しの矛盾が生じるため、必要なら自動的に繰り下げる。
                 changed = self.db.cascade_milestone_to_successors(
                     self.current_job_id, workflow_task_id
                 )
-                if changed:
-                    QMessageBox.information(
-                        self, "マイルストーンを自動調整しました",
-                        f"後継タスク{len(changed)}件のマイルストーンが、変更後のマイルストーン"
-                        "より早かったため、整合性を保つよう自動的に合わせました。",
-                    )
+                if raised or changed:
+                    messages = []
+                    if raised:
+                        messages.append(
+                            "このタスクのマイルストーンが先行タスクより早かったため、"
+                            "先行タスクに合わせて自動的に引き上げました。"
+                        )
+                    if changed:
+                        messages.append(
+                            f"後継タスク{len(changed)}件のマイルストーンが、変更後のマイルストーン"
+                            "より早かったため、整合性を保つよう自動的に合わせました。"
+                        )
+                    QMessageBox.information(self, "マイルストーンを自動調整しました", "\n".join(messages))
                 # このタスク自身の上書き入力に加え、後継タスクの選択肢・表示も
                 # 変わりうるため、テーブル全体を作り直す（シグナル発火元セルの
                 # ウィジェットを直接コールバック内で破棄しないよう次のイベント
@@ -557,8 +568,10 @@ class JobsTab(QWidget):
 
     def _refresh_manual_dependencies(self):
         table = self.manual_deps_section.table
+        table.blockSignals(True)
         table.setRowCount(0)
         if self.current_job_id is None:
+            table.blockSignals(False)
             return
         for d in self.db.list_external_dependencies(job_id=self.current_job_id):
             row = table.rowCount()
@@ -569,7 +582,26 @@ class JobsTab(QWidget):
             kind = "自動（テンプレート）" if d["source_link_id"] is not None else "手動"
             table.setItem(row, 3, _readonly_item(kind))
             set_row_id(table, row, d["id"])
+
+            # 自動生成分は「依存先ジョブ」欄から削除するまで一覧から消えないが、
+            # 一時的に無効化したいだけの場合に備え、削除せず有効/無効だけ
+            # 切り替えられるチェックボックスを設ける（無効化してもDB上の行は残る）。
+            active_checkbox = QCheckBox()
+            active_checkbox.setChecked(bool(d["is_active"]))
+            active_checkbox.stateChanged.connect(
+                lambda _state, dep_id=d["id"]: self._on_dependency_active_changed(dep_id)
+            )
+            table.setCellWidget(row, 4, active_checkbox)
+        table.blockSignals(False)
         auto_size_columns(table)
+
+    def _on_dependency_active_changed(self, dependency_id):
+        table = self.manual_deps_section.table
+        for row in range(table.rowCount()):
+            if row_id(table, row) == dependency_id:
+                checkbox = table.cellWidget(row, 4)
+                self.db.set_external_dependency_active(dependency_id, checkbox.isChecked())
+                return
 
     def _add_manual_dependency(self):
         if self.current_job_id is None:

@@ -8,14 +8,12 @@
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
-    QListWidget,
     QListWidgetItem,
     QMessageBox,
     QPushButton,
@@ -29,6 +27,8 @@ from gui.db import DuplicateNameError, ProjectDatabaseError, ReferencedEntityErr
 from gui.node_canvas import WorkflowGraphScene, WorkflowGraphView
 from gui.widgets_common import (
     CrudSection,
+    NoWheelComboBox,
+    NoWheelListWidget,
     auto_size_columns,
     confirm_or_block_delete,
     keep_selection_visible,
@@ -59,18 +59,18 @@ class DependencyTemplateDialog(QDialog):
 
         form = QFormLayout(self)
 
-        self.task_combo = QComboBox()
+        self.task_combo = NoWheelComboBox()
         for t in db.list_workflow_tasks(workflow_id):
             self.task_combo.addItem(t["name"], t["id"])
         form.addRow("このワークフローのタスク", self.task_combo)
 
-        self.target_workflow_combo = QComboBox()
+        self.target_workflow_combo = NoWheelComboBox()
         for wf in db.list_workflows():
             if wf["id"] != workflow_id:
                 self.target_workflow_combo.addItem(wf["name"], wf["id"])
         self.target_workflow_combo.currentIndexChanged.connect(self._reload_target_tasks)
 
-        self.target_task_combo = QComboBox()
+        self.target_task_combo = NoWheelComboBox()
 
         form.addRow("依存先ワークフロー", self.target_workflow_combo)
         form.addRow("依存先タスク", self.target_task_combo)
@@ -135,7 +135,7 @@ class WorkflowsTab(QWidget):
         toolbar.addWidget(delete_btn)
         left_layout.addLayout(toolbar)
 
-        self.workflow_list = QListWidget()
+        self.workflow_list = NoWheelListWidget()
         self.workflow_list.currentItemChanged.connect(self._on_selection_changed)
         # ドラッグで上下の表示順を入れ替えられるようにする（並び順はDBの
         # workflows.sort_orderに保存し、次回開いた時も同じ順序で表示する）。

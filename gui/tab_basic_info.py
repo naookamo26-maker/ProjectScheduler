@@ -14,15 +14,16 @@
 
 from datetime import date, timedelta
 
-from PySide6.QtCore import QDate, Qt
+from PySide6.QtCore import QDate, Qt, QTimer
 from PySide6.QtWidgets import (
-    QDateEdit,
+    QDialog,
+    QDialogButtonBox,
     QFormLayout,
     QGroupBox,
+    QLabel,
     QLineEdit,
     QMessageBox,
     QScrollArea,
-    QSpinBox,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -31,6 +32,8 @@ from PySide6.QtWidgets import (
 from gui.db import DuplicateNameError, ReferencedEntityError
 from gui.widgets_common import (
     CrudSection,
+    NoWheelDateEdit,
+    NoWheelSpinBox,
     auto_size_columns,
     confirm_or_block_delete,
     make_fk_combo,
@@ -47,6 +50,118 @@ def _to_qdate(iso_str):
 
 def _to_iso(qdate):
     return qdate.toString("yyyy-MM-dd")
+
+
+def _readonly_item(text):
+    item = QTableWidgetItem(text)
+    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+    return item
+
+
+class TeamCapacityDialog(QDialog):
+    """チームの同時ライン数が期間の途中で変わる場合の変更点（適用開始日・
+    ライン数）を追加・削除するダイアログ。開発開始日からの既定値そのものは
+    チーム一覧本体の「同時ライン数」列で編集するため、ここでは以降の
+    変更点のみを扱う（＋削除・追加のみで、値そのものは表内で直接編集する）。"""
+
+    def __init__(self, db, team, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.team = team
+        self.setWindowTitle(f"「{team['name']}」の同時ライン数の変動")
+        self.resize(420, 340)
+
+        layout = QVBoxLayout(self)
+        info = QLabel(
+            f"開発開始日からの既定値: {team['max_lines']}ライン"
+            "（この値自体はチーム一覧の「同時ライン数」列で変更してください）\n"
+            "ここでは、途中でライン数が変わる日付とその日以降のライン数を追加できます。"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.section = CrudSection(
+            "変更点（適用開始日順）", ["適用開始日", "ライン数"],
+            on_add=self._add_change, on_delete=self._delete_change,
+        )
+        layout.addWidget(self.section, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        # QDialogButtonBox(Close) の役割はRejectRoleのため rejected が発火する。
+        buttons.rejected.connect(self.accept)
+        layout.addWidget(buttons)
+
+        self._refresh()
+
+    def _refresh(self):
+        table = self.section.table
+        table.blockSignals(True)
+        table.setRowCount(0)
+        for c in self.db.list_team_capacity_changes(self.team["id"]):
+            row = table.rowCount()
+            table.insertRow(row)
+            set_row_id(table, row, c["id"])
+
+            date_edit = NoWheelDateEdit(_to_qdate(c["start_date"]))
+            date_edit.setCalendarPopup(True)
+            date_edit.setDisplayFormat("yyyy-MM-dd")
+            date_edit.dateChanged.connect(
+                lambda _qdate, cid=c["id"]: self._on_change_edited(cid)
+            )
+            table.setCellWidget(row, 0, date_edit)
+
+            lines_spin = NoWheelSpinBox()
+            lines_spin.setRange(1, 999)
+            lines_spin.setValue(c["lines"])
+            lines_spin.valueChanged.connect(
+                lambda _val, cid=c["id"]: self._on_change_edited(cid)
+            )
+            table.setCellWidget(row, 1, lines_spin)
+        table.blockSignals(False)
+        auto_size_columns(table)
+
+    def _add_change(self):
+        # 既定日は、既存の変更点のうち最も遅い日付の翌日（無ければ開発開始日の翌日）を提案する。
+        existing = self.db.list_team_capacity_changes(self.team["id"])
+        if existing:
+            base = _to_qdate(existing[-1]["start_date"]).addDays(1)
+        else:
+            proj = self.db.get_project()
+            base = _to_qdate(proj["start_date"] or date.today().isoformat()).addDays(1)
+        existing_dates = {c["start_date"] for c in existing}
+        while _to_iso(base) in existing_dates:
+            base = base.addDays(1)
+        try:
+            self.db.add_team_capacity_change(self.team["id"], _to_iso(base), self.team["max_lines"])
+        except DuplicateNameError as e:
+            QMessageBox.warning(self, "追加できません", str(e))
+            return
+        self._refresh()
+
+    def _delete_change(self, row):
+        change_id = row_id(self.section.table, row)
+        self.db.delete_team_capacity_change(change_id)
+        self._refresh()
+
+    def _on_change_edited(self, change_id):
+        table = self.section.table
+        for row in range(table.rowCount()):
+            if row_id(table, row) == change_id:
+                date_edit = table.cellWidget(row, 0)
+                lines_spin = table.cellWidget(row, 1)
+                try:
+                    self.db.update_team_capacity_change(
+                        change_id, _to_iso(date_edit.date()), lines_spin.value()
+                    )
+                except DuplicateNameError as e:
+                    QMessageBox.warning(self, "変更できません", str(e))
+                    self._refresh()
+                    return
+                # 適用開始日を変更すると並び順が変わりうるため、次のイベント
+                # ループで並べ直す（このメソッド自体がdate_editのdateChanged
+                # シグナル内から呼ばれているため、ウィジェットの再構築を遅延させる）。
+                QTimer.singleShot(0, self._refresh)
+                return
 
 
 class BasicInfoTab(QWidget):
@@ -76,8 +191,9 @@ class BasicInfoTab(QWidget):
         layout.addWidget(self.milestones_section)
 
         self.teams_section = CrudSection(
-            "チーム", ["チーム名", "同時ライン数"],
+            "チーム", ["チーム名", "同時ライン数（開発開始日からの既定値）", "期間中の変動"],
             on_add=self._add_team, on_delete=self._delete_team,
+            on_edit=self._edit_team_capacity,
         )
         self.teams_section.table.itemChanged.connect(self._on_team_name_changed)
         layout.addWidget(self.teams_section)
@@ -102,7 +218,7 @@ class BasicInfoTab(QWidget):
         self.project_name_edit.editingFinished.connect(self._on_project_changed)
         form.addRow("プロジェクト名", self.project_name_edit)
 
-        self.start_date_edit = QDateEdit()
+        self.start_date_edit = NoWheelDateEdit()
         self.start_date_edit.setCalendarPopup(True)
         self.start_date_edit.setDisplayFormat("yyyy-MM-dd")
         self.start_date_edit.dateChanged.connect(self._on_project_changed)
@@ -133,7 +249,7 @@ class BasicInfoTab(QWidget):
             table.insertRow(row)
             table.setItem(row, 0, QTableWidgetItem(ms["name"]))
             set_row_id(table, row, ms["id"])
-            date_edit = QDateEdit(_to_qdate(ms["end_date"]))
+            date_edit = NoWheelDateEdit(_to_qdate(ms["end_date"]))
             date_edit.setCalendarPopup(True)
             date_edit.setDisplayFormat("yyyy-MM-dd")
             date_edit.dateChanged.connect(
@@ -176,6 +292,12 @@ class BasicInfoTab(QWidget):
         except DuplicateNameError as e:
             QMessageBox.warning(self, "変更できません", str(e))
             self.refresh_milestones()
+            return
+        # 名前は締切日に次ぐ第2ソートキー（db.list_milestones参照）のため、
+        # 同じ締切日の別マイルストーンとの前後関係が変わりうる。表示順を
+        # 締切日順に合わせ直す（このメソッド自体がitemChangedシグナル内から
+        # 呼ばれているため、ウィジェットの再構築は次のイベントループへ遅延させる）。
+        QTimer.singleShot(0, self.refresh_milestones)
 
     def _on_milestone_date_changed(self, milestone_id, qdate):
         table = self.milestones_section.table
@@ -183,6 +305,10 @@ class BasicInfoTab(QWidget):
             if row_id(table, row) == milestone_id:
                 name = table.item(row, 0).text()
                 self.db.update_milestone(milestone_id, name, _to_iso(qdate))
+                # 締切日を変更したら、締切日順の表示を保つよう並べ直す
+                # （dateChangedシグナル内から呼ばれているため、ウィジェットの
+                # 再構築は次のイベントループへ遅延させる）。
+                QTimer.singleShot(0, self.refresh_milestones)
                 return
 
     # -- チーム ------------------------------------------------------------------
@@ -196,15 +322,32 @@ class BasicInfoTab(QWidget):
             table.insertRow(row)
             table.setItem(row, 0, QTableWidgetItem(team["name"]))
             set_row_id(table, row, team["id"])
-            spin = QSpinBox()
+            spin = NoWheelSpinBox()
             spin.setRange(1, 999)
             spin.setValue(team["max_lines"])
             spin.valueChanged.connect(
                 lambda value, eid=team["id"]: self._on_team_lines_changed(eid, value)
             )
             table.setCellWidget(row, 1, spin)
+
+            changes = self.db.list_team_capacity_changes(team["id"])
+            summary = (
+                "、".join(f"{c['start_date']}〜{c['lines']}ライン" for c in changes)
+                if changes else "（変動なし。「編集...」から追加）"
+            )
+            table.setItem(row, 2, _readonly_item(summary))
         table.blockSignals(False)
         auto_size_columns(table)
+
+    def _edit_team_capacity(self, row):
+        table = self.teams_section.table
+        team_id = row_id(table, row)
+        team = next((t for t in self.db.list_teams() if t["id"] == team_id), None)
+        if team is None:
+            return
+        dialog = TeamCapacityDialog(self.db, team, self)
+        dialog.exec()
+        self.refresh_teams()
 
     def _add_team(self):
         existing = {t["name"] for t in self.db.list_teams()}
@@ -272,7 +415,7 @@ class BasicInfoTab(QWidget):
             table.setItem(row, 0, QTableWidgetItem(""))  # 日付列はウィジェット表示のみ、テキストは未使用
             set_row_id(table, row, hol["id"])
 
-            date_edit = QDateEdit(_to_qdate(hol["date"]))
+            date_edit = NoWheelDateEdit(_to_qdate(hol["date"]))
             date_edit.setCalendarPopup(True)
             date_edit.setDisplayFormat("yyyy-MM-dd")
             date_edit.dateChanged.connect(

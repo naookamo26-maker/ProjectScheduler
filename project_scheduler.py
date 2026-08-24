@@ -216,17 +216,18 @@ def _require_columns(df, required_cols, sheet_name):
 
 def _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
                             df_jtasks=None, df_holidays=None, df_extdeps=None,
-                            df_wf_names=None):
+                            df_wf_names=None, df_team_capacity=None):
     """
     既に読み込み済みのDataFrame群を検証・整形する（列チェック・インデックス設定・
     任意データの既定値補完）。Excel由来（_load_data経由）・DB由来（GUIの
     gui/gantt_generator.py経由）を問わない共通の入口。
 
     df_project/df_teams/df_ms/df_wf/df_jobs は必須。
-    df_jtasks/df_holidays/df_extdeps/df_wf_names は、Noneなら「対応するデータが
-    そもそも存在しない」ことを表し既定の空DataFrameを使う。DataFrame（0行でも可）を
-    渡した場合は「存在する」ことを表し、Excelで対応シートが存在する場合と同じ
-    列検証を行う（Excel側の「シートが存在するかどうか」と1対1に対応する）。
+    df_jtasks/df_holidays/df_extdeps/df_wf_names/df_team_capacity は、Noneなら
+    「対応するデータがそもそも存在しない」ことを表し既定の空DataFrameを使う。
+    DataFrame（0行でも可）を渡した場合は「存在する」ことを表し、Excelで対応
+    シートが存在する場合と同じ列検証を行う（Excel側の「シートが存在するか
+    どうか」と1対1に対応する）。
     """
     _require_columns(df_project, ["Project_ID", "Project_Name", "Start_Date"], "Project")
     _require_columns(df_teams, ["Team_ID", "Max_Lines"], "Teams")
@@ -271,7 +272,18 @@ def _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
     else:
         df_wf_names = pd.DataFrame(columns=["Workflow_ID", "Workflow_Name"])
 
-    return df_project, df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_holidays, df_extdeps, df_wf_names
+    # Team_Capacity_Changes（任意）: チームの同時ライン数（Teams.Max_Lines）を
+    # 開発開始日からの既定値としつつ、途中の日付から変動させたい場合の変更点。
+    if df_team_capacity is not None:
+        if not df_team_capacity.empty:
+            _require_columns(
+                df_team_capacity, ["Team_ID", "Start_Date", "Lines"], "Team_Capacity_Changes"
+            )
+    else:
+        df_team_capacity = pd.DataFrame(columns=["Team_ID", "Start_Date", "Lines"])
+
+    return (df_project, df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_holidays, df_extdeps,
+            df_wf_names, df_team_capacity)
 
 
 def _load_data(excel_file):
@@ -299,9 +311,14 @@ def _load_data(excel_file):
         if "External_Dependencies" in xls.sheet_names else None
     )
     df_wf_names = pd.read_excel(xls, sheet_name="Workflow_Names") if "Workflow_Names" in xls.sheet_names else None
+    df_team_capacity = (
+        pd.read_excel(xls, sheet_name="Team_Capacity_Changes")
+        if "Team_Capacity_Changes" in xls.sheet_names else None
+    )
 
     return _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
-                                   df_jtasks, df_holidays, df_extdeps, df_wf_names)
+                                   df_jtasks, df_holidays, df_extdeps, df_wf_names,
+                                   df_team_capacity)
 
 
 def _load_project_start(df_project):
@@ -545,8 +562,50 @@ def _calc_asap_dates(active_tasks, scheduling_order, project_start, is_holiday_f
     return asap_dates
 
 
-def _run_leveling(active_tasks, scheduling_order, teams_dict, project_start, is_holiday_fn,
-                   asap_dates, raw_dates, distribution_ratio=1.0):
+def _build_team_capacity_schedule(df_teams, df_team_capacity):
+    """チームごとの同時ライン数を、日付で変動しうる区分定数関数として表す
+    {Team_ID: [(適用開始日, ライン数), ...]}（開始日昇順）を組み立てる。
+
+    先頭要素は常に Teams シートの Max_Lines を「いつまでも遡って適用される
+    既定値」として含む（pd.Timestamp.min始まり）ため、開発開始日を含む
+    どの日付を問い合わせても必ず何らかの値が見つかる。Team_Capacity_Changes
+    （任意）に登録された変更点があれば、その後ろに開始日昇順で追加する。"""
+    schedule = {}
+    for team_id, row in df_teams.set_index("Team_ID").iterrows():
+        schedule[team_id] = [(pd.Timestamp.min, int(row["Max_Lines"]))]
+
+    for _, row in df_team_capacity.iterrows():
+        team_id = row.get("Team_ID")
+        start = pd.to_datetime(row.get("Start_Date"))
+        lines = row.get("Lines")
+        if not pd.notna(team_id) or pd.isna(start) or not pd.notna(lines):
+            logger.warning(f"Team_Capacity_Changes に不完全な行があります（スキップ）: {row.to_dict()}")
+            continue
+        schedule.setdefault(team_id, [(pd.Timestamp.min, int(lines))])
+        schedule[team_id].append((start, int(lines)))
+
+    for team_id in schedule:
+        schedule[team_id].sort(key=lambda period: period[0])
+    return schedule
+
+
+def _capacity_at(team_capacity_schedule, team_id, dt):
+    """team_id の dt 時点での同時ライン数。Teams シートに定義の無いチーム
+    （schedule に無い）は None（無制限）を返す——従来の「未定義チームは
+    ライン制限なし」という挙動を維持するため。"""
+    periods = team_capacity_schedule.get(team_id)
+    if periods is None:
+        return None
+    lines = periods[0][1]
+    for start, val in periods:
+        if start > dt:
+            break
+        lines = val
+    return lines
+
+
+def _run_leveling(active_tasks, scheduling_order, team_capacity_schedule, project_start,
+                   is_holiday_fn, asap_dates, raw_dates, distribution_ratio=1.0):
     """
     リソース制約（チームのライン数・休日）を考慮して各タスクの日程を確定する。
 
@@ -580,15 +639,17 @@ def _run_leveling(active_tasks, scheduling_order, teams_dict, project_start, is_
     """
     scheduled = {}
     adjusted = {}
-    team_usage = {team_id: {} for team_id in teams_dict.keys()}
+    team_usage = {team_id: {} for team_id in team_capacity_schedule.keys()}
 
     def is_available(team_id, start_dt, end_dt):
-        max_lines = teams_dict.get(team_id, None)
         curr = start_dt
         while curr < end_dt:
             if is_holiday_fn(curr, team_id):
                 curr += timedelta(days=1)
                 continue
+            # チームの同時ライン数は日付によって変わりうる（team_capacity_schedule、
+            # gui/db.py の team_capacity_changes 参照）ため、日ごとに問い合わせる。
+            max_lines = _capacity_at(team_capacity_schedule, team_id, curr)
             if max_lines is not None:
                 d_str = curr.strftime("%Y-%m-%d")
                 if team_usage.get(team_id, {}).get(d_str, 0) >= max_lines:
@@ -1434,6 +1495,7 @@ def run_resource_constrained_scheduler(excel_file, verbose=True,
 def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
                                                      df_jtasks=None, df_holidays=None,
                                                      df_extdeps=None, df_wf_names=None,
+                                                     df_team_capacity=None,
                                                      verbose=True,
                                                      auto_exclude_weekends=True,
                                                      auto_exclude_jp_holidays=True,
@@ -1450,13 +1512,16 @@ def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, 
     から組み立てたもの）から直接スケジューリングする。
 
     各引数は run_resource_constrained_scheduler() と同じ意味・既定値を持つ
-    （df_project 以降 df_wf_names までが Excel の各シートに相当するDataFrame、
-    df_jtasks/df_holidays/df_extdeps/df_wf_names は None なら「データなし」を表す）。
-    それ以外のキーワード引数・戻り値・送出しうる例外は run_resource_constrained_scheduler()
-    のdocstringを参照。
+    （df_project 以降 df_team_capacity までが Excel の各シートに相当するDataFrame、
+    df_jtasks/df_holidays/df_extdeps/df_wf_names/df_team_capacity は None なら
+    「データなし」を表す。df_team_capacity は Team_ID/Start_Date/Lines 列を持ち、
+    チームの同時ライン数（Teams.Max_Lines）を途中の日付から変動させる場合の
+    変更点を表す）。それ以外のキーワード引数・戻り値・送出しうる例外は
+    run_resource_constrained_scheduler() のdocstringを参照。
     """
     frames = _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
-                                     df_jtasks, df_holidays, df_extdeps, df_wf_names)
+                                     df_jtasks, df_holidays, df_extdeps, df_wf_names,
+                                     df_team_capacity)
     return _run_scheduler_on_frames(
         *frames, verbose=verbose,
         auto_exclude_weekends=auto_exclude_weekends,
@@ -1472,7 +1537,8 @@ def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, 
 
 
 def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jtasks,
-                              df_holidays, df_extdeps, df_wf_names, verbose=True,
+                              df_holidays, df_extdeps, df_wf_names, df_team_capacity,
+                              verbose=True,
                               auto_exclude_weekends=True, auto_exclude_jp_holidays=True,
                               mermaid_output_path=None, mermaid_tick_interval="1week",
                               mermaid_label_wrap_width=14, plotly_output_path=None,
@@ -1513,6 +1579,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
     milestone_markers.sort(key=lambda m: m[2])
 
     teams_dict, active_tasks, active_ids = _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps)
+    team_capacity_schedule = _build_team_capacity_schedule(df_teams, df_team_capacity)
 
     if not active_ids:
         logger.warning("アクティブなタスクがありません")
@@ -1551,7 +1618,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
     raw_dates = _calc_raw_dates(active_tasks, successors, scheduling_order, is_holiday_fn)
     asap_dates = _calc_asap_dates(active_tasks, scheduling_order, project_start, is_holiday_fn)
     leveled, adjusted_flags = _run_leveling(
-        active_tasks, scheduling_order, teams_dict, project_start, is_holiday_fn,
+        active_tasks, scheduling_order, team_capacity_schedule, project_start, is_holiday_fn,
         asap_dates=asap_dates, raw_dates=raw_dates, distribution_ratio=distribution_ratio,
     )
     scheduled = leveled
