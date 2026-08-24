@@ -29,7 +29,7 @@ HTML出力が両方の粒度でチャートを作るのと同じ考え方）。�
 マイルストーンは縦線として表示する。
 """
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.gantt_generator import compute_schedule, validate_for_generation
-from gui.gantt_view import GanttGraphicsView, build_gantt_scene
+from gui.gantt_view import FrozenGanttPane, build_gantt_scene
 from gui.widgets_common import NoWheelComboBox
 from project_scheduler import SchedulingError
 
@@ -96,7 +96,7 @@ class GanttTab(QWidget):
         legend_toolbar.addStretch(1)
         layout.addLayout(legend_toolbar)
 
-        self.view = GanttGraphicsView()
+        self.view = FrozenGanttPane()
         layout.addWidget(self.view, 1)
 
     def refresh_choices(self):
@@ -259,12 +259,4 @@ class GanttTab(QWidget):
             QTimer.singleShot(0, self._fit_chart_view)
 
     def _fit_chart_view(self):
-        scene = self.view.scene()
-        if scene is None:
-            return
-        rect = scene.itemsBoundingRect()
-        if not rect.isEmpty():
-            # ガントチャートは横（時間軸）と縦（行数）で必要な縮尺が大きく異なる
-            # ことが多い。KeepAspectRatioだと縦横比を保つために片方が余ってしまう
-            # ため、IgnoreAspectRatioで縦横それぞれ独立にビューいっぱいへ広げる。
-            self.view.fitInView(rect, Qt.IgnoreAspectRatio)
+        self.view.fit_all()

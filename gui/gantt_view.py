@@ -1,5 +1,5 @@
 """
-「ガントチャート」タブ（gui/tab_gantt.py）用の独自描画部品（段階2）。
+「ガントチャート」タブ（gui/tab_gantt.py）用の独自描画部品（段階2〜3）。
 
 HTMLに頼らず、gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで
 ツール内に直接バーチャートを描画する。データは gui/gantt_generator.py の
@@ -8,17 +8,25 @@ display（チーム色・表示名・マイルストーン一覧）をそのま�
 
 レーン詰め（同じジョブ内で時間的に重ならないタスクは同じ行にまとめる）は
 project_scheduler.py の export_plotly_gantt が持つ考え方を踏襲している。
+
+段階3: 日付ヘッダー／マイルストーン行と、左の項目名列を、本体の拡縮・パン
+操作から見切れないよう画面上に固定表示する（表計算ソフトの「ウィンドウ枠の
+固定」と同じ考え方）。ヘッダー・左列・本体は同じ QGraphicsScene を共有する
+別々の QGraphicsView で、本体の変換／スクロール位置の変化に追従して
+ヘッダーは横方向、左列は縦方向のみ同期する（交差方向の縮尺は常に1.0固定）。
 """
 
 from datetime import timedelta
 
-from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPen
+from PySide6.QtCore import QRectF, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPen, QTransform
 from PySide6.QtWidgets import (
     QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
     QGraphicsView,
+    QGridLayout,
+    QWidget,
 )
 
 DAY_WIDTH = 10
@@ -28,20 +36,28 @@ LEFT_MARGIN = 190
 TOP_MARGIN = 46
 JOB_GAP = 6
 AXIS_MARGIN_DAYS = 3
+# ヘッダー／左列ペインの表示専用の余白（罫線がペイン端で見切れないように）。
+_PANE_PADDING = 10
 
 _ADJUSTED_BORDER = QColor("#c0392b")
 _GRID_COLOR = QColor("#e1e0d9")
 _MILESTONE_COLOR = QColor("#c0392b")
 _PROJECT_START_COLOR = QColor("#52514e")
 _DEFAULT_BAR_COLOR = "#898781"
+_PANE_BG = QColor("#fdfcf9")
 
 
 class GanttGraphicsView(QGraphicsView):
-    """ホイールでズーム、中ボタンドラッグでパン
+    """本体ペイン。ホイールでズーム、中ボタンドラッグでパン
     （gui/node_canvas.py の WorkflowGraphView と同じ操作感）。ガントチャートは
     時間軸（横）と行数（縦）の縮尺を別々に調整したいことが多いため、
     Ctrlを押しながらのホイールで横方向のみ、Shiftを押しながらのホイールで
-    縦方向のみ、修飾キーなしなら従来通り両方向を拡縮する。"""
+    縦方向のみ、修飾キーなしなら従来通り両方向を拡縮する。
+
+    変換／スクロール位置が変わるたびに transformChanged を発火し、
+    FrozenGanttPane がヘッダー・左列ペインを追従させる。"""
+
+    transformChanged = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -50,9 +66,13 @@ class GanttGraphicsView(QGraphicsView):
         # OSがダークモードだと既定の（ダークな）ビュー背景に文字が埋もれて
         # 読めなくなる。この独自キャンバスはOSのテーマに関わらず常に明るい
         # 背景で描くようにし、文字色との組み合わせを固定して視認性を保つ。
-        self.setBackgroundBrush(QBrush(QColor("#fdfcf9")))
+        self.setBackgroundBrush(QBrush(_PANE_BG))
         self._panning = False
         self._pan_last_pos = None
+        h_bar = self.horizontalScrollBar()
+        v_bar = self.verticalScrollBar()
+        h_bar.valueChanged.connect(self.transformChanged)
+        v_bar.valueChanged.connect(self.transformChanged)
 
     def wheelEvent(self, event):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
@@ -63,6 +83,7 @@ class GanttGraphicsView(QGraphicsView):
             self.scale(1.0, factor)
         else:
             self.scale(factor, factor)
+        self.transformChanged.emit()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MiddleButton:
@@ -93,6 +114,119 @@ class GanttGraphicsView(QGraphicsView):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+
+class _FrozenPaneView(QGraphicsView):
+    """ヘッダー／左列ペイン共通の基底クラス。表示専用（ユーザー操作は
+    受け付けず、本体ペインの変換／スクロールに追従するだけ）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setRenderHints(self.renderHints())
+        self.setBackgroundBrush(QBrush(_PANE_BG))
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setInteractive(False)
+        self.setFrameShape(QGraphicsView.NoFrame)
+
+
+class GanttHeaderView(_FrozenPaneView):
+    """日付軸・マイルストーンの行。本体と横方向の縮尺／スクロール位置だけ
+    同期し、縦方向は常に等倍で固定表示する。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(TOP_MARGIN + _PANE_PADDING)
+
+
+class GanttColumnView(_FrozenPaneView):
+    """項目名（ジョブ名）の列。本体と縦方向の縮尺／スクロール位置だけ同期し、
+    横方向は常に等倍で固定表示する。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(LEFT_MARGIN + _PANE_PADDING)
+
+
+class FrozenGanttPane(QWidget):
+    """コーナー／ヘッダー／左列／本体の4分割レイアウトをまとめて管理する
+    コンポジットウィジェット。gui/tab_gantt.py からは本体ペインだけを
+    直接使っていた旧 GanttGraphicsView の代わりにこれを配置する。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.body = GanttGraphicsView()
+        self.header = GanttHeaderView()
+        self.column = GanttColumnView()
+
+        corner = QWidget()
+        corner.setFixedSize(LEFT_MARGIN + _PANE_PADDING, TOP_MARGIN + _PANE_PADDING)
+        corner.setAutoFillBackground(True)
+        pal = corner.palette()
+        pal.setColor(corner.backgroundRole(), _PANE_BG)
+        corner.setPalette(pal)
+
+        grid = QGridLayout(self)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(0)
+        grid.addWidget(corner, 0, 0)
+        grid.addWidget(self.header, 0, 1)
+        grid.addWidget(self.column, 1, 0)
+        grid.addWidget(self.body, 1, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setRowStretch(1, 1)
+
+        self.body.transformChanged.connect(self._sync_panes)
+
+    def setScene(self, scene):
+        self.body.setScene(scene)
+        self.header.setScene(scene)
+        self.column.setScene(scene)
+        if scene is None:
+            return
+        body_rect = getattr(scene, "gantt_body_rect", None)
+        header_rect = getattr(scene, "gantt_header_rect", None)
+        column_rect = getattr(scene, "gantt_column_rect", None)
+        if body_rect is not None:
+            self.body.setSceneRect(body_rect)
+        if header_rect is not None:
+            self.header.setSceneRect(header_rect)
+        if column_rect is not None:
+            self.column.setSceneRect(column_rect)
+        self._sync_panes()
+
+    def scene(self):
+        return self.body.scene()
+
+    def fit_all(self):
+        """本体ペインの内容（ヘッダー行・左列を除いたチャート本体）が
+        ちょうど収まるようにズームを合わせ、ヘッダー・左列ペインもそれに
+        追従させる。gui/node_canvas.py の fit_all() と同じ考え方。"""
+        scene = self.body.scene()
+        if scene is None:
+            return
+        rect = getattr(scene, "gantt_body_rect", None)
+        if rect is None or rect.isEmpty():
+            return
+        # ガントチャートは横（時間軸）と縦（行数）で必要な縮尺が大きく異なる
+        # ことが多い。KeepAspectRatioだと縦横比を保つために片方が余ってしまう
+        # ため、IgnoreAspectRatioで縦横それぞれ独立にビューいっぱいへ広げる。
+        self.body.fitInView(rect, Qt.IgnoreAspectRatio)
+        self._sync_panes()
+
+    def _sync_panes(self):
+        body_transform = self.body.transform()
+        sx, sy = body_transform.m11(), body_transform.m22()
+
+        header_transform = QTransform()
+        header_transform.scale(sx, 1.0)
+        self.header.setTransform(header_transform)
+        self.header.horizontalScrollBar().setValue(self.body.horizontalScrollBar().value())
+
+        column_transform = QTransform()
+        column_transform.scale(1.0, sy)
+        self.column.setTransform(column_transform)
+        self.column.verticalScrollBar().setValue(self.body.verticalScrollBar().value())
 
 
 def _pack_lanes(tasks):
@@ -127,7 +261,11 @@ def build_gantt_scene(df, display, color_by="team"):
 
     color_by: "team"（既定、ワークフロー別表示用——同じワークフロー内で担当
     チームを見分けたい）または "workflow"（チーム別表示用——1チームに
-    絞り込まれている代わりに、どのワークフローの仕事かを見分けたい）。"""
+    絞り込まれている代わりに、どのワークフローの仕事かを見分けたい）。
+
+    返すシーンには、FrozenGanttPane が本体／ヘッダー／左列の3ペインへ
+    それぞれ setSceneRect するための矩形を gantt_body_rect /
+    gantt_header_rect / gantt_column_rect 属性として持たせる。"""
     if df.empty:
         return None
 
@@ -251,4 +389,21 @@ def build_gantt_scene(df, display, color_by="team"):
         boundary.setZValue(-2)
 
     scene.setSceneRect(0, 0, chart_right + 20, chart_bottom + 20)
+
+    # -- フリーズドペイン用の分割矩形 ------------------------------------------------
+    # 本体: 左列・ヘッダー行を除いたチャート本体（タスクバー・目盛り線・境界線）。
+    # ヘッダー: 本体と同じ横範囲、縦は日付軸・マイルストーン行のみ。
+    # 左列: 本体と同じ縦範囲、横は項目名列のみ。
+    # いずれも本体との共有軸（ヘッダーなら横、左列なら縦）の範囲・原点を本体と
+    # 揃えることで、GraphicsView間のスクロールバー可動域を一致させ、
+    # スクロール位置をそのままコピーするだけでズレなく同期できるようにする。
+    scene.gantt_body_rect = QRectF(
+        LEFT_MARGIN, TOP_MARGIN, chart_right - LEFT_MARGIN + 20, chart_bottom - TOP_MARGIN + 20,
+    )
+    scene.gantt_header_rect = QRectF(
+        LEFT_MARGIN, 0, chart_right - LEFT_MARGIN + 20, TOP_MARGIN + _PANE_PADDING,
+    )
+    scene.gantt_column_rect = QRectF(
+        0, TOP_MARGIN, LEFT_MARGIN + _PANE_PADDING, chart_bottom - TOP_MARGIN + 20,
+    )
     return scene
