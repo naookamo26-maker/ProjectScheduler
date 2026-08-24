@@ -11,11 +11,22 @@ project_scheduler.py の export_plotly_gantt が持つ考え方を踏襲して�
 
 段階3: 日付ヘッダー／マイルストーン行と、左の項目名列を、本体の拡縮・パン
 操作から見切れないよう画面上に固定表示する（表計算ソフトの「ウィンドウ枠の
-固定」と同じ考え方）。ヘッダー・左列・本体は同じ QGraphicsScene を共有する
-別々の QGraphicsView で、本体の変換／スクロール位置の変化に追従して
-ヘッダーは横方向、左列は縦方向のみ同期する（交差方向の縮尺は常に1.0固定）。
+固定」と同じ考え方）。
+
+ヘッダー・左列・本体は「担当範囲の項目しか持たない」別々の QGraphicsScene
+として構築する（build_gantt_scenes）。当初は1つのシーンを3つのビューで
+共有し、各ビューの setSceneRect() で見せる範囲を絞る方式にしていたが、
+QGraphicsView は setSceneRect() だけでは実際の描画をクリップしないため、
+ズームアウトしてビューポートがその範囲より広くなるとQtが中身を中央寄せし、
+範囲外にある他ペイン用のアイテム（ヘッダーの日付や左列の項目名など）が
+そのまま透けて見えてしまう問題があった。ペインごとに最初から別シーンへ
+分けて、担当外の項目をそもそも作らないことで、この問題を構造的に防ぐ。
+
+本体の変換／スクロール位置の変化に追従して、ヘッダーは横方向、左列は
+縦方向のみ同期する（交差方向の縮尺は常に1.0固定）。
 """
 
+from collections import namedtuple
 from datetime import timedelta
 
 from PySide6.QtCore import QRectF, Qt, Signal
@@ -44,8 +55,12 @@ _MILESTONE_LABEL_OFFSET = 56
 _YEAR_LABEL_OFFSET = 38
 _TICK_LABEL_OFFSET = 22
 _GRID_TOP_OFFSET = 10
-# ヘッダー／左列ペインの表示専用の余白（罫線がペイン端で見切れないように）。
+# ヘッダー／左列ペインの表示専用の余白。ペイン境界の罫線が、隣接する本体側の
+# 続きと見た目上つながって見えるよう、担当範囲の少し先まで描いておく分。
 _PANE_PADDING = 10
+# 全体表示（フィット）時のズーム下限を計算する際、丸め誤差で隙間が生まれない
+# よう、内容をビューポートよりわずかに大きく保つための安全マージン(px)。
+_SCALE_FLOOR_MARGIN_PX = 4
 
 _ADJUSTED_BORDER = QColor("#c0392b")
 _GRID_COLOR = QColor("#e1e0d9")
@@ -53,6 +68,10 @@ _MILESTONE_COLOR = QColor("#c0392b")
 _PROJECT_START_COLOR = QColor("#52514e")
 _DEFAULT_BAR_COLOR = "#898781"
 _PANE_BG = QColor("#fdfcf9")
+
+# build_gantt_scenes() の戻り値。header/column/body はそれぞれの担当分だけの
+# 項目を持つ独立した QGraphicsScene（FrozenGanttPane.setScene()参照）。
+GanttScenes = namedtuple("GanttScenes", ["header", "column", "body"])
 
 
 class GanttGraphicsView(QGraphicsView):
@@ -91,7 +110,39 @@ class GanttGraphicsView(QGraphicsView):
             self.scale(1.0, factor)
         else:
             self.scale(factor, factor)
+        self._clamp_scale()
         self.transformChanged.emit()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._clamp_scale():
+            self.transformChanged.emit()
+
+    def _clamp_scale(self):
+        """全体表示（フィット時）の縮尺より外側へはズームアウトできないよう
+        下限を設ける。本体の内容（gantt_body_rect）が常にビューポート以上の
+        大きさを保つようにし、それより縮小してもチャート全体は既に見えている
+        ため実用上ズームアウトする意味がない。戻り値: 実際に縮尺を補正したか。"""
+        scene = self.scene()
+        if scene is None:
+            return False
+        rect = getattr(scene, "gantt_body_rect", None)
+        if rect is None or rect.isEmpty():
+            return False
+        viewport_size = self.viewport().size()
+        transform = self.transform()
+        sx, sy = transform.m11(), transform.m22()
+        # fitInView等の丸め誤差でちょうど等倍（隙間ゼロ）を狙うと、わずかな
+        # 誤差で隙間が生まれてしまうことがあるため、数ピクセル分だけ内容を
+        # ビューポートより意図的に大きくしておき、隙間が生じる余地を無くす。
+        min_sx = (viewport_size.width() + _SCALE_FLOOR_MARGIN_PX) / rect.width() if rect.width() > 0 else sx
+        min_sy = (viewport_size.height() + _SCALE_FLOOR_MARGIN_PX) / rect.height() if rect.height() > 0 else sy
+        new_sx = max(sx, min_sx)
+        new_sy = max(sy, min_sy)
+        if new_sx == sx and new_sy == sy:
+            return False
+        self.setTransform(QTransform().scale(new_sx, new_sy))
+        return True
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MiddleButton:
@@ -159,7 +210,10 @@ class GanttColumnView(_FrozenPaneView):
 class FrozenGanttPane(QWidget):
     """コーナー／ヘッダー／左列／本体の4分割レイアウトをまとめて管理する
     コンポジットウィジェット。gui/tab_gantt.py からは本体ペインだけを
-    直接使っていた旧 GanttGraphicsView の代わりにこれを配置する。"""
+    直接使っていた旧 GanttGraphicsView の代わりにこれを配置する。
+
+    setScene() には単一の QGraphicsScene ではなく build_gantt_scenes() が
+    返す GanttScenes（header/column/body の3シーン）を渡す。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -186,21 +240,24 @@ class FrozenGanttPane(QWidget):
 
         self.body.transformChanged.connect(self._sync_panes)
 
-    def setScene(self, scene):
-        self.body.setScene(scene)
-        self.header.setScene(scene)
-        self.column.setScene(scene)
-        if scene is None:
+    def setScene(self, scenes):
+        if scenes is None:
+            self.header.setScene(None)
+            self.column.setScene(None)
+            self.body.setScene(None)
             return
-        body_rect = getattr(scene, "gantt_body_rect", None)
-        header_rect = getattr(scene, "gantt_header_rect", None)
-        column_rect = getattr(scene, "gantt_column_rect", None)
-        if body_rect is not None:
-            self.body.setSceneRect(body_rect)
+        self.header.setScene(scenes.header)
+        self.column.setScene(scenes.column)
+        self.body.setScene(scenes.body)
+        header_rect = getattr(scenes.header, "gantt_header_rect", None)
+        column_rect = getattr(scenes.column, "gantt_column_rect", None)
+        body_rect = getattr(scenes.body, "gantt_body_rect", None)
         if header_rect is not None:
             self.header.setSceneRect(header_rect)
         if column_rect is not None:
             self.column.setSceneRect(column_rect)
+        if body_rect is not None:
+            self.body.setSceneRect(body_rect)
         self._sync_panes()
 
     def scene(self):
@@ -220,6 +277,7 @@ class FrozenGanttPane(QWidget):
         # ことが多い。KeepAspectRatioだと縦横比を保つために片方が余ってしまう
         # ため、IgnoreAspectRatioで縦横それぞれ独立にビューいっぱいへ広げる。
         self.body.fitInView(rect, Qt.IgnoreAspectRatio)
+        self.body._clamp_scale()
         self._sync_panes()
 
     def _sync_panes(self):
@@ -236,47 +294,27 @@ class FrozenGanttPane(QWidget):
         self.column.setTransform(column_transform)
         self.column.verticalScrollBar().setValue(self.body.verticalScrollBar().value())
 
-        self._reposition_last_milestone_label(sx)
+        self._center_milestone_labels(sx)
 
-    def _reposition_last_milestone_label(self, sx):
-        """一番右のマイルストーンラベルが常にチャート右端に収まるよう、
-        線の右側／左側のどちらに表示するかをその都度計算し直す。
-        ItemIgnoresTransformationsを立てた項目のsetPos()はシーン座標系の
-        ままなので、画面上で一定のピクセル数だけ線の反対側へずらすには、
-        現在の横方向の拡縮率(sx)で割ってシーン座標に変換する必要がある。
-        左側に反転させた場合、直前のマイルストーンの縦線と重ならないよう、
-        必要なら（項目名などと同じ）省略表示にして収める。"""
-        scene = self.body.scene()
+    def _center_milestone_labels(self, sx):
+        """マイルストーンラベルを、その縦線を中心に左右均等になるよう配置
+        し直す。ItemIgnoresTransformationsを立てた項目のsetPos()はシーン座標
+        系のままなので、画面上で「中央揃え」を保つオフセット（ラベル幅の半分）
+        は、現在の横方向の拡縮率(sx)で割ってシーン座標に変換する必要がある。
+        また、軸の両端付近では中央揃えのままだとラベルがチャート外へはみ出す
+        ため、ヘッダーの表示範囲（gantt_header_rect）に収まるようクランプする。"""
+        scene = self.header.scene()
         if scene is None or sx <= 0:
             return
-        label = getattr(scene, "gantt_last_milestone_label", None)
-        line_x = getattr(scene, "gantt_last_milestone_line_x", None)
-        if label is None or line_x is None:
-            return
-        full_text = getattr(scene, "gantt_last_milestone_full_text", label.text())
-        prev_x = getattr(scene, "gantt_prev_milestone_line_x", None)
         header_rect = getattr(scene, "gantt_header_rect", None)
-
-        metrics = QFontMetrics(label.font())
-        natural_width_px = metrics.horizontalAdvance(full_text)
-        fits_on_right = header_rect is None or \
-            (header_rect.right() - (line_x + 3)) * sx >= natural_width_px
-
-        if fits_on_right:
-            if label.text() != full_text:
-                label.setText(full_text)
-            label.setPos(line_x + 3 / sx, label.y())
-            return
-
-        text = full_text
-        if prev_x is not None:
-            available_px = (line_x - 3 - prev_x) * sx
-            if available_px > 0:
-                text = metrics.elidedText(full_text, Qt.ElideRight, int(available_px))
-        if label.text() != text:
-            label.setText(text)
-        text_width_px = metrics.horizontalAdvance(text)
-        label.setPos(line_x - (3 + text_width_px) / sx, label.y())
+        for label, line_x in getattr(scene, "gantt_milestone_labels", []):
+            width_px = label.boundingRect().width()
+            anchor = line_x - (width_px / 2) / sx
+            if header_rect is not None:
+                min_anchor = header_rect.left()
+                max_anchor = max(min_anchor, header_rect.right() - width_px / sx)
+                anchor = max(min_anchor, min(anchor, max_anchor))
+            label.setPos(anchor, label.y())
 
 
 def _pack_lanes(tasks):
@@ -322,18 +360,21 @@ def _add_fixed_size_label(scene, text, font, pos, brush=None, z_value=None):
     return label
 
 
-def build_gantt_scene(df, display, color_by="team"):
+def build_gantt_scenes(df, display, color_by="team"):
     """df: result_df を表示対象（1ワークフロー分、または1チーム分）に絞り込んだ
-    もの。display: compute_schedule()の2番目の戻り値。QGraphicsScene を組み立てて
-    返す（絞り込んだ結果が空ならNoneを返す）。
+    もの。display: compute_schedule()の2番目の戻り値。ヘッダー／左列／本体
+    それぞれの担当分の項目だけを持つ3つの QGraphicsScene を GanttScenes に
+    まとめて返す（絞り込んだ結果が空ならNoneを返す）。
 
     color_by: "team"（既定、ワークフロー別表示用——同じワークフロー内で担当
     チームを見分けたい）または "workflow"（チーム別表示用——1チームに
     絞り込まれている代わりに、どのワークフローの仕事かを見分けたい）。
 
-    返すシーンには、FrozenGanttPane が本体／ヘッダー／左列の3ペインへ
-    それぞれ setSceneRect するための矩形を gantt_body_rect /
-    gantt_header_rect / gantt_column_rect 属性として持たせる。"""
+    3つのシーンは同じ座標系（LEFT_MARGIN/TOP_MARGIN起点、x_of()による日付
+    ->x座標変換）を共有しているが、日付軸・マイルストーン・目盛り線の縦線
+    などペインをまたいで見える要素は、各ペインが実際に描く区間だけを別々の
+    アイテムとして両方のシーンに（境界がつながって見えるよう少し重ねて）
+    追加している。"""
     if df.empty:
         return None
 
@@ -345,18 +386,14 @@ def build_gantt_scene(df, display, color_by="team"):
     axis_start = axis_start - timedelta(days=AXIS_MARGIN_DAYS)
     axis_end = axis_end + timedelta(days=AXIS_MARGIN_DAYS)
     total_days = max((axis_end - axis_start).days, 1)
-    # マイルストーンのラベルは通常、縦線の右側に伸びる。一番右（日付が最も
-    # 遅い）マイルストーンだとラベルがチャートの右端からはみ出して見切れて
-    # しまうため、そのラベルだけ縦線の左側に伸びるよう反転させる。ラベル幅は
-    # 拡縮の影響を受けない固定サイズ（ItemIgnoresTransformations）なので、
-    # 軸の余白日数を増やす対策ではズームレベルによって効果が変わってしまい
-    # 根本解決にならない——常に線を跨いで反対側に逃がすほうが確実。
-    _last_milestone_id = max(milestone_markers, key=lambda m: m[2])[0] if milestone_markers else None
 
     def x_of(date):
         return LEFT_MARGIN + (date - axis_start).days * DAY_WIDTH
 
-    scene = QGraphicsScene()
+    header_scene = QGraphicsScene()
+    column_scene = QGraphicsScene()
+    body_scene = QGraphicsScene()
+
     task_font = QFont()
     task_font.setPointSize(9)
     job_font = QFont()
@@ -379,11 +416,15 @@ def build_gantt_scene(df, display, color_by="team"):
 
     chart_bottom = y_cursor
     chart_right = x_of(axis_end)
+    # ヘッダーの縦線・左列の横線は、隣接する本体側の続きと見た目がつながる
+    # よう、それぞれのペイン境界のさらに少し先（_PANE_PADDING分）まで描く。
+    header_stub_bottom = TOP_MARGIN + _PANE_PADDING
+    column_stub_right = LEFT_MARGIN + _PANE_PADDING
 
     # -- 日付軸（週単位の目盛り、期間が長い場合は間引く） -----------------------------
     # 目盛りラベルは年をまたいでも「YYYY-MM-DD」を毎回繰り返すと横に長く冗長なため、
     # 月日のみを目盛りごとに、年は表示範囲に含まれる年ごとに上段中央へ1回だけ表示する
-    # 2段構成にする。
+    # 2段構成にする。いずれもヘッダー専用（本体には描かない）。
     tick_step_days = 7
     if total_days > 365:
         tick_step_days = 28
@@ -395,10 +436,13 @@ def build_gantt_scene(df, display, color_by="team"):
     tick_date = tick_date + timedelta(days=(7 - tick_date.weekday()) % 7)
     while tick_date <= axis_end:
         x = x_of(tick_date)
-        line = scene.addLine(x, TOP_MARGIN - _GRID_TOP_OFFSET, x, chart_bottom, QPen(_GRID_COLOR, 1))
-        line.setZValue(-2)
+        header_line = header_scene.addLine(x, TOP_MARGIN - _GRID_TOP_OFFSET, x, header_stub_bottom,
+                                            QPen(_GRID_COLOR, 1))
+        header_line.setZValue(-2)
+        body_line = body_scene.addLine(x, TOP_MARGIN, x, chart_bottom, QPen(_GRID_COLOR, 1))
+        body_line.setZValue(-2)
         _add_fixed_size_label(
-            scene, tick_date.strftime("%m-%d"), task_font,
+            header_scene, tick_date.strftime("%m-%d"), task_font,
             (x + 2, TOP_MARGIN - _TICK_LABEL_OFFSET),
         )
         tick_date += timedelta(days=tick_step_days)
@@ -415,38 +459,33 @@ def build_gantt_scene(df, display, color_by="team"):
         text = f"{year_cursor.year}年"
         text_width = year_metrics.horizontalAdvance(text)
         _add_fixed_size_label(
-            scene, text, year_font,
+            header_scene, text, year_font,
             (center_x - text_width / 2, TOP_MARGIN - _YEAR_LABEL_OFFSET),
         )
         year_cursor = year_cursor.replace(year=year_cursor.year + 1)
 
     # -- マイルストーン（プロジェクト開始日含む）を縦線で表示 ------------------------
-    sorted_markers = sorted(milestone_markers, key=lambda m: m[2])
-    for i, (marker_id, label_text, date) in enumerate(sorted_markers):
+    # ラベルは「◆」を付けず、縦線を中心に左右均等に配置する（線がどのマイル
+    # ストーンを指しているか一目でわかり、線の片側だけに伸びるより見やすい）。
+    # ItemIgnoresTransformationsを立てた項目はsetPos自体はシーン座標のまま
+    # ズームの影響を受けるため、「中央揃え」を維持するオフセットは実際の表示
+    # 倍率が分かるタイミング（FrozenGanttPane._sync_panes）でしか正しく計算
+    # できない。ここでは対象を後で拾えるよう参照だけ残しておく。
+    header_scene.gantt_milestone_labels = []
+    for marker_id, label_text, date in milestone_markers:
         x = x_of(date)
         color = _PROJECT_START_COLOR if marker_id == "PROJECT_START" else _MILESTONE_COLOR
         pen = QPen(color, 2, Qt.DashLine)
-        line = scene.addLine(x, TOP_MARGIN - _GRID_TOP_OFFSET, x, chart_bottom, pen)
-        line.setZValue(-1)
-        full_text = f"◆{label_text}"
+        header_line = header_scene.addLine(x, TOP_MARGIN - _GRID_TOP_OFFSET, x, header_stub_bottom, pen)
+        header_line.setZValue(-1)
+        body_line = body_scene.addLine(x, TOP_MARGIN, x, chart_bottom, pen)
+        body_line.setZValue(-1)
         label = _add_fixed_size_label(
-            scene, full_text, job_font,
-            (x + 3, TOP_MARGIN - _MILESTONE_LABEL_OFFSET),
+            header_scene, label_text, job_font,
+            (x, TOP_MARGIN - _MILESTONE_LABEL_OFFSET),
             brush=QBrush(color), z_value=2,
         )
-        if marker_id == _last_milestone_id:
-            # 一番右（日付が最も遅い）マイルストーンは、既定の「線の右側」の
-            # ままだとチャート右端からラベルがはみ出して見切れる。
-            # ItemIgnoresTransformationsを立てた項目はsetPos自体はシーン座標の
-            # ままズームの影響を受けるため、「線の左側に反転させる」ための
-            # ピクセル単位オフセットや、直前のマイルストーンと重ならないよう
-            # 収める省略幅は、実際の表示倍率が分かるタイミング
-            # （FrozenGanttPane._sync_panes）でしか正しく計算できない。
-            # ここでは対象を特定できるよう必要な情報を参照として残しておく。
-            scene.gantt_last_milestone_label = label
-            scene.gantt_last_milestone_line_x = x
-            scene.gantt_last_milestone_full_text = full_text
-            scene.gantt_prev_milestone_line_x = x_of(sorted_markers[i - 1][2]) if i > 0 else None
+        header_scene.gantt_milestone_labels.append((label, x))
 
     # -- ジョブ／タスクのバーを描画 ---------------------------------------------------
     team_names = display.get("team_names") or {}
@@ -458,7 +497,7 @@ def build_gantt_scene(df, display, color_by="team"):
 
     for job_id, job_name, y_top, y_bottom, task_lane_pairs in job_blocks:
         _add_fixed_size_label(
-            scene, _elide_text(job_name, job_font, LEFT_MARGIN - 12), job_font,
+            column_scene, _elide_text(job_name, job_font, LEFT_MARGIN - 12), job_font,
             (4, (y_top + y_bottom) / 2 - 8),
         )
 
@@ -484,35 +523,33 @@ def build_gantt_scene(df, display, color_by="team"):
                 f'{r["Start_Date"].strftime("%Y-%m-%d")} 〜 {r["End_Date"].strftime("%Y-%m-%d")}'
                 + ("\n※リソース制約により前倒し" if r["Resource_Adjusted"] else "")
             )
-            scene.addItem(rect)
+            body_scene.addItem(rect)
 
             text = _elide_text(str(r["Task_Name"]), task_font, width - 6)
             if text:
                 task_label = QGraphicsSimpleTextItem(text)
                 task_label.setFont(task_font)
                 task_label.setPos(start_x + 3, y + BAR_MARGIN + 2)
-                scene.addItem(task_label)
+                body_scene.addItem(task_label)
 
-        boundary = scene.addLine(0, y_bottom + JOB_GAP / 2, chart_right, y_bottom + JOB_GAP / 2,
-                                  QPen(_GRID_COLOR, 1))
-        boundary.setZValue(-2)
+        column_boundary = column_scene.addLine(0, y_bottom + JOB_GAP / 2, column_stub_right, y_bottom + JOB_GAP / 2,
+                                                 QPen(_GRID_COLOR, 1))
+        column_boundary.setZValue(-2)
+        body_boundary = body_scene.addLine(LEFT_MARGIN, y_bottom + JOB_GAP / 2, chart_right, y_bottom + JOB_GAP / 2,
+                                            QPen(_GRID_COLOR, 1))
+        body_boundary.setZValue(-2)
 
-    scene.setSceneRect(0, 0, chart_right + 20, chart_bottom + 20)
-
-    # -- フリーズドペイン用の分割矩形 ------------------------------------------------
-    # 本体: 左列・ヘッダー行を除いたチャート本体（タスクバー・目盛り線・境界線）。
-    # ヘッダー: 本体と同じ横範囲、縦は日付軸・マイルストーン行のみ。
-    # 左列: 本体と同じ縦範囲、横は項目名列のみ。
-    # いずれも本体との共有軸（ヘッダーなら横、左列なら縦）の範囲・原点を本体と
-    # 揃えることで、GraphicsView間のスクロールバー可動域を一致させ、
+    # -- 各ペインの担当範囲（スクロールバー可動域の基準にする矩形） -------------------
+    # ヘッダー・左列は本体との共有軸（ヘッダーなら横、左列なら縦）の範囲・原点を
+    # 本体と揃えることで、GraphicsView間のスクロールバー可動域を一致させ、
     # スクロール位置をそのままコピーするだけでズレなく同期できるようにする。
-    scene.gantt_body_rect = QRectF(
+    header_scene.gantt_header_rect = QRectF(
+        LEFT_MARGIN, 0, chart_right - LEFT_MARGIN + 20, header_stub_bottom,
+    )
+    column_scene.gantt_column_rect = QRectF(
+        0, TOP_MARGIN, column_stub_right, chart_bottom - TOP_MARGIN + 20,
+    )
+    body_scene.gantt_body_rect = QRectF(
         LEFT_MARGIN, TOP_MARGIN, chart_right - LEFT_MARGIN + 20, chart_bottom - TOP_MARGIN + 20,
     )
-    scene.gantt_header_rect = QRectF(
-        LEFT_MARGIN, 0, chart_right - LEFT_MARGIN + 20, TOP_MARGIN + _PANE_PADDING,
-    )
-    scene.gantt_column_rect = QRectF(
-        0, TOP_MARGIN, LEFT_MARGIN + _PANE_PADDING, chart_bottom - TOP_MARGIN + 20,
-    )
-    return scene
+    return GanttScenes(header=header_scene, column=column_scene, body=body_scene)

@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.gantt_generator import compute_schedule, validate_for_generation
-from gui.gantt_view import FrozenGanttPane, build_gantt_scene
+from gui.gantt_view import FrozenGanttPane, build_gantt_scenes
 from gui.widgets_common import NoWheelComboBox
 from project_scheduler import SchedulingError
 
@@ -250,9 +250,9 @@ class GanttTab(QWidget):
             df = self._result_df[self._result_df["Workflow_ID"] == group_id]
             df = df[df["Team_ID"].isin(self._visible_filter_ids())]
             color_by = "team"
-        scene = build_gantt_scene(df, self._display, color_by=color_by)
-        self.view.setScene(scene)
-        if scene is not None:
+        scenes = build_gantt_scenes(df, self._display, color_by=color_by)
+        self.view.setScene(scenes)
+        if scenes is not None:
             # setScene直後はビューポートのジオメトリがまだ確定していないことが
             # あるため、次のイベントループでスケジュール全体が収まるようズームを
             # 合わせる（gui/node_canvas.py の fit_all() と同じ考え方）。
