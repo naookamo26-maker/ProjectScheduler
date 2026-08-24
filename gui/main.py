@@ -1,7 +1,7 @@
 """
 GUIエントリポイント（MainWindow）。
 
-3タブ（基本情報設定・ワークフロー設計・ジョブ）を束ね、
+4タブ（基本情報設定・ワークフロー設計・ジョブ・ガントチャート）を束ね、
 File メニューでプロジェクトファイル（.pschedule）の新規作成/オープンを行う。
 プロジェクトファイルをウィンドウにドラッグ&ドロップして開くこともできる。
 """
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 from gui.db import ProjectDatabase
 from gui.gantt_generator import generate_gantt, validate_for_generation
 from gui.tab_basic_info import BasicInfoTab
+from gui.tab_gantt import GanttTab
 from gui.tab_jobs import JobsTab
 from gui.tab_workflows import WorkflowsTab
 from project_scheduler import SchedulingError
@@ -103,6 +104,12 @@ class MainWindow(QMainWindow):
             ),
             "ジョブ",
         )
+        self.tabs.addTab(
+            self._placeholder_tab(
+                "現在の設定でのスケジューリング結果を、ファイル出力せずにその場で確認できます。"
+            ),
+            "ガントチャート",
+        )
         self.tabs.setEnabled(False)
 
     def _rebuild_tabs(self):
@@ -117,6 +124,9 @@ class MainWindow(QMainWindow):
 
         self.tab_jobs = JobsTab(self.db)
         self.tabs.addTab(self.tab_jobs, "ジョブ")
+
+        self.tab_gantt = GanttTab(self.db)
+        self.tabs.addTab(self.tab_gantt, "ガントチャート")
 
         self.tabs.setEnabled(True)
         self.tabs.currentChanged.connect(self._on_tab_changed)
