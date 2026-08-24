@@ -169,8 +169,14 @@ class GanttTab(QWidget):
         self._filter_dim = new_dim
         while self.legend_layout.count():
             item = self.legend_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            widget = item.widget()
+            if widget:
+                # deleteLater()だけだとレイアウトから外れた後も実際に破棄される
+                # （次のイベントループ）までウィジェットが古い位置に表示され続け、
+                # 新しく追加したチェックボックスと重なって古い表記が残って見える
+                # ことがあるため、hide()で即座に非表示にしてから破棄する。
+                widget.hide()
+                widget.deleteLater()
         self._filter_checks = {}
         if not self._display:
             return
