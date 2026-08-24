@@ -23,7 +23,7 @@ import heapq
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 _SCHEMA_SQL = """
 CREATE TABLE schema_meta (
@@ -256,6 +256,32 @@ class ProjectDatabase:
                     "UNIQUE(team_id, start_date))"
                 )
             version = "4"
+
+        if version == "4":
+            # v5: 「個別のタスク依存」を「依存先ジョブ」のリンクに従属させる設計に
+            # 統一した（GUI側、gui/tab_jobs.py）。旧バージョンでは依存先ジョブの
+            # リンクを作らずに個別のタスク依存だけを追加できたため、対応する
+            # job_dependency_links 行が無い (job_id, depends_on_job_id) の組が
+            # あれば補完する（新UIでタスク対応が見えなくなることを防ぐため）。
+            tables = {
+                r["name"] for r in
+                self._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if "job_external_dependencies" in tables and "job_dependency_links" in tables:
+                orphans = self._conn.execute(
+                    "SELECT DISTINCT d.job_id, d.depends_on_job_id "
+                    "FROM job_external_dependencies d "
+                    "WHERE NOT EXISTS ("
+                    "  SELECT 1 FROM job_dependency_links l "
+                    "  WHERE l.job_id = d.job_id AND l.depends_on_job_id = d.depends_on_job_id"
+                    ")"
+                ).fetchall()
+                for o in orphans:
+                    self._conn.execute(
+                        "INSERT INTO job_dependency_links(job_id, depends_on_job_id) VALUES (?, ?)",
+                        (o["job_id"], o["depends_on_job_id"]),
+                    )
+            version = "5"
 
         self._conn.execute(
             "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)
@@ -990,6 +1016,33 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def _upsert_dependency_pair(self, job_id, workflow_task_id, depends_on_job_id,
+                                 depends_on_workflow_task_id, source_link_id):
+        """依存テンプレートから展開されるタスク対応を追加する。同じ組み合わせ
+        （job_id, workflow_task_id, depends_on_job_id, depends_on_workflow_task_id
+        ——job_external_dependenciesのUNIQUEキーそのもの）の行が既に存在する
+        場合は重複させず、source_link_idが未設定（＝手動追加分）であれば
+        テンプレート由来として更新する（手動→自動への昇格）。どのタスク同士を
+        対応させるかという内容自体は複合キーなので、この昇格で変わらない。"""
+        existing = self._conn.execute(
+            "SELECT id, source_link_id FROM job_external_dependencies WHERE "
+            "job_id = ? AND workflow_task_id = ? AND depends_on_job_id = ? "
+            "AND depends_on_workflow_task_id = ?",
+            (job_id, workflow_task_id, depends_on_job_id, depends_on_workflow_task_id),
+        ).fetchone()
+        if existing is None:
+            self._conn.execute(
+                "INSERT INTO job_external_dependencies (job_id, workflow_task_id, "
+                "depends_on_job_id, depends_on_workflow_task_id, source_link_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (job_id, workflow_task_id, depends_on_job_id, depends_on_workflow_task_id, source_link_id),
+            )
+        elif existing["source_link_id"] is None:
+            self._conn.execute(
+                "UPDATE job_external_dependencies SET source_link_id = ? WHERE id = ?",
+                (source_link_id, existing["id"]),
+            )
+
     def add_job_dependency_link(self, job_id, depends_on_job_id):
         if job_id == depends_on_job_id:
             raise ProjectDatabaseError("同じジョブへの自己依存は設定できません")
@@ -1015,20 +1068,29 @@ class ProjectDatabase:
             (job["workflow_id"], depends_on_job["workflow_id"]),
         ).fetchall()
         for t in templates:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO job_external_dependencies "
-                "(job_id, workflow_task_id, depends_on_job_id, depends_on_workflow_task_id, "
-                "source_link_id) VALUES (?, ?, ?, ?, ?)",
-                (job_id, t["workflow_task_id"], depends_on_job_id,
-                 t["depends_on_workflow_task_id"], link_id),
+            self._upsert_dependency_pair(
+                job_id, t["workflow_task_id"], depends_on_job_id,
+                t["depends_on_workflow_task_id"], link_id,
             )
         self._commit()
         return link_id
 
     def delete_job_dependency_link(self, link_id):
         """CASCADEにより、このリンクから自動生成された job_external_dependencies
-        行（source_link_id が一致する行）も同時に削除される。手動追加行
-        （source_link_id が NULL）は影響を受けない。"""
+        行（source_link_id が一致する行）も同時に削除される。個別のタスク対応は
+        「依存先ジョブ」のリンクに従属する設計（GUI上、依存先ジョブを選んだ後に
+        タスク対応を選ぶ導線しか持たない）のため、同じ (job_id, depends_on_job_id)
+        を指す手動追加行（source_link_id が NULL）も合わせて削除する。"""
+        row = self._conn.execute(
+            "SELECT job_id, depends_on_job_id FROM job_dependency_links WHERE id = ?",
+            (link_id,),
+        ).fetchone()
+        if row is not None:
+            self._conn.execute(
+                "DELETE FROM job_external_dependencies WHERE job_id = ? "
+                "AND depends_on_job_id = ? AND source_link_id IS NULL",
+                (row["job_id"], row["depends_on_job_id"]),
+            )
         self._conn.execute("DELETE FROM job_dependency_links WHERE id = ?", (link_id,))
         self._commit()
 
@@ -1094,8 +1156,28 @@ class ProjectDatabase:
             )
         except sqlite3.IntegrityError as e:
             raise ProjectDatabaseError("このテンプレートは既に登録されています") from e
+        template_id = cur.lastrowid
+
+        # 既にこのワークフローペアで「依存先ジョブ」のリンクが張られているジョブが
+        # あれば、新しいテンプレートのタスク対応をそのリンクにも展開する
+        # （依存先ジョブを先に追加し、後からテンプレートを設定した場合の救済）。
+        # 手動で同じ対応が既に追加されていた場合は、重複させず自動生成扱いに
+        # 昇格する（_upsert_dependency_pair参照）。
+        links = self._conn.execute(
+            "SELECT l.id AS link_id, l.job_id, l.depends_on_job_id "
+            "FROM job_dependency_links l "
+            "JOIN jobs j ON j.id = l.job_id "
+            "JOIN jobs dj ON dj.id = l.depends_on_job_id "
+            "WHERE j.workflow_id = ? AND dj.workflow_id = ?",
+            (workflow_id, depends_on_workflow_id),
+        ).fetchall()
+        for link in links:
+            self._upsert_dependency_pair(
+                link["job_id"], workflow_task_id, link["depends_on_job_id"],
+                depends_on_workflow_task_id, link["link_id"],
+            )
         self._commit()
-        return cur.lastrowid
+        return template_id
 
     def update_dependency_template(self, template_id, workflow_task_id,
                                     depends_on_workflow_id, depends_on_workflow_task_id):

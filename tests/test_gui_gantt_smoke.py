@@ -199,6 +199,59 @@ def test_opening_pre_is_active_schema_migrates_and_defaults_to_active(tmp_path):
     db.close()
 
 
+def test_opening_legacy_file_backfills_missing_dependency_links(tmp_path):
+    """旧バージョンでは「依存先ジョブ」のリンクを作らずに個別のタスク依存だけを
+    追加できたため、そのような孤立したjob_external_dependencies行がある
+    .pscheduleファイルを開くと、対応するjob_dependency_links行が自動的に
+    補完されることを確認する（新UIはリンク経由でしかタスク対応を表示しない
+    ため、補完しないと既存データが見えなくなってしまう）。"""
+    import sqlite3
+
+    from gui.db import _SCHEMA_SQL
+
+    path = tmp_path / "legacy_v4.pschedule"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(_SCHEMA_SQL)
+    conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '4')")
+    conn.execute("INSERT INTO project(id, project_name, start_date) VALUES (1, '', '')")
+    team_id = conn.execute("INSERT INTO teams(name, max_lines) VALUES ('チームA', 1)").lastrowid
+    wf1 = conn.execute("INSERT INTO workflows(name, sort_order) VALUES ('WF1', 0)").lastrowid
+    wf2 = conn.execute("INSERT INTO workflows(name, sort_order) VALUES ('WF2', 1)").lastrowid
+    t1 = conn.execute(
+        "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days) VALUES (?, 'A', ?, 1)",
+        (wf1, team_id),
+    ).lastrowid
+    t2 = conn.execute(
+        "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days) VALUES (?, 'B', ?, 1)",
+        (wf2, team_id),
+    ).lastrowid
+    j1 = conn.execute(
+        "INSERT INTO jobs(name, workflow_id, priority) VALUES ('J1', ?, 100)", (wf1,)
+    ).lastrowid
+    j2 = conn.execute(
+        "INSERT INTO jobs(name, workflow_id, priority) VALUES ('J2', ?, 100)", (wf2,)
+    ).lastrowid
+    # job_dependency_links を経由しない「孤立した」個別のタスク依存（旧UIで作成可能だった）
+    conn.execute(
+        "INSERT INTO job_external_dependencies"
+        "(job_id, workflow_task_id, depends_on_job_id, depends_on_workflow_task_id) "
+        "VALUES (?, ?, ?, ?)",
+        (j1, t1, j2, t2),
+    )
+    conn.commit()
+    conn.close()
+
+    assert sqlite3.connect(str(path)).execute(
+        "SELECT COUNT(*) FROM job_dependency_links"
+    ).fetchone()[0] == 0  # 補完前は0件であることの前提確認
+
+    db = ProjectDatabase.open_existing(str(path))
+    links = db.list_job_dependency_links(j1)
+    assert len(links) == 1
+    assert links[0]["depends_on_job_id"] == j2
+    db.close()
+
+
 def test_duplicate_names_are_rejected(tmp_path):
     db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
     db.add_team("チームA", 1)
@@ -334,6 +387,59 @@ def test_dependency_template_rejects_direct_and_transitive_cycles(tmp_path):
     with pytest.raises(ProjectDatabaseError):
         db.update_dependency_template(tpl2, t2, wf1, t1)  # editing into a cycle
 
+    db.close()
+
+
+def test_adding_template_after_link_upgrades_matching_manual_pair(tmp_path):
+    """依存先ジョブのリンクを先に作り、タスク対応を手動で追加した後に、
+    ワークフロー設計タブで同じタスク同士の依存テンプレートを追加すると、
+    重複した行を作らず、既存の手動追加行を自動生成扱い（source_link_id設定）
+    に昇格させることを確認する。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    team_id = db.add_team("チームA", 1)
+    wf1 = db.add_workflow("WF1")
+    wf2 = db.add_workflow("WF2")
+    t1 = db.add_workflow_task(wf1, "A", team_id, 1)
+    t2 = db.add_workflow_task(wf2, "B", team_id, 1)
+    j1 = db.add_job("J1", wf1, None, 100)
+    j2 = db.add_job("J2", wf2, None, 100)
+
+    link_id = db.add_job_dependency_link(j1, j2)  # まだテンプレートは無い
+    db.add_external_dependency(j1, t1, j2, t2)  # 手動でタスク対応を追加
+
+    pairs_before = db.list_external_dependencies(job_id=j1)
+    assert len(pairs_before) == 1
+    assert pairs_before[0]["source_link_id"] is None  # 手動のまま
+
+    db.add_dependency_template(wf1, t1, wf2, t2)  # 同じタスク対応をテンプレート化
+
+    pairs_after = db.list_external_dependencies(job_id=j1)
+    assert len(pairs_after) == 1  # 重複せず1件のまま
+    assert pairs_after[0]["id"] == pairs_before[0]["id"]  # 同じ行が
+    assert pairs_after[0]["source_link_id"] == link_id  # 自動生成扱いに昇格
+    db.close()
+
+
+def test_adding_template_after_link_expands_to_existing_links_without_manual_pair(tmp_path):
+    """依存先ジョブのリンクだけがあり、まだタスク対応が無い状態でテンプレートを
+    追加すると、既存のリンクにもそのタスク対応が自動的に展開されること。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    team_id = db.add_team("チームA", 1)
+    wf1 = db.add_workflow("WF1")
+    wf2 = db.add_workflow("WF2")
+    t1 = db.add_workflow_task(wf1, "A", team_id, 1)
+    t2 = db.add_workflow_task(wf2, "B", team_id, 1)
+    j1 = db.add_job("J1", wf1, None, 100)
+    j2 = db.add_job("J2", wf2, None, 100)
+
+    link_id = db.add_job_dependency_link(j1, j2)
+    assert db.list_external_dependencies(job_id=j1) == []
+
+    db.add_dependency_template(wf1, t1, wf2, t2)
+
+    pairs = db.list_external_dependencies(job_id=j1)
+    assert len(pairs) == 1
+    assert pairs[0]["source_link_id"] == link_id
     db.close()
 
 
