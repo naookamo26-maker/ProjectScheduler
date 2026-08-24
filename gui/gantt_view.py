@@ -46,6 +46,11 @@ class GanttGraphicsView(QGraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setRenderHints(self.renderHints())
+        # 文字色は常に黒固定（QGraphicsSimpleTextItemの既定）で描画しているため、
+        # OSがダークモードだと既定の（ダークな）ビュー背景に文字が埋もれて
+        # 読めなくなる。この独自キャンバスはOSのテーマに関わらず常に明るい
+        # 背景で描くようにし、文字色との組み合わせを固定して視認性を保つ。
+        self.setBackgroundBrush(QBrush(QColor("#fdfcf9")))
         self._panning = False
         self._pan_last_pos = None
 

@@ -104,6 +104,7 @@ class GanttTab(QWidget):
         現在のDB内容でスケジューリングを実行し直す。"""
         errors = validate_for_generation(self.db)
         if errors:
+            self._clear_chart_state("生成できません。\n- " + "\n- ".join(errors))
             QMessageBox.warning(
                 self, "生成できません",
                 "以下を解決してから再度お試しください:\n\n- " + "\n- ".join(errors),
@@ -112,6 +113,7 @@ class GanttTab(QWidget):
         try:
             self._result_df, self._display = compute_schedule(self.db, verbose=False)
         except SchedulingError as e:
+            self._clear_chart_state(f"生成に失敗しました: {e}")
             QMessageBox.critical(self, "生成に失敗しました", str(e))
             return
 
@@ -127,6 +129,26 @@ class GanttTab(QWidget):
                 f"{len(self._result_df)}件のタスクを生成しました"
                 f"（うちリソース制約による前倒し ⚠ {adjusted}件、赤枠のバーで表示）。"
             )
+
+    def _clear_chart_state(self, status_message):
+        """スケジューリングに失敗した場合に、前回の生成結果（チャート・凡例・
+        対象コンボ）を全てクリアする。クリアしないと、直前まで表示していた
+        古い結果が失敗後もそのまま残ってしまい、あたかも最新の内容であるかの
+        ように誤解させてしまうため。"""
+        self._result_df = None
+        self._display = None
+        self.view.setScene(None)
+        self.group_combo.blockSignals(True)
+        self.group_combo.clear()
+        self.group_combo.blockSignals(False)
+        while self.legend_layout.count():
+            item = self.legend_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.hide()
+                widget.deleteLater()
+        self._filter_checks = {}
+        self.status_label.setText(status_message)
 
     def _on_mode_changed(self):
         self._refresh_group_choices()
