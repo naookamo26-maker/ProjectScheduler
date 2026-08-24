@@ -21,6 +21,7 @@ from datetime import timedelta
 from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPen, QTransform
 from PySide6.QtWidgets import (
+    QGraphicsItem,
     QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
@@ -33,9 +34,16 @@ DAY_WIDTH = 10
 ROW_HEIGHT = 26
 BAR_MARGIN = 3
 LEFT_MARGIN = 190
-TOP_MARGIN = 46
+# ヘッダーは上から (1)マイルストーン名 (2)年 (3)月日 の3段構成のため、
+# 目盛り1段のみだった頃より高さが必要。
+TOP_MARGIN = 58
 JOB_GAP = 6
 AXIS_MARGIN_DAYS = 3
+# ヘッダー内の各段のY位置（TOP_MARGINからの差分。値が大きいほど上）。
+_MILESTONE_LABEL_OFFSET = 56
+_YEAR_LABEL_OFFSET = 38
+_TICK_LABEL_OFFSET = 22
+_GRID_TOP_OFFSET = 10
 # ヘッダー／左列ペインの表示専用の余白（罫線がペイン端で見切れないように）。
 _PANE_PADDING = 10
 
@@ -228,6 +236,48 @@ class FrozenGanttPane(QWidget):
         self.column.setTransform(column_transform)
         self.column.verticalScrollBar().setValue(self.body.verticalScrollBar().value())
 
+        self._reposition_last_milestone_label(sx)
+
+    def _reposition_last_milestone_label(self, sx):
+        """一番右のマイルストーンラベルが常にチャート右端に収まるよう、
+        線の右側／左側のどちらに表示するかをその都度計算し直す。
+        ItemIgnoresTransformationsを立てた項目のsetPos()はシーン座標系の
+        ままなので、画面上で一定のピクセル数だけ線の反対側へずらすには、
+        現在の横方向の拡縮率(sx)で割ってシーン座標に変換する必要がある。
+        左側に反転させた場合、直前のマイルストーンの縦線と重ならないよう、
+        必要なら（項目名などと同じ）省略表示にして収める。"""
+        scene = self.body.scene()
+        if scene is None or sx <= 0:
+            return
+        label = getattr(scene, "gantt_last_milestone_label", None)
+        line_x = getattr(scene, "gantt_last_milestone_line_x", None)
+        if label is None or line_x is None:
+            return
+        full_text = getattr(scene, "gantt_last_milestone_full_text", label.text())
+        prev_x = getattr(scene, "gantt_prev_milestone_line_x", None)
+        header_rect = getattr(scene, "gantt_header_rect", None)
+
+        metrics = QFontMetrics(label.font())
+        natural_width_px = metrics.horizontalAdvance(full_text)
+        fits_on_right = header_rect is None or \
+            (header_rect.right() - (line_x + 3)) * sx >= natural_width_px
+
+        if fits_on_right:
+            if label.text() != full_text:
+                label.setText(full_text)
+            label.setPos(line_x + 3 / sx, label.y())
+            return
+
+        text = full_text
+        if prev_x is not None:
+            available_px = (line_x - 3 - prev_x) * sx
+            if available_px > 0:
+                text = metrics.elidedText(full_text, Qt.ElideRight, int(available_px))
+        if label.text() != text:
+            label.setText(text)
+        text_width_px = metrics.horizontalAdvance(text)
+        label.setPos(line_x - (3 + text_width_px) / sx, label.y())
+
 
 def _pack_lanes(tasks):
     """tasks: 開始日昇順に並んだタスク（各要素は 'start'/'end' キーを持つ辞書）。
@@ -254,6 +304,24 @@ def _elide_text(text, font, max_width):
     return metrics.elidedText(text, Qt.ElideRight, int(max_width))
 
 
+def _add_fixed_size_label(scene, text, font, pos, brush=None, z_value=None):
+    """日付・マイルストーン・項目名のラベル用。ItemIgnoresTransformationsを
+    立てることで、ヘッダー／左列ペインの拡縮（本体に追従する軸方向の縮尺）に
+    よらず常に一定の文字サイズ・縦横比で表示されるようにする（親ビューの
+    変換を無視して等倍描画される）。位置(pos)はシーン座標のまま指定でき、
+    描画時にその位置へマッピングされる。"""
+    label = QGraphicsSimpleTextItem(text)
+    label.setFont(font)
+    if brush is not None:
+        label.setBrush(brush)
+    label.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+    label.setPos(*pos)
+    if z_value is not None:
+        label.setZValue(z_value)
+    scene.addItem(label)
+    return label
+
+
 def build_gantt_scene(df, display, color_by="team"):
     """df: result_df を表示対象（1ワークフロー分、または1チーム分）に絞り込んだ
     もの。display: compute_schedule()の2番目の戻り値。QGraphicsScene を組み立てて
@@ -277,6 +345,13 @@ def build_gantt_scene(df, display, color_by="team"):
     axis_start = axis_start - timedelta(days=AXIS_MARGIN_DAYS)
     axis_end = axis_end + timedelta(days=AXIS_MARGIN_DAYS)
     total_days = max((axis_end - axis_start).days, 1)
+    # マイルストーンのラベルは通常、縦線の右側に伸びる。一番右（日付が最も
+    # 遅い）マイルストーンだとラベルがチャートの右端からはみ出して見切れて
+    # しまうため、そのラベルだけ縦線の左側に伸びるよう反転させる。ラベル幅は
+    # 拡縮の影響を受けない固定サイズ（ItemIgnoresTransformations）なので、
+    # 軸の余白日数を増やす対策ではズームレベルによって効果が変わってしまい
+    # 根本解決にならない——常に線を跨いで反対側に逃がすほうが確実。
+    _last_milestone_id = max(milestone_markers, key=lambda m: m[2])[0] if milestone_markers else None
 
     def x_of(date):
         return LEFT_MARGIN + (date - axis_start).days * DAY_WIDTH
@@ -306,6 +381,9 @@ def build_gantt_scene(df, display, color_by="team"):
     chart_right = x_of(axis_end)
 
     # -- 日付軸（週単位の目盛り、期間が長い場合は間引く） -----------------------------
+    # 目盛りラベルは年をまたいでも「YYYY-MM-DD」を毎回繰り返すと横に長く冗長なため、
+    # 月日のみを目盛りごとに、年は表示範囲に含まれる年ごとに上段中央へ1回だけ表示する
+    # 2段構成にする。
     tick_step_days = 7
     if total_days > 365:
         tick_step_days = 28
@@ -317,27 +395,58 @@ def build_gantt_scene(df, display, color_by="team"):
     tick_date = tick_date + timedelta(days=(7 - tick_date.weekday()) % 7)
     while tick_date <= axis_end:
         x = x_of(tick_date)
-        line = scene.addLine(x, TOP_MARGIN - 10, x, chart_bottom, QPen(_GRID_COLOR, 1))
+        line = scene.addLine(x, TOP_MARGIN - _GRID_TOP_OFFSET, x, chart_bottom, QPen(_GRID_COLOR, 1))
         line.setZValue(-2)
-        label = QGraphicsSimpleTextItem(tick_date.strftime("%Y-%m-%d"))
-        label.setPos(x + 2, TOP_MARGIN - 26)
-        label.setFont(task_font)
-        scene.addItem(label)
+        _add_fixed_size_label(
+            scene, tick_date.strftime("%m-%d"), task_font,
+            (x + 2, TOP_MARGIN - _TICK_LABEL_OFFSET),
+        )
         tick_date += timedelta(days=tick_step_days)
 
+    year_font = QFont(task_font)
+    year_font.setBold(True)
+    year_metrics = QFontMetrics(year_font)
+    year_cursor = axis_start.replace(month=1, day=1)
+    while year_cursor <= axis_end:
+        year_end = year_cursor.replace(month=12, day=31)
+        span_start = max(axis_start, year_cursor)
+        span_end = min(axis_end, year_end)
+        center_x = (x_of(span_start) + x_of(span_end)) / 2
+        text = f"{year_cursor.year}年"
+        text_width = year_metrics.horizontalAdvance(text)
+        _add_fixed_size_label(
+            scene, text, year_font,
+            (center_x - text_width / 2, TOP_MARGIN - _YEAR_LABEL_OFFSET),
+        )
+        year_cursor = year_cursor.replace(year=year_cursor.year + 1)
+
     # -- マイルストーン（プロジェクト開始日含む）を縦線で表示 ------------------------
-    for marker_id, label_text, date in milestone_markers:
+    sorted_markers = sorted(milestone_markers, key=lambda m: m[2])
+    for i, (marker_id, label_text, date) in enumerate(sorted_markers):
         x = x_of(date)
         color = _PROJECT_START_COLOR if marker_id == "PROJECT_START" else _MILESTONE_COLOR
         pen = QPen(color, 2, Qt.DashLine)
-        line = scene.addLine(x, TOP_MARGIN - 10, x, chart_bottom, pen)
+        line = scene.addLine(x, TOP_MARGIN - _GRID_TOP_OFFSET, x, chart_bottom, pen)
         line.setZValue(-1)
-        label = QGraphicsSimpleTextItem(f"◆{label_text}")
-        label.setFont(job_font)
-        label.setBrush(QBrush(color))
-        label.setPos(x + 3, TOP_MARGIN - 44)
-        label.setZValue(2)
-        scene.addItem(label)
+        full_text = f"◆{label_text}"
+        label = _add_fixed_size_label(
+            scene, full_text, job_font,
+            (x + 3, TOP_MARGIN - _MILESTONE_LABEL_OFFSET),
+            brush=QBrush(color), z_value=2,
+        )
+        if marker_id == _last_milestone_id:
+            # 一番右（日付が最も遅い）マイルストーンは、既定の「線の右側」の
+            # ままだとチャート右端からラベルがはみ出して見切れる。
+            # ItemIgnoresTransformationsを立てた項目はsetPos自体はシーン座標の
+            # ままズームの影響を受けるため、「線の左側に反転させる」ための
+            # ピクセル単位オフセットや、直前のマイルストーンと重ならないよう
+            # 収める省略幅は、実際の表示倍率が分かるタイミング
+            # （FrozenGanttPane._sync_panes）でしか正しく計算できない。
+            # ここでは対象を特定できるよう必要な情報を参照として残しておく。
+            scene.gantt_last_milestone_label = label
+            scene.gantt_last_milestone_line_x = x
+            scene.gantt_last_milestone_full_text = full_text
+            scene.gantt_prev_milestone_line_x = x_of(sorted_markers[i - 1][2]) if i > 0 else None
 
     # -- ジョブ／タスクのバーを描画 ---------------------------------------------------
     team_names = display.get("team_names") or {}
@@ -348,10 +457,10 @@ def build_gantt_scene(df, display, color_by="team"):
         color_map, color_key = (display.get("team_colors") or {}), "Team_ID"
 
     for job_id, job_name, y_top, y_bottom, task_lane_pairs in job_blocks:
-        job_label = QGraphicsSimpleTextItem(_elide_text(job_name, job_font, LEFT_MARGIN - 12))
-        job_label.setFont(job_font)
-        job_label.setPos(4, (y_top + y_bottom) / 2 - 8)
-        scene.addItem(job_label)
+        _add_fixed_size_label(
+            scene, _elide_text(job_name, job_font, LEFT_MARGIN - 12), job_font,
+            (4, (y_top + y_bottom) / 2 - 8),
+        )
 
         for r, lane in task_lane_pairs:
             y = y_top + lane * ROW_HEIGHT
