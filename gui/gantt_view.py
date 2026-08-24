@@ -62,7 +62,6 @@ _PANE_PADDING = 10
 # よう、内容をビューポートよりわずかに大きく保つための安全マージン(px)。
 _SCALE_FLOOR_MARGIN_PX = 4
 
-_ADJUSTED_BORDER = QColor("#c0392b")
 _GRID_COLOR = QColor("#e1e0d9")
 _MILESTONE_COLOR = QColor("#c0392b")
 _PROJECT_START_COLOR = QColor("#52514e")
@@ -82,9 +81,14 @@ class GanttGraphicsView(QGraphicsView):
     縦方向のみ、修飾キーなしなら従来通り両方向を拡縮する。
 
     変換／スクロール位置が変わるたびに transformChanged を発火し、
-    FrozenGanttPane がヘッダー・左列ペインを追従させる。"""
+    FrozenGanttPane がヘッダー・左列ペインを追従させる。タスクバーは
+    選択可能（ラバーバンド選択・クリック選択）にしてあり、Aキーで全体表示、
+    Fキーで選択中のタスクへズームする（gui/node_canvas.py の
+    WorkflowGraphView と同じキー操作）。"""
 
     transformChanged = Signal()
+    fitAllRequested = Signal()
+    fitSelectedRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -94,12 +98,24 @@ class GanttGraphicsView(QGraphicsView):
         # 読めなくなる。この独自キャンバスはOSのテーマに関わらず常に明るい
         # 背景で描くようにし、文字色との組み合わせを固定して視認性を保つ。
         self.setBackgroundBrush(QBrush(_PANE_BG))
+        self.setDragMode(QGraphicsView.RubberBandDrag)
         self._panning = False
         self._pan_last_pos = None
         h_bar = self.horizontalScrollBar()
         v_bar = self.verticalScrollBar()
         h_bar.valueChanged.connect(self.transformChanged)
         v_bar.valueChanged.connect(self.transformChanged)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_A:
+            self.fitAllRequested.emit()
+            event.accept()
+            return
+        if event.key() == Qt.Key_F:
+            self.fitSelectedRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def wheelEvent(self, event):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
@@ -239,6 +255,8 @@ class FrozenGanttPane(QWidget):
         grid.setRowStretch(1, 1)
 
         self.body.transformChanged.connect(self._sync_panes)
+        self.body.fitAllRequested.connect(self.fit_all)
+        self.body.fitSelectedRequested.connect(self.fit_selected)
 
     def setScene(self, scenes):
         if scenes is None:
@@ -276,6 +294,26 @@ class FrozenGanttPane(QWidget):
         # ガントチャートは横（時間軸）と縦（行数）で必要な縮尺が大きく異なる
         # ことが多い。KeepAspectRatioだと縦横比を保つために片方が余ってしまう
         # ため、IgnoreAspectRatioで縦横それぞれ独立にビューいっぱいへ広げる。
+        self.body.fitInView(rect, Qt.IgnoreAspectRatio)
+        self.body._clamp_scale()
+        self._sync_panes()
+
+    def fit_selected(self):
+        """選択中のタスクバーだけが収まるようにズームを合わせる（Fキー）。
+        選択が無ければ全体表示にフォールバックする
+        （gui/node_canvas.py の fit_selected() と同じ考え方）。"""
+        scene = self.body.scene()
+        if scene is None:
+            return
+        selected = scene.selectedItems()
+        if not selected:
+            self.fit_all()
+            return
+        rect = QRectF()
+        for item in selected:
+            rect = rect.united(item.sceneBoundingRect())
+        margin = 20
+        rect = rect.adjusted(-margin, -margin, margin, margin)
         self.body.fitInView(rect, Qt.IgnoreAspectRatio)
         self.body._clamp_scale()
         self._sync_panes()
@@ -508,12 +546,11 @@ def build_gantt_scenes(df, display, color_by="team"):
             width = max(end_x - start_x, 2)
             color_hex = color_map.get(r[color_key], _DEFAULT_BAR_COLOR)
 
-            rect = QGraphicsRectItem(QRectF(start_x, y + BAR_MARGIN, width, ROW_HEIGHT - BAR_MARGIN * 2))
+            bar_height = ROW_HEIGHT - BAR_MARGIN * 2
+            rect = QGraphicsRectItem(QRectF(start_x, y + BAR_MARGIN, width, bar_height))
             rect.setBrush(QBrush(QColor(color_hex)))
-            if r["Resource_Adjusted"]:
-                rect.setPen(QPen(_ADJUSTED_BORDER, 2))
-            else:
-                rect.setPen(QPen(QColor("#0b0b0b"), 1))
+            rect.setPen(QPen(QColor("#0b0b0b"), 1))
+            rect.setFlag(QGraphicsItem.ItemIsSelectable, True)
             team_name = team_names.get(r["Team_ID"], str(r["Team_ID"]))
             workflow_name = workflow_names.get(r["Workflow_ID"], str(r["Workflow_ID"]))
             rect.setToolTip(
@@ -529,7 +566,13 @@ def build_gantt_scenes(df, display, color_by="team"):
             if text:
                 task_label = QGraphicsSimpleTextItem(text)
                 task_label.setFont(task_font)
-                task_label.setPos(start_x + 3, y + BAR_MARGIN + 2)
+                metrics = QFontMetrics(task_font)
+                text_width = metrics.horizontalAdvance(text)
+                text_height = metrics.height()
+                task_label.setPos(
+                    start_x + (width - text_width) / 2,
+                    y + BAR_MARGIN + (bar_height - text_height) / 2,
+                )
                 body_scene.addItem(task_label)
 
         column_boundary = column_scene.addLine(0, y_bottom + JOB_GAP / 2, column_stub_right, y_bottom + JOB_GAP / 2,

@@ -70,10 +70,10 @@ class GanttTab(QWidget):
         self.group_combo.currentIndexChanged.connect(self._refresh_chart)
         toolbar.addWidget(self.group_combo)
         toolbar.addSpacing(16)
-        fit_btn = QPushButton("全体表示")
-        fit_btn.clicked.connect(self._fit_chart_view)
-        toolbar.addWidget(fit_btn)
-        toolbar.addWidget(QLabel("（ホイールでズーム、Ctrl+ホイールで横のみ、Shift+ホイールで縦のみ、中ボタンドラッグでパン）"))
+        toolbar.addWidget(QLabel(
+            "（ホイールでズーム、Ctrl+ホイールで横のみ、Shift+ホイールで縦のみ、中ボタンドラッグでパン、"
+            "Aキーで全体表示、Fキーで選択中のタスクにズーム）"
+        ))
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
 
@@ -124,11 +124,7 @@ class GanttTab(QWidget):
         if self._result_df.empty:
             self.status_label.setText("有効なタスクがありません。")
         else:
-            adjusted = int(self._result_df["Resource_Adjusted"].sum())
-            self.status_label.setText(
-                f"{len(self._result_df)}件のタスクを生成しました"
-                f"（うちリソース制約による前倒し ⚠ {adjusted}件、赤枠のバーで表示）。"
-            )
+            self.status_label.setText(f"{len(self._result_df)}件のタスクを生成しました。")
 
     def _clear_chart_state(self, status_message):
         """スケジューリングに失敗した場合に、前回の生成結果（チャート・凡例・
