@@ -1,0 +1,249 @@
+"""
+「ガントチャート」タブ（gui/tab_gantt.py）用の独自描画部品（段階2）。
+
+HTMLに頼らず、gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで
+ツール内に直接バーチャートを描画する。データは gui/gantt_generator.py の
+compute_schedule() が返す result_df（1ワークフロー分に絞り込み済み）と
+display（チーム色・表示名・マイルストーン一覧）をそのまま使う。
+
+レーン詰め（同じジョブ内で時間的に重ならないタスクは同じ行にまとめる）は
+project_scheduler.py の export_plotly_gantt が持つ考え方を踏襲している。
+"""
+
+from datetime import timedelta
+
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPen
+from PySide6.QtWidgets import (
+    QGraphicsRectItem,
+    QGraphicsScene,
+    QGraphicsSimpleTextItem,
+    QGraphicsView,
+)
+
+DAY_WIDTH = 10
+ROW_HEIGHT = 26
+BAR_MARGIN = 3
+LEFT_MARGIN = 190
+TOP_MARGIN = 46
+JOB_GAP = 6
+AXIS_MARGIN_DAYS = 3
+
+_ADJUSTED_BORDER = QColor("#c0392b")
+_GRID_COLOR = QColor("#e1e0d9")
+_MILESTONE_COLOR = QColor("#c0392b")
+_PROJECT_START_COLOR = QColor("#52514e")
+_DEFAULT_BAR_COLOR = "#898781"
+
+
+class GanttGraphicsView(QGraphicsView):
+    """ホイールでズーム、中ボタンドラッグでパン
+    （gui/node_canvas.py の WorkflowGraphView と同じ操作感）。ガントチャートは
+    時間軸（横）と行数（縦）の縮尺を別々に調整したいことが多いため、
+    Ctrlを押しながらのホイールで横方向のみ、Shiftを押しながらのホイールで
+    縦方向のみ、修飾キーなしなら従来通り両方向を拡縮する。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setRenderHints(self.renderHints())
+        self._panning = False
+        self._pan_last_pos = None
+
+    def wheelEvent(self, event):
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        modifiers = event.modifiers()
+        if modifiers & Qt.ControlModifier:
+            self.scale(factor, 1.0)
+        elif modifiers & Qt.ShiftModifier:
+            self.scale(1.0, factor)
+        else:
+            self.scale(factor, factor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MiddleButton:
+            self._panning = True
+            self._pan_last_pos = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._panning:
+            delta = event.pos() - self._pan_last_pos
+            self._pan_last_pos = event.pos()
+            h_bar = self.horizontalScrollBar()
+            v_bar = self.verticalScrollBar()
+            h_bar.setValue(h_bar.value() - delta.x())
+            v_bar.setValue(v_bar.value() - delta.y())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MiddleButton and self._panning:
+            self._panning = False
+            self._pan_last_pos = None
+            self.setCursor(Qt.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+def _pack_lanes(tasks):
+    """tasks: 開始日昇順に並んだタスク（各要素は 'start'/'end' キーを持つ辞書）。
+    時間的に重ならないタスクは同じレーンに詰め、各タスクにレーン番号（0始まり）を
+    割り当てる。Returns: (レーン番号のリスト, 総レーン数)。"""
+    lane_end_dates = []
+    lanes = []
+    for t in tasks:
+        placed = False
+        for lane_idx, end_date in enumerate(lane_end_dates):
+            if t["start"] >= end_date:
+                lane_end_dates[lane_idx] = t["end"]
+                lanes.append(lane_idx)
+                placed = True
+                break
+        if not placed:
+            lane_end_dates.append(t["end"])
+            lanes.append(len(lane_end_dates) - 1)
+    return lanes, len(lane_end_dates)
+
+
+def _elide_text(text, font, max_width):
+    metrics = QFontMetrics(font)
+    return metrics.elidedText(text, Qt.ElideRight, int(max_width))
+
+
+def build_gantt_scene(df, display, color_by="team"):
+    """df: result_df を表示対象（1ワークフロー分、または1チーム分）に絞り込んだ
+    もの。display: compute_schedule()の2番目の戻り値。QGraphicsScene を組み立てて
+    返す（絞り込んだ結果が空ならNoneを返す）。
+
+    color_by: "team"（既定、ワークフロー別表示用——同じワークフロー内で担当
+    チームを見分けたい）または "workflow"（チーム別表示用——1チームに
+    絞り込まれている代わりに、どのワークフローの仕事かを見分けたい）。"""
+    if df.empty:
+        return None
+
+    milestone_markers = display.get("milestone_markers") or []
+    axis_start = min(df["Start_Date"].min(), *(m[2] for m in milestone_markers)) if milestone_markers \
+        else df["Start_Date"].min()
+    axis_end = max(df["End_Date"].max(), *(m[2] for m in milestone_markers)) if milestone_markers \
+        else df["End_Date"].max()
+    axis_start = axis_start - timedelta(days=AXIS_MARGIN_DAYS)
+    axis_end = axis_end + timedelta(days=AXIS_MARGIN_DAYS)
+    total_days = max((axis_end - axis_start).days, 1)
+
+    def x_of(date):
+        return LEFT_MARGIN + (date - axis_start).days * DAY_WIDTH
+
+    scene = QGraphicsScene()
+    task_font = QFont()
+    task_font.setPointSize(9)
+    job_font = QFont()
+    job_font.setPointSize(9)
+    job_font.setBold(True)
+
+    # -- ジョブごとにレーン詰め、Y座標を決める --------------------------------------
+    job_order = df.groupby("Job_ID")["Start_Date"].min().sort_values().index.tolist()
+    y_cursor = TOP_MARGIN
+    job_blocks = []  # (job_id, job_name, y_top, y_bottom, [(task_row, lane), ...])
+    for job_id in job_order:
+        job_rows = df[df["Job_ID"] == job_id].sort_values("Start_Date")
+        tasks = [{"start": r["Start_Date"], "end": r["End_Date"]} for _, r in job_rows.iterrows()]
+        lanes, lane_count = _pack_lanes(tasks)
+        y_top = y_cursor
+        y_bottom = y_top + lane_count * ROW_HEIGHT
+        job_blocks.append((job_id, str(job_rows.iloc[0]["Job_Name"]), y_top, y_bottom,
+                            list(zip(job_rows.to_dict("records"), lanes))))
+        y_cursor = y_bottom + JOB_GAP
+
+    chart_bottom = y_cursor
+    chart_right = x_of(axis_end)
+
+    # -- 日付軸（週単位の目盛り、期間が長い場合は間引く） -----------------------------
+    tick_step_days = 7
+    if total_days > 365:
+        tick_step_days = 28
+    elif total_days > 120:
+        tick_step_days = 14
+
+    tick_date = axis_start
+    # 最初の目盛りを月曜に揃える
+    tick_date = tick_date + timedelta(days=(7 - tick_date.weekday()) % 7)
+    while tick_date <= axis_end:
+        x = x_of(tick_date)
+        line = scene.addLine(x, TOP_MARGIN - 10, x, chart_bottom, QPen(_GRID_COLOR, 1))
+        line.setZValue(-2)
+        label = QGraphicsSimpleTextItem(tick_date.strftime("%Y-%m-%d"))
+        label.setPos(x + 2, TOP_MARGIN - 26)
+        label.setFont(task_font)
+        scene.addItem(label)
+        tick_date += timedelta(days=tick_step_days)
+
+    # -- マイルストーン（プロジェクト開始日含む）を縦線で表示 ------------------------
+    for marker_id, label_text, date in milestone_markers:
+        x = x_of(date)
+        color = _PROJECT_START_COLOR if marker_id == "PROJECT_START" else _MILESTONE_COLOR
+        pen = QPen(color, 2, Qt.DashLine)
+        line = scene.addLine(x, TOP_MARGIN - 10, x, chart_bottom, pen)
+        line.setZValue(-1)
+        label = QGraphicsSimpleTextItem(f"◆{label_text}")
+        label.setFont(job_font)
+        label.setBrush(QBrush(color))
+        label.setPos(x + 3, TOP_MARGIN - 44)
+        label.setZValue(2)
+        scene.addItem(label)
+
+    # -- ジョブ／タスクのバーを描画 ---------------------------------------------------
+    team_names = display.get("team_names") or {}
+    workflow_names = display.get("workflow_names") or {}
+    if color_by == "workflow":
+        color_map, color_key = (display.get("workflow_colors") or {}), "Workflow_ID"
+    else:
+        color_map, color_key = (display.get("team_colors") or {}), "Team_ID"
+
+    for job_id, job_name, y_top, y_bottom, task_lane_pairs in job_blocks:
+        job_label = QGraphicsSimpleTextItem(_elide_text(job_name, job_font, LEFT_MARGIN - 12))
+        job_label.setFont(job_font)
+        job_label.setPos(4, (y_top + y_bottom) / 2 - 8)
+        scene.addItem(job_label)
+
+        for r, lane in task_lane_pairs:
+            y = y_top + lane * ROW_HEIGHT
+            start_x = x_of(r["Start_Date"])
+            end_x = x_of(r["End_Date"])
+            width = max(end_x - start_x, 2)
+            color_hex = color_map.get(r[color_key], _DEFAULT_BAR_COLOR)
+
+            rect = QGraphicsRectItem(QRectF(start_x, y + BAR_MARGIN, width, ROW_HEIGHT - BAR_MARGIN * 2))
+            rect.setBrush(QBrush(QColor(color_hex)))
+            if r["Resource_Adjusted"]:
+                rect.setPen(QPen(_ADJUSTED_BORDER, 2))
+            else:
+                rect.setPen(QPen(QColor("#0b0b0b"), 1))
+            team_name = team_names.get(r["Team_ID"], str(r["Team_ID"]))
+            workflow_name = workflow_names.get(r["Workflow_ID"], str(r["Workflow_ID"]))
+            rect.setToolTip(
+                f'{job_name} / {r["Task_Name"]}\n'
+                f'ワークフロー: {workflow_name}\n'
+                f'チーム: {team_name}\n'
+                f'{r["Start_Date"].strftime("%Y-%m-%d")} 〜 {r["End_Date"].strftime("%Y-%m-%d")}'
+                + ("\n※リソース制約により前倒し" if r["Resource_Adjusted"] else "")
+            )
+            scene.addItem(rect)
+
+            text = _elide_text(str(r["Task_Name"]), task_font, width - 6)
+            if text:
+                task_label = QGraphicsSimpleTextItem(text)
+                task_label.setFont(task_font)
+                task_label.setPos(start_x + 3, y + BAR_MARGIN + 2)
+                scene.addItem(task_label)
+
+        boundary = scene.addLine(0, y_bottom + JOB_GAP / 2, chart_right, y_bottom + JOB_GAP / 2,
+                                  QPen(_GRID_COLOR, 1))
+        boundary.setZValue(-2)
+
+    scene.setSceneRect(0, 0, chart_right + 20, chart_bottom + 20)
+    return scene

@@ -8,7 +8,11 @@ DB（ProjectDatabase）の内容から project_scheduler.py を直接呼び出�
 
 import pandas as pd
 
-from project_scheduler import run_resource_constrained_scheduler_from_frames
+from project_scheduler import (
+    _TEAM_COLOR_OVERFLOW,
+    _build_team_color_map,
+    run_resource_constrained_scheduler_from_frames,
+)
 
 
 def _fmt(prefix, entity_id, width=3):
@@ -147,6 +151,68 @@ def build_frames(db):
         "holidays": df_holidays, "external_dependencies": df_extdeps,
         "team_capacity": df_team_capacity,
     }
+
+
+def compute_schedule(db, **scheduler_kwargs):
+    """DBの現在の設定でスケジューリングだけを実行し、ファイル出力せずに結果を
+    返す（「ガントチャート」タブでのプレビュー用途、gui/tab_gantt.py参照。
+    メニューの generate_gantt() はファイル出力までを一度に行うのに対し、
+    こちらはタブ内表示に必要な最小限の表示用補助情報だけを添えて返す）。
+
+    Returns: (result_df, display) のタプル。
+      result_df: run_resource_constrained_scheduler_from_frames() の戻り値そのもの。
+      display: 表示用の補助情報を持つ辞書
+        - team_names: {Team_ID(文字列): チーム名}
+        - team_colors: {Team_ID(文字列): 16進色}
+        - workflow_names: {Workflow_ID(文字列): ワークフロー名}
+        - workflow_colors: {Workflow_ID(文字列): 16進色}（チーム別表示でバーを
+          ワークフロー別に色分けする際に使う。チーム色と同じ固定パレット）
+        - milestone_markers: [(id, 名前, pd.Timestamp), ...]（プロジェクト開始日を含む、締切順）
+
+    SchedulingError系の例外はそのまま呼び出し元に伝播させる。
+    """
+    frames = build_frames(db)
+    result_df = run_resource_constrained_scheduler_from_frames(
+        frames["project"], frames["teams"], frames["milestones"], frames["workflows"],
+        frames["jobs"], frames["job_tasks"], frames["holidays"], frames["external_dependencies"],
+        frames["workflow_names"], df_team_capacity=frames["team_capacity"],
+        **scheduler_kwargs,
+    )
+
+    teams = db.list_teams()
+    team_str = {t["id"]: _fmt("TEAM", t["id"]) for t in teams}
+    team_names = {team_str[t["id"]]: t["name"] for t in teams}
+    team_order_str = [team_str[t["id"]] for t in teams]
+    team_colors_by_display_name = _build_team_color_map(team_order_str, team_names)
+    team_colors = {
+        sid: team_colors_by_display_name.get(team_names[sid], _TEAM_COLOR_OVERFLOW)
+        for sid in team_order_str
+    }
+
+    workflows = db.list_workflows()
+    workflow_str = {w["id"]: _fmt("WF", w["id"]) for w in workflows}
+    workflow_names = {workflow_str[w["id"]]: w["name"] for w in workflows}
+    workflow_order_str = [workflow_str[w["id"]] for w in workflows]
+    workflow_colors_by_display_name = _build_team_color_map(workflow_order_str, workflow_names)
+    workflow_colors = {
+        sid: workflow_colors_by_display_name.get(workflow_names[sid], _TEAM_COLOR_OVERFLOW)
+        for sid in workflow_order_str
+    }
+
+    proj = db.get_project()
+    milestone_markers = []
+    if proj["start_date"]:
+        milestone_markers.append(("PROJECT_START", "プロジェクト開始", pd.to_datetime(proj["start_date"])))
+    for m in db.list_milestones():
+        milestone_markers.append((_fmt("MS", m["id"]), m["name"], pd.to_datetime(m["end_date"])))
+    milestone_markers.sort(key=lambda marker: marker[2])
+
+    display = {
+        "team_names": team_names, "team_colors": team_colors,
+        "workflow_names": workflow_names, "workflow_colors": workflow_colors,
+        "milestone_markers": milestone_markers,
+    }
+    return result_df, display
 
 
 def generate_gantt(db, mermaid_output_path=None, plotly_output_path=None, **scheduler_kwargs):
