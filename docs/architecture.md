@@ -13,8 +13,9 @@ project_scheduler.py ──────────┤  スケジューリング
   └ _run_scheduler_on_frames(…) ┘  スケジューリング本体（共有）
 
 gui/ ───────────────────────────  PySide6デスクトップアプリ（.pschedule編集用）
-  ├ db.py            SQLiteスキーマ + CRUD（Qt非依存）
-  ├ main.py           MainWindow・3タブ組み立て・Fileメニュー・D&Dで開く
+  ├ db.py            SQLiteスキーマ + CRUD（Qt非依存）+ Undo記録の仕組み
+  ├ undo_manager.py   Undo/Redoスタック（Qt非依存）
+  ├ main.py           MainWindow・3タブ組み立て・File/Editメニュー・D&Dで開く
   ├ tab_basic_info.py  タブ1「基本情報設定」
   ├ tab_workflows.py    タブ2「ワークフロー設計」（node_canvas.pyをホスト、
   │                       依存テンプレート編集セクションも持つ）
@@ -143,3 +144,44 @@ GUI側でダイアログ表示する（プロジェクト全体の依存グラ�
 コールバック経由で未保存の変更（`is_dirty()`）をタイトルバーに反映する。
 新規作成／プロジェクトを開く／ウィンドウを閉じる際に未保存の変更があれば、
 保存するか破棄するかを確認するダイアログを出す。
+
+## Undo/Redo（DBスナップショット方式）
+
+GUIで編集できる項目はすべてUndo/Redoで元に戻せる。個々の操作ごとに「逆操作」を
+書く方式（コマンドパターン）は採らず、**操作の前後でDB全体のバイト列
+スナップショット（`sqlite3.Connection.serialize()`）を取り、1エントリとして
+積む**方式にしている。`sync_dependency_templates`やマイルストーンの前後整合
+（`cascade_milestone_to_successors`/`enforce_milestone_floor`）のように連鎖的な
+副作用を持つ操作が多く、逆操作を個別に書くと書き漏れの温床になるためで、
+この方式なら連鎖もまとめて1回で正しく戻る。
+
+- **記録の単位**: `ProjectDatabase`の変更系メソッドはすべて`@undoable("ラベル")`
+  で包まれ、内部は`undo_group()`に委譲される。ネストした呼び出し（例:
+  `add_job_dependency_link`→`sync_dependency_templates`）は外側のスナップショットに
+  合流し、1エントリにまとまる。GUI側で複数のDB呼び出しにまたがる1操作
+  （例: タスク追加→自動レイアウト）は、呼び出し側が`with db.undo_group(...)`で
+  明示的にまとめる。
+- **記録漏れの防止**: `_commit()`は`@undoable`/`undo_group`の外側から呼ばれると
+  例外を送出する。新しい変更系メソッドにデコレータを付け忘れると、GUI実行時と
+  テストで即座に検知できる。
+- **前後対称のエントリ**: 1エントリは操作の「前」「後」両方のDBスナップショットと
+  UI状態（選択・フォーカス・アクティブタブ）を持ち、Undoは前を、Redoは後を
+  復元する。「後」のUI状態だけは、DB更新に続く表の作り直しと再選択まで終わってから
+  取りたいため、`QTimer.singleShot(0, ...)`で現在のイベント処理の後に取得する。
+  これにより、操作したタブとは別のタブに移ってからUndo/Redoしても、どちらも
+  操作を行ったタブへ戻って当時の選択を復元する。
+- **適用中の書き込みの抑止**: Undo/Redoの適用は、スナップショットの復元に続けて
+  アクティブなタブの`refresh_choices()`まで行う。この再読込がDBに書き込むことが
+  あるため（`gui/tab_jobs.py`の`refresh_choices()`は`sync_dependency_templates()`を
+  呼ぶ）、`db.suspend_undo_recording()`で囲み、ユーザーの新しい操作と誤認して
+  Redoスタックを破棄してしまうことを防いでいる。
+- **タブへの依存を持たない**: `MainWindow`は特定のタブ名を知らず、
+  `refresh_choices()`と同じ規約で`capture_ui_state()`/`restore_ui_state(state)`を
+  実装しているウィジェットだけを対象にする。新しいタブや、ガントチャートタブへの
+  編集機能追加でも、この2メソッドを実装すれば自動的にUndo/Redoの選択復元に
+  参加できる（未実装でもDB内容のUndo/Redo自体は機能する）。
+- **割り切り**: 履歴はプロジェクトファイルを開く/新規作成するたびに破棄する
+  （ファイルをまたいだUndoはしない）。保存では消えない。1エントリが前後2つの
+  スナップショット（移行済みサンプルで1つ約124KB）を持つため、上限は100段。
+  また、保存済みの状態までUndoで戻っても`is_dirty()`はTrueのまま
+  （保存を促す方向に倒した保守的な扱い）。

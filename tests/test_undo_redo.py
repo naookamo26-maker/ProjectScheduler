@@ -17,23 +17,36 @@ from gui.db import ProjectDatabase  # noqa: E402
 from gui.undo_manager import UndoManager  # noqa: E402
 
 
-def _attach_dummy_undo_manager(db):
-    """UI状態は単なる連番として記録するダミーのUndoManagerをdbに接続する
-    （Qtに依存せず、DB層のUndo/Redoの記録タイミング・粒度だけを検証するため）。"""
+def _attach_dummy_undo_manager(db, ui_states=None, on_restore=None):
+    """ダミーのUndoManagerをdbに接続する（Qtに依存せず、DB層のUndo/Redoの
+    記録タイミング・粒度だけを検証するため）。
+
+    ui_states: capture_ui_state が順に返す値のリスト（省略時は連番）。
+    on_restore: restore_ui_state から追加で呼ぶcallable（GUI側の再読込が
+        DBに書き込む状況を模す用途）。
+
+    schedule_after_capture には「即座に実行する」callableを渡し、Qtの
+    イベントループ無しでも「操作直後のUI状態」の記録経路を検証できるように
+    する（実アプリでは QTimer.singleShot(0, ...) 相当）。"""
     calls = {"capture": 0, "restore": []}
 
     def capture():
         calls["capture"] += 1
+        if ui_states is not None:
+            return ui_states[min(calls["capture"] - 1, len(ui_states) - 1)]
         return calls["capture"]
 
     def restore(value):
         calls["restore"].append(value)
+        if on_restore is not None:
+            on_restore()
 
     manager = UndoManager(
         db=db,
         capture_ui_state=capture,
         restore_ui_state=restore,
         apply_db_state=db.restore_state,
+        schedule_after_capture=lambda fn: fn(),
     )
     db.undo_manager = manager
     return manager, calls
@@ -163,18 +176,84 @@ def test_commit_without_manager_is_unaffected(tmp_path):
     db.close()
 
 
-def test_ui_state_captured_before_change_and_restored_in_order(tmp_path):
-    """undo()/redo()が、DBスナップショットと対になるUI状態を正しいタイミングで
-    キャプチャ・復元していることを確認する。"""
+def test_undo_restores_before_state_and_redo_restores_after_state(tmp_path):
+    """1エントリが操作の「前」「後」両方のUI状態を持ち、Undoは前を、Redoは
+    後を復元すること（＝Redoは「Ctrl+Zを押した時の画面」ではなく「操作直後の
+    画面」へ戻る）。"""
     db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
-    manager, calls = _attach_dummy_undo_manager(db)
+    manager, calls = _attach_dummy_undo_manager(db, ui_states=["操作前", "操作直後"])
 
-    db.add_team("チームA", 1)  # 変更前の状態としてUI状態#1をキャプチャ
-    manager.undo()  # 現在地をUI状態#2としてredoスタックへ退避し、#1を復元
-    assert calls["restore"][-1] == 1
+    db.add_team("チームA", 1)
+    entry = manager._undo_stack[-1]
+    assert entry.before_ui == "操作前"
+    assert entry.after_ui == "操作直後"  # 予約された取得処理で埋まっている
 
-    manager.redo()  # 現在地をUI状態#3としてundoスタックへ戻し、#2を復元
-    assert calls["restore"][-1] == 2
+    manager.undo()
+    assert calls["restore"][-1] == "操作前"
+
+    manager.redo()
+    assert calls["restore"][-1] == "操作直後"
+    db.close()
+
+
+def test_redo_survives_db_writes_during_undo_application(tmp_path):
+    """回帰テスト: Undo/Redoの適用中にGUI側の再読込がDBへ書き込んでも、
+    それが新しい操作として記録されずRedoが可能なままであること。
+
+    現に gui/tab_jobs.py の refresh_choices() は sync_dependency_templates()
+    （@undoable）を呼ぶため、抑止が無いとUndo直後にRedoできなくなる。
+    今後追加するタブが同様の実装をしても壊れないことを担保する。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    writes = {"enabled": False}
+
+    def write_during_restore():
+        if writes["enabled"]:
+            db.add_holiday("2099-12-31")
+
+    manager, _ = _attach_dummy_undo_manager(db, on_restore=write_during_restore)
+
+    db.add_team("チームA", 1)
+    db.add_team("チームB", 1)
+    writes["enabled"] = True
+
+    manager.undo()
+    assert manager.can_redo(), "適用中の書き込みでRedoスタックが破棄されている"
+    assert len(manager._undo_stack) == 1
+
+    manager.redo()
+    assert [t["name"] for t in db.list_teams()] == ["チームA", "チームB"]
+    db.close()
+
+
+def test_partial_changes_before_an_exception_stay_undoable(tmp_path):
+    """回帰テスト: 複合操作の途中で例外が起きても、そこまでにコミット済みの
+    変更はUndoで取り消せること（取り消せない変更が残る方が有害なため、
+    エントリを積む方針）。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    manager, _ = _attach_dummy_undo_manager(db)
+
+    with pytest.raises(RuntimeError):
+        with db.undo_group("途中で失敗する複合操作"):
+            db.add_team("チームX", 1)
+            raise RuntimeError("途中で失敗")
+
+    assert [t["name"] for t in db.list_teams()] == ["チームX"]
+    assert manager.can_undo()
+    manager.undo()
+    assert db.list_teams() == []
+    db.close()
+
+
+def test_commit_is_allowed_while_undo_recording_is_suspended(tmp_path):
+    """Undo/Redoの適用中は、@undoableの外側からの_commit()もガードに
+    引っかからないこと（適用中はそもそも記録しない区間のため）。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    _attach_dummy_undo_manager(db)
+
+    with db.suspend_undo_recording():
+        db._commit()  # 例外にならない
+    with pytest.raises(AssertionError):
+        db._commit()  # 抑止を抜けたらガードが復活する
     db.close()
 
 

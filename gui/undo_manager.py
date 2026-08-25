@@ -2,62 +2,99 @@
 DBスナップショット方式によるUndo/Redoの管理（Qt非依存）。
 
 gui/db.py の ProjectDatabase は、変更系メソッドを @undoable / db.undo_group() で
-包んでおり、1つの論理操作（ネストした呼び出しも含む）が完了するたびに
-「操作前のDB全体のバイト列スナップショット」を1エントリとしてこのクラスの
-Undoスタックへ積む。Undo/Redoは、内容だけでなく操作直前の選択・フォーカスも
-まとめて元に戻すため、DBスナップショットと対になる「UI状態」も同じエントリに
-保持する。
+包んでおり、1つの論理操作（ネストした呼び出しも含む）が完了するたびに1件の
+エントリをこのクラスへ積む。1エントリは、その操作の「前」と「後」の両方の
+状態——DB全体のバイト列スナップショットと、対になるUI状態（選択・フォーカス）
+——を持つ。Undoは前の状態を、Redoは後の状態を復元する、という対称な作りに
+することで、「操作を行ったタブへ戻して、その時の選択を復元する」という
+振る舞いがUndo/Redoのどちらでも同じように成り立つ。
 
 UI状態の取得・復元・DBスナップショットの適用はQt依存のため、この層は
-capture_ui_state / restore_ui_state / apply_db_state という3つのcallableとして
-呼び出し側（gui/main.py）から差し込んでもらう（このモジュール自体はQtを
-一切importしない）。
+callableとして呼び出し側（gui/main.py）から差し込んでもらう（このモジュール
+自体はQtを一切importしない）。
+
+「後」のUI状態だけは、操作の直後ではなく少し遅らせて取得する。GUI側の
+1つの操作は「DBを更新する→表やキャンバスを作り直す→新しい行を選択する」と
+いう順で進むため、DB呼び出しが終わった時点ではまだ選択が確定していない
+（例: gui/tab_basic_info.py の _add_team は add_team() の後に refresh_teams()
+と select_row_by_id() を呼ぶ）。そこで schedule_after_capture 経由で
+「現在のイベント処理が終わった後」に取得させ、実際に画面が落ち着いた状態を
+記録する。イベントループが無い場面（Qt非依存のテスト等）では取得されない
+ままになるが、その場合もDBの復元は通常どおり行われる。
 """
 
-_MAX_STACK_SIZE = 200
+# 1エントリが操作前後2つのDBスナップショット（移行済みサンプルプロジェクトで
+# 1つ約124KB）を保持するため、上限がそのままメモリ使用量に効く。100段あれば
+# 実用上の「戻したい範囲」は十分に賄えるため、メモリとのバランスでこの値にしている。
+_MAX_STACK_SIZE = 100
 
 
 class _UndoEntry:
-    __slots__ = ("db_state", "ui_state", "label")
+    __slots__ = ("before_db", "before_ui", "after_db", "after_ui", "label")
 
-    def __init__(self, db_state, ui_state, label):
-        self.db_state = db_state
-        self.ui_state = ui_state
+    def __init__(self, before_db, before_ui, after_db, label):
+        self.before_db = before_db
+        self.before_ui = before_ui
+        self.after_db = after_db
+        # 操作直後のUI状態。schedule_after_capture 経由で後から埋まる
+        # （埋まらないままでも、DBの復元自体は after_db で正しく行える）。
+        self.after_ui = None
         self.label = label
 
 
 class UndoManager:
-    def __init__(self, db, capture_ui_state, restore_ui_state, apply_db_state, on_stack_changed=None):
+    def __init__(self, db, capture_ui_state, restore_ui_state, apply_db_state,
+                 on_stack_changed=None, schedule_after_capture=None):
         """
         db: gui.db.ProjectDatabase（このマネージャを db.undo_manager に設定するのは
-            呼び出し側の責務。db側は capture_ui_state() を呼ぶだけの薄い依存で済む）。
-        capture_ui_state: () -> 任意のシリアライズ可能なオブジェクト。
+            呼び出し側の責務）。
+        capture_ui_state: () -> 任意のオブジェクト（選択・フォーカス等の記録）。
         restore_ui_state: (state) -> None。DBスナップショットの適用後に呼ばれる。
-        apply_db_state: (blob) -> None。db.restore_state(blob) に加えて、GUI側の
-            各タブの表示をDBの最新内容へ作り直す責務を呼び出し側に持たせるため、
-            db.restore_state そのものではなくラップしたcallableを受け取る。
+            state が None（＝操作直後のUI状態を取得できていない場合）でも、
+            表示の最新化だけは行えるように実装しておくこと。
+        apply_db_state: (blob) -> None。db.restore_state(blob) を呼ぶcallable。
         on_stack_changed: () -> None。Undo/Redoメニューの有効化・ラベル更新用。
+        schedule_after_capture: (callable) -> None。渡されたcallableを「現在の
+            イベント処理が終わった後」に呼ぶよう予約する（Qt側では
+            QTimer.singleShot(0, ...)）。省略時は操作直後のUI状態を記録しない。
         """
         self.db = db
         self.capture_ui_state = capture_ui_state
         self.restore_ui_state = restore_ui_state
         self.apply_db_state = apply_db_state
         self.on_stack_changed = on_stack_changed
+        self.schedule_after_capture = schedule_after_capture
         self._undo_stack = []
         self._redo_stack = []
+        # 「操作直後のUI状態」がまだ埋まっていないエントリ（高々1件）。
+        self._pending_after = None
 
-    def push(self, before_db_state, before_ui_state, label):
-        self._undo_stack.append(_UndoEntry(before_db_state, before_ui_state, label))
+    def push(self, before_db, before_ui, after_db, label):
+        # 直前の操作の「後」の状態がまだ埋まっていなければ、ここで確定させる
+        # （1回のイベント処理の中で複数の操作が続けて起きた場合、予約した
+        # 取得処理が走る前に次の操作が来るため）。
+        self.flush_pending_after_state()
+
+        entry = _UndoEntry(before_db, before_ui, after_db, label)
+        self._undo_stack.append(entry)
         if len(self._undo_stack) > _MAX_STACK_SIZE:
             self._undo_stack.pop(0)
         self._redo_stack.clear()
+
+        self._pending_after = entry
+        if self.schedule_after_capture is not None:
+            self.schedule_after_capture(self.flush_pending_after_state)
         self._notify()
 
-    def reset(self):
-        """新規プロジェクトを開いた際に呼び、履歴をすべて破棄する。"""
-        self._undo_stack.clear()
-        self._redo_stack.clear()
-        self._notify()
+    def flush_pending_after_state(self):
+        """「操作直後のUI状態」がまだ記録されていないエントリがあれば、現在の
+        画面状態をそれとして記録する。予約された取得処理の本体であり、次の
+        操作時やUndo実行時にも取りこぼし防止のため呼ばれる（何も保留が
+        無ければ何もしない）。"""
+        if self._pending_after is None:
+            return
+        entry, self._pending_after = self._pending_after, None
+        entry.after_ui = self.capture_ui_state()
 
     def can_undo(self):
         return bool(self._undo_stack)
@@ -72,24 +109,33 @@ class UndoManager:
         return self._redo_stack[-1].label if self._redo_stack else None
 
     def undo(self):
+        # Undoする操作自体の「後」の状態を確定させてから戻す
+        # （この後Redoされたときに、操作直後の画面へ復元できるようにするため）。
+        self.flush_pending_after_state()
         if not self._undo_stack:
             return
         entry = self._undo_stack.pop()
-        current = _UndoEntry(self.db.serialize_state(), self.capture_ui_state(), entry.label)
-        self._redo_stack.append(current)
-        self.apply_db_state(entry.db_state)
-        self.restore_ui_state(entry.ui_state)
+        self._redo_stack.append(entry)
+        self._apply(entry.before_db, entry.before_ui)
         self._notify()
 
     def redo(self):
         if not self._redo_stack:
             return
         entry = self._redo_stack.pop()
-        current = _UndoEntry(self.db.serialize_state(), self.capture_ui_state(), entry.label)
-        self._undo_stack.append(current)
-        self.apply_db_state(entry.db_state)
-        self.restore_ui_state(entry.ui_state)
+        self._undo_stack.append(entry)
+        self._apply(entry.after_db, entry.after_ui)
         self._notify()
+
+    def _apply(self, db_state, ui_state):
+        """スナップショットの復元とUI状態の復元。この区間でのDBへの変更は
+        新しいUndoエントリとして記録しない——GUI側の再読込（各タブの
+        refresh_choices()）がDBに書き込むことがあり、抑止しないとそれが
+        ユーザーの新しい操作と誤認されてRedoスタックが破棄されてしまうため
+        （gui/db.py の suspend_undo_recording 参照）。"""
+        with self.db.suspend_undo_recording():
+            self.apply_db_state(db_state)
+            self.restore_ui_state(ui_state)
 
     def _notify(self):
         if self.on_stack_changed is not None:

@@ -9,7 +9,7 @@ File メニューでプロジェクトファイル（.pschedule）の新規作�
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -49,6 +49,12 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
+        # 接続はここで一度だけ行う。プロジェクトを開くたびに実行される
+        # _rebuild_tabs() の側で接続すると、同じQTabWidgetに対して接続が
+        # 累積し、タブ切り替え1回につき refresh_choices() が開いた回数だけ
+        # 呼ばれてしまう（ジョブタブの refresh_choices() はDBへ書き込む
+        # sync_dependency_templates() を含むため、Undo履歴にも影響する）。
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         self._build_empty_state_tabs()
 
         self._build_menu()
@@ -133,7 +139,6 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_gantt, "ガントチャート")
 
         self.tabs.setEnabled(True)
-        self.tabs.currentChanged.connect(self._on_tab_changed)
         self.generate_action.setEnabled(True)
         self.save_action.setEnabled(True)
         self.save_as_action.setEnabled(True)
@@ -328,6 +333,10 @@ class MainWindow(QMainWindow):
             restore_ui_state=self._restore_ui_state,
             apply_db_state=self._apply_db_state,
             on_stack_changed=self._update_undo_redo_actions,
+            # 「操作直後のUI状態」は、DB更新に続く表の作り直しと再選択まで
+            # 終わってから取りたいので、現在のイベント処理の後へ回す
+            # （gui/undo_manager.py 冒頭参照）。
+            schedule_after_capture=lambda fn: QTimer.singleShot(0, fn),
         )
         self.db.undo_manager = self.undo_manager
         self._update_undo_redo_actions()
@@ -381,18 +390,30 @@ class MainWindow(QMainWindow):
         ダイアログが出てしまう。既存の _on_tab_changed が「タブに切り替える
         たびにそのタブを最新化する」役目を既に持っているため、非表示タブは
         次にユーザーが実際に切り替えた時に自然と最新化される（＝データが
-        古いまま放置されるわけではなく、更新を遅延させているだけ）。"""
-        if not state:
-            return
+        古いまま放置されるわけではなく、更新を遅延させているだけ）。
+
+        順序が重要: タブの切り替えを最初に済ませる。タブ切り替えは
+        _on_tab_changed 経由で対象タブの refresh_choices() を呼び、表や
+        キャンバスを作り直す——選択・フォーカスを復元した後に切り替えると、
+        その作り直しで復元したばかりの選択が破棄されてしまう
+        （別タブで行った操作をUndoする場合に必ず起きる）。
+
+        state が None（操作直後のUI状態を記録できていない場合。
+        gui/undo_manager.py 参照）でも、現在のタブの表示だけは必ず
+        最新化する——DBは復元済みなので、画面をそのままにすると内容が
+        食い違って見えてしまうため。"""
+        state = state or {}
         tab_index = state.get("tab_index", self.tabs.currentIndex())
         if not (0 <= tab_index < self.tabs.count()):
             tab_index = self.tabs.currentIndex()
+        self.tabs.setCurrentIndex(tab_index)
         widget = self.tabs.widget(tab_index)
+        # 切り替えが発生しなかった場合（既にそのタブにいた場合）は
+        # _on_tab_changed が呼ばれないため、ここで明示的に最新化する。
         if hasattr(widget, "refresh_choices"):
             widget.refresh_choices()
         if hasattr(widget, "restore_ui_state"):
             widget.restore_ui_state(state.get("tabs", {}).get(tab_index))
-        self.tabs.setCurrentIndex(tab_index)
 
     def _apply_db_state(self, blob):
         self.db.restore_state(blob)

@@ -206,6 +206,8 @@ class ProjectDatabase:
         # undo_group のネスト検知用（Trueの間は既に外側でスナップショットを
         # 取得済みなので、内側の呼び出しでは何もしない）。
         self._in_undoable_call = False
+        # Undo/Redoの適用中（suspend_undo_recording）かどうか。
+        self._undo_suppressed = False
 
     def close(self):
         self._conn.close()
@@ -233,11 +235,15 @@ class ProjectDatabase:
         （ネストした呼び出し）は何もしない——外側の呼び出しが取得したスナップショットに
         自動的に合流する。
 
-        undo_manager が未設定（GUIを介さない利用）の場合は素通しする。
-        ブロック内で例外が発生した場合、その時点までの変更が万一あってもUndo
-        エントリは記録しない（呼び出し側の例外処理・DB制約違反時のロールバック
-        方針は既存の各メソッドの通り）。"""
-        if self.undo_manager is None or self._in_undoable_call:
+        undo_manager が未設定（GUIを介さない利用）の場合、および
+        suspend_undo_recording() の内側（Undo/Redoの適用中）の場合は素通しする。
+
+        ブロックの内容が実際にDBを変えなかった場合はUndoエントリを積まない
+        （重複名エラー等で何も変わらずに終わった操作で、空のUndoが増えるのを
+        防ぐ）。逆に、例外で中断した場合でも、その時点までに実際にコミット
+        された変更が残っていればUndoエントリを積む——取り消せない変更が
+        残ってしまう方が、余分なUndoエントリより有害なため。"""
+        if self.undo_manager is None or self._in_undoable_call or self._undo_suppressed:
             yield
             return
         self._in_undoable_call = True
@@ -247,9 +253,30 @@ class ProjectDatabase:
             yield
         finally:
             self._in_undoable_call = False
-        after_db = self.serialize_state()
-        if after_db != before_db:
-            self.undo_manager.push(before_db, before_ui, label)
+            after_db = self.serialize_state()
+            if after_db != before_db:
+                self.undo_manager.push(before_db, before_ui, after_db, label)
+
+    @contextmanager
+    def suspend_undo_recording(self):
+        """このブロック内でのDBへの変更を、新しいUndoエントリとして記録しない。
+
+        Undo/Redoの適用中（gui/undo_manager.py）に使う。適用処理は、スナップ
+        ショットの復元に続けてGUI側の再読込（各タブの refresh_choices()）まで
+        行うが、この再読込がDBに書き込むことがある——現に
+        gui/tab_jobs.py の refresh_choices() は sync_dependency_templates() を
+        呼ぶ。抑止しないと、その書き込みが「ユーザーの新しい操作」として
+        Undoスタックに積まれ、同時にRedoスタックが破棄されてしまう
+        （＝Undoした直後にRedoできなくなる）。
+
+        今後追加するタブの refresh_choices() が同様にDBへ書き込む場合も、
+        この抑止によって自動的に守られる。"""
+        previous = self._undo_suppressed
+        self._undo_suppressed = True
+        try:
+            yield
+        finally:
+            self._undo_suppressed = previous
 
     # -- 生成/オープン -----------------------------------------------------
 
@@ -414,8 +441,10 @@ class ProjectDatabase:
 
         undo_manager が設定されている場合、@undoable / undo_group の外側から
         呼ばれると例外を送出する。変更系メソッドに @undoable を付け忘れると
-        ここで即座に検知できるようにするためのガード（Undo/Redoの記録漏れ防止）。"""
-        if self.undo_manager is not None and not self._in_undoable_call:
+        ここで即座に検知できるようにするためのガード（Undo/Redoの記録漏れ防止）。
+        Undo/Redoの適用中（suspend_undo_recording）はそもそも記録しない区間
+        なので、このガードも見送る。"""
+        if self.undo_manager is not None and not self._in_undoable_call and not self._undo_suppressed:
             raise AssertionError(
                 f"{type(self).__name__}._commit() が @undoable / undo_group の外側から呼ばれました。"
                 "変更系メソッドには @undoable(\"ラベル\") を付けてください。"

@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
+    QApplication,
     QComboBox,
     QDateEdit,
     QGroupBox,
@@ -163,8 +164,6 @@ def capture_table_state(table):
     位置をUndo/Redo後に復元できる形で取り出す。テーブル自体、またはセル内の
     ウィジェット（QComboBox/QSpinBox等）がフォーカスを持っている場合は、その
     セル位置も記録する。復元は restore_table_state を使う。"""
-    from PySide6.QtWidgets import QApplication
-
     row = table.currentRow()
     entity_id = row_id(table, row) if row >= 0 else None
     focus_widget = QApplication.focusWidget()
