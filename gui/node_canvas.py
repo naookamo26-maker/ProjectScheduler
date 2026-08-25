@@ -359,13 +359,32 @@ class WorkflowGraphScene(QGraphicsScene):
 
     def _delete_node_unconfirmed(self, node):
         """確認ダイアログを経ずにノード1件を削除する内部処理。確認は呼び出し側
-        （delete_node、または複数選択時はまとめて1回）の責務とする。"""
+        （delete_node、または複数選択時はまとめて1回）の責務とする。
+
+        削除するタスクの直前・直後のタスクは、削除後も前後関係が保たれるよう
+        橋渡しの依存関係で繋ぎ直す（例: A→B→Cという流れでBを削除すると、
+        A→Cになる）。分岐がある場合は先行タスク全体×後続タスク全体の
+        組み合わせすべてに橋渡しする。元の依存グラフに閉路が無い前提であれば、
+        この橋渡しが新たな閉路を生むことはない——削除するタスクが先行タスクから
+        後続タスクへ至る経路上にあった以上、橋渡し先は元々到達可能だったため。
+        橋渡し先の依存が既に存在する場合（他の経路で既に繋がっている場合）は
+        try_add_edge が重複させずスキップする。
+
+        複数選択でまとめて削除する場合（_delete_selected）も、1件ずつ順に
+        この処理を通すことで連鎖的な橋渡しが正しく働く。例えばA→B→C→D→Eから
+        B・Dをまとめて削除すると、Bの処理でA→Cが繋がり、続くDの処理はその
+        時点の後続関係（C→E）を見るため、最終的にA→C→Eになる。"""
+        pred_nodes = [edge.pred_node for edge in node.edges if edge.succ_node is node]
+        succ_nodes = [edge.succ_node for edge in node.edges if edge.pred_node is node]
         with self.db.undo_group("タスクを削除"):
             for edge in list(node.edges):
                 self.delete_edge(edge)
             self.db.delete_workflow_task(node.workflow_task_id)
             del self.nodes[node.workflow_task_id]
             self.removeItem(node)
+            for pred_node in pred_nodes:
+                for succ_node in succ_nodes:
+                    self.try_add_edge(pred_node, succ_node)
             self.auto_arrange()
 
     def add_task(self, name, team_id, days, x, y):

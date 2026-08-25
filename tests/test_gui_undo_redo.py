@@ -333,6 +333,128 @@ def test_multi_select_delete_shows_a_single_aggregated_confirmation(window, qapp
     assert window.db.list_workflow_tasks(wf_id) == []
 
 
+def test_deleting_a_task_bridges_its_predecessors_and_successors(window, qapp):
+    """タスクA→B→Cという流れでBを削除すると、A→Cの依存関係が新設され、
+    前後関係が保たれること。Undo1回で橋渡し込みの状態が元に戻ることも確認する。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    task_a = scene.add_task("A", team_id, 1, 0, 0)
+    qapp.processEvents()
+    task_b = wf_tab.current_scene.add_task("B", team_id, 1, 200, 0)
+    qapp.processEvents()
+    task_c = wf_tab.current_scene.add_task("C", team_id, 1, 400, 0)
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    scene.try_add_edge(scene.nodes[task_a.workflow_task_id], scene.nodes[task_b.workflow_task_id])
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    scene.try_add_edge(scene.nodes[task_b.workflow_task_id], scene.nodes[task_c.workflow_task_id])
+    qapp.processEvents()
+
+    def pairs():
+        id_to_name = {t["id"]: t["name"] for t in window.db.list_workflow_tasks(wf_id)}
+        return sorted(
+            (id_to_name.get(d["predecessor_task_id"]), id_to_name.get(d["successor_task_id"]))
+            for d in window.db.list_task_dependencies(wf_id)
+        )
+
+    assert pairs() == [("A", "B"), ("B", "C")]
+
+    scene = wf_tab.current_scene
+    with patch.object(QMessageBox, "question", return_value=QMessageBox.Yes):
+        scene.delete_node(scene.nodes[task_b.workflow_task_id])
+    qapp.processEvents()
+
+    assert pairs() == [("A", "C")]  # Bが消え、A→Cへ橋渡しされる
+    assert len(window.db.list_workflow_tasks(wf_id)) == 2
+
+    window.on_undo()
+    qapp.processEvents()
+    assert pairs() == [("A", "B"), ("B", "C")]  # 橋渡し込みで1回のUndoで復元
+
+
+def test_deleting_a_task_does_not_duplicate_an_existing_bridge(window, qapp):
+    """A→B→D、A→C→D、かつA→Dも直接存在する状態でBを削除しても、既に存在する
+    A→Dへ重複した依存関係を作ろうとしてエラーにならないこと。"""
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    nodes = {}
+    for name in ("A", "B", "C", "D"):
+        nodes[name] = wf_tab.current_scene.add_task(name, team_id, 1, 0, 0)
+        qapp.processEvents()
+    scene = wf_tab.current_scene
+    for pred, succ in [("A", "B"), ("B", "D"), ("A", "C"), ("C", "D"), ("A", "D")]:
+        scene = wf_tab.current_scene
+        scene.try_add_edge(scene.nodes[nodes[pred].workflow_task_id], scene.nodes[nodes[succ].workflow_task_id])
+        qapp.processEvents()
+
+    from PySide6.QtWidgets import QMessageBox
+    scene = wf_tab.current_scene
+    with patch.object(QMessageBox, "question", return_value=QMessageBox.Yes):
+        scene.delete_node(scene.nodes[nodes["B"].workflow_task_id])
+    qapp.processEvents()
+
+    id_to_name = {t["id"]: t["name"] for t in window.db.list_workflow_tasks(wf_id)}
+    result = sorted(
+        (id_to_name.get(d["predecessor_task_id"]), id_to_name.get(d["successor_task_id"]))
+        for d in window.db.list_task_dependencies(wf_id)
+    )
+    assert result == [("A", "C"), ("A", "D"), ("C", "D")]
+
+
+def test_multi_select_delete_bridges_across_chained_deletions(window, qapp):
+    """A→B→C→D→EからB・Dをまとめて削除すると、連鎖的にA→C→Eへ橋渡しされること
+    （Bの処理でA→Cが繋がり、続くDの処理はその時点の後続関係C→Eを見るため）。"""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QMessageBox
+
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    nodes = {}
+    for name in ("A", "B", "C", "D", "E"):
+        nodes[name] = wf_tab.current_scene.add_task(name, team_id, 1, 0, 0)
+        qapp.processEvents()
+    for pred, succ in [("A", "B"), ("B", "C"), ("C", "D"), ("D", "E")]:
+        scene = wf_tab.current_scene
+        scene.try_add_edge(scene.nodes[nodes[pred].workflow_task_id], scene.nodes[nodes[succ].workflow_task_id])
+        qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    scene.nodes[nodes["B"].workflow_task_id].setSelected(True)
+    scene.nodes[nodes["D"].workflow_task_id].setSelected(True)
+    qapp.processEvents()
+    with patch.object(QMessageBox, "question", return_value=QMessageBox.Yes):
+        wf_tab.view.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier))
+    qapp.processEvents()
+
+    id_to_name = {t["id"]: t["name"] for t in window.db.list_workflow_tasks(wf_id)}
+    result = sorted(
+        (id_to_name.get(d["predecessor_task_id"]), id_to_name.get(d["successor_task_id"]))
+        for d in window.db.list_task_dependencies(wf_id)
+    )
+    assert result == [("A", "C"), ("C", "E")]
+
+
 def test_multi_select_delete_on_canvas_is_a_single_undo_step(window, qapp):
     """回帰テスト: キャンバスで複数選択してDeleteした場合、選択項目ごとに
     Undoが分かれず1回のUndoで全部戻ること。あわせて、タスクとその依存線を
