@@ -27,6 +27,7 @@
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -55,9 +56,11 @@ from gui.widgets_common import (
     NoWheelListWidget,
     NoWheelSpinBox,
     auto_size_columns,
+    capture_table_state,
     confirm_or_block_delete,
     keep_selection_visible,
     make_fk_combo,
+    restore_table_state,
     row_id,
     set_row_id,
     unique_default_name,
@@ -559,24 +562,25 @@ class JobsTab(QWidget):
                 milestone_id = table.cellWidget(row, 3).currentData()
                 team_id = table.cellWidget(row, 4).currentData()
 
-                if not is_active or override_days is not None or milestone_id is not None or team_id is not None:
-                    self.db.upsert_job_task_override(
-                        self.current_job_id, workflow_task_id, is_active=is_active,
-                        override_days=override_days, milestone_id=milestone_id, team_id=team_id,
-                    )
-                else:
-                    self.db.clear_job_task_override(self.current_job_id, workflow_task_id)
+                with self.db.undo_group("タスク上書きを変更"):
+                    if not is_active or override_days is not None or milestone_id is not None or team_id is not None:
+                        self.db.upsert_job_task_override(
+                            self.current_job_id, workflow_task_id, is_active=is_active,
+                            override_days=override_days, milestone_id=milestone_id, team_id=team_id,
+                        )
+                    else:
+                        self.db.clear_job_task_override(self.current_job_id, workflow_task_id)
 
-                # このタスク自身が、先行タスクの実効マイルストーンより早くなって
-                # しまった場合（既定に戻した結果、前倒しの矛盾が生じた場合を含む）、
-                # 先行タスクに合わせて自動的に引き上げる。
-                raised = self.db.enforce_milestone_floor(self.current_job_id, workflow_task_id)
-                # マイルストーンを変更した場合、後継タスク（同一ワークフロー内、
-                # transitively）が前のタスクより早いマイルストーンのままだと
-                # 前倒しの矛盾が生じるため、必要なら自動的に繰り下げる。
-                changed = self.db.cascade_milestone_to_successors(
-                    self.current_job_id, workflow_task_id
-                )
+                    # このタスク自身が、先行タスクの実効マイルストーンより早くなって
+                    # しまった場合（既定に戻した結果、前倒しの矛盾が生じた場合を含む）、
+                    # 先行タスクに合わせて自動的に引き上げる。
+                    raised = self.db.enforce_milestone_floor(self.current_job_id, workflow_task_id)
+                    # マイルストーンを変更した場合、後継タスク（同一ワークフロー内、
+                    # transitively）が前のタスクより早いマイルストーンのままだと
+                    # 前倒しの矛盾が生じるため、必要なら自動的に繰り下げる。
+                    changed = self.db.cascade_milestone_to_successors(
+                        self.current_job_id, workflow_task_id
+                    )
                 if raised or changed:
                     messages = []
                     if raised:
@@ -668,11 +672,12 @@ class JobsTab(QWidget):
             QMessageBox.warning(self, "入力エラー", "依存先ジョブを1つ以上選択してください。")
             return
         errors = []
-        for depends_on_job_id in depends_on_job_ids:
-            try:
-                self.db.add_job_dependency_link(self.current_job_id, depends_on_job_id)
-            except ProjectDatabaseError as e:
-                errors.append(str(e))
+        with self.db.undo_group("依存先ジョブを追加"):
+            for depends_on_job_id in depends_on_job_ids:
+                try:
+                    self.db.add_job_dependency_link(self.current_job_id, depends_on_job_id)
+                except ProjectDatabaseError as e:
+                    errors.append(str(e))
         if errors:
             QMessageBox.warning(self, "一部追加できませんでした", "\n".join(errors))
         self._refresh_dependencies()
@@ -746,3 +751,38 @@ class JobsTab(QWidget):
         self.refresh_jobs(select_id=self.current_job_id)
         if self.current_job_id is not None:
             self._refresh_dependencies()
+
+    # -- Undo/Redo用の選択・フォーカス状態 -------------------------------------------
+
+    def capture_ui_state(self):
+        focus = QApplication.focusWidget()
+        dep_item = self.dep_tree.currentItem()
+        return {
+            "jobs": capture_table_state(self.jobs_section.table),
+            "overrides": capture_table_state(self.override_table),
+            "dep_selected": dep_item.data(0, Qt.UserRole) if dep_item else None,
+            "dep_tree_focus": focus is self.dep_tree,
+        }
+
+    def restore_ui_state(self, state):
+        if not state:
+            return
+        restore_table_state(self.jobs_section.table, state.get("jobs"))
+        restore_table_state(self.override_table, state.get("overrides"))
+        dep_data = state.get("dep_selected")
+        if dep_data is not None:
+            self._select_dep_tree_item(dep_data)
+        if state.get("dep_tree_focus"):
+            self.dep_tree.setFocus()
+
+    def _select_dep_tree_item(self, data):
+        for i in range(self.dep_tree.topLevelItemCount()):
+            top = self.dep_tree.topLevelItem(i)
+            if top.data(0, Qt.UserRole) == data:
+                self.dep_tree.setCurrentItem(top)
+                return
+            for j in range(top.childCount()):
+                child = top.child(j)
+                if child.data(0, Qt.UserRole) == data:
+                    self.dep_tree.setCurrentItem(child)
+                    return

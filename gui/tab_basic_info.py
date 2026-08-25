@@ -16,6 +16,7 @@ from datetime import date, timedelta
 
 from PySide6.QtCore import QDate, Qt, QTimer
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -35,8 +36,10 @@ from gui.widgets_common import (
     NoWheelDateEdit,
     NoWheelSpinBox,
     auto_size_columns,
+    capture_table_state,
     confirm_or_block_delete,
     make_fk_combo,
+    restore_table_state,
     row_id,
     select_row_by_id,
     set_row_id,
@@ -577,3 +580,26 @@ class BasicInfoTab(QWidget):
         """他タブの変更（現状なし）に合わせて表示を更新する共通インターフェース。
         MainWindowのタブ切り替え時フックから呼ばれる。"""
         self.refresh_all()
+
+    # -- Undo/Redo用の選択・フォーカス状態 -------------------------------------------
+
+    def capture_ui_state(self):
+        focus = QApplication.focusWidget()
+        return {
+            "milestones": capture_table_state(self.milestones_section.table),
+            "teams": capture_table_state(self.teams_section.table),
+            "holidays": capture_table_state(self.holidays_section.table),
+            "project_name_focus": focus is self.project_name_edit,
+            "start_date_focus": focus is self.start_date_edit,
+        }
+
+    def restore_ui_state(self, state):
+        if not state:
+            return
+        restore_table_state(self.milestones_section.table, state.get("milestones"))
+        restore_table_state(self.teams_section.table, state.get("teams"))
+        restore_table_state(self.holidays_section.table, state.get("holidays"))
+        if state.get("project_name_focus"):
+            self.project_name_edit.setFocus()
+        elif state.get("start_date_focus"):
+            self.start_date_edit.setFocus()

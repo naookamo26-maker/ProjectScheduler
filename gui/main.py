@@ -9,7 +9,7 @@ File メニューでプロジェクトファイル（.pschedule）の新規作�
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -28,6 +28,7 @@ from gui.tab_basic_info import BasicInfoTab
 from gui.tab_gantt import GanttTab
 from gui.tab_jobs import JobsTab
 from gui.tab_workflows import WorkflowsTab
+from gui.undo_manager import UndoManager
 from project_scheduler import SchedulingError
 
 FILE_FILTER = "Project Scheduler Files (*.pschedule);;All Files (*)"
@@ -38,6 +39,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.db: ProjectDatabase | None = None
+        # プロジェクトファイルを開くたびに作り直す（ファイルをまたいだUndoは
+        # 行わない）。詳細は gui/undo_manager.py 参照。
+        self.undo_manager: UndoManager | None = None
 
         self.setWindowTitle("プロジェクトスケジューラー")
         self.resize(1500, 900)
@@ -45,6 +49,12 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
+        # 接続はここで一度だけ行う。プロジェクトを開くたびに実行される
+        # _rebuild_tabs() の側で接続すると、同じQTabWidgetに対して接続が
+        # 累積し、タブ切り替え1回につき refresh_choices() が開いた回数だけ
+        # 呼ばれてしまう（ジョブタブの refresh_choices() はDBへ書き込む
+        # sync_dependency_templates() を含むため、Undo履歴にも影響する）。
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         self._build_empty_state_tabs()
 
         self._build_menu()
@@ -129,7 +139,6 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_gantt, "ガントチャート")
 
         self.tabs.setEnabled(True)
-        self.tabs.currentChanged.connect(self._on_tab_changed)
         self.generate_action.setEnabled(True)
         self.save_action.setEnabled(True)
         self.save_as_action.setEnabled(True)
@@ -185,6 +194,20 @@ class MainWindow(QMainWindow):
         exit_action = QAction("終了(&X)", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
+
+        edit_menu = self.menuBar().addMenu("編集(&E)")
+
+        self.undo_action = QAction("元に戻す", self)
+        self.undo_action.setShortcut(QKeySequence.Undo)
+        self.undo_action.triggered.connect(self.on_undo)
+        self.undo_action.setEnabled(False)
+        edit_menu.addAction(self.undo_action)
+
+        self.redo_action = QAction("やり直す", self)
+        self.redo_action.setShortcut(QKeySequence.Redo)
+        self.redo_action.triggered.connect(self.on_redo)
+        self.redo_action.setEnabled(False)
+        edit_menu.addAction(self.redo_action)
 
     def on_new_project(self):
         """保存先パスはこの時点では選ばせず、初回保存（Ctrl+S/名前を付けて保存）
@@ -295,14 +318,117 @@ class MainWindow(QMainWindow):
         )
 
     def _open_database(self, db):
-        if self.db is not None:
-            self.db.on_change = None
-            self.db.close()
+        # 旧DBを閉じるのは、旧タブを差し替え終えた後にする。タブの差し替えでは
+        # 入力欄からフォーカスが外れ、editingFinished 等のシグナルが発火して
+        # 旧タブが自分の持つDBへ書き込もうとする——先に閉じてしまうと
+        # 「Cannot operate on a closed database」になる（Qtがスロット内の例外を
+        # 握りつぶすため画面上は無害に見えるが、書き込みは失われている）。
+        previous = self.db
+        if previous is not None:
+            previous.on_change = None
+            previous.undo_manager = None
         self.db = db
         self.db.on_change = self._on_db_changed
+        # UndoManagerを繋ぐ前に確認しておく（繋いだ後の is_dirty() は
+        # Undo履歴上の位置で判定されるようになるため）。既存ファイルを開いた
+        # 直後は保存済み、新規プロジェクトは未保存。
+        opened_clean = not self.db.is_dirty()
         self._rebuild_tabs()
+        if previous is not None:
+            previous.close()
+        # ファイルを開く/新規作成するたびにUndo履歴も作り直す（ファイルを
+        # またいだUndoは行わない）。
+        self.undo_manager = UndoManager(
+            db=self.db,
+            capture_ui_state=self._capture_ui_state,
+            restore_ui_state=self._restore_ui_state,
+            apply_db_state=self._apply_db_state,
+            on_stack_changed=self._update_undo_redo_actions,
+            # 「操作直後のUI状態」は、DB更新に続く表の作り直しと再選択まで
+            # 終わってから取りたいので、現在のイベント処理の後へ回す
+            # （gui/undo_manager.py 冒頭参照）。
+            schedule_after_capture=lambda fn: QTimer.singleShot(0, fn),
+        )
+        self.db.undo_manager = self.undo_manager
+        if opened_clean:
+            self.undo_manager.mark_clean()
+        self._update_undo_redo_actions()
         self.statusBar().showMessage(f"開いているプロジェクト: {db.path or '無題（未保存）'}")
         self._update_title()
+
+    # -- Undo/Redo -----------------------------------------------------------
+    #
+    # 内容だけでなく、操作直前の選択・フォーカスも合わせて復元する
+    # （gui/undo_manager.py 参照）。各タブ固有の状態は、refresh_choices() と
+    # 対になる規約として capture_ui_state()/restore_ui_state() を実装している
+    # タブについてのみ扱う——タブ名をここで列挙しないことで、将来タブが
+    # 追加されたり、ガントチャートタブに編集機能が追加されたりしても、
+    # そのタブ自身が2メソッドを実装しさえすれば自動的に対応できるようにする。
+
+    def on_undo(self):
+        if self.undo_manager is not None:
+            self.undo_manager.undo()
+
+    def on_redo(self):
+        if self.undo_manager is not None:
+            self.undo_manager.redo()
+
+    def _update_undo_redo_actions(self):
+        can_undo = self.undo_manager is not None and self.undo_manager.can_undo()
+        can_redo = self.undo_manager is not None and self.undo_manager.can_redo()
+        self.undo_action.setEnabled(can_undo)
+        self.undo_action.setText(f"元に戻す: {self.undo_manager.undo_label()}" if can_undo else "元に戻す")
+        self.redo_action.setEnabled(can_redo)
+        self.redo_action.setText(f"やり直す: {self.undo_manager.redo_label()}" if can_redo else "やり直す")
+
+    def _iter_tab_widgets(self):
+        return [(i, self.tabs.widget(i)) for i in range(self.tabs.count())]
+
+    def _capture_ui_state(self):
+        return {
+            "tab_index": self.tabs.currentIndex(),
+            "tabs": {
+                i: widget.capture_ui_state()
+                for i, widget in self._iter_tab_widgets()
+                if hasattr(widget, "capture_ui_state")
+            },
+        }
+
+    def _restore_ui_state(self, state):
+        """操作直前にアクティブだったタブだけを対象に、データの再読込と
+        選択・フォーカスの復元を行う。それ以外のタブは意図的に触らない
+        ——ガントチャートタブの refresh_choices() はスケジューリングを実行し直す
+        重い処理であり、見えていないタブのために毎回走らせる必要がない。
+        既存の _on_tab_changed が「タブに切り替えるたびにそのタブを最新化する」
+        役目を既に持っているため、非表示タブは次にユーザーが実際に切り替えた
+        時に自然と最新化される（＝データが古いまま放置されるわけではなく、
+        更新を遅延させているだけ）。
+
+        順序が重要: タブの切り替えを最初に済ませる。タブ切り替えは
+        _on_tab_changed 経由で対象タブの refresh_choices() を呼び、表や
+        キャンバスを作り直す——選択・フォーカスを復元した後に切り替えると、
+        その作り直しで復元したばかりの選択が破棄されてしまう
+        （別タブで行った操作をUndoする場合に必ず起きる）。
+
+        state が None（操作直後のUI状態を記録できていない場合。
+        gui/undo_manager.py 参照）でも、現在のタブの表示だけは必ず
+        最新化する——DBは復元済みなので、画面をそのままにすると内容が
+        食い違って見えてしまうため。"""
+        state = state or {}
+        tab_index = state.get("tab_index", self.tabs.currentIndex())
+        if not (0 <= tab_index < self.tabs.count()):
+            tab_index = self.tabs.currentIndex()
+        self.tabs.setCurrentIndex(tab_index)
+        widget = self.tabs.widget(tab_index)
+        # 切り替えが発生しなかった場合（既にそのタブにいた場合）は
+        # _on_tab_changed が呼ばれないため、ここで明示的に最新化する。
+        if hasattr(widget, "refresh_choices"):
+            widget.refresh_choices()
+        if hasattr(widget, "restore_ui_state"):
+            widget.restore_ui_state(state.get("tabs", {}).get(tab_index))
+
+    def _apply_db_state(self, blob):
+        self.db.restore_state(blob)
 
     def _on_db_changed(self):
         """DB変更時のフック（保存以外の全てのCRUD操作後に呼ばれる）。
@@ -321,6 +447,11 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if self.db is not None:
+            # _open_database と同じ理由で、タブを片付けてからDBを閉じる
+            # （フォーカスが外れた入力欄が、閉じたDBへ書き込もうとするのを防ぐ）。
+            self.db.on_change = None
+            self.db.undo_manager = None
+            self._build_empty_state_tabs()
             self.db.close()
         super().closeEvent(event)
 

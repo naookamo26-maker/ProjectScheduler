@@ -8,6 +8,7 @@
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -30,8 +31,11 @@ from gui.widgets_common import (
     NoWheelComboBox,
     NoWheelListWidget,
     auto_size_columns,
+    capture_table_state,
     confirm_or_block_delete,
+    is_descendant_of,
     keep_selection_visible,
+    restore_table_state,
     row_id,
     set_row_id,
 )
@@ -348,3 +352,48 @@ class WorkflowsTab(QWidget):
         current = self.workflow_list.currentItem()
         select_id = current.data(Qt.UserRole) if current else None
         self.refresh_workflows(select_id=select_id)
+
+    # -- Undo/Redo用の選択・フォーカス状態 -------------------------------------------
+
+    def capture_ui_state(self):
+        focus = QApplication.focusWidget()
+        current_item = self.workflow_list.currentItem()
+        canvas_state = None
+        if self.current_scene is not None:
+            canvas_state = {
+                "selected_task_ids": [
+                    task_id for task_id, node in self.current_scene.nodes.items()
+                    if node.isSelected()
+                ],
+                "selected_dep_ids": [
+                    dep_id for dep_id, edge in self.current_scene.edges.items()
+                    if edge.isSelected()
+                ],
+                "view_focus": focus is not None and is_descendant_of(focus, self.view),
+            }
+        return {
+            "workflow_id": current_item.data(Qt.UserRole) if current_item else None,
+            "workflow_list_focus": focus is self.workflow_list,
+            "template": capture_table_state(self.template_section.table),
+            "canvas": canvas_state,
+        }
+
+    def restore_ui_state(self, state):
+        if not state:
+            return
+        self.refresh_workflows(select_id=state.get("workflow_id"))
+        canvas_state = state.get("canvas")
+        if self.current_scene is not None and canvas_state:
+            for task_id in canvas_state.get("selected_task_ids", []):
+                node = self.current_scene.nodes.get(task_id)
+                if node is not None:
+                    node.setSelected(True)
+            for dep_id in canvas_state.get("selected_dep_ids", []):
+                edge = self.current_scene.edges.get(dep_id)
+                if edge is not None:
+                    edge.setSelected(True)
+            if canvas_state.get("view_focus"):
+                self.view.setFocus()
+        restore_table_state(self.template_section.table, state.get("template"))
+        if state.get("workflow_list_focus"):
+            self.workflow_list.setFocus()

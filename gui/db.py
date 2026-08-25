@@ -17,127 +17,21 @@ ID方針: 全テーブルは整数の自動採番PKを持ち、GUI上はこのID
 （常に名前で参照する）。project_scheduler.py が期待する文字列ID
 （"WF_001" 等）への変換は gantt_generator.py 側でガントチャート生成の
 直前にのみ行う。
+
+スキーマ定義（DDL）と旧バージョンからのマイグレーションは gui/db_schema.py に
+分離している（テーブルを足すたびに伸びる部分を、CRUDの実装から切り離すため）。
 """
 
+import functools
 import heapq
+import os
 import sqlite3
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = "5"
-
-_SCHEMA_SQL = """
-CREATE TABLE schema_meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE project (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    project_name TEXT NOT NULL DEFAULT '',
-    start_date   TEXT NOT NULL DEFAULT ''
-);
-
-CREATE TABLE milestones (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    end_date TEXT NOT NULL
-);
-
-CREATE TABLE teams (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    max_lines INTEGER NOT NULL CHECK (max_lines >= 1)
-);
-
-CREATE TABLE team_capacity_changes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-    start_date TEXT NOT NULL,
-    lines INTEGER NOT NULL CHECK (lines >= 1),
-    UNIQUE(team_id, start_date)
-);
-
-CREATE TABLE holidays (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT NOT NULL,
-    team_id INTEGER REFERENCES teams(id) ON DELETE CASCADE
-);
-CREATE UNIQUE INDEX ux_holidays_team ON holidays(date, team_id) WHERE team_id IS NOT NULL;
-
-CREATE TABLE workflows (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    sort_order INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE workflow_tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE RESTRICT,
-    default_days INTEGER NOT NULL CHECK (default_days >= 1),
-    canvas_x REAL NOT NULL DEFAULT 0,
-    canvas_y REAL NOT NULL DEFAULT 0,
-    UNIQUE(workflow_id, name)
-);
-
-CREATE TABLE task_dependencies (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
-    predecessor_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
-    successor_task_id   INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
-    UNIQUE(predecessor_task_id, successor_task_id),
-    CHECK (predecessor_task_id != successor_task_id)
-);
-
-CREATE TABLE jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE RESTRICT,
-    default_milestone_id INTEGER REFERENCES milestones(id) ON DELETE SET NULL,
-    priority INTEGER NOT NULL DEFAULT 100 CHECK (priority >= 1)
-);
-
-CREATE TABLE job_task_overrides (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
-    is_active INTEGER NOT NULL DEFAULT 1,
-    override_days INTEGER,
-    milestone_id INTEGER REFERENCES milestones(id) ON DELETE SET NULL,
-    team_id INTEGER REFERENCES teams(id) ON DELETE SET NULL,
-    UNIQUE(job_id, workflow_task_id)
-);
-
-CREATE TABLE job_dependency_links (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    depends_on_job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    UNIQUE(job_id, depends_on_job_id),
-    CHECK (job_id != depends_on_job_id)
-);
-
-CREATE TABLE job_external_dependencies (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
-    depends_on_job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    depends_on_workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
-    source_link_id INTEGER REFERENCES job_dependency_links(id) ON DELETE CASCADE,
-    is_active INTEGER NOT NULL DEFAULT 1,
-    UNIQUE(job_id, workflow_task_id, depends_on_job_id, depends_on_workflow_task_id)
-);
-
-CREATE TABLE workflow_dependency_templates (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
-    workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
-    depends_on_workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
-    depends_on_workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
-    UNIQUE(workflow_id, workflow_task_id, depends_on_workflow_id, depends_on_workflow_task_id),
-    CHECK (workflow_id != depends_on_workflow_id)
-);
-"""
+# 再エクスポート: 呼び出し側・テストからは従来どおり gui.db から参照できるようにする。
+from gui.db_schema import SCHEMA_VERSION, _SCHEMA_SQL, migrate as _migrate_schema  # noqa: F401
 
 
 class ProjectDatabaseError(Exception):
@@ -152,6 +46,62 @@ class ReferencedEntityError(ProjectDatabaseError):
     """参照が残っている行を削除しようとした場合"""
 
 
+def undoable(label):
+    """ProjectDatabaseの変更系メソッドに付け、Undo/Redoの記録対象にするデコレータ。
+
+    label は固定文字列、または (self, *args, **kwargs) -> str の callable
+    （呼び出し内容に応じたラベルにしたい場合、例:「マイルストーン「本番リリース」を追加」）。
+
+    実体は self.undo_group(label) にメソッド本体を丸ごと委譲するだけ。ネストした
+    呼び出し（例: add_job_dependency_link 内から sync_dependency_templates を呼ぶ）は
+    undo_group 側のガードにより自動的に1つのUndo単位へまとめられる。
+
+    新しく変更系メソッドを追加する際は必ずこのデコレータを付けること。付け忘れは
+    2つの経路で検知される:
+
+    1. 実行時ガード — 付け忘れたメソッドが self._commit() を呼ぶと、Undo管理が
+       有効な場面（GUI実行時、およびそれを模したテスト）で例外が送出される。
+       ただし self._conn.commit() を直接呼ぶ実装にはこのガードが効かないため、
+       変更系メソッドは必ず _commit() を経由すること。
+    2. 反射テスト — tests/test_undo_redo.py が、変更系の命名（add_/update_/
+       delete_ 等）を持つ公開メソッドすべてに下記の _is_undoable マーカーが
+       付いていることを検査する。_commit() を経由しない実装でも検知できる。"""
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            resolved_label = label(self, *args, **kwargs) if callable(label) else label
+            with self.undo_group(resolved_label):
+                return fn(self, *args, **kwargs)
+
+        # 反射テストからデコレータの適用有無を判定するための目印。
+        wrapper._is_undoable = True
+        return wrapper
+
+    return decorator
+
+
+# Undoメニューのラベルに使う「名前を引くSQL」。テーブル名をSQL文字列へ
+# 組み立てず、あらかじめ用意した文の中からキーで選ぶ形にしている
+# （呼び出し元は常に固定の文字列を渡すが、SQLを動的に組み立てる書き方自体を
+# 残さないため）。
+_ENTITY_NAME_SQL = {
+    "milestones": "SELECT name FROM milestones WHERE id = ?",
+    "teams": "SELECT name FROM teams WHERE id = ?",
+    "workflows": "SELECT name FROM workflows WHERE id = ?",
+    "workflow_tasks": "SELECT name FROM workflow_tasks WHERE id = ?",
+    "jobs": "SELECT name FROM jobs WHERE id = ?",
+}
+
+
+def _entity_name(conn, table, entity_id):
+    """Undoメニューのラベル用に、削除対象の名前を引く小さなヘルパー。
+    対象が既に存在しない場合は "?" を返す（ラベルのためだけの処理なので、
+    ここで失敗させない）。"""
+    row = conn.execute(_ENTITY_NAME_SQL[table], (entity_id,)).fetchone()
+    return row["name"] if row else "?"
+
+
 class ProjectDatabase:
     def __init__(self, path):
         # pathがNoneの場合は「まだ保存先未定の新規プロジェクト」を表す
@@ -164,9 +114,84 @@ class ProjectDatabase:
         # GUI側から差し込む変更通知フック（タイトルバーの未保存マーク更新等に使う）。
         # 引数なしで呼ばれる callable、または None。
         self.on_change = None
+        # GUI側から差し込む gui.undo_manager.UndoManager（またはNone）。
+        # None の間は undo_group が完全に無効化され、通常のCRUDとして動作する
+        # （Qt非依存のテスト等、GUIを介さない利用を妨げないため）。
+        self.undo_manager = None
+        # undo_group のネスト検知用（Trueの間は既に外側でスナップショットを
+        # 取得済みなので、内側の呼び出しでは何もしない）。
+        self._in_undoable_call = False
+        # Undo/Redoの適用中（suspend_undo_recording）かどうか。
+        self._undo_suppressed = False
 
     def close(self):
         self._conn.close()
+
+    def serialize_state(self):
+        """メモリ上のDB全体をバイト列として取り出す（Undo用スナップショット）。"""
+        return self._conn.serialize()
+
+    def restore_state(self, blob):
+        """serialize_state() が返したバイト列で、メモリ上のDB内容を丸ごと置き換える
+        （Undo/Redoの実行時にのみ呼ぶ）。通常の変更系メソッドと同様、未保存フラグを
+        立て、変更通知フックを呼ぶ。"""
+        self._conn.deserialize(blob)
+        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._dirty = True
+        self._notify_change()
+
+    @contextmanager
+    def undo_group(self, label):
+        """このwithブロック内でのDBへの変更をまとめて1つのUndo単位として記録する。
+
+        GUI側で複数のDB呼び出しにまたがる1つのユーザー操作（例: タスク追加後の
+        自動レイアウト）をまとめたい場合に明示的に使う。@undoable デコレータも
+        内部的にこれを使っており、既に外側でこのブロックに入っている場合
+        （ネストした呼び出し）は何もしない——外側の呼び出しが取得したスナップショットに
+        自動的に合流する。
+
+        undo_manager が未設定（GUIを介さない利用）の場合、および
+        suspend_undo_recording() の内側（Undo/Redoの適用中）の場合は素通しする。
+
+        ブロックの内容が実際にDBを変えなかった場合はUndoエントリを積まない
+        （重複名エラー等で何も変わらずに終わった操作で、空のUndoが増えるのを
+        防ぐ）。逆に、例外で中断した場合でも、その時点までに実際にコミット
+        された変更が残っていればUndoエントリを積む——取り消せない変更が
+        残ってしまう方が、余分なUndoエントリより有害なため。"""
+        if self.undo_manager is None or self._in_undoable_call or self._undo_suppressed:
+            yield
+            return
+        self._in_undoable_call = True
+        before_db = self.serialize_state()
+        before_ui = self.undo_manager.capture_ui_state()
+        try:
+            yield
+        finally:
+            self._in_undoable_call = False
+            after_db = self.serialize_state()
+            if after_db != before_db:
+                self.undo_manager.push(before_db, before_ui, after_db, label)
+
+    @contextmanager
+    def suspend_undo_recording(self):
+        """このブロック内でのDBへの変更を、新しいUndoエントリとして記録しない。
+
+        Undo/Redoの適用中（gui/undo_manager.py）に使う。適用処理は、スナップ
+        ショットの復元に続けてGUI側の再読込（各タブの refresh_choices()）まで
+        行うが、この再読込がDBに書き込むことがある——現に
+        gui/tab_jobs.py の refresh_choices() は sync_dependency_templates() を
+        呼ぶ。抑止しないと、その書き込みが「ユーザーの新しい操作」として
+        Undoスタックに積まれ、同時にRedoスタックが破棄されてしまう
+        （＝Undoした直後にRedoできなくなる）。
+
+        今後追加するタブの refresh_choices() が同様にDBへ書き込む場合も、
+        この抑止によって自動的に守られる。"""
+        previous = self._undo_suppressed
+        self._undo_suppressed = True
+        try:
+            yield
+        finally:
+            self._undo_suppressed = previous
 
     # -- 生成/オープン -----------------------------------------------------
 
@@ -200,102 +225,27 @@ class ProjectDatabase:
             disk_conn.backup(db._conn)
         finally:
             disk_conn.close()
-        db._migrate_schema()
+        _migrate_schema(db._conn)
         db._dirty = False
         return db
-
-    def _migrate_schema(self):
-        """旧バージョンの.pscheduleファイルを開いた際、不足しているカラム等を
-        後から追加する（既存データはそのまま維持し、schema_versionだけ進める）。"""
-        row = self._conn.execute(
-            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-        ).fetchone()
-        version = row["value"] if row else "1"
-
-        if version == "1":
-            # v2: workflows.sort_order を追加し、既存の並び順（従来の表示順である
-            # 名前順）に基づいて連番を振る。
-            self._conn.execute(
-                "ALTER TABLE workflows ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"
-            )
-            rows = self._conn.execute("SELECT id FROM workflows ORDER BY name").fetchall()
-            for i, r in enumerate(rows):
-                self._conn.execute(
-                    "UPDATE workflows SET sort_order = ? WHERE id = ?", (i, r["id"])
-                )
-            version = "2"
-
-        if version == "2":
-            # v3: job_external_dependencies.is_active を追加（個別のタスク依存を
-            # 削除せず一時的に無効化できるようにするため）。既存行はすべて有効。
-            # テーブル自体が無い（テスト用の簡略化した旧スキーマ等）場合は何もしない。
-            cols = [
-                r["name"] for r in
-                self._conn.execute("PRAGMA table_info(job_external_dependencies)").fetchall()
-            ]
-            if cols and "is_active" not in cols:
-                self._conn.execute(
-                    "ALTER TABLE job_external_dependencies ADD COLUMN is_active "
-                    "INTEGER NOT NULL DEFAULT 1"
-                )
-            version = "3"
-
-        if version == "3":
-            # v4: team_capacity_changes を追加（チームの同時ライン数を、
-            # 開発開始日からの既定値（teams.max_lines）に加えて、途中の日付から
-            # 変動させられるようにするため）。旧ファイルには変更点が無い
-            # （＝全期間 teams.max_lines のまま）ものとして扱う。
-            exists = self._conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                "AND name = 'team_capacity_changes'"
-            ).fetchone()
-            if not exists:
-                self._conn.execute(
-                    "CREATE TABLE team_capacity_changes ("
-                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                    "team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE, "
-                    "start_date TEXT NOT NULL, "
-                    "lines INTEGER NOT NULL CHECK (lines >= 1), "
-                    "UNIQUE(team_id, start_date))"
-                )
-            version = "4"
-
-        if version == "4":
-            # v5: 「個別のタスク依存」を「依存先ジョブ」のリンクに従属させる設計に
-            # 統一した（GUI側、gui/tab_jobs.py）。旧バージョンでは依存先ジョブの
-            # リンクを作らずに個別のタスク依存だけを追加できたため、対応する
-            # job_dependency_links 行が無い (job_id, depends_on_job_id) の組が
-            # あれば補完する（新UIでタスク対応が見えなくなることを防ぐため）。
-            tables = {
-                r["name"] for r in
-                self._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
-            }
-            if "job_external_dependencies" in tables and "job_dependency_links" in tables:
-                orphans = self._conn.execute(
-                    "SELECT DISTINCT d.job_id, d.depends_on_job_id "
-                    "FROM job_external_dependencies d "
-                    "WHERE NOT EXISTS ("
-                    "  SELECT 1 FROM job_dependency_links l "
-                    "  WHERE l.job_id = d.job_id AND l.depends_on_job_id = d.depends_on_job_id"
-                    ")"
-                ).fetchall()
-                for o in orphans:
-                    self._conn.execute(
-                        "INSERT INTO job_dependency_links(job_id, depends_on_job_id) VALUES (?, ?)",
-                        (o["job_id"], o["depends_on_job_id"]),
-                    )
-            version = "5"
-
-        self._conn.execute(
-            "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)
-        )
-        self._conn.commit()
 
     # -- 保存（明示的） -----------------------------------------------------
 
     def is_dirty(self):
-        """前回の保存（またはオープン/新規作成）以降に変更があれば True。"""
+        """前回の保存（またはオープン/新規作成）以降に変更があれば True。
+
+        Undo管理が有効な場合は、単純な「変更したか」のフラグではなく、Undo履歴
+        上の位置で判定する（gui/undo_manager.py の is_clean）。変更→保存→変更→
+        Undo と操作して保存時点の内容に戻った場合、未保存マークが消える。"""
+        if self.undo_manager is not None:
+            return not self.undo_manager.is_clean()
         return self._dirty
+
+    def _mark_saved(self):
+        self._dirty = False
+        if self.undo_manager is not None:
+            self.undo_manager.mark_clean()
+        self._notify_change()
 
     def save(self):
         """メモリ上の内容を self.path のファイルへ書き出す。保存先未定
@@ -304,30 +254,55 @@ class ProjectDatabase:
         if self.path is None:
             raise ProjectDatabaseError("保存先が未設定です（save_asでパスを指定してください）")
         self._write_to(self.path)
-        self._dirty = False
-        self._notify_change()
+        self._mark_saved()
 
     def save_as(self, new_path):
         """メモリ上の内容を new_path へ書き出し、以降そのパスを対象とする。"""
         self._write_to(new_path)
         self.path = str(new_path)
-        self._dirty = False
-        self._notify_change()
+        self._mark_saved()
 
     def _write_to(self, path):
+        """同じフォルダの一時ファイルへ書き出し、成功してから os.replace() で
+        本来の名前に置き換える。
+
+        書き込み先を先に削除してから書くと、途中で失敗した場合（ディスク満杯・
+        権限エラー・書き込み中のクラッシュ等）に、保存済みの内容ごと失われて
+        しまう。Undo履歴はメモリ上にしか無いため、こうなると復旧手段が無い。
+        一時ファイル経由なら、失敗しても既存の保存済みファイルは無傷のまま残る。
+
+        一時ファイルを同じフォルダに作るのは、os.replace() が同一ファイル
+        システム上でしか原子的に置き換えられないため（テンポラリ領域が別の
+        ドライブにあると保証が崩れる）。"""
         p = Path(path)
-        if p.exists():
-            p.unlink()
-        dest_conn = sqlite3.connect(str(p))
+        fd, tmp_name = tempfile.mkstemp(dir=str(p.parent), prefix=f".{p.name}.", suffix=".tmp")
+        os.close(fd)  # sqlite3が自分で開き直すため、ここではファイル名の確保だけが目的
         try:
-            self._conn.backup(dest_conn)
-        finally:
-            dest_conn.close()
+            dest_conn = sqlite3.connect(tmp_name)
+            try:
+                self._conn.backup(dest_conn)
+            finally:
+                dest_conn.close()
+            os.replace(tmp_name, str(p))
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
 
     def _commit(self):
         """変更系メソッドの末尾から呼ぶ内部コミット。メモリ上のトランザクションを
         確定し、未保存フラグを立てて変更通知フックを呼ぶ（ファイルへの書き込みは
-        行わない——それは save()/save_as() の役目）。"""
+        行わない——それは save()/save_as() の役目）。
+
+        undo_manager が設定されている場合、@undoable / undo_group の外側から
+        呼ばれると例外を送出する。変更系メソッドに @undoable を付け忘れると
+        ここで即座に検知できるようにするためのガード（Undo/Redoの記録漏れ防止）。
+        Undo/Redoの適用中（suspend_undo_recording）はそもそも記録しない区間
+        なので、このガードも見送る。"""
+        if self.undo_manager is not None and not self._in_undoable_call and not self._undo_suppressed:
+            raise AssertionError(
+                f"{type(self).__name__}._commit() が @undoable / undo_group の外側から呼ばれました。"
+                "変更系メソッドには @undoable(\"ラベル\") を付けてください。"
+            )
         self._conn.commit()
         self._dirty = True
         self._notify_change()
@@ -344,6 +319,7 @@ class ProjectDatabase:
         ).fetchone()
         return {"project_name": row["project_name"], "start_date": row["start_date"]}
 
+    @undoable("プロジェクト概要を変更")
     def set_project(self, project_name, start_date):
         self._conn.execute(
             "UPDATE project SET project_name = ?, start_date = ? WHERE id = 1",
@@ -359,6 +335,7 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @undoable(lambda self, name, end_date: f"マイルストーン「{name}」を追加")
     def add_milestone(self, name, end_date):
         try:
             cur = self._conn.execute(
@@ -369,6 +346,7 @@ class ProjectDatabase:
         self._commit()
         return cur.lastrowid
 
+    @undoable(lambda self, milestone_id, name, end_date: f"マイルストーン「{name}」を変更")
     def update_milestone(self, milestone_id, name, end_date):
         try:
             self._conn.execute(
@@ -388,6 +366,7 @@ class ProjectDatabase:
         ).fetchone()
         return row["n"]
 
+    @undoable(lambda self, milestone_id: f"マイルストーン「{_entity_name(self._conn, 'milestones', milestone_id)}」を削除")
     def delete_milestone(self, milestone_id):
         self._conn.execute("DELETE FROM milestones WHERE id = ?", (milestone_id,))
         self._commit()
@@ -400,6 +379,7 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @undoable(lambda self, name, max_lines: f"チーム「{name}」を追加")
     def add_team(self, name, max_lines):
         try:
             cur = self._conn.execute(
@@ -410,6 +390,7 @@ class ProjectDatabase:
         self._commit()
         return cur.lastrowid
 
+    @undoable(lambda self, team_id, name, max_lines: f"チーム「{name}」を変更")
     def update_team(self, team_id, name, max_lines):
         try:
             self._conn.execute(
@@ -429,6 +410,7 @@ class ProjectDatabase:
         ).fetchone()
         return row["n"]
 
+    @undoable(lambda self, team_id: f"チーム「{_entity_name(self._conn, 'teams', team_id)}」を削除")
     def delete_team(self, team_id):
         if self.team_usage_count(team_id) > 0:
             raise ReferencedEntityError("このチームはタスクに使用されているため削除できません")
@@ -449,6 +431,7 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @undoable(lambda self, team_id, start_date, lines: f"同時ライン数の変更点（{start_date}）を追加")
     def add_team_capacity_change(self, team_id, start_date, lines):
         try:
             cur = self._conn.execute(
@@ -463,6 +446,7 @@ class ProjectDatabase:
         self._commit()
         return cur.lastrowid
 
+    @undoable(lambda self, change_id, start_date, lines: f"同時ライン数の変更点（{start_date}）を変更")
     def update_team_capacity_change(self, change_id, start_date, lines):
         try:
             self._conn.execute(
@@ -475,6 +459,7 @@ class ProjectDatabase:
             ) from e
         self._commit()
 
+    @undoable("同時ライン数の変更点を削除")
     def delete_team_capacity_change(self, change_id):
         self._conn.execute("DELETE FROM team_capacity_changes WHERE id = ?", (change_id,))
         self._commit()
@@ -489,6 +474,7 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @undoable(lambda self, date, team_id=None: f"休業日（{date}）を追加")
     def add_holiday(self, date, team_id=None):
         exists = self._conn.execute(
             "SELECT 1 FROM holidays WHERE date = ? AND team_id IS ?", (date, team_id)
@@ -501,6 +487,7 @@ class ProjectDatabase:
         self._commit()
         return cur.lastrowid
 
+    @undoable(lambda self, holiday_id, date, team_id=None: f"休業日（{date}）を変更")
     def update_holiday(self, holiday_id, date, team_id=None):
         exists = self._conn.execute(
             "SELECT 1 FROM holidays WHERE date = ? AND team_id IS ? AND id != ?",
@@ -514,6 +501,7 @@ class ProjectDatabase:
         )
         self._commit()
 
+    @undoable("休業日を削除")
     def delete_holiday(self, holiday_id):
         self._conn.execute("DELETE FROM holidays WHERE id = ?", (holiday_id,))
         self._commit()
@@ -526,6 +514,7 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @undoable(lambda self, name: f"ワークフロー「{name}」を追加")
     def add_workflow(self, name):
         next_order = self._conn.execute(
             "SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM workflows"
@@ -539,6 +528,7 @@ class ProjectDatabase:
         self._commit()
         return cur.lastrowid
 
+    @undoable("ワークフローの並び順を変更")
     def reorder_workflows(self, ordered_workflow_ids):
         """左のワークフロー一覧をドラッグで並び替えた結果を反映する。
         ordered_workflow_ids は表示させたい順のワークフローIDの並び。"""
@@ -548,6 +538,7 @@ class ProjectDatabase:
             )
         self._commit()
 
+    @undoable(lambda self, workflow_id, name: f"ワークフロー名を「{name}」に変更")
     def rename_workflow(self, workflow_id, name):
         try:
             self._conn.execute(
@@ -563,6 +554,7 @@ class ProjectDatabase:
         ).fetchone()
         return row["n"]
 
+    @undoable(lambda self, workflow_id: f"ワークフロー「{_entity_name(self._conn, 'workflows', workflow_id)}」を削除")
     def delete_workflow(self, workflow_id):
         if self.workflow_usage_count(workflow_id) > 0:
             raise ReferencedEntityError(
@@ -583,6 +575,7 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @undoable(lambda self, workflow_id, name, team_id, default_days, x=0.0, y=0.0: f"タスク「{name}」を追加")
     def add_workflow_task(self, workflow_id, name, team_id, default_days, x=0.0, y=0.0):
         try:
             cur = self._conn.execute(
@@ -597,6 +590,7 @@ class ProjectDatabase:
         self._commit()
         return cur.lastrowid
 
+    @undoable(lambda self, task_id, name, team_id, default_days: f"タスク「{name}」を変更")
     def update_workflow_task(self, task_id, name, team_id, default_days):
         try:
             self._conn.execute(
@@ -610,6 +604,7 @@ class ProjectDatabase:
             ) from e
         self._commit()
 
+    @undoable("タスクの位置を変更")
     def update_task_position(self, task_id, x, y):
         self._conn.execute(
             "UPDATE workflow_tasks SET canvas_x = ?, canvas_y = ? WHERE id = ?",
@@ -631,6 +626,7 @@ class ProjectDatabase:
         ).fetchone()
         return row["n"]
 
+    @undoable(lambda self, task_id: f"タスク「{_entity_name(self._conn, 'workflow_tasks', task_id)}」を削除")
     def delete_workflow_task(self, task_id):
         self._conn.execute("DELETE FROM workflow_tasks WHERE id = ?", (task_id,))
         self._commit()
@@ -645,6 +641,7 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @undoable("依存関係を追加")
     def add_task_dependency(self, workflow_id, predecessor_task_id, successor_task_id):
         """循環依存のチェックは呼び出し側（gui/node_canvas.py）が事前に行う想定。
         ここでは構造的制約（自己参照禁止・重複禁止）のみDB制約で守る。"""
@@ -659,6 +656,7 @@ class ProjectDatabase:
         self._commit()
         return cur.lastrowid
 
+    @undoable("依存関係を削除")
     def delete_task_dependency(self, dependency_id):
         self._conn.execute("DELETE FROM task_dependencies WHERE id = ?", (dependency_id,))
         self._commit()
@@ -676,6 +674,7 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @undoable(lambda self, name, workflow_id, default_milestone_id, priority: f"ジョブ「{name}」を追加")
     def add_job(self, name, workflow_id, default_milestone_id, priority):
         try:
             cur = self._conn.execute(
@@ -688,6 +687,7 @@ class ProjectDatabase:
         self._commit()
         return cur.lastrowid
 
+    @undoable(lambda self, job_id, name, workflow_id, default_milestone_id, priority: f"ジョブ「{name}」を変更")
     def update_job(self, job_id, name, workflow_id, default_milestone_id, priority):
         old = self._conn.execute(
             "SELECT workflow_id FROM jobs WHERE id = ?", (job_id,)
@@ -718,6 +718,7 @@ class ProjectDatabase:
         ).fetchone()
         return row["n"]
 
+    @undoable(lambda self, job_id: f"ジョブ「{_entity_name(self._conn, 'jobs', job_id)}」を削除")
     def delete_job(self, job_id):
         self._conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
         self._commit()
@@ -785,6 +786,7 @@ class ProjectDatabase:
         result.sort(key=lambda r: order_index.get(r["workflow_task_id"], len(order)))
         return result
 
+    @undoable("タスク上書きを変更")
     def upsert_job_task_override(self, job_id, workflow_task_id, is_active=True,
                                   override_days=None, milestone_id=None, team_id=None):
         existing = self._conn.execute(
@@ -805,6 +807,7 @@ class ProjectDatabase:
             )
         self._commit()
 
+    @undoable("タスク上書きを既定に戻す")
     def clear_job_task_override(self, job_id, workflow_task_id):
         """タスクが既定値に戻った場合、上書き行自体を削除する（差分のみ保持）。"""
         self._conn.execute(
@@ -866,6 +869,7 @@ class ProjectDatabase:
                 end_dates.append(ms["end_date"])
         return max(end_dates) if end_dates else None
 
+    @undoable("マイルストーンを後続タスクへ反映")
     def cascade_milestone_to_successors(self, job_id, workflow_task_id):
         """workflow_task_idのマイルストーンを変更した直後に呼ぶ。後続タスク
         （transitively）の実効マイルストーンが、このタスクの実効マイルストーン
@@ -904,6 +908,7 @@ class ProjectDatabase:
                 queue.extend(succ_map.get(succ_id, []))
         return changed
 
+    @undoable("マイルストーンを先行タスクに合わせて調整")
     def enforce_milestone_floor(self, job_id, workflow_task_id):
         """workflow_task_idの上書きを変更・解除した直後に呼ぶ。先行タスク
         （同一ワークフロー内、直接のみ）の実効マイルストーンより、このタスク
@@ -965,6 +970,7 @@ class ProjectDatabase:
         rows = self._conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
+    @undoable("個別のタスク依存を追加")
     def add_external_dependency(self, job_id, workflow_task_id, depends_on_job_id,
                                  depends_on_workflow_task_id):
         if (job_id, workflow_task_id) == (depends_on_job_id, depends_on_workflow_task_id):
@@ -980,6 +986,7 @@ class ProjectDatabase:
         self._commit()
         return cur.lastrowid
 
+    @undoable("個別のタスク依存を変更")
     def update_external_dependency(self, dependency_id, workflow_task_id, depends_on_job_id,
                                     depends_on_workflow_task_id):
         """手動追加した個別のタスク依存の内容を選び直す（自動生成分＝
@@ -1002,6 +1009,7 @@ class ProjectDatabase:
             raise ProjectDatabaseError("この依存関係は既に登録されています") from e
         self._commit()
 
+    @undoable(lambda self, dependency_id, is_active: "個別のタスク依存を有効化" if is_active else "個別のタスク依存を無効化")
     def set_external_dependency_active(self, dependency_id, is_active):
         """個別のタスク依存（自動生成分・手動追加分いずれも）を、削除せずに
         有効/無効だけ切り替える。無効化した依存はスケジューリング時に無視される
@@ -1013,6 +1021,7 @@ class ProjectDatabase:
         )
         self._commit()
 
+    @undoable("個別のタスク依存を削除")
     def delete_external_dependency(self, dependency_id):
         self._conn.execute(
             "DELETE FROM job_external_dependencies WHERE id = ?", (dependency_id,)
@@ -1058,6 +1067,7 @@ class ProjectDatabase:
                 (source_link_id, existing["id"]),
             )
 
+    @undoable("依存テンプレートの同期")
     def sync_dependency_templates(self):
         """既存の「依存先ジョブ」リンクすべてに対し、現在の依存テンプレートの
         内容を改めて適用し直す（テンプレート由来のタスク対応を最新状態へ
@@ -1112,6 +1122,7 @@ class ProjectDatabase:
                     )
         self._commit()
 
+    @undoable("依存先ジョブを追加")
     def add_job_dependency_link(self, job_id, depends_on_job_id):
         if job_id == depends_on_job_id:
             raise ProjectDatabaseError("同じジョブへの自己依存は設定できません")
@@ -1126,6 +1137,7 @@ class ProjectDatabase:
         self.sync_dependency_templates()
         return link_id
 
+    @undoable("依存先ジョブを削除")
     def delete_job_dependency_link(self, link_id):
         """CASCADEにより、このリンクから自動生成された job_external_dependencies
         行（source_link_id が一致する行）も同時に削除される。個別のタスク対応は
@@ -1192,6 +1204,7 @@ class ProjectDatabase:
             stack.extend(graph.get(current, ()))
         return False
 
+    @undoable("依存テンプレートを追加")
     def add_dependency_template(self, workflow_id, workflow_task_id,
                                  depends_on_workflow_id, depends_on_workflow_task_id):
         if self._would_create_workflow_template_cycle(workflow_id, depends_on_workflow_id):
@@ -1215,6 +1228,7 @@ class ProjectDatabase:
         self.sync_dependency_templates()
         return template_id
 
+    @undoable("依存テンプレートを変更")
     def update_dependency_template(self, template_id, workflow_task_id,
                                     depends_on_workflow_id, depends_on_workflow_task_id):
         """テンプレートの依存先ワークフロー/タスクを変更する（ワークフロー自体は
@@ -1245,6 +1259,7 @@ class ProjectDatabase:
         # タスク対応が新たに展開される。
         self.sync_dependency_templates()
 
+    @undoable("依存テンプレートを削除")
     def delete_dependency_template(self, template_id):
         self._conn.execute(
             "DELETE FROM workflow_dependency_templates WHERE id = ?", (template_id,)
