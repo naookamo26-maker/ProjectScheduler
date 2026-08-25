@@ -277,6 +277,62 @@ def test_tab_changed_is_connected_only_once_across_reopens(window, qapp):
             qapp.processEvents()
 
 
+def test_multi_select_delete_shows_a_single_aggregated_confirmation(window, qapp):
+    """回帰テスト: 参照されているタスクを複数選択してDeleteした場合、ノードの
+    数だけ確認ダイアログが繰り返されず、1回だけ・合計件数をまとめた文面で
+    出ること。単一削除（右クリック「削除」相当）は従来通り単数形の文面のまま
+    であることも確認する。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    n1 = scene.add_task("タスク1", team_id, 1, 0, 0)
+    qapp.processEvents()
+    n2 = wf_tab.current_scene.add_task("タスク2", team_id, 1, 200, 0)
+    qapp.processEvents()
+    n3 = wf_tab.current_scene.add_task("タスク3", team_id, 1, 400, 0)
+    qapp.processEvents()
+    job_id = window.db.add_job("J1", wf_id, None, 100)
+    # タスク1・タスク2を参照ありの状態にする（タスク3は参照なしのまま）。
+    window.db.upsert_job_task_override(job_id, n1.workflow_task_id, is_active=False)
+    window.db.upsert_job_task_override(job_id, n2.workflow_task_id, is_active=False)
+
+    # -- 単一削除（右クリック「削除」相当）: 従来通り単数形・1回だけ ------------------
+    scene = wf_tab.current_scene
+    messages = []
+    with patch.object(QMessageBox, "question",
+                       side_effect=lambda *a, **k: (messages.append(a[2]), QMessageBox.Yes)[1]):
+        scene.delete_node(scene.nodes[n1.workflow_task_id])
+    qapp.processEvents()
+    assert len(messages) == 1
+    assert messages[0].startswith("このタスクは ")
+
+    # -- 複数選択削除: 参照ありのタスク2＋参照なしのタスク3をまとめてDelete ----------
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    scene = wf_tab.current_scene
+    scene.nodes[n2.workflow_task_id].setSelected(True)
+    scene.nodes[n3.workflow_task_id].setSelected(True)
+    qapp.processEvents()
+
+    messages2 = []
+    with patch.object(QMessageBox, "question",
+                       side_effect=lambda *a, **k: (messages2.append(a[2]), QMessageBox.Yes)[1]):
+        wf_tab.view.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier))
+    qapp.processEvents()
+
+    assert len(messages2) == 1, "選択ノードの数だけダイアログが繰り返されている"
+    assert "選択した2件のタスクは" in messages2[0]
+    assert window.db.list_workflow_tasks(wf_id) == []
+
+
 def test_multi_select_delete_on_canvas_is_a_single_undo_step(window, qapp):
     """回帰テスト: キャンバスで複数選択してDeleteした場合、選択項目ごとに
     Undoが分かれず1回のUndoで全部戻ること。あわせて、タスクとその依存線を

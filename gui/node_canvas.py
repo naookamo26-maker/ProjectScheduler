@@ -318,16 +318,48 @@ class WorkflowGraphScene(QGraphicsScene):
             self.auto_arrange()
 
     def delete_node(self, node):
-        usage = self.db.workflow_task_usage_count(node.workflow_task_id)
-        if usage > 0:
-            reply = QMessageBox.question(
-                self.parent_widget, "削除の確認",
+        if not self.confirm_delete_nodes([node]):
+            return
+        self._delete_node_unconfirmed(node)
+
+    def confirm_delete_nodes(self, nodes):
+        """削除しようとしているタスク群について、他所から参照されている分が
+        あれば確認ダイアログを1回だけ出す。複数選択してまとめて削除する場合
+        （gui/node_canvas.py の _delete_selected）でも、ノードの数だけダイアログが
+        繰り返し出ないよう、対象ノード全体の被参照件数をまとめて確認する。
+
+        文面はノード数に応じて単数形/複数形を切り替える——1件なら「このタスクは」、
+        複数件なら「選択した3件のタスクは」のように、対象がどれなのか誤解の
+        無いようにする。"""
+        if not nodes:
+            return True
+        # ノード同士の依存関係（task_dependencies）は両端でそれぞれ数えられるため、
+        # 選択範囲内の依存はここで多重に計上されうるが、これは「削除して問題
+        # ないか」を大まかに伝えるための件数であり、厳密な重複排除はしない
+        # （削除自体は対象ノードすべてで行われるため、実害は無い）。
+        usage = sum(self.db.workflow_task_usage_count(n.workflow_task_id) for n in nodes)
+        if usage <= 0:
+            return True
+        if len(nodes) == 1:
+            message = (
                 f"このタスクは {usage} 件のジョブ設定/依存関係から参照されています。"
-                "削除すると、それらの参照も削除されます。続行しますか？",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                "削除すると、それらの参照も削除されます。続行しますか？"
             )
-            if reply != QMessageBox.Yes:
-                return
+        else:
+            message = (
+                f"選択した{len(nodes)}件のタスクは、合計{usage}件のジョブ設定/依存関係"
+                "から参照されています。削除すると、それらの参照も削除されます。"
+                "続行しますか？"
+            )
+        reply = QMessageBox.question(
+            self.parent_widget, "削除の確認", message,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
+    def _delete_node_unconfirmed(self, node):
+        """確認ダイアログを経ずにノード1件を削除する内部処理。確認は呼び出し側
+        （delete_node、または複数選択時はまとめて1回）の責務とする。"""
         with self.db.undo_group("タスクを削除"):
             for edge in list(node.edges):
                 self.delete_edge(edge)
@@ -616,7 +648,11 @@ class WorkflowGraphView(QGraphicsView):
         タスクを削除するとそのタスクに繋がる依存関係も一緒に消えるため、
         タスクを先に処理し、依存関係は「まだ残っているもの」だけを削除する
         （タスクとその依存線を同時に選択した場合に、同じ依存線を二重に
-        削除しようとして落ちるのを防ぐ）。"""
+        削除しようとして落ちるのを防ぐ）。
+
+        参照されているタスクが選択に含まれる場合の確認ダイアログは、ノードの
+        数だけ繰り返さず、選択範囲全体でまとめて1回だけ出す
+        （WorkflowGraphScene.confirm_delete_nodes 参照）。"""
         scene = self.scene()
         if scene is None:
             return
@@ -625,10 +661,12 @@ class WorkflowGraphView(QGraphicsView):
         edges = [i for i in selected if isinstance(i, EdgeItem)]
         if not nodes and not edges:
             return
+        if not scene.confirm_delete_nodes(nodes):
+            return
         with scene.db.undo_group("選択したタスク・依存関係を削除"):
             for node in nodes:
                 if node.workflow_task_id in scene.nodes:
-                    scene.delete_node(node)
+                    scene._delete_node_unconfirmed(node)
             for edge in edges:
                 if edge.dependency_id in scene.edges:
                     scene.delete_edge(edge)
