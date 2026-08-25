@@ -58,7 +58,8 @@ def window(qapp):
     w.db.close()
 
 
-def test_team_add_undo_redo_restores_selection_and_focus(window, qapp):
+def test_team_add_undo_redo_restores_selection(window, qapp):
+    """内容と、表の選択（行・列）が復元されること。"""
     bi = window.tab_basic_info
     new_id = window.db.add_team("チームテスト", 2)
     bi.refresh_teams()
@@ -78,7 +79,66 @@ def test_team_add_undo_redo_restores_selection_and_focus(window, qapp):
     row = bi.teams_section.table.currentRow()
     assert row >= 0
     assert row_id(bi.teams_section.table, row) == new_id
-    assert QApplication.focusWidget() is bi.teams_section.table
+
+
+def test_spinbox_edits_collapse_into_one_undo_step_at_focus_out(window, qapp):
+    """回帰テスト: スピンボックスを連続して変更しても、フォーカスが外れるまでは
+    Undoが分かれず、外れた時点で1エントリにまとまること。
+
+    DBは変更のたびに更新される（値を変えた直後に保存しても取りこぼさない）が、
+    Undoの単位は「フォーカスを得てから外れるまで」でまとめる。"""
+    bi = window.tab_basic_info
+    window.db.add_team("チームA", 1)
+    bi.refresh_all()
+    qapp.processEvents()
+    spin = bi.teams_section.table.cellWidget(0, 1)
+
+    steps_before = len(window.undo_manager._undo_stack)
+    spin.setFocus()
+    qapp.processEvents()
+    for _ in range(5):
+        spin.stepBy(1)
+        qapp.processEvents()
+
+    assert window.db.list_teams()[0]["max_lines"] == 6  # DBは即座に最新
+    assert len(window.undo_manager._undo_stack) == steps_before  # まだ記録されない
+
+    bi.project_name_edit.setFocus()  # フォーカスを外して編集を確定
+    qapp.processEvents()
+    assert len(window.undo_manager._undo_stack) == steps_before + 1
+
+    window.on_undo()
+    qapp.processEvents()
+    assert window.db.list_teams()[0]["max_lines"] == 1  # 1回のUndoで一気に戻る
+
+
+def test_focus_is_never_moved_into_cell_widgets_by_undo(window, qapp):
+    """回帰テスト: Undo/Redoの復元で、スピンボックスや日付欄へフォーカスが
+    移らないこと。
+
+    これらはCtrl+Zを自分のものとして横取りする（QAbstractSpinBox/QLineEditが
+    ShortcutOverrideを受け取る）ため、フォーカスが入ると次のCtrl+Zがメニューまで
+    届かず、Undoが効かなくなったように見える。現在セルの復元は、その列に
+    セルウィジェットがあるとフォーカスを移してしまうので、選択だけを戻す。"""
+    bi = window.tab_basic_info
+    window.db.add_team("チームA", 1)
+    bi.refresh_all()
+    qapp.processEvents()
+
+    spin = bi.teams_section.table.cellWidget(0, 1)
+    spin.setFocus()
+    qapp.processEvents()
+    spin.stepBy(1)
+    qapp.processEvents()
+    bi.project_name_edit.setFocus()  # 編集を確定し、フォーカスを表の外へ
+    qapp.processEvents()
+
+    window.on_undo()
+    qapp.processEvents()
+    focused = QApplication.focusWidget()
+    assert focused is bi.project_name_edit, f"フォーカスが移動している: {type(focused).__name__}"
+    # 選択自体は復元されている
+    assert bi.teams_section.table.currentColumn() == 1
 
 
 def test_workflow_task_add_is_single_undo_step_and_restores_canvas_selection(window, qapp):
@@ -97,7 +157,6 @@ def test_workflow_task_add_is_single_undo_step_and_restores_canvas_selection(win
     stack_size_before = len(window.undo_manager._undo_stack)
     node = scene.add_task("タスクA", team_id, 3, 0, 0)
     node.setSelected(True)
-    wf_tab.view.setFocus()
     qapp.processEvents()
 
     # add_task内部でauto_arrangeが複数のupdate_task_positionを呼んでも、
@@ -113,10 +172,42 @@ def test_workflow_task_add_is_single_undo_step_and_restores_canvas_selection(win
     qapp.processEvents()
     tasks = window.db.list_workflow_tasks(wf_id)
     assert len(tasks) == 1
+    # ノードの選択（視覚的なハイライト）は復元される。フォーカス（キーボード
+    # 入力の宛先）はUndo/Redoの対象外——スピンボックス等と異なりビューは
+    # Ctrl+Zを横取りしないため実害は無いが、設計として意図的に外している。
     restored_scene = wf_tab.current_scene
     restored_node = restored_scene.nodes[tasks[0]["id"]]
     assert restored_node.isSelected()
-    assert wf_tab.view.hasFocus()
+
+
+def test_canvas_selection_survives_switching_tabs_away_and_back(window, qapp):
+    """回帰テスト: Undo/Redoとは無関係に、単に別のタブへ移って戻ってきただけでも
+    ノードの選択が保たれること。
+
+    ワークフローを選択するたびに WorkflowGraphScene を作り直すため
+    （_on_selection_changed）、タブ切り替え時の refresh_choices() が選択状態を
+    明示的に持ち回らないと、ノードをクリックしただけで選んだ選択が、他のタブを
+    見て戻ってくるたびに消えてしまう。"""
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    node = wf_tab.current_scene.add_task("タスクA", team_id, 3, 0, 0)
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    scene.nodes[node.workflow_task_id].setSelected(True)
+    qapp.processEvents()
+
+    window.tabs.setCurrentWidget(window.tab_jobs)
+    qapp.processEvents()
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    restored_scene = wf_tab.current_scene
+    assert restored_scene.nodes[node.workflow_task_id].isSelected()
 
 
 def test_undo_and_redo_from_another_tab_return_to_the_edited_tab(window, qapp):
@@ -184,6 +275,184 @@ def test_tab_changed_is_connected_only_once_across_reopens(window, qapp):
             assert calls["n"] == 1
             window.tabs.setCurrentIndex(0)
             qapp.processEvents()
+
+
+def test_multi_select_delete_shows_a_single_aggregated_confirmation(window, qapp):
+    """回帰テスト: 参照されているタスクを複数選択してDeleteした場合、ノードの
+    数だけ確認ダイアログが繰り返されず、1回だけ・合計件数をまとめた文面で
+    出ること。単一削除（右クリック「削除」相当）は従来通り単数形の文面のまま
+    であることも確認する。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    n1 = scene.add_task("タスク1", team_id, 1, 0, 0)
+    qapp.processEvents()
+    n2 = wf_tab.current_scene.add_task("タスク2", team_id, 1, 200, 0)
+    qapp.processEvents()
+    n3 = wf_tab.current_scene.add_task("タスク3", team_id, 1, 400, 0)
+    qapp.processEvents()
+    job_id = window.db.add_job("J1", wf_id, None, 100)
+    # タスク1・タスク2を参照ありの状態にする（タスク3は参照なしのまま）。
+    window.db.upsert_job_task_override(job_id, n1.workflow_task_id, is_active=False)
+    window.db.upsert_job_task_override(job_id, n2.workflow_task_id, is_active=False)
+
+    # -- 単一削除（右クリック「削除」相当）: 従来通り単数形・1回だけ ------------------
+    scene = wf_tab.current_scene
+    messages = []
+    with patch.object(QMessageBox, "question",
+                       side_effect=lambda *a, **k: (messages.append(a[2]), QMessageBox.Yes)[1]):
+        scene.delete_node(scene.nodes[n1.workflow_task_id])
+    qapp.processEvents()
+    assert len(messages) == 1
+    assert messages[0].startswith("このタスクは ")
+
+    # -- 複数選択削除: 参照ありのタスク2＋参照なしのタスク3をまとめてDelete ----------
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    scene = wf_tab.current_scene
+    scene.nodes[n2.workflow_task_id].setSelected(True)
+    scene.nodes[n3.workflow_task_id].setSelected(True)
+    qapp.processEvents()
+
+    messages2 = []
+    with patch.object(QMessageBox, "question",
+                       side_effect=lambda *a, **k: (messages2.append(a[2]), QMessageBox.Yes)[1]):
+        wf_tab.view.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier))
+    qapp.processEvents()
+
+    assert len(messages2) == 1, "選択ノードの数だけダイアログが繰り返されている"
+    assert "選択した2件のタスクは" in messages2[0]
+    assert window.db.list_workflow_tasks(wf_id) == []
+
+
+def test_deleting_a_task_bridges_its_predecessors_and_successors(window, qapp):
+    """タスクA→B→Cという流れでBを削除すると、A→Cの依存関係が新設され、
+    前後関係が保たれること。Undo1回で橋渡し込みの状態が元に戻ることも確認する。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    task_a = scene.add_task("A", team_id, 1, 0, 0)
+    qapp.processEvents()
+    task_b = wf_tab.current_scene.add_task("B", team_id, 1, 200, 0)
+    qapp.processEvents()
+    task_c = wf_tab.current_scene.add_task("C", team_id, 1, 400, 0)
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    scene.try_add_edge(scene.nodes[task_a.workflow_task_id], scene.nodes[task_b.workflow_task_id])
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    scene.try_add_edge(scene.nodes[task_b.workflow_task_id], scene.nodes[task_c.workflow_task_id])
+    qapp.processEvents()
+
+    def pairs():
+        id_to_name = {t["id"]: t["name"] for t in window.db.list_workflow_tasks(wf_id)}
+        return sorted(
+            (id_to_name.get(d["predecessor_task_id"]), id_to_name.get(d["successor_task_id"]))
+            for d in window.db.list_task_dependencies(wf_id)
+        )
+
+    assert pairs() == [("A", "B"), ("B", "C")]
+
+    scene = wf_tab.current_scene
+    with patch.object(QMessageBox, "question", return_value=QMessageBox.Yes):
+        scene.delete_node(scene.nodes[task_b.workflow_task_id])
+    qapp.processEvents()
+
+    assert pairs() == [("A", "C")]  # Bが消え、A→Cへ橋渡しされる
+    assert len(window.db.list_workflow_tasks(wf_id)) == 2
+
+    window.on_undo()
+    qapp.processEvents()
+    assert pairs() == [("A", "B"), ("B", "C")]  # 橋渡し込みで1回のUndoで復元
+
+
+def test_deleting_a_task_does_not_duplicate_an_existing_bridge(window, qapp):
+    """A→B→D、A→C→D、かつA→Dも直接存在する状態でBを削除しても、既に存在する
+    A→Dへ重複した依存関係を作ろうとしてエラーにならないこと。"""
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    nodes = {}
+    for name in ("A", "B", "C", "D"):
+        nodes[name] = wf_tab.current_scene.add_task(name, team_id, 1, 0, 0)
+        qapp.processEvents()
+    scene = wf_tab.current_scene
+    for pred, succ in [("A", "B"), ("B", "D"), ("A", "C"), ("C", "D"), ("A", "D")]:
+        scene = wf_tab.current_scene
+        scene.try_add_edge(scene.nodes[nodes[pred].workflow_task_id], scene.nodes[nodes[succ].workflow_task_id])
+        qapp.processEvents()
+
+    from PySide6.QtWidgets import QMessageBox
+    scene = wf_tab.current_scene
+    with patch.object(QMessageBox, "question", return_value=QMessageBox.Yes):
+        scene.delete_node(scene.nodes[nodes["B"].workflow_task_id])
+    qapp.processEvents()
+
+    id_to_name = {t["id"]: t["name"] for t in window.db.list_workflow_tasks(wf_id)}
+    result = sorted(
+        (id_to_name.get(d["predecessor_task_id"]), id_to_name.get(d["successor_task_id"]))
+        for d in window.db.list_task_dependencies(wf_id)
+    )
+    assert result == [("A", "C"), ("A", "D"), ("C", "D")]
+
+
+def test_multi_select_delete_bridges_across_chained_deletions(window, qapp):
+    """A→B→C→D→EからB・Dをまとめて削除すると、連鎖的にA→C→Eへ橋渡しされること
+    （Bの処理でA→Cが繋がり、続くDの処理はその時点の後続関係C→Eを見るため）。"""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QMessageBox
+
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    nodes = {}
+    for name in ("A", "B", "C", "D", "E"):
+        nodes[name] = wf_tab.current_scene.add_task(name, team_id, 1, 0, 0)
+        qapp.processEvents()
+    for pred, succ in [("A", "B"), ("B", "C"), ("C", "D"), ("D", "E")]:
+        scene = wf_tab.current_scene
+        scene.try_add_edge(scene.nodes[nodes[pred].workflow_task_id], scene.nodes[nodes[succ].workflow_task_id])
+        qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    scene.nodes[nodes["B"].workflow_task_id].setSelected(True)
+    scene.nodes[nodes["D"].workflow_task_id].setSelected(True)
+    qapp.processEvents()
+    with patch.object(QMessageBox, "question", return_value=QMessageBox.Yes):
+        wf_tab.view.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier))
+    qapp.processEvents()
+
+    id_to_name = {t["id"]: t["name"] for t in window.db.list_workflow_tasks(wf_id)}
+    result = sorted(
+        (id_to_name.get(d["predecessor_task_id"]), id_to_name.get(d["successor_task_id"]))
+        for d in window.db.list_task_dependencies(wf_id)
+    )
+    assert result == [("A", "C"), ("C", "E")]
 
 
 def test_multi_select_delete_on_canvas_is_a_single_undo_step(window, qapp):
@@ -260,6 +529,44 @@ def test_opening_another_project_while_editing_does_not_touch_a_closed_db(window
         sys.excepthook = original_hook
 
     assert errors == []
+
+
+def test_override_days_edit_keeps_its_spinbox_alive(window, qapp):
+    """回帰テスト: ジョブのタスク上書きで日数を変えても、表全体が作り直されない
+    こと。
+
+    作り直すと、▲で連続操作している最中にスピンボックスごと差し替わって
+    フォーカスが飛び、続けて操作できないうえ、フォーカス単位でまとめている
+    Undoの区切りも途切れてしまう。他の行に影響するマイルストーンの変更時だけ
+    作り直す。"""
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    window.db.add_workflow_task(wf_id, "タスク1", team_id, 3)
+    job_id = window.db.add_job("J1", wf_id, None, 100)
+    window.tabs.setCurrentWidget(window.tab_jobs)
+    window.tab_jobs.refresh_jobs(select_id=job_id)
+    qapp.processEvents()
+
+    spin = window.tab_jobs.override_table.cellWidget(0, 2)
+    spin.setFocus()
+    qapp.processEvents()
+    steps_before = len(window.undo_manager._undo_stack)
+    for _ in range(3):
+        spin.stepBy(1)
+        qapp.processEvents()
+
+    assert window.tab_jobs.override_table.cellWidget(0, 2) is spin, "スピンボックスが作り直されている"
+    assert QApplication.focusWidget() is spin, "編集中にフォーカスが外れている"
+    assert len(window.undo_manager._undo_stack) == steps_before  # 編集中は記録しない
+
+    window.tab_jobs.jobs_section.table.setFocus()  # 編集を確定
+    qapp.processEvents()
+    assert len(window.undo_manager._undo_stack) == steps_before + 1
+
+    window.on_undo()
+    qapp.processEvents()
+    rows = window.db.list_job_tasks_with_overrides(job_id)
+    assert rows[0]["override_days"] is None  # 1回のUndoで上書きが消える
 
 
 def test_gantt_tab_reports_validation_errors_without_a_modal(window, qapp):

@@ -168,6 +168,10 @@ class UndoManager:
         return self._redo_stack[-1].label if self._redo_stack else None
 
     def undo(self):
+        # 編集途中（スピンボックスにフォーカスが残ったまま等）なら、その編集を
+        # 先に1つのUndo単位として確定させる。そうしないと、これから戻す対象が
+        # 「編集前の状態」ではなく1つ前の操作になってしまう。
+        self.db.end_undo_group()
         # Undoする操作自体の「後」の状態を確定させてから戻す
         # （この後Redoされたときに、操作直後の画面へ復元できるようにするため）。
         self.flush_pending_after_state()
@@ -179,6 +183,7 @@ class UndoManager:
         self._notify()
 
     def redo(self):
+        self.db.end_undo_group()
         if not self._redo_stack:
             return
         entry = self._redo_stack.pop()
