@@ -546,6 +546,7 @@ def build_gantt_scenes(df, display, color_by="team"):
     elif total_days > 120:
         tick_step_days = 14
 
+    tick_font_metrics = QFontMetrics(task_font)
     tick_date = axis_start
     # 最初の目盛りを月曜に揃える
     tick_date = tick_date + timedelta(days=(7 - tick_date.weekday()) % 7)
@@ -556,9 +557,11 @@ def build_gantt_scenes(df, display, color_by="team"):
         header_line.setZValue(-2)
         body_line = body_scene.addLine(x, TOP_MARGIN, x, chart_bottom, QPen(_GRID_COLOR, 1))
         body_line.setZValue(-2)
+        tick_text = tick_date.strftime("%m/%d")
+        tick_text_width = tick_font_metrics.horizontalAdvance(tick_text)
         _add_fixed_size_label(
-            header_scene, tick_date.strftime("%m-%d"), task_font,
-            (x + 2, TOP_MARGIN - _TICK_LABEL_OFFSET),
+            header_scene, tick_text, task_font,
+            (x - tick_text_width / 2, TOP_MARGIN - _TICK_LABEL_OFFSET),
         )
         tick_date += timedelta(days=tick_step_days)
 

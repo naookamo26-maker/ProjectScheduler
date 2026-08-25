@@ -187,17 +187,12 @@ class MainWindow(QMainWindow):
         file_menu.addAction(exit_action)
 
     def on_new_project(self):
+        """保存先パスはこの時点では選ばせず、初回保存（Ctrl+S/名前を付けて保存）
+        まで未定のまま進める（ファイルはまだディスク上に作られない）。"""
         if not self._confirm_discard_unsaved():
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "新規プロジェクトファイルの作成", "", FILE_FILTER
-        )
-        if not path:
-            return
-        if not path.endswith(f".{DEFAULT_SUFFIX}"):
-            path = f"{path}.{DEFAULT_SUFFIX}"
         try:
-            self._open_database(ProjectDatabase.create_new(path))
+            self._open_database(ProjectDatabase.create_new())
         except Exception as e:
             QMessageBox.critical(self, "エラー", f"プロジェクトを作成できませんでした:\n{e}")
 
@@ -215,9 +210,13 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "エラー", f"プロジェクトを開けませんでした:\n{e}")
 
     def on_save(self):
-        """保存（Ctrl+S）。ファイルへの書き込みはここで明示的に行うまで発生しない。"""
+        """保存（Ctrl+S）。ファイルへの書き込みはここで明示的に行うまで発生しない。
+        保存先パスが未定（新規プロジェクトの初回保存）の場合は、名前を付けて
+        保存と同じ扱いでパス選択に迂回する。"""
         if self.db is None:
             return False
+        if self.db.path is None:
+            return self.on_save_as()
         try:
             self.db.save()
         except Exception as e:
@@ -276,7 +275,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        default_dir = str(Path(self.db.path).resolve().parent)
+        default_dir = str(Path(self.db.path).resolve().parent) if self.db.path else str(Path.home())
         out_dir = QFileDialog.getExistingDirectory(self, "ガントチャートの出力先フォルダ", default_dir)
         if not out_dir:
             return
@@ -302,7 +301,7 @@ class MainWindow(QMainWindow):
         self.db = db
         self.db.on_change = self._on_db_changed
         self._rebuild_tabs()
-        self.statusBar().showMessage(f"開いているプロジェクト: {db.path}")
+        self.statusBar().showMessage(f"開いているプロジェクト: {db.path or '無題（未保存）'}")
         self._update_title()
 
     def _on_db_changed(self):
@@ -315,7 +314,7 @@ class MainWindow(QMainWindow):
             self.setWindowTitle("プロジェクトスケジューラー")
             return
         mark = "*" if self.db.is_dirty() else ""
-        self.setWindowTitle(f"プロジェクトスケジューラー — {mark}{self.db.path}")
+        self.setWindowTitle(f"プロジェクトスケジューラー — {mark}{self.db.path or '無題（未保存）'}")
 
     def closeEvent(self, event):
         if self.db is not None and not self._confirm_discard_unsaved():

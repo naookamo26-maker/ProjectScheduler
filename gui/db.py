@@ -154,7 +154,9 @@ class ReferencedEntityError(ProjectDatabaseError):
 
 class ProjectDatabase:
     def __init__(self, path):
-        self.path = str(path)
+        # pathがNoneの場合は「まだ保存先未定の新規プロジェクト」を表す
+        # （初回保存時にsave_as相当でパスが確定する）。
+        self.path = str(path) if path is not None else None
         self._conn = sqlite3.connect(":memory:")
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -169,10 +171,11 @@ class ProjectDatabase:
     # -- 生成/オープン -----------------------------------------------------
 
     @classmethod
-    def create_new(cls, path):
+    def create_new(cls, path=None):
         """新規プロジェクトを（メモリ上に）作成する。この時点ではまだファイルへの
         書き込みは行わない——ユーザーが保存（Ctrl+S）するまでディスク上には
-        何も生成されない。"""
+        何も生成されない。path省略時（GUIの「新規プロジェクト」）は保存先未定
+        のまま開き、初回保存時にパスを選ばせる。"""
         db = cls(path)
         db._conn.executescript(_SCHEMA_SQL)
         db._conn.execute(
@@ -295,7 +298,11 @@ class ProjectDatabase:
         return self._dirty
 
     def save(self):
-        """メモリ上の内容を self.path のファイルへ書き出す。"""
+        """メモリ上の内容を self.path のファイルへ書き出す。保存先未定
+        （path未確定の新規プロジェクト）の場合は呼び出し側の責務漏れなので
+        明示的に失敗させる（GUI側はこの場合save_as相当のパス選択に迂回する）。"""
+        if self.path is None:
+            raise ProjectDatabaseError("保存先が未設定です（save_asでパスを指定してください）")
         self._write_to(self.path)
         self._dirty = False
         self._notify_change()
