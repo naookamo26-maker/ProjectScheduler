@@ -123,6 +123,9 @@ class ProjectDatabase:
         self._in_undoable_call = False
         # Undo/Redoの適用中（suspend_undo_recording）かどうか。
         self._undo_suppressed = False
+        # begin_undo_group() で開いたまま保持している単位。
+        # (ラベル, 操作前のDBスナップショット, 操作前のUI状態) または None。
+        self._open_group = None
 
     def close(self):
         self._conn.close()
@@ -150,15 +153,17 @@ class ProjectDatabase:
         （ネストした呼び出し）は何もしない——外側の呼び出しが取得したスナップショットに
         自動的に合流する。
 
-        undo_manager が未設定（GUIを介さない利用）の場合、および
-        suspend_undo_recording() の内側（Undo/Redoの適用中）の場合は素通しする。
+        undo_manager が未設定（GUIを介さない利用）の場合、
+        suspend_undo_recording() の内側（Undo/Redoの適用中）の場合、および
+        begin_undo_group() で開いた単位の内側の場合は素通しする。
 
         ブロックの内容が実際にDBを変えなかった場合はUndoエントリを積まない
         （重複名エラー等で何も変わらずに終わった操作で、空のUndoが増えるのを
         防ぐ）。逆に、例外で中断した場合でも、その時点までに実際にコミット
         された変更が残っていればUndoエントリを積む——取り消せない変更が
         残ってしまう方が、余分なUndoエントリより有害なため。"""
-        if self.undo_manager is None or self._in_undoable_call or self._undo_suppressed:
+        if (self.undo_manager is None or self._in_undoable_call
+                or self._undo_suppressed or self._open_group is not None):
             yield
             return
         self._in_undoable_call = True
@@ -171,6 +176,34 @@ class ProjectDatabase:
             after_db = self.serialize_state()
             if after_db != before_db:
                 self.undo_manager.push(before_db, before_ui, after_db, label)
+
+    def begin_undo_group(self, label):
+        """複数のイベントにまたがる編集を1つのUndo単位にまとめ始める。
+        end_undo_group() を呼ぶまで、その間のすべての変更が1エントリに合流する。
+
+        スピンボックスや日付欄のように、1回の編集で値が何度も変わる入力のために
+        用意している。これらは変更のたびにDBへ書き込むが（＝DBは常に最新なので、
+        値を変えた直後に保存しても取りこぼさない）、Undoの単位まで変更ごとに
+        分かれると「▲を5回押したのに5回Undoしないと戻らない」ことになる。
+        フォーカスを得た時に開き、外れた時に閉じることで、1回の編集＝1回のUndoに
+        なる（gui/widgets_common.py の bind_undo_session）。
+
+        既に開いている単位があれば先に確定する。値が結局変わらなければ、
+        閉じる時に何も記録しない。"""
+        if self.undo_manager is None or self._undo_suppressed or self._in_undoable_call:
+            return
+        self.end_undo_group()
+        self._open_group = (label, self.serialize_state(), self.undo_manager.capture_ui_state())
+
+    def end_undo_group(self):
+        """begin_undo_group() で開いた単位を確定する（開いていなければ何もしない）。"""
+        if self._open_group is None:
+            return
+        label, before_db, before_ui = self._open_group
+        self._open_group = None
+        after_db = self.serialize_state()
+        if after_db != before_db:
+            self.undo_manager.push(before_db, before_ui, after_db, label)
 
     @contextmanager
     def suspend_undo_recording(self):
@@ -253,11 +286,17 @@ class ProjectDatabase:
         明示的に失敗させる（GUI側はこの場合save_as相当のパス選択に迂回する）。"""
         if self.path is None:
             raise ProjectDatabaseError("保存先が未設定です（save_asでパスを指定してください）")
+        # 編集途中（スピンボックスにフォーカスが残ったまま等）で保存された場合、
+        # その編集を先に1つのUndo単位として確定させる。確定させないまま
+        # 「保存済み」を記録すると、後でフォーカスが外れてエントリが積まれた
+        # 瞬間に、内容は保存済みなのに未保存マークが付いてしまう。
+        self.end_undo_group()
         self._write_to(self.path)
         self._mark_saved()
 
     def save_as(self, new_path):
         """メモリ上の内容を new_path へ書き出し、以降そのパスを対象とする。"""
+        self.end_undo_group()
         self._write_to(new_path)
         self.path = str(new_path)
         self._mark_saved()
@@ -297,8 +336,10 @@ class ProjectDatabase:
         呼ばれると例外を送出する。変更系メソッドに @undoable を付け忘れると
         ここで即座に検知できるようにするためのガード（Undo/Redoの記録漏れ防止）。
         Undo/Redoの適用中（suspend_undo_recording）はそもそも記録しない区間
-        なので、このガードも見送る。"""
-        if self.undo_manager is not None and not self._in_undoable_call and not self._undo_suppressed:
+        なので、このガードも見送る。begin_undo_group() で開いた単位の内側も
+        同様に記録済みとして扱う。"""
+        if (self.undo_manager is not None and not self._in_undoable_call
+                and not self._undo_suppressed and self._open_group is None):
             raise AssertionError(
                 f"{type(self).__name__}._commit() が @undoable / undo_group の外側から呼ばれました。"
                 "変更系メソッドには @undoable(\"ラベル\") を付けてください。"

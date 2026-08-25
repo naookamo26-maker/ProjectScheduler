@@ -327,6 +327,65 @@ def test_save_failure_keeps_the_previously_saved_file(tmp_path):
     db.close()
 
 
+def test_open_ended_group_collapses_changes_until_it_is_closed(tmp_path):
+    """begin_undo_group()/end_undo_group() の間の変更が、何回あっても1エントリに
+    まとまること（スピンボックスの▲連打をフォーカス単位で1Undoにする仕組み）。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    manager, _ = _attach_dummy_undo_manager(db)
+    team_id = db.add_team("チームA", 1)
+
+    steps_before = len(manager._undo_stack)
+    db.begin_undo_group("チームの同時ライン数を変更")
+    for lines in range(2, 7):
+        db.update_team(team_id, "チームA", lines)
+    assert db.list_teams()[0]["max_lines"] == 6  # DBは変更のたびに最新
+    assert len(manager._undo_stack) == steps_before  # まだ記録されない
+
+    db.end_undo_group()
+    assert len(manager._undo_stack) == steps_before + 1
+    assert manager.undo_label() == "チームの同時ライン数を変更"
+
+    manager.undo()
+    assert db.list_teams()[0]["max_lines"] == 1  # 1回で一気に戻る
+    db.close()
+
+
+def test_open_ended_group_records_nothing_when_the_value_is_unchanged(tmp_path):
+    """フォーカスを出入りしただけ（値が変わっていない）なら記録しないこと。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    manager, _ = _attach_dummy_undo_manager(db)
+    team_id = db.add_team("チームA", 1)
+
+    steps_before = len(manager._undo_stack)
+    db.begin_undo_group("チームの同時ライン数を変更")
+    db.update_team(team_id, "チームA", 1)  # 同じ値に設定＝実質変化なし
+    db.end_undo_group()
+    assert len(manager._undo_stack) == steps_before
+    db.close()
+
+
+def test_open_ended_group_is_closed_by_undo_and_by_save(tmp_path):
+    """編集途中のまま Undo や 保存 が行われた場合、その編集を先に1つの単位として
+    確定させること（確定しないと、Undoが1つ前の操作を戻してしまう／保存済みの
+    内容なのに後から未保存マークが付く）。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    manager, _ = _attach_dummy_undo_manager(db)
+    team_id = db.add_team("チームA", 1)
+
+    db.begin_undo_group("チームの同時ライン数を変更")
+    db.update_team(team_id, "チームA", 5)
+    manager.undo()  # 編集途中でUndo
+    assert db.list_teams()[0]["max_lines"] == 1  # 直前の編集が取り消される
+    assert db._open_group is None
+
+    db.begin_undo_group("チームの同時ライン数を変更")
+    db.update_team(team_id, "チームA", 7)
+    db.save()  # 編集途中で保存
+    assert db._open_group is None
+    assert not db.is_dirty()
+    db.close()
+
+
 def test_saved_state_is_tracked_across_undo_and_redo(tmp_path):
     """保存した時点までUndoで戻ったら未保存扱いが解除され、そこから離れると
     また未保存になること（変更→保存→変更→Undo で未保存マークが消える）。"""

@@ -58,7 +58,8 @@ def window(qapp):
     w.db.close()
 
 
-def test_team_add_undo_redo_restores_selection_and_focus(window, qapp):
+def test_team_add_undo_redo_restores_selection(window, qapp):
+    """内容と、表の選択（行・列）が復元されること。"""
     bi = window.tab_basic_info
     new_id = window.db.add_team("チームテスト", 2)
     bi.refresh_teams()
@@ -78,7 +79,66 @@ def test_team_add_undo_redo_restores_selection_and_focus(window, qapp):
     row = bi.teams_section.table.currentRow()
     assert row >= 0
     assert row_id(bi.teams_section.table, row) == new_id
-    assert QApplication.focusWidget() is bi.teams_section.table
+
+
+def test_spinbox_edits_collapse_into_one_undo_step_at_focus_out(window, qapp):
+    """回帰テスト: スピンボックスを連続して変更しても、フォーカスが外れるまでは
+    Undoが分かれず、外れた時点で1エントリにまとまること。
+
+    DBは変更のたびに更新される（値を変えた直後に保存しても取りこぼさない）が、
+    Undoの単位は「フォーカスを得てから外れるまで」でまとめる。"""
+    bi = window.tab_basic_info
+    window.db.add_team("チームA", 1)
+    bi.refresh_all()
+    qapp.processEvents()
+    spin = bi.teams_section.table.cellWidget(0, 1)
+
+    steps_before = len(window.undo_manager._undo_stack)
+    spin.setFocus()
+    qapp.processEvents()
+    for _ in range(5):
+        spin.stepBy(1)
+        qapp.processEvents()
+
+    assert window.db.list_teams()[0]["max_lines"] == 6  # DBは即座に最新
+    assert len(window.undo_manager._undo_stack) == steps_before  # まだ記録されない
+
+    bi.project_name_edit.setFocus()  # フォーカスを外して編集を確定
+    qapp.processEvents()
+    assert len(window.undo_manager._undo_stack) == steps_before + 1
+
+    window.on_undo()
+    qapp.processEvents()
+    assert window.db.list_teams()[0]["max_lines"] == 1  # 1回のUndoで一気に戻る
+
+
+def test_focus_is_never_moved_into_cell_widgets_by_undo(window, qapp):
+    """回帰テスト: Undo/Redoの復元で、スピンボックスや日付欄へフォーカスが
+    移らないこと。
+
+    これらはCtrl+Zを自分のものとして横取りする（QAbstractSpinBox/QLineEditが
+    ShortcutOverrideを受け取る）ため、フォーカスが入ると次のCtrl+Zがメニューまで
+    届かず、Undoが効かなくなったように見える。現在セルの復元は、その列に
+    セルウィジェットがあるとフォーカスを移してしまうので、選択だけを戻す。"""
+    bi = window.tab_basic_info
+    window.db.add_team("チームA", 1)
+    bi.refresh_all()
+    qapp.processEvents()
+
+    spin = bi.teams_section.table.cellWidget(0, 1)
+    spin.setFocus()
+    qapp.processEvents()
+    spin.stepBy(1)
+    qapp.processEvents()
+    bi.project_name_edit.setFocus()  # 編集を確定し、フォーカスを表の外へ
+    qapp.processEvents()
+
+    window.on_undo()
+    qapp.processEvents()
+    focused = QApplication.focusWidget()
+    assert focused is bi.project_name_edit, f"フォーカスが移動している: {type(focused).__name__}"
+    # 選択自体は復元されている
+    assert bi.teams_section.table.currentColumn() == 1
 
 
 def test_workflow_task_add_is_single_undo_step_and_restores_canvas_selection(window, qapp):
@@ -260,6 +320,44 @@ def test_opening_another_project_while_editing_does_not_touch_a_closed_db(window
         sys.excepthook = original_hook
 
     assert errors == []
+
+
+def test_override_days_edit_keeps_its_spinbox_alive(window, qapp):
+    """回帰テスト: ジョブのタスク上書きで日数を変えても、表全体が作り直されない
+    こと。
+
+    作り直すと、▲で連続操作している最中にスピンボックスごと差し替わって
+    フォーカスが飛び、続けて操作できないうえ、フォーカス単位でまとめている
+    Undoの区切りも途切れてしまう。他の行に影響するマイルストーンの変更時だけ
+    作り直す。"""
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    window.db.add_workflow_task(wf_id, "タスク1", team_id, 3)
+    job_id = window.db.add_job("J1", wf_id, None, 100)
+    window.tabs.setCurrentWidget(window.tab_jobs)
+    window.tab_jobs.refresh_jobs(select_id=job_id)
+    qapp.processEvents()
+
+    spin = window.tab_jobs.override_table.cellWidget(0, 2)
+    spin.setFocus()
+    qapp.processEvents()
+    steps_before = len(window.undo_manager._undo_stack)
+    for _ in range(3):
+        spin.stepBy(1)
+        qapp.processEvents()
+
+    assert window.tab_jobs.override_table.cellWidget(0, 2) is spin, "スピンボックスが作り直されている"
+    assert QApplication.focusWidget() is spin, "編集中にフォーカスが外れている"
+    assert len(window.undo_manager._undo_stack) == steps_before  # 編集中は記録しない
+
+    window.tab_jobs.jobs_section.table.setFocus()  # 編集を確定
+    qapp.processEvents()
+    assert len(window.undo_manager._undo_stack) == steps_before + 1
+
+    window.on_undo()
+    qapp.processEvents()
+    rows = window.db.list_job_tasks_with_overrides(job_id)
+    assert rows[0]["override_days"] is None  # 1回のUndoで上書きが消える
 
 
 def test_gantt_tab_reports_validation_errors_without_a_modal(window, qapp):

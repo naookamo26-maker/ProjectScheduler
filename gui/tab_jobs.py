@@ -27,7 +27,6 @@
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -56,6 +55,7 @@ from gui.widgets_common import (
     NoWheelListWidget,
     NoWheelSpinBox,
     auto_size_columns,
+    bind_undo_session,
     capture_table_state,
     confirm_or_block_delete,
     keep_selection_visible,
@@ -373,6 +373,7 @@ class JobsTab(QWidget):
             priority_spin.valueChanged.connect(
                 lambda _val, jid=job["id"]: self._on_job_field_changed(jid)
             )
+            bind_undo_session(priority_spin, self.db, "ジョブの優先度を変更")
             table.setCellWidget(row, 3, priority_spin)
         table.blockSignals(False)
         auto_size_columns(table)
@@ -501,6 +502,7 @@ class JobsTab(QWidget):
             days_spin.valueChanged.connect(
                 lambda _val, tid=r["workflow_task_id"]: self._on_override_changed(tid)
             )
+            bind_undo_session(days_spin, self.db, "タスクの日数上書きを変更")
             table.setCellWidget(row, 2, days_spin)
 
             # 先行タスク（同一ワークフロー内）の実効マイルストーンより早い締切の
@@ -517,7 +519,8 @@ class JobsTab(QWidget):
                 blank_label=f"（既定: {default_ms_label}）",
             )
             ms_combo.currentIndexChanged.connect(
-                lambda _idx, tid=r["workflow_task_id"]: self._on_override_changed(tid)
+                lambda _idx, tid=r["workflow_task_id"]:
+                self._on_override_changed(tid, milestone_changed=True)
             )
             table.setCellWidget(row, 3, ms_combo)
 
@@ -552,7 +555,7 @@ class JobsTab(QWidget):
                 table.setCurrentCell(row, max(table.currentColumn(), 0))
                 return
 
-    def _on_override_changed(self, workflow_task_id):
+    def _on_override_changed(self, workflow_task_id, milestone_changed=False):
         table = self.override_table
         for row in range(table.rowCount()):
             if row_id(table, row) == workflow_task_id:
@@ -594,11 +597,21 @@ class JobsTab(QWidget):
                             "より早かったため、整合性を保つよう自動的に合わせました。"
                         )
                     QMessageBox.information(self, "マイルストーンを自動調整しました", "\n".join(messages))
-                # このタスク自身の上書き入力に加え、後継タスクの選択肢・表示も
-                # 変わりうるため、テーブル全体を作り直す（シグナル発火元セルの
-                # ウィジェットを直接コールバック内で破棄しないよう次のイベント
-                # ループへ遅延させる）。
-                QTimer.singleShot(0, self._refresh_overrides)
+                # マイルストーンを変えた場合は、後継タスクの選択肢や自動調整の
+                # 結果が他の行にも及ぶため、テーブル全体を作り直す（シグナル
+                # 発火元セルのウィジェットを直接コールバック内で破棄しないよう
+                # 次のイベントループへ遅延させる）。
+                #
+                # 一方、日数・チーム・有効の変更は他の行に影響しない。ここで
+                # 作り直すと、スピンボックスを▲で連続操作している最中に
+                # ウィジェットごと差し替わってフォーカスが飛んでしまい、
+                # 続けて操作できないうえ、フォーカス単位でまとめている
+                # Undoの区切りも途切れてしまう（gui/widgets_common.py の
+                # bind_undo_session 参照）。
+                if milestone_changed or raised or changed:
+                    QTimer.singleShot(0, self._refresh_overrides)
+                else:
+                    self._ensure_job_selection()
                 return
 
     # -- 依存ジョブ（ツリー表示） ----------------------------------------------------
@@ -755,13 +768,11 @@ class JobsTab(QWidget):
     # -- Undo/Redo用の選択・フォーカス状態 -------------------------------------------
 
     def capture_ui_state(self):
-        focus = QApplication.focusWidget()
         dep_item = self.dep_tree.currentItem()
         return {
             "jobs": capture_table_state(self.jobs_section.table),
             "overrides": capture_table_state(self.override_table),
             "dep_selected": dep_item.data(0, Qt.UserRole) if dep_item else None,
-            "dep_tree_focus": focus is self.dep_tree,
         }
 
     def restore_ui_state(self, state):
@@ -772,8 +783,6 @@ class JobsTab(QWidget):
         dep_data = state.get("dep_selected")
         if dep_data is not None:
             self._select_dep_tree_item(dep_data)
-        if state.get("dep_tree_focus"):
-            self.dep_tree.setFocus()
 
     def _select_dep_tree_item(self, data):
         for i in range(self.dep_tree.topLevelItemCount()):

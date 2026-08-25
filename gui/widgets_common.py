@@ -47,7 +47,47 @@ class NoWheelComboBox(QComboBox):
             event.ignore()
 
 
-class NoWheelSpinBox(QSpinBox):
+# -- 連続した値編集を1つのUndo単位にまとめる ------------------------------------------
+#
+# スピンボックスや日付欄は、1回の編集で値が何度も変わる（▲を押すたび、
+# 矢印キーを押すたび）。変更のたびにDBへ書き込む方針自体はそのままにしつつ
+# （DBが常に最新なら、値を変えた直後に保存しても取りこぼさない）、Undoの単位は
+# 「フォーカスを得てから外れるまで」でまとめる。そうしないと「▲を5回押したのに
+# 5回Undoしないと戻らない」ことになる。
+
+
+class _UndoSessionMixin:
+    """フォーカスの出入りを ProjectDatabase の begin/end_undo_group に繋ぐ。
+    bind_undo_session() を呼んだウィジェットでのみ有効になる。"""
+
+    _undo_session = None  # (db, ラベル, セッション終了時のコールバック) または None
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        if self._undo_session is not None:
+            db, label, _on_end = self._undo_session
+            db.begin_undo_group(label)
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        if self._undo_session is not None:
+            db, _label, on_end = self._undo_session
+            db.end_undo_group()
+            if on_end is not None:
+                on_end()
+
+
+def bind_undo_session(widget, db, label, on_session_end=None):
+    """widget にフォーカスがある間の連続した変更を、1つのUndo単位にまとめる。
+
+    on_session_end を渡すと、編集が終わった（フォーカスが外れた）時に呼ばれる。
+    並べ替えを伴う表など、「編集中に作り直すとフォーカスが飛んでしまうので、
+    編集が終わってから作り直したい」処理をここに載せる。"""
+    widget._undo_session = (db, label, on_session_end)
+    return widget
+
+
+class NoWheelSpinBox(_UndoSessionMixin, QSpinBox):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # 既定のWheelFocus（ホイールを回しただけでフォーカスを奪う）は「選択した
@@ -104,7 +144,7 @@ class DefaultAwareSpinBox(NoWheelSpinBox):
         return QAbstractSpinBox.StepUpEnabled | QAbstractSpinBox.StepDownEnabled
 
 
-class NoWheelDateEdit(QDateEdit):
+class NoWheelDateEdit(_UndoSessionMixin, QDateEdit):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -148,58 +188,44 @@ def row_id(table, row):
     return item.data(ROW_ID_ROLE) if item else None
 
 
-def is_descendant_of(widget, ancestor):
-    """widget自身、またはその親ウィジェットを辿った先に ancestor が現れればTrue
-    （QComboBox内部のラインエディット等、フォーカスの実体が子ウィジェットに
-    ある場合の判定に使う）。"""
-    while widget is not None:
-        if widget is ancestor:
-            return True
-        widget = widget.parentWidget()
-    return False
-
-
 def capture_table_state(table):
-    """CrudSection等のQTableWidgetについて、選択行（DB上の実体ID）とフォーカス
-    位置をUndo/Redo後に復元できる形で取り出す。テーブル自体、またはセル内の
-    ウィジェット（QComboBox/QSpinBox等）がフォーカスを持っている場合は、その
-    セル位置も記録する。復元は restore_table_state を使う。"""
+    """QTableWidgetの選択位置を、Undo/Redo後に復元できる形で取り出す
+    （選択行はDB上の実体IDで、列は番号で覚える）。復元は restore_table_state。
+
+    フォーカスは意図的に記録しない。スピンボックス・日付欄・テキスト欄は
+    いずれもCtrl+Zを自分のものとして横取りする（QAbstractSpinBoxやQLineEditが
+    ShortcutOverrideを受け取る）ため、Undoのたびにフォーカスをそれらへ戻すと、
+    次のCtrl+Zがメニューまで届かず「Undoが効かなくなった」ように見える。"""
     row = table.currentRow()
-    entity_id = row_id(table, row) if row >= 0 else None
-    focus_widget = QApplication.focusWidget()
-    has_focus = False
-    focus_column = None
-    if focus_widget is not None:
-        if focus_widget is table:
-            has_focus = True
-            focus_column = table.currentColumn()
-        elif row >= 0:
-            for col in range(table.columnCount()):
-                cell_widget = table.cellWidget(row, col)
-                if cell_widget is not None and is_descendant_of(focus_widget, cell_widget):
-                    has_focus = True
-                    focus_column = col
-                    break
-    return {"entity_id": entity_id, "has_focus": has_focus, "focus_column": focus_column}
+    if row < 0:
+        return {"entity_id": None, "column": None}
+    return {"entity_id": row_id(table, row), "column": table.currentColumn()}
 
 
 def restore_table_state(table, state):
-    """capture_table_state() の戻り値から選択行・フォーカスを復元する。対象の
-    entity_idが（Undo/Redoの結果）もう存在しない場合は何もしない。"""
+    """capture_table_state() の戻り値から選択位置を復元する。対象の entity_id が
+    （Undo/Redoの結果）もう存在しない場合は何もしない。
+
+    現在セルの移動は、その列にセルウィジェット（スピンボックスや日付欄）が
+    置かれていると、そのウィジェットへフォーカスを移してしまう。これらは
+    Ctrl+Zを自分のものとして横取りするため、Undoのたびにフォーカスが入ると
+    次のCtrl+Zがメニューまで届かなくなる。選択だけを復元してフォーカスは
+    元の位置に留めるため、移ってしまった場合は戻す。"""
     if not state or state.get("entity_id") is None:
         return
+    previous_focus = QApplication.focusWidget()
     select_row_by_id(table, state["entity_id"])
-    if not state.get("has_focus"):
-        return
     row = table.currentRow()
-    col = state.get("focus_column")
-    if row < 0:
-        return
-    cell_widget = table.cellWidget(row, col) if col is not None else None
-    if cell_widget is not None:
-        cell_widget.setFocus()
-    else:
-        table.setFocus()
+    column = state.get("column")
+    if row >= 0 and column is not None and 0 <= column < table.columnCount():
+        table.setCurrentCell(row, column)
+
+    moved_focus = QApplication.focusWidget()
+    if moved_focus is not previous_focus:
+        if previous_focus is not None:
+            previous_focus.setFocus()
+        elif moved_focus is not None:
+            moved_focus.clearFocus()
 
 
 def select_row_by_id(table, entity_id):

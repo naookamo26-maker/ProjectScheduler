@@ -8,7 +8,6 @@
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -33,7 +32,6 @@ from gui.widgets_common import (
     auto_size_columns,
     capture_table_state,
     confirm_or_block_delete,
-    is_descendant_of,
     keep_selection_visible,
     restore_table_state,
     row_id,
@@ -356,7 +354,6 @@ class WorkflowsTab(QWidget):
     # -- Undo/Redo用の選択・フォーカス状態 -------------------------------------------
 
     def capture_ui_state(self):
-        focus = QApplication.focusWidget()
         current_item = self.workflow_list.currentItem()
         canvas_state = None
         if self.current_scene is not None:
@@ -369,11 +366,9 @@ class WorkflowsTab(QWidget):
                     dep_id for dep_id, edge in self.current_scene.edges.items()
                     if edge.isSelected()
                 ],
-                "view_focus": focus is not None and is_descendant_of(focus, self.view),
             }
         return {
             "workflow_id": current_item.data(Qt.UserRole) if current_item else None,
-            "workflow_list_focus": focus is self.workflow_list,
             "template": capture_table_state(self.template_section.table),
             "canvas": canvas_state,
         }
@@ -392,8 +387,4 @@ class WorkflowsTab(QWidget):
                 edge = self.current_scene.edges.get(dep_id)
                 if edge is not None:
                     edge.setSelected(True)
-            if canvas_state.get("view_focus"):
-                self.view.setFocus()
         restore_table_state(self.template_section.table, state.get("template"))
-        if state.get("workflow_list_focus"):
-            self.workflow_list.setFocus()

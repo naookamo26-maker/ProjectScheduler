@@ -16,7 +16,6 @@ from datetime import date, timedelta
 
 from PySide6.QtCore import QDate, Qt, QTimer
 from PySide6.QtWidgets import (
-    QApplication,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -36,6 +35,7 @@ from gui.widgets_common import (
     NoWheelDateEdit,
     NoWheelSpinBox,
     auto_size_columns,
+    bind_undo_session,
     capture_table_state,
     confirm_or_block_delete,
     make_fk_combo,
@@ -304,6 +304,7 @@ class BasicInfoTab(QWidget):
         self.start_date_edit.setCalendarPopup(True)
         self.start_date_edit.setDisplayFormat("yyyy-MM-dd")
         self.start_date_edit.dateChanged.connect(self._on_project_changed)
+        bind_undo_session(self.start_date_edit, self.db, "開発開始日を変更")
         form.addRow("開発開始日", self.start_date_edit)
 
         return group
@@ -336,6 +337,12 @@ class BasicInfoTab(QWidget):
             date_edit.setDisplayFormat("yyyy-MM-dd")
             date_edit.dateChanged.connect(
                 lambda qdate, eid=ms["id"]: self._on_milestone_date_changed(eid, qdate)
+            )
+            # 締切日順の並べ替えは編集中に行わず、編集が終わってから行う
+            # （編集中に表を作り直すと、操作中の日付欄が破棄されてフォーカスが飛ぶ）。
+            bind_undo_session(
+                date_edit, self.db, "マイルストーンの締切日を変更",
+                on_session_end=self._resort_milestones_later,
             )
             table.setCellWidget(row, 1, date_edit)
         table.blockSignals(False)
@@ -387,16 +394,18 @@ class BasicInfoTab(QWidget):
         # 呼ばれているため、ウィジェットの再構築は次のイベントループへ遅延させる）。
         QTimer.singleShot(0, self.refresh_milestones)
 
+    def _resort_milestones_later(self):
+        """締切日順の表示を保つよう並べ直す。日付欄の編集が終わった時点で呼ぶ
+        （このメソッド自体がフォーカス喪失の処理中から呼ばれるため、ウィジェットの
+        再構築は次のイベントループへ遅延させる）。"""
+        QTimer.singleShot(0, self.refresh_milestones)
+
     def _on_milestone_date_changed(self, milestone_id, qdate):
         table = self.milestones_section.table
         for row in range(table.rowCount()):
             if row_id(table, row) == milestone_id:
                 name = table.item(row, 0).text()
                 self.db.update_milestone(milestone_id, name, _to_iso(qdate))
-                # 締切日を変更したら、締切日順の表示を保つよう並べ直す
-                # （dateChangedシグナル内から呼ばれているため、ウィジェットの
-                # 再構築は次のイベントループへ遅延させる）。
-                QTimer.singleShot(0, self.refresh_milestones)
                 return
 
     # -- チーム ------------------------------------------------------------------
@@ -416,6 +425,7 @@ class BasicInfoTab(QWidget):
             spin.valueChanged.connect(
                 lambda value, eid=team["id"]: self._on_team_lines_changed(eid, value)
             )
+            bind_undo_session(spin, self.db, "チームの同時ライン数を変更")
             table.setCellWidget(row, 1, spin)
 
             changes = self.db.list_team_capacity_changes(team["id"])
@@ -516,6 +526,7 @@ class BasicInfoTab(QWidget):
             date_edit.dateChanged.connect(
                 lambda qdate, eid=hol["id"]: self._on_holiday_changed(eid)
             )
+            bind_undo_session(date_edit, self.db, "休業日の日付を変更")
             table.setCellWidget(row, 0, date_edit)
 
             combo = make_fk_combo(team_options, hol["team_id"], allow_blank=True, blank_label="（全社共通）")
@@ -584,13 +595,10 @@ class BasicInfoTab(QWidget):
     # -- Undo/Redo用の選択・フォーカス状態 -------------------------------------------
 
     def capture_ui_state(self):
-        focus = QApplication.focusWidget()
         return {
             "milestones": capture_table_state(self.milestones_section.table),
             "teams": capture_table_state(self.teams_section.table),
             "holidays": capture_table_state(self.holidays_section.table),
-            "project_name_focus": focus is self.project_name_edit,
-            "start_date_focus": focus is self.start_date_edit,
         }
 
     def restore_ui_state(self, state):
@@ -599,7 +607,3 @@ class BasicInfoTab(QWidget):
         restore_table_state(self.milestones_section.table, state.get("milestones"))
         restore_table_state(self.teams_section.table, state.get("teams"))
         restore_table_state(self.holidays_section.table, state.get("holidays"))
-        if state.get("project_name_focus"):
-            self.project_name_edit.setFocus()
-        elif state.get("start_date_focus"):
-            self.start_date_edit.setFocus()
