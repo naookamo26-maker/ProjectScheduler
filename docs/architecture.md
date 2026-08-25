@@ -220,6 +220,14 @@ GUIで編集できる項目はすべてUndo/Redoで元に戻せる。個々の�
   なった」ように見える。なお表の現在セルを移動させるだけでも、その列にセル
   ウィジェットがあるとQtがそこへフォーカスを移すため、`restore_table_state()`は
   移ってしまったフォーカスを元の位置へ戻している。
+- **キャンバスの選択はタブ切り替えでも維持する**: ノードグラフの選択・
+  フォーカスと違い、ノード・依存関係の視覚的な選択状態は、Undo/Redoの対象で
+  なくても失われるべきではない。ワークフロー選択のたびに`WorkflowGraphScene`を
+  作り直す（`WorkflowsTab._on_selection_changed`）ため、何もしないと選択が
+  消えてしまう。`WorkflowsTab._capture_canvas_selection`/
+  `_restore_canvas_selection`を、Undo/Redo用の`capture_ui_state`/
+  `restore_ui_state`と、通常のタブ切り替え時の`refresh_choices`の両方から
+  共通で使うことで、どちらの経路でも選択を保つ。
 - **適用中の書き込みの抑止**: Undo/Redoの適用は、スナップショットの復元に続けて
   アクティブなタブの`refresh_choices()`まで行う。この再読込がDBに書き込むことが
   あるため（`gui/tab_jobs.py`の`refresh_choices()`は`sync_dependency_templates()`を

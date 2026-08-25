@@ -346,45 +346,65 @@ class WorkflowsTab(QWidget):
 
     def refresh_choices(self):
         """MainWindowのタブ切り替え時フックから呼ばれる共通インターフェース。
-        選択中のワークフローを維持したまま一覧・キャンバスを最新化する。"""
+        選択中のワークフローを維持したまま一覧・キャンバスを最新化する。
+
+        キャンバス上のノード・依存関係の選択（フォーカスではなく、視覚的な
+        選択状態）は、_on_selection_changed がワークフロー選択のたびに
+        WorkflowGraphScene を作り直すため、何もしないと消えてしまう。
+        単に別のタブへ移って戻ってきただけでも選択が消えるのは不便なので、
+        Undo/Redoでの選択復元（capture_ui_state/restore_ui_state）と同じ
+        ヘルパーを使い、作り直し前後で維持する。"""
         current = self.workflow_list.currentItem()
         select_id = current.data(Qt.UserRole) if current else None
+        canvas_selection = self._capture_canvas_selection()
         self.refresh_workflows(select_id=select_id)
+        self._restore_canvas_selection(canvas_selection)
 
-    # -- Undo/Redo用の選択・フォーカス状態 -------------------------------------------
+    # -- キャンバスの選択（ノード・依存関係） -----------------------------------------
+    #
+    # ワークフロー選択のたびにWorkflowGraphSceneを作り直すため、選択状態は
+    # 明示的に持ち回らないと消える。Undo/Redoでの復元（下記）と、単なる
+    # タブの往復（refresh_choices、上記）の両方から使う共通ロジック。
+
+    def _capture_canvas_selection(self):
+        if self.current_scene is None:
+            return None
+        return {
+            "selected_task_ids": [
+                task_id for task_id, node in self.current_scene.nodes.items()
+                if node.isSelected()
+            ],
+            "selected_dep_ids": [
+                dep_id for dep_id, edge in self.current_scene.edges.items()
+                if edge.isSelected()
+            ],
+        }
+
+    def _restore_canvas_selection(self, canvas_state):
+        if self.current_scene is None or not canvas_state:
+            return
+        for task_id in canvas_state.get("selected_task_ids", []):
+            node = self.current_scene.nodes.get(task_id)
+            if node is not None:
+                node.setSelected(True)
+        for dep_id in canvas_state.get("selected_dep_ids", []):
+            edge = self.current_scene.edges.get(dep_id)
+            if edge is not None:
+                edge.setSelected(True)
+
+    # -- Undo/Redo用の選択状態 -------------------------------------------------------
 
     def capture_ui_state(self):
         current_item = self.workflow_list.currentItem()
-        canvas_state = None
-        if self.current_scene is not None:
-            canvas_state = {
-                "selected_task_ids": [
-                    task_id for task_id, node in self.current_scene.nodes.items()
-                    if node.isSelected()
-                ],
-                "selected_dep_ids": [
-                    dep_id for dep_id, edge in self.current_scene.edges.items()
-                    if edge.isSelected()
-                ],
-            }
         return {
             "workflow_id": current_item.data(Qt.UserRole) if current_item else None,
             "template": capture_table_state(self.template_section.table),
-            "canvas": canvas_state,
+            "canvas": self._capture_canvas_selection(),
         }
 
     def restore_ui_state(self, state):
         if not state:
             return
         self.refresh_workflows(select_id=state.get("workflow_id"))
-        canvas_state = state.get("canvas")
-        if self.current_scene is not None and canvas_state:
-            for task_id in canvas_state.get("selected_task_ids", []):
-                node = self.current_scene.nodes.get(task_id)
-                if node is not None:
-                    node.setSelected(True)
-            for dep_id in canvas_state.get("selected_dep_ids", []):
-                edge = self.current_scene.edges.get(dep_id)
-                if edge is not None:
-                    edge.setSelected(True)
+        self._restore_canvas_selection(state.get("canvas"))
         restore_table_state(self.template_section.table, state.get("template"))

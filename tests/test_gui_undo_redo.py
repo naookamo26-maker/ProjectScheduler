@@ -157,7 +157,6 @@ def test_workflow_task_add_is_single_undo_step_and_restores_canvas_selection(win
     stack_size_before = len(window.undo_manager._undo_stack)
     node = scene.add_task("タスクA", team_id, 3, 0, 0)
     node.setSelected(True)
-    wf_tab.view.setFocus()
     qapp.processEvents()
 
     # add_task内部でauto_arrangeが複数のupdate_task_positionを呼んでも、
@@ -173,10 +172,42 @@ def test_workflow_task_add_is_single_undo_step_and_restores_canvas_selection(win
     qapp.processEvents()
     tasks = window.db.list_workflow_tasks(wf_id)
     assert len(tasks) == 1
+    # ノードの選択（視覚的なハイライト）は復元される。フォーカス（キーボード
+    # 入力の宛先）はUndo/Redoの対象外——スピンボックス等と異なりビューは
+    # Ctrl+Zを横取りしないため実害は無いが、設計として意図的に外している。
     restored_scene = wf_tab.current_scene
     restored_node = restored_scene.nodes[tasks[0]["id"]]
     assert restored_node.isSelected()
-    assert wf_tab.view.hasFocus()
+
+
+def test_canvas_selection_survives_switching_tabs_away_and_back(window, qapp):
+    """回帰テスト: Undo/Redoとは無関係に、単に別のタブへ移って戻ってきただけでも
+    ノードの選択が保たれること。
+
+    ワークフローを選択するたびに WorkflowGraphScene を作り直すため
+    （_on_selection_changed）、タブ切り替え時の refresh_choices() が選択状態を
+    明示的に持ち回らないと、ノードをクリックしただけで選んだ選択が、他のタブを
+    見て戻ってくるたびに消えてしまう。"""
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    node = wf_tab.current_scene.add_task("タスクA", team_id, 3, 0, 0)
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    scene.nodes[node.workflow_task_id].setSelected(True)
+    qapp.processEvents()
+
+    window.tabs.setCurrentWidget(window.tab_jobs)
+    qapp.processEvents()
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    restored_scene = wf_tab.current_scene
+    assert restored_scene.nodes[node.workflow_task_id].isSelected()
 
 
 def test_undo_and_redo_from_another_tab_return_to_the_edited_tab(window, qapp):
