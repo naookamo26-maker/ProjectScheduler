@@ -34,7 +34,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -101,20 +100,27 @@ class GanttTab(QWidget):
 
     def refresh_choices(self):
         """このタブに切り替わるたびに gui/main.py の _on_tab_changed から呼ばれ、
-        現在のDB内容でスケジューリングを実行し直す。"""
+        現在のDB内容でスケジューリングを実行し直す。
+
+        失敗した場合はダイアログを出さず、タブ内の status_label に表示するだけに
+        留める。このメソッドはユーザーの明示的な操作ではなく「タブが表示される
+        たび」「Undo/Redoで表示を作り直すたび」に自動的に呼ばれるため、
+        ダイアログにすると、プロジェクトが未完成な間ずっと操作のたびに
+        割り込むことになる（Undo/Redoのたびに無関係なダイアログが出るのを
+        避けるための特別扱いが、gui/main.py 側で必要になっていた）。
+        明示的な操作であるFileメニューの「ガントチャートを生成」は、従来どおり
+        ダイアログでエラーを知らせる。"""
         errors = validate_for_generation(self.db)
         if errors:
-            self._clear_chart_state("生成できません。\n- " + "\n- ".join(errors))
-            QMessageBox.warning(
-                self, "生成できません",
-                "以下を解決してから再度お試しください:\n\n- " + "\n- ".join(errors),
+            self._clear_chart_state(
+                "ガントチャートを表示できません。以下を解決してください:\n- " + "\n- ".join(errors),
+                is_error=True,
             )
             return
         try:
             self._result_df, self._display = compute_schedule(self.db, verbose=False)
         except SchedulingError as e:
-            self._clear_chart_state(f"生成に失敗しました: {e}")
-            QMessageBox.critical(self, "生成に失敗しました", str(e))
+            self._clear_chart_state(f"スケジューリングに失敗しました: {e}", is_error=True)
             return
 
         self._refresh_group_choices()
@@ -122,11 +128,17 @@ class GanttTab(QWidget):
         self._refresh_chart()
 
         if self._result_df.empty:
-            self.status_label.setText("有効なタスクがありません。")
+            self._set_status("有効なタスクがありません。")
         else:
-            self.status_label.setText(f"{len(self._result_df)}件のタスクを生成しました。")
+            self._set_status(f"{len(self._result_df)}件のタスクを生成しました。")
 
-    def _clear_chart_state(self, status_message):
+    def _set_status(self, message, is_error=False):
+        """状況表示。エラーはダイアログを出さずここに表示するため、通常の
+        メッセージと見分けが付くよう色を変える。"""
+        self.status_label.setStyleSheet("color: #b3261e;" if is_error else "")
+        self.status_label.setText(message)
+
+    def _clear_chart_state(self, status_message, is_error=False):
         """スケジューリングに失敗した場合に、前回の生成結果（チャート・凡例・
         対象コンボ）を全てクリアする。クリアしないと、直前まで表示していた
         古い結果が失敗後もそのまま残ってしまい、あたかも最新の内容であるかの
@@ -144,7 +156,7 @@ class GanttTab(QWidget):
                 widget.hide()
                 widget.deleteLater()
         self._filter_checks = {}
-        self.status_label.setText(status_message)
+        self._set_status(status_message, is_error=is_error)
 
     def _on_mode_changed(self):
         self._refresh_group_choices()

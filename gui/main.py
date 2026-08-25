@@ -329,6 +329,10 @@ class MainWindow(QMainWindow):
             previous.undo_manager = None
         self.db = db
         self.db.on_change = self._on_db_changed
+        # UndoManagerを繋ぐ前に確認しておく（繋いだ後の is_dirty() は
+        # Undo履歴上の位置で判定されるようになるため）。既存ファイルを開いた
+        # 直後は保存済み、新規プロジェクトは未保存。
+        opened_clean = not self.db.is_dirty()
         self._rebuild_tabs()
         if previous is not None:
             previous.close()
@@ -346,6 +350,8 @@ class MainWindow(QMainWindow):
             schedule_after_capture=lambda fn: QTimer.singleShot(0, fn),
         )
         self.db.undo_manager = self.undo_manager
+        if opened_clean:
+            self.undo_manager.mark_clean()
         self._update_undo_redo_actions()
         self.statusBar().showMessage(f"開いているプロジェクト: {db.path or '無題（未保存）'}")
         self._update_title()
@@ -391,13 +397,12 @@ class MainWindow(QMainWindow):
     def _restore_ui_state(self, state):
         """操作直前にアクティブだったタブだけを対象に、データの再読込と
         選択・フォーカスの復元を行う。それ以外のタブは意図的に触らない
-        ——例えばガントチャートタブは、未完成なプロジェクトに対して
-        refresh_choices() を呼ぶと検証エラーのダイアログを表示する仕様のため、
-        非表示のタブに対して裏側で自動的に呼ぶと、Undo/Redoのたびに無関係な
-        ダイアログが出てしまう。既存の _on_tab_changed が「タブに切り替える
-        たびにそのタブを最新化する」役目を既に持っているため、非表示タブは
-        次にユーザーが実際に切り替えた時に自然と最新化される（＝データが
-        古いまま放置されるわけではなく、更新を遅延させているだけ）。
+        ——ガントチャートタブの refresh_choices() はスケジューリングを実行し直す
+        重い処理であり、見えていないタブのために毎回走らせる必要がない。
+        既存の _on_tab_changed が「タブに切り替えるたびにそのタブを最新化する」
+        役目を既に持っているため、非表示タブは次にユーザーが実際に切り替えた
+        時に自然と最新化される（＝データが古いまま放置されるわけではなく、
+        更新を遅延させているだけ）。
 
         順序が重要: タブの切り替えを最初に済ませる。タブ切り替えは
         _on_tab_changed 経由で対象タブの refresh_choices() を呼び、表や

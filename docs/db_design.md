@@ -8,9 +8,12 @@ GUI（`gui/`）の入力データは、1プロジェクト＝1ファイルのSQL
 中身を確認できる。既定のブラウザ関連付けやファイル選択ダイアログでの見分けやすさ
 のためだけの命名で、フォーマット上の特別な処理は一切ない）。
 
-スキーマとCRUD一式は `gui/db.py` の `ProjectDatabase` クラスに実装する。
-このモジュールはPySide6（Qt）に一切依存しないため、GUIを起動せずに
-単体でテストできる（`tests/test_gui_gantt_smoke.py` 等）。
+CRUD一式は `gui/db.py` の `ProjectDatabase` クラスに、スキーマ定義（DDL）と
+旧バージョンからのマイグレーションは `gui/db_schema.py` に実装する
+（テーブルを足すたびに伸びるスキーマ側を、CRUDの実装から切り離すため。
+スキーマ変更の手順は `gui/db_schema.py` の冒頭に記載）。いずれのモジュールも
+PySide6（Qt）に一切依存しないため、GUIを起動せずに単体でテストできる
+（`tests/test_gui_gantt_smoke.py` 等）。
 
 接続のたびに `PRAGMA foreign_keys = ON` を明示的に設定する（SQLiteは
 既定で外部キー制約が無効なため）。
@@ -34,7 +37,7 @@ GUI（`gui/`）の入力データは、1プロジェクト＝1ファイルのSQL
 | `job_external_dependencies` | ジョブをまたぐタスク依存（External_Dependencies相当）。`source_link_id`で`job_dependency_links`からの自動生成分か手動追加分かを区別する。`is_active`で（自動生成分も含め）削除せず一時的に無効化できる |
 | `workflow_dependency_templates` | ワークフローペア単位の既定タスク対応（例: ワークフローAがワークフローBに依存する場合、Aのどのタスクが、Bのどのタスクの完了を待つか） |
 
-DDLの正本は `gui/db.py` の `_SCHEMA_SQL` を参照（このドキュメントは概要説明用で、
+DDLの正本は `gui/db_schema.py` の `_SCHEMA_SQL` を参照（このドキュメントは概要説明用で、
 列の追加・変更が生じた場合は `_SCHEMA_SQL` 側を先に直し、本ドキュメントを追随させる）。
 
 ## 主要な設計判断

@@ -327,6 +327,75 @@ def test_save_failure_keeps_the_previously_saved_file(tmp_path):
     db.close()
 
 
+def test_saved_state_is_tracked_across_undo_and_redo(tmp_path):
+    """保存した時点までUndoで戻ったら未保存扱いが解除され、そこから離れると
+    また未保存になること（変更→保存→変更→Undo で未保存マークが消える）。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    manager, _ = _attach_dummy_undo_manager(db)
+
+    assert db.is_dirty()  # 新規作成直後は未保存
+    db.add_team("チームA", 1)
+    db.save()
+    assert not db.is_dirty()
+
+    db.add_team("チームB", 1)
+    assert db.is_dirty()
+
+    manager.undo()  # 保存した時点へ戻る
+    assert not db.is_dirty()
+
+    manager.redo()
+    assert db.is_dirty()
+
+    manager.undo()
+    manager.undo()  # 保存した時点より前へ
+    assert db.is_dirty()
+
+    manager.redo()  # 再び保存した時点へ
+    assert not db.is_dirty()
+    db.close()
+
+
+def test_saved_state_is_forgotten_when_its_entry_is_discarded(tmp_path):
+    """保存時点を指すエントリが上限超過で捨てられたら、以降は未保存扱いに
+    倒すこと（もう「保存時と同じ内容か」を判定できないため）。"""
+    from gui.undo_manager import _MAX_STACK_SIZE
+
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    manager, _ = _attach_dummy_undo_manager(db)
+    db.add_team("チームA", 1)
+    db.save()
+    assert not db.is_dirty()
+
+    for i in range(_MAX_STACK_SIZE + 1):
+        db.add_team(f"チーム{i}", 1)
+    for _ in range(len(manager._undo_stack)):
+        manager.undo()
+
+    assert db.is_dirty()
+    db.close()
+
+
+def test_adjacent_entries_share_snapshots(tmp_path):
+    """連続した操作では、直前のエントリの「後」と今回の「前」が同じbytes
+    オブジェクトとして共有され、保持するスナップショット数がエントリ数+1に
+    収まること（スナップショット方式のメモリ使用量を半減させる工夫）。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    manager, _ = _attach_dummy_undo_manager(db)
+
+    for i in range(5):
+        db.add_team(f"チーム{i}", 1)
+
+    stack = manager._undo_stack
+    assert len(stack) == 5
+    for previous, current in zip(stack, stack[1:]):
+        assert current.before_db is previous.after_db
+
+    held = {id(e.before_db) for e in stack} | {id(e.after_db) for e in stack}
+    assert len(held) == len(stack) + 1
+    db.close()
+
+
 def test_undo_stack_is_capped(tmp_path):
     db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
     manager, _ = _attach_dummy_undo_manager(db)

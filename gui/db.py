@@ -17,6 +17,9 @@ ID方針: 全テーブルは整数の自動採番PKを持ち、GUI上はこのID
 （常に名前で参照する）。project_scheduler.py が期待する文字列ID
 （"WF_001" 等）への変換は gantt_generator.py 側でガントチャート生成の
 直前にのみ行う。
+
+スキーマ定義（DDL）と旧バージョンからのマイグレーションは gui/db_schema.py に
+分離している（テーブルを足すたびに伸びる部分を、CRUDの実装から切り離すため）。
 """
 
 import functools
@@ -27,121 +30,8 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = "5"
-
-_SCHEMA_SQL = """
-CREATE TABLE schema_meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE project (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    project_name TEXT NOT NULL DEFAULT '',
-    start_date   TEXT NOT NULL DEFAULT ''
-);
-
-CREATE TABLE milestones (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    end_date TEXT NOT NULL
-);
-
-CREATE TABLE teams (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    max_lines INTEGER NOT NULL CHECK (max_lines >= 1)
-);
-
-CREATE TABLE team_capacity_changes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-    start_date TEXT NOT NULL,
-    lines INTEGER NOT NULL CHECK (lines >= 1),
-    UNIQUE(team_id, start_date)
-);
-
-CREATE TABLE holidays (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT NOT NULL,
-    team_id INTEGER REFERENCES teams(id) ON DELETE CASCADE
-);
-CREATE UNIQUE INDEX ux_holidays_team ON holidays(date, team_id) WHERE team_id IS NOT NULL;
-
-CREATE TABLE workflows (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    sort_order INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE workflow_tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE RESTRICT,
-    default_days INTEGER NOT NULL CHECK (default_days >= 1),
-    canvas_x REAL NOT NULL DEFAULT 0,
-    canvas_y REAL NOT NULL DEFAULT 0,
-    UNIQUE(workflow_id, name)
-);
-
-CREATE TABLE task_dependencies (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
-    predecessor_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
-    successor_task_id   INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
-    UNIQUE(predecessor_task_id, successor_task_id),
-    CHECK (predecessor_task_id != successor_task_id)
-);
-
-CREATE TABLE jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE RESTRICT,
-    default_milestone_id INTEGER REFERENCES milestones(id) ON DELETE SET NULL,
-    priority INTEGER NOT NULL DEFAULT 100 CHECK (priority >= 1)
-);
-
-CREATE TABLE job_task_overrides (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
-    is_active INTEGER NOT NULL DEFAULT 1,
-    override_days INTEGER,
-    milestone_id INTEGER REFERENCES milestones(id) ON DELETE SET NULL,
-    team_id INTEGER REFERENCES teams(id) ON DELETE SET NULL,
-    UNIQUE(job_id, workflow_task_id)
-);
-
-CREATE TABLE job_dependency_links (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    depends_on_job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    UNIQUE(job_id, depends_on_job_id),
-    CHECK (job_id != depends_on_job_id)
-);
-
-CREATE TABLE job_external_dependencies (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
-    depends_on_job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    depends_on_workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
-    source_link_id INTEGER REFERENCES job_dependency_links(id) ON DELETE CASCADE,
-    is_active INTEGER NOT NULL DEFAULT 1,
-    UNIQUE(job_id, workflow_task_id, depends_on_job_id, depends_on_workflow_task_id)
-);
-
-CREATE TABLE workflow_dependency_templates (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
-    workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
-    depends_on_workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
-    depends_on_workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
-    UNIQUE(workflow_id, workflow_task_id, depends_on_workflow_id, depends_on_workflow_task_id),
-    CHECK (workflow_id != depends_on_workflow_id)
-);
-"""
+# 再エクスポート: 呼び出し側・テストからは従来どおり gui.db から参照できるようにする。
+from gui.db_schema import SCHEMA_VERSION, _SCHEMA_SQL, migrate as _migrate_schema  # noqa: F401
 
 
 class ProjectDatabaseError(Exception):
@@ -191,11 +81,25 @@ def undoable(label):
     return decorator
 
 
-def _entity_name(conn, table, entity_id, name_col="name"):
-    """Undoメニューのラベル用に、削除対象の名前を引く小さなヘルパー
-    （table/name_colは常に呼び出し元が固定で指定する既知のテーブル/列名のみ）。"""
-    row = conn.execute(f"SELECT {name_col} FROM {table} WHERE id = ?", (entity_id,)).fetchone()
-    return row[name_col] if row else "?"
+# Undoメニューのラベルに使う「名前を引くSQL」。テーブル名をSQL文字列へ
+# 組み立てず、あらかじめ用意した文の中からキーで選ぶ形にしている
+# （呼び出し元は常に固定の文字列を渡すが、SQLを動的に組み立てる書き方自体を
+# 残さないため）。
+_ENTITY_NAME_SQL = {
+    "milestones": "SELECT name FROM milestones WHERE id = ?",
+    "teams": "SELECT name FROM teams WHERE id = ?",
+    "workflows": "SELECT name FROM workflows WHERE id = ?",
+    "workflow_tasks": "SELECT name FROM workflow_tasks WHERE id = ?",
+    "jobs": "SELECT name FROM jobs WHERE id = ?",
+}
+
+
+def _entity_name(conn, table, entity_id):
+    """Undoメニューのラベル用に、削除対象の名前を引く小さなヘルパー。
+    対象が既に存在しない場合は "?" を返す（ラベルのためだけの処理なので、
+    ここで失敗させない）。"""
+    row = conn.execute(_ENTITY_NAME_SQL[table], (entity_id,)).fetchone()
+    return row["name"] if row else "?"
 
 
 class ProjectDatabase:
@@ -321,102 +225,27 @@ class ProjectDatabase:
             disk_conn.backup(db._conn)
         finally:
             disk_conn.close()
-        db._migrate_schema()
+        _migrate_schema(db._conn)
         db._dirty = False
         return db
-
-    def _migrate_schema(self):
-        """旧バージョンの.pscheduleファイルを開いた際、不足しているカラム等を
-        後から追加する（既存データはそのまま維持し、schema_versionだけ進める）。"""
-        row = self._conn.execute(
-            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-        ).fetchone()
-        version = row["value"] if row else "1"
-
-        if version == "1":
-            # v2: workflows.sort_order を追加し、既存の並び順（従来の表示順である
-            # 名前順）に基づいて連番を振る。
-            self._conn.execute(
-                "ALTER TABLE workflows ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"
-            )
-            rows = self._conn.execute("SELECT id FROM workflows ORDER BY name").fetchall()
-            for i, r in enumerate(rows):
-                self._conn.execute(
-                    "UPDATE workflows SET sort_order = ? WHERE id = ?", (i, r["id"])
-                )
-            version = "2"
-
-        if version == "2":
-            # v3: job_external_dependencies.is_active を追加（個別のタスク依存を
-            # 削除せず一時的に無効化できるようにするため）。既存行はすべて有効。
-            # テーブル自体が無い（テスト用の簡略化した旧スキーマ等）場合は何もしない。
-            cols = [
-                r["name"] for r in
-                self._conn.execute("PRAGMA table_info(job_external_dependencies)").fetchall()
-            ]
-            if cols and "is_active" not in cols:
-                self._conn.execute(
-                    "ALTER TABLE job_external_dependencies ADD COLUMN is_active "
-                    "INTEGER NOT NULL DEFAULT 1"
-                )
-            version = "3"
-
-        if version == "3":
-            # v4: team_capacity_changes を追加（チームの同時ライン数を、
-            # 開発開始日からの既定値（teams.max_lines）に加えて、途中の日付から
-            # 変動させられるようにするため）。旧ファイルには変更点が無い
-            # （＝全期間 teams.max_lines のまま）ものとして扱う。
-            exists = self._conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                "AND name = 'team_capacity_changes'"
-            ).fetchone()
-            if not exists:
-                self._conn.execute(
-                    "CREATE TABLE team_capacity_changes ("
-                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                    "team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE, "
-                    "start_date TEXT NOT NULL, "
-                    "lines INTEGER NOT NULL CHECK (lines >= 1), "
-                    "UNIQUE(team_id, start_date))"
-                )
-            version = "4"
-
-        if version == "4":
-            # v5: 「個別のタスク依存」を「依存先ジョブ」のリンクに従属させる設計に
-            # 統一した（GUI側、gui/tab_jobs.py）。旧バージョンでは依存先ジョブの
-            # リンクを作らずに個別のタスク依存だけを追加できたため、対応する
-            # job_dependency_links 行が無い (job_id, depends_on_job_id) の組が
-            # あれば補完する（新UIでタスク対応が見えなくなることを防ぐため）。
-            tables = {
-                r["name"] for r in
-                self._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
-            }
-            if "job_external_dependencies" in tables and "job_dependency_links" in tables:
-                orphans = self._conn.execute(
-                    "SELECT DISTINCT d.job_id, d.depends_on_job_id "
-                    "FROM job_external_dependencies d "
-                    "WHERE NOT EXISTS ("
-                    "  SELECT 1 FROM job_dependency_links l "
-                    "  WHERE l.job_id = d.job_id AND l.depends_on_job_id = d.depends_on_job_id"
-                    ")"
-                ).fetchall()
-                for o in orphans:
-                    self._conn.execute(
-                        "INSERT INTO job_dependency_links(job_id, depends_on_job_id) VALUES (?, ?)",
-                        (o["job_id"], o["depends_on_job_id"]),
-                    )
-            version = "5"
-
-        self._conn.execute(
-            "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)
-        )
-        self._conn.commit()
 
     # -- 保存（明示的） -----------------------------------------------------
 
     def is_dirty(self):
-        """前回の保存（またはオープン/新規作成）以降に変更があれば True。"""
+        """前回の保存（またはオープン/新規作成）以降に変更があれば True。
+
+        Undo管理が有効な場合は、単純な「変更したか」のフラグではなく、Undo履歴
+        上の位置で判定する（gui/undo_manager.py の is_clean）。変更→保存→変更→
+        Undo と操作して保存時点の内容に戻った場合、未保存マークが消える。"""
+        if self.undo_manager is not None:
+            return not self.undo_manager.is_clean()
         return self._dirty
+
+    def _mark_saved(self):
+        self._dirty = False
+        if self.undo_manager is not None:
+            self.undo_manager.mark_clean()
+        self._notify_change()
 
     def save(self):
         """メモリ上の内容を self.path のファイルへ書き出す。保存先未定
@@ -425,15 +254,13 @@ class ProjectDatabase:
         if self.path is None:
             raise ProjectDatabaseError("保存先が未設定です（save_asでパスを指定してください）")
         self._write_to(self.path)
-        self._dirty = False
-        self._notify_change()
+        self._mark_saved()
 
     def save_as(self, new_path):
         """メモリ上の内容を new_path へ書き出し、以降そのパスを対象とする。"""
         self._write_to(new_path)
         self.path = str(new_path)
-        self._dirty = False
-        self._notify_change()
+        self._mark_saved()
 
     def _write_to(self, path):
         """同じフォルダの一時ファイルへ書き出し、成功してから os.replace() で

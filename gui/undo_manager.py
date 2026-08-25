@@ -26,7 +26,16 @@ callableとして呼び出し側（gui/main.py）から差し込んでもらう�
 # 1エントリが操作前後2つのDBスナップショット（移行済みサンプルプロジェクトで
 # 1つ約124KB）を保持するため、上限がそのままメモリ使用量に効く。100段あれば
 # 実用上の「戻したい範囲」は十分に賄えるため、メモリとのバランスでこの値にしている。
+#
+# 加えて、プロジェクトが大きくなるとスナップショット1つが大きくなるため、
+# 段数だけでは使用量が読めない。合計バイト数でも上限を設け、大きい
+# プロジェクトでは段数が減る（＝メモリ使用量は頭打ちになる）ようにしている。
 _MAX_STACK_SIZE = 100
+_MAX_TOTAL_BYTES = 128 * 1024 * 1024
+
+# 「一度も保存していない」ことを表す番兵。None は「保存した時点で操作履歴が
+# 空だった」という正当な状態を表すため、区別する必要がある。
+_NEVER_SAVED = object()
 
 
 class _UndoEntry:
@@ -68,6 +77,8 @@ class UndoManager:
         self._redo_stack = []
         # 「操作直後のUI状態」がまだ埋まっていないエントリ（高々1件）。
         self._pending_after = None
+        # 保存済みの状態を指すエントリ（mark_clean で設定）。詳細は is_clean 参照。
+        self._clean_marker = _NEVER_SAVED
 
     def push(self, before_db, before_ui, after_db, label):
         # 直前の操作の「後」の状態がまだ埋まっていなければ、ここで確定させる
@@ -75,16 +86,64 @@ class UndoManager:
         # 取得処理が走る前に次の操作が来るため）。
         self.flush_pending_after_state()
 
+        # 直前のエントリの「後」と今回の「前」は、間に別の変更が無ければ同じ
+        # 内容になる。同じbytesオブジェクトを共有させ、保持するスナップショットの
+        # 実数をエントリ数+1に抑える（比較はメモリ上の単純な突き合わせで、
+        # 既に2回行っているserialize()に比べれば十分安い）。
+        if self._undo_stack and self._undo_stack[-1].after_db == before_db:
+            before_db = self._undo_stack[-1].after_db
+
         entry = _UndoEntry(before_db, before_ui, after_db, label)
         self._undo_stack.append(entry)
-        if len(self._undo_stack) > _MAX_STACK_SIZE:
-            self._undo_stack.pop(0)
         self._redo_stack.clear()
+        self._trim()
 
         self._pending_after = entry
         if self.schedule_after_capture is not None:
             self.schedule_after_capture(self.flush_pending_after_state)
         self._notify()
+
+    def _trim(self):
+        """段数・合計バイト数の上限を超えた分を、古い方から捨てる。"""
+        while len(self._undo_stack) > _MAX_STACK_SIZE:
+            self._discard_oldest()
+        while len(self._undo_stack) > 1 and self._total_bytes() > _MAX_TOTAL_BYTES:
+            self._discard_oldest()
+
+    def _total_bytes(self):
+        # push() で隣接エントリ間のスナップショットを共有しているため、
+        # 実際に保持しているのは「先頭の before + 各エントリの after」に相当する。
+        if not self._undo_stack:
+            return 0
+        return len(self._undo_stack[0].before_db) + sum(
+            len(e.after_db) for e in self._undo_stack
+        )
+
+    def _discard_oldest(self):
+        discarded = self._undo_stack.pop(0)
+        if discarded is self._clean_marker:
+            # 保存済みの状態を指していたエントリを捨てたので、以降は
+            # 「保存時と同じ内容かどうか」を判定できない（＝常に未保存扱い）。
+            self._clean_marker = _NEVER_SAVED
+
+    # -- 保存済み状態の追跡 ---------------------------------------------------
+
+    def mark_clean(self):
+        """現在の状態を「保存済み」として覚える（保存の直後に呼ぶ）。"""
+        self._clean_marker = self._undo_stack[-1] if self._undo_stack else None
+
+    def is_clean(self):
+        """現在の内容が、最後に保存した時点と同じなら True。
+
+        Undoで保存時点まで戻した場合も True になる（変更→保存→変更→Undo で
+        未保存マークが消える）。判定にはUndoスタックの位置——正確には
+        「最後に適用されたエントリ」の同一性——を使う。スナップショット同士を
+        比較する方法もあるが、変更のたびにDB全体を比較することになるため、
+        位置で見る方が安い。"""
+        if self._clean_marker is _NEVER_SAVED:
+            return False
+        top = self._undo_stack[-1] if self._undo_stack else None
+        return top is self._clean_marker
 
     def flush_pending_after_state(self):
         """「操作直後のUI状態」がまだ記録されていないエントリがあれば、現在の

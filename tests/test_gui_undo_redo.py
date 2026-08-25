@@ -262,12 +262,24 @@ def test_opening_another_project_while_editing_does_not_touch_a_closed_db(window
     assert errors == []
 
 
+def test_gantt_tab_reports_validation_errors_without_a_modal(window, qapp):
+    """未完成なプロジェクトでガントチャートタブに切り替えても、モーダル
+    ダイアログではなくタブ内の表示でエラーを知らせること。
+
+    refresh_choices() は「タブが表示されるたび」「Undo/Redoで表示を作り直す
+    たび」に自動的に呼ばれるため、ダイアログにするとプロジェクトが未完成な
+    間ずっと操作に割り込むことになる（headlessテストでは応答できず停止する）。"""
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    qapp.processEvents()
+
+    assert window.tab_gantt._result_df is None
+    assert "解決してください" in window.tab_gantt.status_label.text()
+
+
 def test_hidden_gantt_tab_is_not_refreshed_during_undo(window, qapp):
-    """ガントチャートタブは、未完成なプロジェクトに対してrefresh_choices()を
-    呼ぶと検証エラーのモーダルダイアログを表示する仕様のため、非表示のまま
-    裏側でUndo/Redoのたびに自動的に呼ばれてしまうと、無関係なダイアログで
-    アプリがフリーズしてしまう（実装中に実際に踏んだ回帰）。アクティブでない
-    タブのrefresh_choices()が呼ばれないことをスパイで確認する。"""
+    """ガントチャートタブの refresh_choices() はスケジューリングを実行し直す
+    重い処理なので、見えていない間はUndo/Redoのたびに走らせない
+    （アクティブなタブだけを更新し、非表示タブはタブ切り替え時に最新化する）。"""
     window.tabs.setCurrentWidget(window.tab_basic_info)
     qapp.processEvents()
     assert window.tabs.currentWidget() is not window.tab_gantt
