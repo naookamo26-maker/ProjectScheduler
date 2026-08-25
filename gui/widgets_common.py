@@ -66,15 +66,30 @@ class DefaultAwareSpinBox(NoWheelSpinBox):
     ▲▼で増減すると1やマイナスからしか始まらず使い勝手が悪い。この特殊値の
     状態から増減した場合は、既定値を起点に増減させる（0の状態で▲を押すと
     既定値+1、▼を押すと既定値-1になる）。DB保存時の「0＝既定を使用」という
-    意味はそのまま変えない（0に戻ればまた「既定（n日）」の表示に戻る）。"""
+    意味はそのまま変えない（0に戻ればまた「既定（n日）」の表示に戻る）。
+
+    また、増減の結果として値が既定値とちょうど同じ数値になった場合は、
+    自動的に特殊値（0）へ畳み込む（既定+1してから-1すると既定と同じ数値の
+    「上書き」が残ってしまい既定表示に戻らない、という問題への対応）。
+    逆に、通常の減算で0（既定を使用）へ意図せず落ち込まないよう、増減で
+    到達できる実際の日数としての下限は1にする（0日という設定自体に意味が
+    無いため）。0に戻すのは既定値と一致した場合の自動畳み込み、または
+    直接入力のみとする。"""
 
     def __init__(self, default_value, parent=None):
         super().__init__(parent)
         self.default_value = default_value
+        self.valueChanged.connect(self._collapse_to_default_if_matched)
+
+    def _collapse_to_default_if_matched(self, value):
+        if value == self.default_value and value != self.minimum():
+            self.setValue(self.minimum())
 
     def stepBy(self, steps):
         if self.value() == self.minimum() and steps != 0:
             self.setValue(max(self.minimum() + 1, self.default_value + steps))
+        elif steps < 0 and self.value() + steps <= self.minimum():
+            self.setValue(self.minimum() + 1)
         else:
             super().stepBy(steps)
 
