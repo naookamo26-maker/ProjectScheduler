@@ -237,7 +237,7 @@ class WorkflowGraphScene(QGraphicsScene):
         tasks = self.db.list_workflow_tasks(self.workflow_id)
         for t in tasks:
             node = TaskNodeItem(
-                t["id"], t["name"], t["team_name"], colors.get(t["team_id"], "#898781"),
+                t["id"], t["name"], t["team_name"], colors.get(t["team_id"], "#cbc9c2"),
                 t["default_days"], on_moved=self._on_node_moved,
             )
             node.setPos(t["canvas_x"], t["canvas_y"])
@@ -333,7 +333,7 @@ class WorkflowGraphScene(QGraphicsScene):
         task_id = self.db.add_workflow_task(self.workflow_id, name, team_id, days, x, y)
         colors = team_color_map(self.db.list_teams())
         team = next(t for t in self.db.list_teams() if t["id"] == team_id)
-        node = TaskNodeItem(task_id, name, team["name"], colors.get(team_id, "#898781"),
+        node = TaskNodeItem(task_id, name, team["name"], colors.get(team_id, "#cbc9c2"),
                              days, on_moved=self._on_node_moved)
         node.setPos(x, y)
         self.addItem(node)
@@ -362,7 +362,7 @@ class WorkflowGraphScene(QGraphicsScene):
         for t in self.db.list_workflow_tasks(self.workflow_id):
             node = self.nodes.get(t["id"])
             if node:
-                node.set_color(colors.get(t["team_id"], "#898781"))
+                node.set_color(colors.get(t["team_id"], "#cbc9c2"))
                 node.update_labels(t["name"], t["team_name"], t["default_days"])
 
 
@@ -665,7 +665,7 @@ class WorkflowGraphView(QGraphicsView):
         colors = team_color_map(db.list_teams())
         team = next(t for t in db.list_teams() if t["id"] == team_id)
         node.update_labels(name, team["name"], days)
-        node.set_color(colors.get(team_id, "#898781"))
+        node.set_color(colors.get(team_id, "#cbc9c2"))
         self._apply_predecessors(node, dialog.selected_predecessor_ids())
         self.scene().auto_arrange()
 

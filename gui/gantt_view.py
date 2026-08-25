@@ -65,7 +65,7 @@ _SCALE_FLOOR_MARGIN_PX = 4
 _GRID_COLOR = QColor("#e1e0d9")
 _MILESTONE_COLOR = QColor("#c0392b")
 _PROJECT_START_COLOR = QColor("#52514e")
-_DEFAULT_BAR_COLOR = "#898781"
+_DEFAULT_BAR_COLOR = "#cbc9c2"
 _PANE_BG = QColor("#fdfcf9")
 
 # build_gantt_scenes() の戻り値。header/column/body はそれぞれの担当分だけの
@@ -333,6 +333,19 @@ class FrozenGanttPane(QWidget):
         self.column.verticalScrollBar().setValue(self.body.verticalScrollBar().value())
 
         self._center_milestone_labels(sx)
+        self._center_task_labels(sx, sy)
+
+    def _center_task_labels(self, sx, sy):
+        """タスクバー内のラベルを、そのバーの中心に揃え続ける。
+        _center_milestone_labelsと同じ理由で、バー中心からのオフセットは
+        現在の拡縮率(sx, sy)で割ってシーン座標に変換する必要がある。"""
+        scene = self.body.scene()
+        if scene is None or sx <= 0 or sy <= 0:
+            return
+        for label, center_x, center_y in getattr(scene, "gantt_task_labels", []):
+            width_px = label.boundingRect().width()
+            height_px = label.boundingRect().height()
+            label.setPos(center_x - (width_px / 2) / sx, center_y - (height_px / 2) / sy)
 
     def _center_milestone_labels(self, sx):
         """マイルストーンラベルを、その縦線を中心に左右均等になるよう配置
@@ -533,6 +546,14 @@ def build_gantt_scenes(df, display, color_by="team"):
     else:
         color_map, color_key = (display.get("team_colors") or {}), "Team_ID"
 
+    # タスクバー内のラベルは、拡縮の縦横比が違う（IgnoreAspectRatioで独立に
+    # 拡縮する）と文字が歪んで見えるため、日付・マイルストーン・項目名と
+    # 同様にItemIgnoresTransformationsで常に等倍描画する。バーの中心位置は
+    # 一定でも、ラベルを常にバー中央に揃え続けるオフセットは実際の表示倍率が
+    # 分かるタイミング（FrozenGanttPane._sync_panes）でしか正しく計算できない
+    # ため、ここでは対象を後で拾えるよう参照だけ残しておく。
+    body_scene.gantt_task_labels = []
+
     for job_id, job_name, y_top, y_bottom, task_lane_pairs in job_blocks:
         _add_fixed_size_label(
             column_scene, _elide_text(job_name, job_font, LEFT_MARGIN - 12), job_font,
@@ -564,16 +585,16 @@ def build_gantt_scenes(df, display, color_by="team"):
 
             text = _elide_text(str(r["Task_Name"]), task_font, width - 6)
             if text:
-                task_label = QGraphicsSimpleTextItem(text)
-                task_label.setFont(task_font)
                 metrics = QFontMetrics(task_font)
                 text_width = metrics.horizontalAdvance(text)
                 text_height = metrics.height()
-                task_label.setPos(
-                    start_x + (width - text_width) / 2,
-                    y + BAR_MARGIN + (bar_height - text_height) / 2,
+                center_x = start_x + width / 2
+                center_y = y + BAR_MARGIN + bar_height / 2
+                task_label = _add_fixed_size_label(
+                    body_scene, text, task_font,
+                    (center_x - text_width / 2, center_y - text_height / 2),
                 )
-                body_scene.addItem(task_label)
+                body_scene.gantt_task_labels.append((task_label, center_x, center_y))
 
         column_boundary = column_scene.addLine(0, y_bottom + JOB_GAP / 2, column_stub_right, y_bottom + JOB_GAP / 2,
                                                  QPen(_GRID_COLOR, 1))

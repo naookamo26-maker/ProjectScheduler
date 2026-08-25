@@ -205,7 +205,7 @@ class GanttTab(QWidget):
         names = self._display["workflow_names"] if new_dim == "workflow" else self._display["team_names"]
         colors = self._display["workflow_colors"] if new_dim == "workflow" else self._display["team_colors"]
         for entity_id, name in names.items():
-            color = colors.get(entity_id, "#898781")
+            color = colors.get(entity_id, "#cbc9c2")
             swatch = QLabel("　")
             swatch.setFixedWidth(14)
             swatch.setStyleSheet(f"background-color: {color}; border: 1px solid #0b0b0b;")

@@ -99,15 +99,21 @@ class ResourceOverflowError(SchedulingError):
 
 DEFAULT_LOW_PRIORITY = 999  # Priority未指定タスクのフォールバック（最後に処理＝押し出されやすい）
 
-# チーム別色分け（Plotlyガントチャート）用の固定カテゴリカルパレット（8色、順序固定）。
-# CVD（色覚多様性）シミュレーション下でも隣接色を判別できるよう検証済みの順序のため、
-# 並び替えたり色を追加したりしない。9チーム目以降は _TEAM_COLOR_OVERFLOW（無彩色）に
-# 折りたたむ（色だけに頼らず、凡例・ホバーのチーム名表示と併用する前提）。
+# チーム別色分け（Plotlyガントチャート／ガントチャートタブ／ワークフロー設計）
+# 用の固定カテゴリカルパレット（8色、順序固定）。バー内に黒文字（#0b0b0b）を
+# 重ねて表示する用途で使うため、彩度を抑え明度を高めにした「淡い配色」に
+# している（各色の明度差は、元の彩度100%・明度差の大きい旧パレットの
+# 相対関係をおおむね保つように再配分してあり、色覚多様性(CVD)シミュレーション
+# 下での隣接色の判別性を、単純に全色同一の明度・彩度へ揃えるよりは確保して
+# いる。ただし旧パレット（彩度が高く明度差も大きかった）ほどのCVD耐性は
+# 無いため、色だけに頼らず凡例・ホバーのチーム名表示と併用する前提は
+# これまで以上に重要）。並び替えたり色を追加したりしない。9チーム目以降は
+# _TEAM_COLOR_OVERFLOW（無彩色）に折りたたむ。
 _TEAM_COLOR_PALETTE = [
-    "#2a78d6", "#eb6834", "#1baf7a", "#eda100",
-    "#e87ba4", "#008300", "#4a3aa7", "#e34948",
+    "#98b9e1", "#e5b8a6", "#80daba", "#dfc590",
+    "#eec4d4", "#61d161", "#968add", "#e7abab",
 ]
-_TEAM_COLOR_OVERFLOW = "#898781"
+_TEAM_COLOR_OVERFLOW = "#cbc9c2"
 
 
 def _build_team_color_map(team_ids_in_order, team_name_map):
@@ -1049,7 +1055,7 @@ const ROW_HEIGHT = 26;
 
 function teamColor(teamId) {
   const t = TEAMS.find(function (t) { return t.id === teamId; });
-  return t ? t.color : "#898781";
+  return t ? t.color : "#cbc9c2";
 }
 
 function topMargin() {
