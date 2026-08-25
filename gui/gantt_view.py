@@ -356,9 +356,16 @@ class FrozenGanttPane(QWidget):
         scene = self.body.scene()
         if scene is None or sx <= 0 or sy <= 0:
             return
+        # 全タスクラベルが同じフォント（task_font）を共有しているのが通常なので、
+        # QFontMetricsをラベルごとに作り直さず使い回す（数百〜数千件のラベルを
+        # 毎フレーム処理するため、地味だが効く最適化）。
+        metrics_cache = {}
         for label, center_x, center_y, bar_width, bar_height, full_text, font in \
                 getattr(scene, "gantt_task_labels", []):
-            metrics = QFontMetrics(font)
+            metrics = metrics_cache.get(id(font))
+            if metrics is None:
+                metrics = QFontMetrics(font)
+                metrics_cache[id(font)] = metrics
             line_height = metrics.height()
             avail_w = bar_width * sx - _TASK_LABEL_H_MARGIN_PX
             avail_h = bar_height * sy - _TASK_LABEL_V_MARGIN_PX
