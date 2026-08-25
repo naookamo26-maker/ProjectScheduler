@@ -61,11 +61,16 @@ _PANE_PADDING = 10
 # 全体表示（フィット）時のズーム下限を計算する際、丸め誤差で隙間が生まれない
 # よう、内容をビューポートよりわずかに大きく保つための安全マージン(px)。
 _SCALE_FLOOR_MARGIN_PX = 4
+# タスクバー内ラベル用。バーの左右・上下に対する表示可能幅・高さの余白(px)。
+_TASK_LABEL_H_MARGIN_PX = 6
+_TASK_LABEL_V_MARGIN_PX = 2
+# 2行表示に切り替える際、1行目と2行目の間に最低限見込む余白(px)。
+_TASK_LABEL_LINE_GAP_PX = 2
 
 _GRID_COLOR = QColor("#e1e0d9")
 _MILESTONE_COLOR = QColor("#c0392b")
 _PROJECT_START_COLOR = QColor("#52514e")
-_DEFAULT_BAR_COLOR = "#898781"
+_DEFAULT_BAR_COLOR = "#cbc9c2"
 _PANE_BG = QColor("#fdfcf9")
 
 # build_gantt_scenes() の戻り値。header/column/body はそれぞれの担当分だけの
@@ -333,6 +338,59 @@ class FrozenGanttPane(QWidget):
         self.column.verticalScrollBar().setValue(self.body.verticalScrollBar().value())
 
         self._center_milestone_labels(sx)
+        self._center_task_labels(sx, sy)
+
+    def _center_task_labels(self, sx, sy):
+        """タスクバー内のラベルを、そのバーの中心に揃え続ける。
+        _center_milestone_labelsと同じ理由で、バー中心からのオフセットは
+        現在の拡縮率(sx, sy)で割ってシーン座標に変換する必要がある。
+
+        ラベルはItemIgnoresTransformationsで常に等倍（一定ピクセル数）で
+        描画される一方、バー自体はズームすると画面上のサイズが変わるため、
+        ズームアウトするとラベルがバーの外へはみ出してしまう。そこで、
+        現在の拡縮率から実際に使える画面上の幅・高さを求め、
+        - 幅が足りなければ省略（…）表示にする
+        - それでも表示に値する幅すら無ければ非表示にする
+        - 縦方向にもう1行分の余裕があれば2行に分けて表示する
+        よう、その都度テキストを組み立て直す。"""
+        scene = self.body.scene()
+        if scene is None or sx <= 0 or sy <= 0:
+            return
+        # 全タスクラベルが同じフォント（task_font）を共有しているのが通常なので、
+        # QFontMetricsをラベルごとに作り直さず使い回す（数百〜数千件のラベルを
+        # 毎フレーム処理するため、地味だが効く最適化）。
+        metrics_cache = {}
+        for label, center_x, center_y, bar_width, bar_height, full_text, font in \
+                getattr(scene, "gantt_task_labels", []):
+            metrics = metrics_cache.get(id(font))
+            if metrics is None:
+                metrics = QFontMetrics(font)
+                metrics_cache[id(font)] = metrics
+            line_height = metrics.height()
+            avail_w = bar_width * sx - _TASK_LABEL_H_MARGIN_PX
+            avail_h = bar_height * sy - _TASK_LABEL_V_MARGIN_PX
+
+            if avail_w < metrics.averageCharWidth() or avail_h < line_height:
+                label.setVisible(False)
+                continue
+
+            single_line = metrics.elidedText(full_text, Qt.ElideRight, int(avail_w))
+            if not single_line or single_line == "…":
+                label.setVisible(False)
+                continue
+
+            if single_line != full_text and avail_h >= line_height * 2 + _TASK_LABEL_LINE_GAP_PX:
+                line1, line2 = _wrap_two_lines(full_text, metrics, avail_w)
+                text = f"{line1}\n{line2}" if line2 else line1
+            else:
+                text = single_line
+
+            label.setVisible(True)
+            if label.text() != text:
+                label.setText(text)
+            width_px = label.boundingRect().width()
+            height_px = label.boundingRect().height()
+            label.setPos(center_x - (width_px / 2) / sx, center_y - (height_px / 2) / sy)
 
     def _center_milestone_labels(self, sx):
         """マイルストーンラベルを、その縦線を中心に左右均等になるよう配置
@@ -378,6 +436,22 @@ def _pack_lanes(tasks):
 def _elide_text(text, font, max_width):
     metrics = QFontMetrics(font)
     return metrics.elidedText(text, Qt.ElideRight, int(max_width))
+
+
+def _wrap_two_lines(text, metrics, max_width):
+    """textを2行に分ける。1行目は max_width に収まる範囲で貪欲に文字を
+    詰め、残りを2行目として max_width に収まるよう省略する
+    （スペース区切りの無い日本語のタスク名でも自然に折り返せるよう、
+    単語単位ではなく文字単位で詰める）。"""
+    fit_len = 1
+    for i in range(1, len(text) + 1):
+        if metrics.horizontalAdvance(text[:i]) > max_width:
+            break
+        fit_len = i
+    line1 = text[:fit_len]
+    remainder = text[fit_len:]
+    line2 = metrics.elidedText(remainder, Qt.ElideRight, int(max_width)) if remainder else ""
+    return line1, line2
 
 
 def _add_fixed_size_label(scene, text, font, pos, brush=None, z_value=None):
@@ -533,6 +607,17 @@ def build_gantt_scenes(df, display, color_by="team"):
     else:
         color_map, color_key = (display.get("team_colors") or {}), "Team_ID"
 
+    # タスクバー内のラベルは、拡縮の縦横比が違う（IgnoreAspectRatioで独立に
+    # 拡縮する）と文字が歪んで見えるため、日付・マイルストーン・項目名と
+    # 同様にItemIgnoresTransformationsで常に等倍（一定ピクセル数）描画する。
+    # ただしそのままだと、バーを画面上で小さく縮小した際にラベルがバーから
+    # はみ出してしまう。バーの中心揃えに加えて、現在の表示倍率でのバーの
+    # 実サイズに応じた省略表示・非表示・2行化も、実際の表示倍率が分かる
+    # タイミング（FrozenGanttPane._sync_panes）でしか正しく計算できないため、
+    # ここでは元のタスク名とバーサイズ（シーン座標）を後で拾えるよう
+    # 参照だけ残しておく。
+    body_scene.gantt_task_labels = []
+
     for job_id, job_name, y_top, y_bottom, task_lane_pairs in job_blocks:
         _add_fixed_size_label(
             column_scene, _elide_text(job_name, job_font, LEFT_MARGIN - 12), job_font,
@@ -562,18 +647,21 @@ def build_gantt_scenes(df, display, color_by="team"):
             )
             body_scene.addItem(rect)
 
-            text = _elide_text(str(r["Task_Name"]), task_font, width - 6)
-            if text:
-                task_label = QGraphicsSimpleTextItem(text)
-                task_label.setFont(task_font)
-                metrics = QFontMetrics(task_font)
-                text_width = metrics.horizontalAdvance(text)
-                text_height = metrics.height()
-                task_label.setPos(
-                    start_x + (width - text_width) / 2,
-                    y + BAR_MARGIN + (bar_height - text_height) / 2,
+            task_name = str(r["Task_Name"])
+            if task_name:
+                center_x = start_x + width / 2
+                center_y = y + BAR_MARGIN + bar_height / 2
+                # 表示内容（省略・非表示・2行化）はバーの実際の画面上サイズ
+                # （拡縮率次第で変わる）に応じてFrozenGanttPane._sync_panesが
+                # その都度決めるため、ここでは仮の位置に元のタスク名をそのまま
+                # 置いておくだけにする。
+                task_label = _add_fixed_size_label(
+                    body_scene, task_name, task_font,
+                    (center_x, center_y),
                 )
-                body_scene.addItem(task_label)
+                body_scene.gantt_task_labels.append(
+                    (task_label, center_x, center_y, width, bar_height, task_name, task_font)
+                )
 
         column_boundary = column_scene.addLine(0, y_bottom + JOB_GAP / 2, column_stub_right, y_bottom + JOB_GAP / 2,
                                                  QPen(_GRID_COLOR, 1))
