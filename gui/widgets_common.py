@@ -147,6 +147,15 @@ def row_id(table, row):
     return item.data(ROW_ID_ROLE) if item else None
 
 
+def select_row_by_id(table, entity_id):
+    """entity_id に対応する行を選択状態にする（新規追加直後の行を選ぶ用途）。
+    見つからない場合は何もしない。"""
+    for row in range(table.rowCount()):
+        if row_id(table, row) == entity_id:
+            table.setCurrentCell(row, 0)
+            return
+
+
 def set_row_id(table, row, entity_id):
     item = table.item(row, 0)
     if item is None:
@@ -221,11 +230,18 @@ class CrudSection(QGroupBox):
     列やセルウィジェットの構成は各タブ側の責務とする（追加/削除の導線と
     見た目の一貫性だけをここで共通化する）。"""
 
-    def __init__(self, title, column_labels, on_add, on_delete, on_edit=None, parent=None):
+    def __init__(
+        self, title, column_labels, on_add, on_delete, on_edit=None,
+        edit_dblclick_columns=None, parent=None,
+    ):
         super().__init__(title, parent)
         self.on_add = on_add
         self.on_delete = on_delete
         self.on_edit = on_edit
+        # on_edit をダブルクリックで開く対象列を限定したい場合に指定する
+        # （例: 列0がインライン編集可能なテキストで、別の列だけダイアログを
+        # 開かせたいケース）。Noneなら全列で発火（従来互換の挙動）。
+        self.edit_dblclick_columns = edit_dblclick_columns
 
         layout = QVBoxLayout(self)
 
@@ -250,8 +266,13 @@ class CrudSection(QGroupBox):
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         keep_selection_visible(self.table)
         if on_edit is not None:
-            self.table.itemDoubleClicked.connect(lambda _item: self._handle_edit())
+            self.table.itemDoubleClicked.connect(self._handle_item_double_clicked)
         layout.addWidget(self.table)
+
+    def _handle_item_double_clicked(self, item):
+        if self.edit_dblclick_columns is not None and item.column() not in self.edit_dblclick_columns:
+            return
+        self._handle_edit()
 
     def _handle_add(self):
         self.on_add()
