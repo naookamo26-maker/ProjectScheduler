@@ -593,11 +593,7 @@ class WorkflowGraphView(QGraphicsView):
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
-            for item in list(self.scene().selectedItems()):
-                if isinstance(item, TaskNodeItem):
-                    self.scene().delete_node(item)
-                elif isinstance(item, EdgeItem):
-                    self.scene().delete_edge(item)
+            self._delete_selected()
             event.accept()
             return
         if event.key() == Qt.Key_A:
@@ -609,6 +605,33 @@ class WorkflowGraphView(QGraphicsView):
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def _delete_selected(self):
+        """選択中のタスク・依存関係をまとめて削除する。
+
+        複数選択に対する一括操作は1つのUndo単位にまとめる（選択項目ごとに
+        Undoが分かれると、1回のDeleteを取り消すのに複数回のUndoが必要に
+        なってしまう）。
+
+        タスクを削除するとそのタスクに繋がる依存関係も一緒に消えるため、
+        タスクを先に処理し、依存関係は「まだ残っているもの」だけを削除する
+        （タスクとその依存線を同時に選択した場合に、同じ依存線を二重に
+        削除しようとして落ちるのを防ぐ）。"""
+        scene = self.scene()
+        if scene is None:
+            return
+        selected = list(scene.selectedItems())
+        nodes = [i for i in selected if isinstance(i, TaskNodeItem)]
+        edges = [i for i in selected if isinstance(i, EdgeItem)]
+        if not nodes and not edges:
+            return
+        with scene.db.undo_group("選択したタスク・依存関係を削除"):
+            for node in nodes:
+                if node.workflow_task_id in scene.nodes:
+                    scene.delete_node(node)
+            for edge in edges:
+                if edge.dependency_id in scene.edges:
+                    scene.delete_edge(edge)
 
     def contextMenuEvent(self, event):
         scene_pos = self.mapToScene(event.pos())

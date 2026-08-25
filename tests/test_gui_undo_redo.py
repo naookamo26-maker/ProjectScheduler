@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 pytest.importorskip("PySide6")
 
+from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from gui.db import ProjectDatabase  # noqa: E402
@@ -183,6 +184,82 @@ def test_tab_changed_is_connected_only_once_across_reopens(window, qapp):
             assert calls["n"] == 1
             window.tabs.setCurrentIndex(0)
             qapp.processEvents()
+
+
+def test_multi_select_delete_on_canvas_is_a_single_undo_step(window, qapp):
+    """回帰テスト: キャンバスで複数選択してDeleteした場合、選択項目ごとに
+    Undoが分かれず1回のUndoで全部戻ること。あわせて、タスクとその依存線を
+    同時に選択しても、同じ依存線を二重に削除して落ちないこと。"""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QMessageBox
+
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    first = wf_tab.current_scene.add_task("タスク1", team_id, 1, 0, 0)
+    qapp.processEvents()
+    second = wf_tab.current_scene.add_task("タスク2", team_id, 1, 200, 0)
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    scene.try_add_edge(scene.nodes[first.workflow_task_id], scene.nodes[second.workflow_task_id])
+    qapp.processEvents()
+    assert len(window.db.list_workflow_tasks(wf_id)) == 2
+    assert len(window.db.list_task_dependencies(wf_id)) == 1
+
+    scene = wf_tab.current_scene
+    for node in scene.nodes.values():
+        node.setSelected(True)
+    for edge in scene.edges.values():  # タスクとその依存線を同時に選択する
+        edge.setSelected(True)
+    qapp.processEvents()
+
+    steps_before = len(window.undo_manager._undo_stack)
+    # 参照があるタスクの削除は確認ダイアログを出すため、常に「はい」を返させる。
+    with patch.object(QMessageBox, "question", return_value=QMessageBox.Yes):
+        wf_tab.view.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier))
+    qapp.processEvents()
+
+    assert window.db.list_workflow_tasks(wf_id) == []
+    assert len(window.undo_manager._undo_stack) - steps_before == 1
+
+    window.on_undo()
+    qapp.processEvents()
+    assert len(window.db.list_workflow_tasks(wf_id)) == 2
+    assert len(window.db.list_task_dependencies(wf_id)) == 1
+
+
+def test_opening_another_project_while_editing_does_not_touch_a_closed_db(window, qapp):
+    """回帰テスト: 入力欄にフォーカスがある状態で別プロジェクトを開いても、
+    閉じたDBへの書き込みが発生しないこと。
+
+    タブの差し替えでフォーカスが外れると editingFinished 等が発火し、旧タブが
+    自分の持つDBへ書き込もうとする。旧DBを先に閉じていると
+    「Cannot operate on a closed database」になる（Qtがスロット内の例外を
+    握りつぶすため、画面上は無害に見えてしまう）。"""
+    errors = []
+
+    def record(exc_type, exc_value, _tb):
+        errors.append(f"{exc_type.__name__}: {exc_value}")
+
+    name_edit = window.tab_basic_info.project_name_edit
+    name_edit.setFocus()
+    name_edit.setText("編集中のプロジェクト名")
+    qapp.processEvents()
+
+    original_hook = sys.excepthook
+    sys.excepthook = record
+    try:
+        window._open_database(ProjectDatabase.create_new())
+        qapp.processEvents()
+    finally:
+        sys.excepthook = original_hook
+
+    assert errors == []
 
 
 def test_hidden_gantt_tab_is_not_refreshed_during_undo(window, qapp):

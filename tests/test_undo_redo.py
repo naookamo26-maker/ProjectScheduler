@@ -8,6 +8,7 @@ Qtを介したGUIレベルの選択・フォーカス復元は tests/test_gui_un
 
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -254,6 +255,75 @@ def test_commit_is_allowed_while_undo_recording_is_suspended(tmp_path):
         db._commit()  # 例外にならない
     with pytest.raises(AssertionError):
         db._commit()  # 抑止を抜けたらガードが復活する
+    db.close()
+
+
+def test_all_mutating_methods_are_marked_undoable():
+    """変更系の命名を持つ公開メソッドすべてに @undoable が付いていること。
+
+    _commit() の実行時ガードは「_commit() を経由する実装」しか検知できない
+    （self._conn.commit() を直接呼ぶ実装をすり抜ける）ため、命名規約からの
+    静的な検査も併用する。新しい変更系メソッドを追加してデコレータを付け
+    忘れると、GUIを起動しなくてもこのテストが失敗する。"""
+    mutating_prefixes = (
+        "add_", "update_", "delete_", "set_", "upsert_",
+        "clear_", "reorder_", "rename_", "sync_", "enforce_", "cascade_",
+    )
+    # 変更系の命名だが、意図的にUndo対象外にしているもの。
+    exempt = {
+        # Undo/Redoの適用そのもの（gui/undo_manager.py から呼ばれる）。
+        # これ自体をUndo記録の対象にすると無限に入れ子になる。
+        "restore_state",
+    }
+    checked, missing = [], []
+    for name in dir(ProjectDatabase):
+        if name.startswith("_") or name in exempt:
+            continue
+        if not name.startswith(mutating_prefixes):
+            continue
+        checked.append(name)
+        if not getattr(getattr(ProjectDatabase, name), "_is_undoable", False):
+            missing.append(name)
+
+    assert checked, "検査対象のメソッドが1件も見つかっていない（命名規約か検査条件の変更漏れ）"
+    assert missing == [], f"@undoable が付いていない変更系メソッド: {missing}"
+
+
+def test_save_failure_keeps_the_previously_saved_file(tmp_path):
+    """回帰テスト: 保存が途中で失敗しても、保存済みのファイルが失われないこと。
+
+    書き込み先を先に削除する実装だと、ディスク満杯・権限エラー等で保存済みの
+    内容ごと消えてしまう。Undo履歴はメモリ上にしか無いため復旧手段が無い。"""
+    import sqlite3
+
+    path = tmp_path / "大事なプロジェクト.pschedule"
+    db = ProjectDatabase.create_new(str(path))
+    db.set_project("重要", "2026-01-01")
+    db.add_team("チームA", 3)
+    db.save()
+    saved_size = path.stat().st_size
+
+    db.add_team("チームB", 2)
+    real_connect = sqlite3.connect
+
+    def failing_connect(target, *args, **kwargs):
+        # 一時ファイルへの書き込みが失敗する状況（ディスク満杯等）を再現する。
+        if str(target).endswith(".tmp"):
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_connect(target, *args, **kwargs)
+
+    with patch("sqlite3.connect", failing_connect):
+        with pytest.raises(sqlite3.OperationalError):
+            db.save()
+
+    assert path.exists(), "保存に失敗した結果、保存済みファイルが消えている"
+    assert path.stat().st_size == saved_size
+    # 失敗した保存の一時ファイルが残っていないこと
+    assert list(tmp_path.glob("*.tmp")) == []
+
+    reopened = ProjectDatabase.open_existing(str(path))
+    assert [t["name"] for t in reopened.list_teams()] == ["チームA"]  # 失敗前の内容のまま
+    reopened.close()
     db.close()
 
 

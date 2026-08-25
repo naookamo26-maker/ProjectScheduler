@@ -318,13 +318,20 @@ class MainWindow(QMainWindow):
         )
 
     def _open_database(self, db):
-        if self.db is not None:
-            self.db.on_change = None
-            self.db.undo_manager = None
-            self.db.close()
+        # 旧DBを閉じるのは、旧タブを差し替え終えた後にする。タブの差し替えでは
+        # 入力欄からフォーカスが外れ、editingFinished 等のシグナルが発火して
+        # 旧タブが自分の持つDBへ書き込もうとする——先に閉じてしまうと
+        # 「Cannot operate on a closed database」になる（Qtがスロット内の例外を
+        # 握りつぶすため画面上は無害に見えるが、書き込みは失われている）。
+        previous = self.db
+        if previous is not None:
+            previous.on_change = None
+            previous.undo_manager = None
         self.db = db
         self.db.on_change = self._on_db_changed
         self._rebuild_tabs()
+        if previous is not None:
+            previous.close()
         # ファイルを開く/新規作成するたびにUndo履歴も作り直す（ファイルを
         # またいだUndoは行わない）。
         self.undo_manager = UndoManager(
@@ -435,6 +442,11 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if self.db is not None:
+            # _open_database と同じ理由で、タブを片付けてからDBを閉じる
+            # （フォーカスが外れた入力欄が、閉じたDBへ書き込もうとするのを防ぐ）。
+            self.db.on_change = None
+            self.db.undo_manager = None
+            self._build_empty_state_tabs()
             self.db.close()
         super().closeEvent(event)
 

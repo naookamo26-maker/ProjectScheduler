@@ -21,7 +21,9 @@ ID方針: 全テーブルは整数の自動採番PKを持ち、GUI上はこのID
 
 import functools
 import heapq
+import os
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -164,9 +166,16 @@ def undoable(label):
     呼び出し（例: add_job_dependency_link 内から sync_dependency_templates を呼ぶ）は
     undo_group 側のガードにより自動的に1つのUndo単位へまとめられる。
 
-    新しく変更系メソッドを追加する際は必ずこのデコレータを付けること。付け忘れた
-    メソッドが self._commit() を呼ぶと、Undo管理が有効な場面（GUI実行時、および
-    それを模したテスト）では例外が送出され、記録漏れに気づける。"""
+    新しく変更系メソッドを追加する際は必ずこのデコレータを付けること。付け忘れは
+    2つの経路で検知される:
+
+    1. 実行時ガード — 付け忘れたメソッドが self._commit() を呼ぶと、Undo管理が
+       有効な場面（GUI実行時、およびそれを模したテスト）で例外が送出される。
+       ただし self._conn.commit() を直接呼ぶ実装にはこのガードが効かないため、
+       変更系メソッドは必ず _commit() を経由すること。
+    2. 反射テスト — tests/test_undo_redo.py が、変更系の命名（add_/update_/
+       delete_ 等）を持つ公開メソッドすべてに下記の _is_undoable マーカーが
+       付いていることを検査する。_commit() を経由しない実装でも検知できる。"""
 
     def decorator(fn):
         @functools.wraps(fn)
@@ -175,6 +184,8 @@ def undoable(label):
             with self.undo_group(resolved_label):
                 return fn(self, *args, **kwargs)
 
+        # 反射テストからデコレータの適用有無を判定するための目印。
+        wrapper._is_undoable = True
         return wrapper
 
     return decorator
@@ -425,14 +436,30 @@ class ProjectDatabase:
         self._notify_change()
 
     def _write_to(self, path):
+        """同じフォルダの一時ファイルへ書き出し、成功してから os.replace() で
+        本来の名前に置き換える。
+
+        書き込み先を先に削除してから書くと、途中で失敗した場合（ディスク満杯・
+        権限エラー・書き込み中のクラッシュ等）に、保存済みの内容ごと失われて
+        しまう。Undo履歴はメモリ上にしか無いため、こうなると復旧手段が無い。
+        一時ファイル経由なら、失敗しても既存の保存済みファイルは無傷のまま残る。
+
+        一時ファイルを同じフォルダに作るのは、os.replace() が同一ファイル
+        システム上でしか原子的に置き換えられないため（テンポラリ領域が別の
+        ドライブにあると保証が崩れる）。"""
         p = Path(path)
-        if p.exists():
-            p.unlink()
-        dest_conn = sqlite3.connect(str(p))
+        fd, tmp_name = tempfile.mkstemp(dir=str(p.parent), prefix=f".{p.name}.", suffix=".tmp")
+        os.close(fd)  # sqlite3が自分で開き直すため、ここではファイル名の確保だけが目的
         try:
-            self._conn.backup(dest_conn)
-        finally:
-            dest_conn.close()
+            dest_conn = sqlite3.connect(tmp_name)
+            try:
+                self._conn.backup(dest_conn)
+            finally:
+                dest_conn.close()
+            os.replace(tmp_name, str(p))
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
 
     def _commit(self):
         """変更系メソッドの末尾から呼ぶ内部コミット。メモリ上のトランザクションを
