@@ -147,6 +147,62 @@ def row_id(table, row):
     return item.data(ROW_ID_ROLE) if item else None
 
 
+def is_descendant_of(widget, ancestor):
+    """widget自身、またはその親ウィジェットを辿った先に ancestor が現れればTrue
+    （QComboBox内部のラインエディット等、フォーカスの実体が子ウィジェットに
+    ある場合の判定に使う）。"""
+    while widget is not None:
+        if widget is ancestor:
+            return True
+        widget = widget.parentWidget()
+    return False
+
+
+def capture_table_state(table):
+    """CrudSection等のQTableWidgetについて、選択行（DB上の実体ID）とフォーカス
+    位置をUndo/Redo後に復元できる形で取り出す。テーブル自体、またはセル内の
+    ウィジェット（QComboBox/QSpinBox等）がフォーカスを持っている場合は、その
+    セル位置も記録する。復元は restore_table_state を使う。"""
+    from PySide6.QtWidgets import QApplication
+
+    row = table.currentRow()
+    entity_id = row_id(table, row) if row >= 0 else None
+    focus_widget = QApplication.focusWidget()
+    has_focus = False
+    focus_column = None
+    if focus_widget is not None:
+        if focus_widget is table:
+            has_focus = True
+            focus_column = table.currentColumn()
+        elif row >= 0:
+            for col in range(table.columnCount()):
+                cell_widget = table.cellWidget(row, col)
+                if cell_widget is not None and is_descendant_of(focus_widget, cell_widget):
+                    has_focus = True
+                    focus_column = col
+                    break
+    return {"entity_id": entity_id, "has_focus": has_focus, "focus_column": focus_column}
+
+
+def restore_table_state(table, state):
+    """capture_table_state() の戻り値から選択行・フォーカスを復元する。対象の
+    entity_idが（Undo/Redoの結果）もう存在しない場合は何もしない。"""
+    if not state or state.get("entity_id") is None:
+        return
+    select_row_by_id(table, state["entity_id"])
+    if not state.get("has_focus"):
+        return
+    row = table.currentRow()
+    col = state.get("focus_column")
+    if row < 0:
+        return
+    cell_widget = table.cellWidget(row, col) if col is not None else None
+    if cell_widget is not None:
+        cell_widget.setFocus()
+    else:
+        table.setFocus()
+
+
 def select_row_by_id(table, entity_id):
     """entity_id に対応する行を選択状態にする（新規追加直後の行を選ぶ用途）。
     見つからない場合は何もしない。"""

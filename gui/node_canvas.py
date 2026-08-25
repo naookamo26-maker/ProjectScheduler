@@ -291,29 +291,31 @@ class WorkflowGraphScene(QGraphicsScene):
                 "この依存関係を追加すると循環依存になるため、追加できません。",
             )
             return
-        try:
-            dep_id = self.db.add_task_dependency(self.workflow_id, pred_id, succ_id)
-        except ProjectDatabaseError as e:
-            QMessageBox.warning(self.parent_widget, "エラー", str(e))
-            return
-        edge = EdgeItem(dep_id, pred_node, succ_node)
-        self.addItem(edge)
-        self.edges[dep_id] = edge
-        pred_node.edges.append(edge)
-        succ_node.edges.append(edge)
-        self.adjacency.setdefault(pred_id, []).append(succ_id)
-        self.auto_arrange()
+        with self.db.undo_group("依存関係を追加"):
+            try:
+                dep_id = self.db.add_task_dependency(self.workflow_id, pred_id, succ_id)
+            except ProjectDatabaseError as e:
+                QMessageBox.warning(self.parent_widget, "エラー", str(e))
+                return
+            edge = EdgeItem(dep_id, pred_node, succ_node)
+            self.addItem(edge)
+            self.edges[dep_id] = edge
+            pred_node.edges.append(edge)
+            succ_node.edges.append(edge)
+            self.adjacency.setdefault(pred_id, []).append(succ_id)
+            self.auto_arrange()
 
     def delete_edge(self, edge):
-        self.db.delete_task_dependency(edge.dependency_id)
-        pred_id, succ_id = edge.pred_node.workflow_task_id, edge.succ_node.workflow_task_id
-        if succ_id in self.adjacency.get(pred_id, []):
-            self.adjacency[pred_id].remove(succ_id)
-        edge.pred_node.edges.remove(edge)
-        edge.succ_node.edges.remove(edge)
-        del self.edges[edge.dependency_id]
-        self.removeItem(edge)
-        self.auto_arrange()
+        with self.db.undo_group("依存関係を削除"):
+            self.db.delete_task_dependency(edge.dependency_id)
+            pred_id, succ_id = edge.pred_node.workflow_task_id, edge.succ_node.workflow_task_id
+            if succ_id in self.adjacency.get(pred_id, []):
+                self.adjacency[pred_id].remove(succ_id)
+            edge.pred_node.edges.remove(edge)
+            edge.succ_node.edges.remove(edge)
+            del self.edges[edge.dependency_id]
+            self.removeItem(edge)
+            self.auto_arrange()
 
     def delete_node(self, node):
         usage = self.db.workflow_task_usage_count(node.workflow_task_id)
@@ -326,23 +328,25 @@ class WorkflowGraphScene(QGraphicsScene):
             )
             if reply != QMessageBox.Yes:
                 return
-        for edge in list(node.edges):
-            self.delete_edge(edge)
-        self.db.delete_workflow_task(node.workflow_task_id)
-        del self.nodes[node.workflow_task_id]
-        self.removeItem(node)
-        self.auto_arrange()
+        with self.db.undo_group("タスクを削除"):
+            for edge in list(node.edges):
+                self.delete_edge(edge)
+            self.db.delete_workflow_task(node.workflow_task_id)
+            del self.nodes[node.workflow_task_id]
+            self.removeItem(node)
+            self.auto_arrange()
 
     def add_task(self, name, team_id, days, x, y):
-        task_id = self.db.add_workflow_task(self.workflow_id, name, team_id, days, x, y)
-        colors = team_color_map(self.db.list_teams())
-        team = next(t for t in self.db.list_teams() if t["id"] == team_id)
-        node = TaskNodeItem(task_id, name, team["name"], colors.get(team_id, "#cbc9c2"),
-                             days, on_moved=self._on_node_moved)
-        node.setPos(x, y)
-        self.addItem(node)
-        self.nodes[task_id] = node
-        self.auto_arrange()
+        with self.db.undo_group(f"タスク「{name}」を追加"):
+            task_id = self.db.add_workflow_task(self.workflow_id, name, team_id, days, x, y)
+            colors = team_color_map(self.db.list_teams())
+            team = next(t for t in self.db.list_teams() if t["id"] == team_id)
+            node = TaskNodeItem(task_id, name, team["name"], colors.get(team_id, "#cbc9c2"),
+                                 days, on_moved=self._on_node_moved)
+            node.setPos(x, y)
+            self.addItem(node)
+            self.nodes[task_id] = node
+            self.auto_arrange()
         return node
 
     def auto_arrange(self):
@@ -350,15 +354,16 @@ class WorkflowGraphScene(QGraphicsScene):
         変わるたびに呼び出し、依存の深さに基づく自動レイアウトへ整列し直す
         （compute_auto_layout、gui/node_canvas.py冒頭参照）。手動でドラッグした
         位置は、次に何か編集するとリセットされる。"""
-        tasks = self.db.list_workflow_tasks(self.workflow_id)
-        deps = self.db.list_task_dependencies(self.workflow_id)
-        positions = compute_auto_layout(tasks, deps)
-        for task_id, (x, y) in positions.items():
-            node = self.nodes.get(task_id)
-            if node is None:
-                continue
-            node.setPos(x, y)
-            self.db.update_task_position(task_id, x, y)
+        with self.db.undo_group("レイアウトを自動調整"):
+            tasks = self.db.list_workflow_tasks(self.workflow_id)
+            deps = self.db.list_task_dependencies(self.workflow_id)
+            positions = compute_auto_layout(tasks, deps)
+            for task_id, (x, y) in positions.items():
+                node = self.nodes.get(task_id)
+                if node is None:
+                    continue
+                node.setPos(x, y)
+                self.db.update_task_position(task_id, x, y)
 
     def refresh_colors(self):
         """チームマスタが変わった際、既存ノードの色を再計算する。"""
@@ -643,8 +648,9 @@ class WorkflowGraphView(QGraphicsView):
         if not name or team_id is None or team_id == _ADD_TEAM_SENTINEL:
             QMessageBox.warning(self, "入力エラー", "タスク名とチームを指定してください。")
             return
-        node = self.scene().add_task(name, team_id, days, scene_pos.x(), scene_pos.y())
-        self._apply_predecessors(node, dialog.selected_predecessor_ids())
+        with db.undo_group(f"タスク「{name}」を追加"):
+            node = self.scene().add_task(name, team_id, days, scene_pos.x(), scene_pos.y())
+            self._apply_predecessors(node, dialog.selected_predecessor_ids())
 
     def _edit_node(self, node):
         db = self.scene().db
@@ -661,17 +667,18 @@ class WorkflowGraphView(QGraphicsView):
         if not name or team_id is None or team_id == _ADD_TEAM_SENTINEL:
             QMessageBox.warning(self, "入力エラー", "タスク名とチームを指定してください。")
             return
-        try:
-            db.update_workflow_task(node.workflow_task_id, name, team_id, days)
-        except DuplicateNameError as e:
-            QMessageBox.warning(self, "変更できません", str(e))
-            return
-        colors = team_color_map(db.list_teams())
-        team = next(t for t in db.list_teams() if t["id"] == team_id)
-        node.update_labels(name, team["name"], days)
-        node.set_color(colors.get(team_id, "#cbc9c2"))
-        self._apply_predecessors(node, dialog.selected_predecessor_ids())
-        self.scene().auto_arrange()
+        with db.undo_group(f"タスク「{name}」を編集"):
+            try:
+                db.update_workflow_task(node.workflow_task_id, name, team_id, days)
+            except DuplicateNameError as e:
+                QMessageBox.warning(self, "変更できません", str(e))
+                return
+            colors = team_color_map(db.list_teams())
+            team = next(t for t in db.list_teams() if t["id"] == team_id)
+            node.update_labels(name, team["name"], days)
+            node.set_color(colors.get(team_id, "#cbc9c2"))
+            self._apply_predecessors(node, dialog.selected_predecessor_ids())
+            self.scene().auto_arrange()
 
     def _apply_predecessors(self, node, predecessor_task_ids):
         """タスク編集ダイアログで選択された先行タスク集合を、実際の

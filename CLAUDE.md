@@ -11,3 +11,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - プランの了承が得られたら実装を進める。
 - 実装結果は画像で共有・報告する。コミット・PRは指示を待ってから行う。
 - PRは日本語で記述する。
+
+## Undo/Redo
+
+- GUIで編集可能な機能は、既存・将来を問わずすべてUndo/Redoで元に戻せること
+  （対象をタブ名で限定しない。新しいタブや既存タブへの編集機能追加にも適用される）。
+  内容だけでなく、操作直前の選択・フォーカスも合わせて復元する。
+- ProjectDatabase (gui/db.py) に変更系メソッドを追加する際は、必ず @undoable("ラベル")
+  を付けること。付け忘れると _commit() が例外を送出し、実行時・テストで検知される
+  （タブ側の呼び出し元がどこであってもこのガードが効く）。
+- GUI側で複数のDB呼び出しにまたがる1つのユーザー操作は、
+  `with db.undo_group("ラベル"):` で1つのUndo単位にまとめること。
+- 新しいタブ（またはガントチャートタブへの編集機能追加等）を作る際は、
+  refresh_choices() と同様の規約として capture_ui_state() / restore_ui_state(state)
+  を実装し、選択・フォーカスの復元に対応させること。
