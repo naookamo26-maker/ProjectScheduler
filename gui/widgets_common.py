@@ -66,15 +66,30 @@ class DefaultAwareSpinBox(NoWheelSpinBox):
     ▲▼で増減すると1やマイナスからしか始まらず使い勝手が悪い。この特殊値の
     状態から増減した場合は、既定値を起点に増減させる（0の状態で▲を押すと
     既定値+1、▼を押すと既定値-1になる）。DB保存時の「0＝既定を使用」という
-    意味はそのまま変えない（0に戻ればまた「既定（n日）」の表示に戻る）。"""
+    意味はそのまま変えない（0に戻ればまた「既定（n日）」の表示に戻る）。
+
+    また、増減の結果として値が既定値とちょうど同じ数値になった場合は、
+    自動的に特殊値（0）へ畳み込む（既定+1してから-1すると既定と同じ数値の
+    「上書き」が残ってしまい既定表示に戻らない、という問題への対応）。
+    逆に、通常の減算で0（既定を使用）へ意図せず落ち込まないよう、増減で
+    到達できる実際の日数としての下限は1にする（0日という設定自体に意味が
+    無いため）。0に戻すのは既定値と一致した場合の自動畳み込み、または
+    直接入力のみとする。"""
 
     def __init__(self, default_value, parent=None):
         super().__init__(parent)
         self.default_value = default_value
+        self.valueChanged.connect(self._collapse_to_default_if_matched)
+
+    def _collapse_to_default_if_matched(self, value):
+        if value == self.default_value and value != self.minimum():
+            self.setValue(self.minimum())
 
     def stepBy(self, steps):
         if self.value() == self.minimum() and steps != 0:
             self.setValue(max(self.minimum() + 1, self.default_value + steps))
+        elif steps < 0 and self.value() + steps <= self.minimum():
+            self.setValue(self.minimum() + 1)
         else:
             super().stepBy(steps)
 
@@ -130,6 +145,15 @@ def row_id(table, row):
     """table の row 行に紐づくDB上のID（先頭列のQt.UserRoleに格納）を返す。"""
     item = table.item(row, 0)
     return item.data(ROW_ID_ROLE) if item else None
+
+
+def select_row_by_id(table, entity_id):
+    """entity_id に対応する行を選択状態にする（新規追加直後の行を選ぶ用途）。
+    見つからない場合は何もしない。"""
+    for row in range(table.rowCount()):
+        if row_id(table, row) == entity_id:
+            table.setCurrentCell(row, 0)
+            return
 
 
 def set_row_id(table, row, entity_id):
@@ -206,11 +230,18 @@ class CrudSection(QGroupBox):
     列やセルウィジェットの構成は各タブ側の責務とする（追加/削除の導線と
     見た目の一貫性だけをここで共通化する）。"""
 
-    def __init__(self, title, column_labels, on_add, on_delete, on_edit=None, parent=None):
+    def __init__(
+        self, title, column_labels, on_add, on_delete, on_edit=None,
+        edit_dblclick_columns=None, parent=None,
+    ):
         super().__init__(title, parent)
         self.on_add = on_add
         self.on_delete = on_delete
         self.on_edit = on_edit
+        # on_edit をダブルクリックで開く対象列を限定したい場合に指定する
+        # （例: 列0がインライン編集可能なテキストで、別の列だけダイアログを
+        # 開かせたいケース）。Noneなら全列で発火（従来互換の挙動）。
+        self.edit_dblclick_columns = edit_dblclick_columns
 
         layout = QVBoxLayout(self)
 
@@ -235,8 +266,13 @@ class CrudSection(QGroupBox):
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         keep_selection_visible(self.table)
         if on_edit is not None:
-            self.table.itemDoubleClicked.connect(lambda _item: self._handle_edit())
+            self.table.itemDoubleClicked.connect(self._handle_item_double_clicked)
         layout.addWidget(self.table)
+
+    def _handle_item_double_clicked(self, item):
+        if self.edit_dblclick_columns is not None and item.column() not in self.edit_dblclick_columns:
+            return
+        self._handle_edit()
 
     def _handle_add(self):
         self.on_add()

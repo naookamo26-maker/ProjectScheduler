@@ -18,8 +18,11 @@
     後続タスク）。別ウィンドウにすると一覧性が悪いため、ツリーをその場で
     展開したまま編集できるようにしている。ワークフロー設計タブの依存
     テンプレートに対応があれば自動的にタスク対応が展開される
-    （gui/db.py の add_dependency_template / add_job_dependency_link 参照。
-    既に手動で同じ対応が追加済みの場合は重複させず自動生成扱いに変換する）。
+    （gui/db.py の sync_dependency_templates 参照。既に手動で同じ対応が
+    追加済みの場合は重複させず自動生成扱いに変換する）。テンプレートの
+    追加・編集・削除、依存先ジョブの追加、ジョブのワークフロー再割当ての
+    いずれからもこの同期が呼ばれるほか、このタブがアクティブになった際にも
+    念のため呼び直す（refresh_choices参照）。
 """
 
 from PySide6.QtCore import Qt, QTimer
@@ -433,14 +436,29 @@ class JobsTab(QWidget):
     # -- タスク上書き ------------------------------------------------------------
 
     def _on_job_selection_changed(self, current_row, _current_col, _prev_row, _prev_col):
-        if current_row is None or current_row < 0:
-            self.current_job_id = None
-            self.override_table.setRowCount(0)
-            self.dep_tree.clear()
+        if current_row is not None and current_row >= 0:
+            self.current_job_id = row_id(self.jobs_section.table, current_row)
+            self._refresh_overrides()
+            self._refresh_dependencies()
             return
-        self.current_job_id = row_id(self.jobs_section.table, current_row)
-        self._refresh_overrides()
-        self._refresh_dependencies()
+        # current_row < 0: ジョブ一覧の「現在セル」が本当に無くなった
+        # （ジョブが削除された・絞り込みで非表示になった等）のか、タスク
+        # 上書き欄のセルウィジェットへフォーカスが移る際のQtの内部挙動による
+        # 一時的な現在セル解除なのかを区別する。後者はよく起こり、放置すると
+        # 選択中ジョブの情報（current_job_id・タスク上書き欄・依存先ジョブ欄）
+        # が意図せず消えてしまう。current_job_id がまだジョブ一覧に存在する
+        # なら一時的な解除とみなし、状態は保持したまま該当行を選び直す
+        # （setCurrentCellにより本メソッドが再度呼ばれ、上のブロックで
+        # 通常通り更新される）。
+        if self.current_job_id is not None:
+            table = self.jobs_section.table
+            for row in range(table.rowCount()):
+                if row_id(table, row) == self.current_job_id:
+                    table.setCurrentCell(row, max(table.currentColumn(), 0))
+                    return
+        self.current_job_id = None
+        self.override_table.setRowCount(0)
+        self.dep_tree.clear()
 
     def _refresh_overrides(self):
         table = self.override_table
@@ -650,21 +668,14 @@ class JobsTab(QWidget):
             QMessageBox.warning(self, "入力エラー", "依存先ジョブを1つ以上選択してください。")
             return
         errors = []
-        added_ids = []
         for depends_on_job_id in depends_on_job_ids:
             try:
                 self.db.add_job_dependency_link(self.current_job_id, depends_on_job_id)
-                added_ids.append(depends_on_job_id)
             except ProjectDatabaseError as e:
                 errors.append(str(e))
         if errors:
             QMessageBox.warning(self, "一部追加できませんでした", "\n".join(errors))
         self._refresh_dependencies()
-        # 「依存先のジョブを追加した後に、依存先の先行タスク／本ジョブの後続タスクを
-        # 選ぶ」導線として、1件だけ新規追加した場合は続けてタスク対応の追加を開く
-        # （複数選択時はどれから開くか曖昧になるため、後からツリー上で個別に追加する）。
-        if len(added_ids) == 1:
-            self._add_task_pair(added_ids[0])
 
     def _delete_selected_dependency_link(self):
         _item, data = self._selected_link()
@@ -725,5 +736,13 @@ class JobsTab(QWidget):
     # -- 他タブからの通知 ----------------------------------------------------------
 
     def refresh_choices(self):
-        """ワークフロー・マイルストーン・チームの変更を反映する。"""
+        """ワークフロー・マイルストーン・チームの変更を反映する。
+
+        依存テンプレートと依存先ジョブのタスク対応は、変更が起こりうる
+        DB操作（gui/db.py の add_job_dependency_link 等）側で都度同期して
+        いるため本来ここで呼ぶ必要は無いはずだが、想定外の経路でズレる
+        場合に備え、このタブがアクティブになるたびにも念のため同期し直す。"""
+        self.db.sync_dependency_templates()
         self.refresh_jobs(select_id=self.current_job_id)
+        if self.current_job_id is not None:
+            self._refresh_dependencies()

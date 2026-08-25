@@ -443,6 +443,83 @@ def test_adding_template_after_link_expands_to_existing_links_without_manual_pai
     db.close()
 
 
+def test_updating_template_resyncs_existing_links(tmp_path):
+    """既存の依存テンプレートを編集（依存先ワークフロー/タスクを変更）すると、
+    その場で追加した時と同じように、既存の「依存先ジョブ」リンクへ即座に
+    反映されること。変更前のワークフローペア向けに自動生成されていた
+    タスク対応は削除され、変更後のワークフローペアに合致するリンクへは
+    新しく展開される。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    (wf1, t1), (wf2, t2), (wf3, t3) = _build_three_workflows(db)
+    j1 = db.add_job("J1", wf1, None, 100)
+    j2 = db.add_job("J2", wf2, None, 100)
+    j3 = db.add_job("J3", wf3, None, 100)
+
+    tpl_id = db.add_dependency_template(wf1, t1, wf2, t2)
+    db.add_job_dependency_link(j1, j2)  # WF1->WF2のテンプレートで自動展開される
+    link_to_j3 = db.add_job_dependency_link(j1, j3)  # まだWF1->WF3のテンプレートは無い
+
+    pairs_before = db.list_external_dependencies(job_id=j1)
+    assert {p["depends_on_job_id"] for p in pairs_before} == {j2}
+
+    db.update_dependency_template(tpl_id, t1, wf3, t3)  # 依存先をWF2からWF3へ変更
+
+    pairs_after = db.list_external_dependencies(job_id=j1)
+    assert {p["depends_on_job_id"] for p in pairs_after} == {j3}  # J2向けは消え、J3向けが追加
+    assert pairs_after[0]["source_link_id"] == link_to_j3
+    db.close()
+
+
+def test_deleting_template_removes_stale_auto_pair_but_keeps_manual(tmp_path):
+    """依存テンプレートを削除すると、そのテンプレートから自動生成されていた
+    タスク対応は削除されるが、手動で追加した別のタスク対応には影響しない
+    こと。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    team_id = db.add_team("チームA", 1)
+    wf1 = db.add_workflow("WF1")
+    wf2 = db.add_workflow("WF2")
+    t1 = db.add_workflow_task(wf1, "A", team_id, 1)
+    t2 = db.add_workflow_task(wf2, "B", team_id, 1)
+    t3 = db.add_workflow_task(wf2, "C", team_id, 1)
+    j1 = db.add_job("J1", wf1, None, 100)
+    j2 = db.add_job("J2", wf2, None, 100)
+
+    tpl_id = db.add_dependency_template(wf1, t1, wf2, t2)
+    db.add_job_dependency_link(j1, j2)  # 自動: t1 -> t2
+    db.add_external_dependency(j1, t1, j2, t3)  # 手動: t1 -> t3（別ペア）
+    assert len(db.list_external_dependencies(job_id=j1)) == 2
+
+    db.delete_dependency_template(tpl_id)
+
+    pairs = db.list_external_dependencies(job_id=j1)
+    assert len(pairs) == 1
+    assert pairs[0]["depends_on_workflow_task_id"] == t3
+    assert pairs[0]["source_link_id"] is None
+    db.close()
+
+
+def test_job_workflow_reassignment_resyncs_dependency_templates(tmp_path):
+    """ジョブ作成タブでジョブのワークフローを再割当てすると、依存先ジョブの
+    タスク対応が新しいワークフローの組み合わせに合わせて同期し直される
+    こと（テンプレートが無い組み合わせになった場合は自動生成分が削除される）。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    (wf1, t1), (wf2, t2), (_wf3, _t3) = _build_three_workflows(db)
+    j1 = db.add_job("J1", wf1, None, 100)
+    j2 = db.add_job("J2", wf2, None, 100)
+
+    db.add_dependency_template(wf1, t1, wf2, t2)
+    db.add_job_dependency_link(j1, j2)
+    assert len(db.list_external_dependencies(job_id=j1)) == 1  # 自動展開済み
+
+    job = next(j for j in db.list_jobs() if j["id"] == j1)
+    wf3 = next(w["id"] for w in db.list_workflows() if w["id"] not in (wf1, wf2))
+    db.update_job(j1, job["name"], wf3, job["default_milestone_id"], job["priority"])
+
+    # WF3->WF2のテンプレートは存在しないため、自動生成分は削除される
+    assert db.list_external_dependencies(job_id=j1) == []
+    db.close()
+
+
 # -- job_task_overrides: マイルストーンの整合性（先行/後続タスク間） -----------------
 
 def _build_linear_workflow_job(db):

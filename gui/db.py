@@ -682,6 +682,10 @@ class ProjectDatabase:
         return cur.lastrowid
 
     def update_job(self, job_id, name, workflow_id, default_milestone_id, priority):
+        old = self._conn.execute(
+            "SELECT workflow_id FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        workflow_changed = old is not None and old["workflow_id"] != workflow_id
         try:
             self._conn.execute(
                 "UPDATE jobs SET name = ?, workflow_id = ?, default_milestone_id = ?, "
@@ -691,6 +695,10 @@ class ProjectDatabase:
         except sqlite3.IntegrityError as e:
             raise DuplicateNameError(f"ジョブ名 '{name}' は既に使用されています") from e
         self._commit()
+        if workflow_changed:
+            # ワークフローの組み合わせが変わると、依存先ジョブのタスク対応が
+            # 参照すべきテンプレートも変わるため、最新の状態へ同期し直す。
+            self.sync_dependency_templates()
 
     def job_usage_count(self, job_id):
         """他のジョブがこのジョブに外部依存している数（削除時の警告用）"""
@@ -1043,6 +1051,60 @@ class ProjectDatabase:
                 (source_link_id, existing["id"]),
             )
 
+    def sync_dependency_templates(self):
+        """既存の「依存先ジョブ」リンクすべてに対し、現在の依存テンプレートの
+        内容を改めて適用し直す（テンプレート由来のタスク対応を最新状態へ
+        揃える）。
+
+        テンプレートの新規追加時（add_dependency_template）・依存先ジョブの
+        新規追加時（add_job_dependency_link）は、追加されたその場でタスク
+        対応を展開しているが、それ以外の変更経路——テンプレートの編集
+        （update_dependency_template）・削除（delete_dependency_template）・
+        ジョブのワークフロー再割当て（update_job）——は、どのリンクに影響する
+        かをその場で正確に絞り込むより、影響しうる全リンクをこの関数で
+        一括して現在のテンプレート状態に合わせ直す方が単純で漏れがない。
+        そのため、これらの変更経路すべてからこの関数を呼び出す。
+
+        テンプレートに合致する対応は追加/自動生成扱いへ昇格（既存の
+        _upsert_dependency_pairと同じ「重複させない・手動を尊重」ルール）し、
+        このリンクから自動生成された対応（source_link_id一致）のうち、
+        現在どのテンプレートにも合致しなくなったもの（テンプレートの編集・
+        削除で古くなったもの）は削除する。手動追加分（source_link_idが
+        NULL）には一切触れない。"""
+        links = self._conn.execute(
+            "SELECT l.id AS link_id, l.job_id, l.depends_on_job_id, "
+            "j.workflow_id AS job_workflow_id, dj.workflow_id AS depends_on_workflow_id "
+            "FROM job_dependency_links l "
+            "JOIN jobs j ON j.id = l.job_id "
+            "JOIN jobs dj ON dj.id = l.depends_on_job_id"
+        ).fetchall()
+        for link in links:
+            templates = self._conn.execute(
+                "SELECT workflow_task_id, depends_on_workflow_task_id "
+                "FROM workflow_dependency_templates "
+                "WHERE workflow_id = ? AND depends_on_workflow_id = ?",
+                (link["job_workflow_id"], link["depends_on_workflow_id"]),
+            ).fetchall()
+            expected = {
+                (t["workflow_task_id"], t["depends_on_workflow_task_id"]) for t in templates
+            }
+            for workflow_task_id, depends_on_workflow_task_id in expected:
+                self._upsert_dependency_pair(
+                    link["job_id"], workflow_task_id, link["depends_on_job_id"],
+                    depends_on_workflow_task_id, link["link_id"],
+                )
+            auto_rows = self._conn.execute(
+                "SELECT id, workflow_task_id, depends_on_workflow_task_id "
+                "FROM job_external_dependencies WHERE source_link_id = ?",
+                (link["link_id"],),
+            ).fetchall()
+            for row in auto_rows:
+                if (row["workflow_task_id"], row["depends_on_workflow_task_id"]) not in expected:
+                    self._conn.execute(
+                        "DELETE FROM job_external_dependencies WHERE id = ?", (row["id"],)
+                    )
+        self._commit()
+
     def add_job_dependency_link(self, job_id, depends_on_job_id):
         if job_id == depends_on_job_id:
             raise ProjectDatabaseError("同じジョブへの自己依存は設定できません")
@@ -1054,25 +1116,7 @@ class ProjectDatabase:
         except sqlite3.IntegrityError as e:
             raise ProjectDatabaseError("このジョブへの依存は既に登録されています") from e
         link_id = cur.lastrowid
-
-        job = self._conn.execute(
-            "SELECT workflow_id FROM jobs WHERE id = ?", (job_id,)
-        ).fetchone()
-        depends_on_job = self._conn.execute(
-            "SELECT workflow_id FROM jobs WHERE id = ?", (depends_on_job_id,)
-        ).fetchone()
-        templates = self._conn.execute(
-            "SELECT workflow_task_id, depends_on_workflow_task_id "
-            "FROM workflow_dependency_templates "
-            "WHERE workflow_id = ? AND depends_on_workflow_id = ?",
-            (job["workflow_id"], depends_on_job["workflow_id"]),
-        ).fetchall()
-        for t in templates:
-            self._upsert_dependency_pair(
-                job_id, t["workflow_task_id"], depends_on_job_id,
-                t["depends_on_workflow_task_id"], link_id,
-            )
-        self._commit()
+        self.sync_dependency_templates()
         return link_id
 
     def delete_job_dependency_link(self, link_id):
@@ -1157,26 +1201,11 @@ class ProjectDatabase:
         except sqlite3.IntegrityError as e:
             raise ProjectDatabaseError("このテンプレートは既に登録されています") from e
         template_id = cur.lastrowid
-
-        # 既にこのワークフローペアで「依存先ジョブ」のリンクが張られているジョブが
-        # あれば、新しいテンプレートのタスク対応をそのリンクにも展開する
-        # （依存先ジョブを先に追加し、後からテンプレートを設定した場合の救済）。
-        # 手動で同じ対応が既に追加されていた場合は、重複させず自動生成扱いに
-        # 昇格する（_upsert_dependency_pair参照）。
-        links = self._conn.execute(
-            "SELECT l.id AS link_id, l.job_id, l.depends_on_job_id "
-            "FROM job_dependency_links l "
-            "JOIN jobs j ON j.id = l.job_id "
-            "JOIN jobs dj ON dj.id = l.depends_on_job_id "
-            "WHERE j.workflow_id = ? AND dj.workflow_id = ?",
-            (workflow_id, depends_on_workflow_id),
-        ).fetchall()
-        for link in links:
-            self._upsert_dependency_pair(
-                link["job_id"], workflow_task_id, link["depends_on_job_id"],
-                depends_on_workflow_task_id, link["link_id"],
-            )
-        self._commit()
+        # 既にこのワークフローペアで「依存先ジョブ」のリンクが張られている
+        # ジョブがあれば、新しいテンプレートのタスク対応をそのリンクにも展開
+        # する（依存先ジョブを先に追加し、後からテンプレートを設定した場合の
+        # 救済）。
+        self.sync_dependency_templates()
         return template_id
 
     def update_dependency_template(self, template_id, workflow_task_id,
@@ -1204,10 +1233,15 @@ class ProjectDatabase:
             )
         except sqlite3.IntegrityError as e:
             raise ProjectDatabaseError("このテンプレートは既に登録されています") from e
-        self._commit()
+        # 変更前のタスク対応で自動生成されていた行は、もう現在のテンプレートに
+        # 合致しなくなるため sync_dependency_templates が削除し、変更後の
+        # タスク対応が新たに展開される。
+        self.sync_dependency_templates()
 
     def delete_dependency_template(self, template_id):
         self._conn.execute(
             "DELETE FROM workflow_dependency_templates WHERE id = ?", (template_id,)
         )
-        self._commit()
+        # このテンプレートから自動生成されていたタスク対応は、もうどの
+        # テンプレートにも合致しなくなるため sync_dependency_templates が削除する。
+        self.sync_dependency_templates()

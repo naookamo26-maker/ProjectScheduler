@@ -38,6 +38,7 @@ from gui.widgets_common import (
     confirm_or_block_delete,
     make_fk_combo,
     row_id,
+    select_row_by_id,
     set_row_id,
     unique_default_name,
 )
@@ -164,6 +165,84 @@ class TeamCapacityDialog(QDialog):
                 return
 
 
+class AddMilestoneDialog(QDialog):
+    """マイルストーン追加ダイアログ。名前と締切日を入力してから追加する。"""
+
+    def __init__(self, default_name, default_date, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("マイルストーンを追加")
+
+        form = QFormLayout(self)
+
+        self.name_edit = QLineEdit(default_name)
+        form.addRow("マイルストーン名", self.name_edit)
+
+        self.date_edit = NoWheelDateEdit(default_date)
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        form.addRow("締切日", self.date_edit)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        form.addRow(self.buttons)
+
+    def values(self):
+        return self.name_edit.text(), _to_iso(self.date_edit.date())
+
+
+class AddTeamDialog(QDialog):
+    """チーム追加ダイアログ。名前と同時ライン数（既定値）を入力してから追加する。"""
+
+    def __init__(self, default_name, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("チームを追加")
+
+        form = QFormLayout(self)
+
+        self.name_edit = QLineEdit(default_name)
+        form.addRow("チーム名", self.name_edit)
+
+        self.lines_spin = NoWheelSpinBox()
+        self.lines_spin.setRange(1, 999)
+        self.lines_spin.setValue(1)
+        form.addRow("同時ライン数（開発開始日からの既定値）", self.lines_spin)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def values(self):
+        return self.name_edit.text(), self.lines_spin.value()
+
+
+class AddHolidayDialog(QDialog):
+    """休業日追加ダイアログ。日付と対象チーム（未設定＝全社共通）を入力してから追加する。"""
+
+    def __init__(self, team_options, default_date, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("休業日を追加")
+
+        form = QFormLayout(self)
+
+        self.date_edit = NoWheelDateEdit(default_date)
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        form.addRow("日付", self.date_edit)
+
+        self.team_combo = make_fk_combo(team_options, allow_blank=True, blank_label="（全社共通）")
+        form.addRow("対象チーム", self.team_combo)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def values(self):
+        return _to_iso(self.date_edit.date()), self.team_combo.currentData()
+
+
 class BasicInfoTab(QWidget):
     def __init__(self, db, on_teams_changed=None, parent=None):
         super().__init__(parent)
@@ -193,7 +272,7 @@ class BasicInfoTab(QWidget):
         self.teams_section = CrudSection(
             "チーム", ["チーム名", "同時ライン数（開発開始日からの既定値）", "期間中の変動"],
             on_add=self._add_team, on_delete=self._delete_team,
-            on_edit=self._edit_team_capacity,
+            on_edit=self._edit_team_capacity, edit_dblclick_columns={2},
         )
         self.teams_section.table.itemChanged.connect(self._on_team_name_changed)
         layout.addWidget(self.teams_section)
@@ -261,14 +340,20 @@ class BasicInfoTab(QWidget):
 
     def _add_milestone(self):
         existing = {ms["name"] for ms in self.db.list_milestones()}
-        name = unique_default_name(existing, "新しいマイルストーン")
-        default_date = date.today().isoformat()
-        try:
-            self.db.add_milestone(name, default_date)
-        except DuplicateNameError as e:
-            QMessageBox.warning(self, "追加できません", str(e))
-            return
+        default_name = unique_default_name(existing, "新しいマイルストーン")
+        dialog = AddMilestoneDialog(default_name, QDate.currentDate(), self)
+        while True:
+            if dialog.exec() != QDialog.Accepted:
+                return
+            name, end_date = dialog.values()
+            try:
+                new_id = self.db.add_milestone(name, end_date)
+            except DuplicateNameError as e:
+                QMessageBox.warning(self, "追加できません", str(e))
+                continue
+            break
         self.refresh_milestones()
+        select_row_by_id(self.milestones_section.table, new_id)
 
     def _delete_milestone(self, row):
         table = self.milestones_section.table
@@ -351,13 +436,20 @@ class BasicInfoTab(QWidget):
 
     def _add_team(self):
         existing = {t["name"] for t in self.db.list_teams()}
-        name = unique_default_name(existing, "新しいチーム")
-        try:
-            self.db.add_team(name, 1)
-        except DuplicateNameError as e:
-            QMessageBox.warning(self, "追加できません", str(e))
-            return
+        default_name = unique_default_name(existing, "新しいチーム")
+        dialog = AddTeamDialog(default_name, self)
+        while True:
+            if dialog.exec() != QDialog.Accepted:
+                return
+            name, max_lines = dialog.values()
+            try:
+                new_id = self.db.add_team(name, max_lines)
+            except DuplicateNameError as e:
+                QMessageBox.warning(self, "追加できません", str(e))
+                continue
+            break
         self.refresh_teams()
+        select_row_by_id(self.teams_section.table, new_id)
         self._notify_teams_changed()
 
     def _delete_team(self, row):
@@ -433,13 +525,26 @@ class BasicInfoTab(QWidget):
 
     def _add_holiday(self):
         # 「追加」連打で全社共通・同日の重複エラーが出ないよう、空いている日付を
-        # 自動的に探す（既定は全社共通＝チーム未設定）。
+        # 既定値として提案する（既定は全社共通＝チーム未設定。ダイアログ側で
+        # 変更可能なので、実際に重複した場合はダイアログ内で警告して再入力させる）。
         existing = {h["date"] for h in self.db.list_holidays() if h["team_id"] is None}
         d = date.today()
         while d.isoformat() in existing:
             d += timedelta(days=1)
-        self.db.add_holiday(d.isoformat(), None)
+        team_options = [(t["id"], t["name"]) for t in self.db.list_teams()]
+        dialog = AddHolidayDialog(team_options, _to_qdate(d.isoformat()), self)
+        while True:
+            if dialog.exec() != QDialog.Accepted:
+                return
+            hol_date, team_id = dialog.values()
+            try:
+                new_id = self.db.add_holiday(hol_date, team_id)
+            except DuplicateNameError as e:
+                QMessageBox.warning(self, "追加できません", str(e))
+                continue
+            break
         self.refresh_holidays()
+        select_row_by_id(self.holidays_section.table, new_id)
 
     def _delete_holiday(self, row):
         table = self.holidays_section.table
