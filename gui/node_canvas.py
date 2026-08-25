@@ -24,7 +24,6 @@ from PySide6.QtWidgets import (
     QGraphicsItem,
     QGraphicsPathItem,
     QGraphicsPolygonItem,
-    QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
     QGraphicsView,
@@ -41,6 +40,9 @@ from gui.widgets_common import NoWheelComboBox, NoWheelListWidget, NoWheelSpinBo
 NODE_WIDTH = 170
 NODE_HEIGHT = 64
 ANCHOR_RADIUS = 8
+# ノード矩形の角丸半径。gui/gantt_view.py のタスクバーと同様、隣接する
+# 要素との境目を視認しやすくする狙い。
+NODE_CORNER_RADIUS = 6
 
 _ADD_TEAM_SENTINEL = "__add_new_team__"
 
@@ -112,9 +114,11 @@ class AnchorItem(QGraphicsEllipseItem):
         self.setAcceptedMouseButtons(Qt.NoButton)  # クリックはView側でitemAtにより処理する
 
 
-class TaskNodeItem(QGraphicsRectItem):
+class TaskNodeItem(QGraphicsPathItem):
     def __init__(self, workflow_task_id, name, team_name, color_hex, days, on_moved):
-        super().__init__(0, 0, NODE_WIDTH, NODE_HEIGHT)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, NODE_WIDTH, NODE_HEIGHT), NODE_CORNER_RADIUS, NODE_CORNER_RADIUS)
+        super().__init__(path)
         self.workflow_task_id = workflow_task_id
         self.on_moved = on_moved
         self.edges = []  # 接続中のEdgeItem一覧（移動時の再描画用）
