@@ -341,6 +341,7 @@ class FrozenGanttPane(QWidget):
         self.column.verticalScrollBar().setValue(self.body.verticalScrollBar().value())
 
         self._center_milestone_labels(sx)
+        self._center_tick_labels(sx)
         self._center_task_labels(sx, sy)
 
     def _center_task_labels(self, sx, sy):
@@ -414,6 +415,17 @@ class FrozenGanttPane(QWidget):
                 max_anchor = max(min_anchor, header_rect.right() - width_px / sx)
                 anchor = max(min_anchor, min(anchor, max_anchor))
             label.setPos(anchor, label.y())
+
+    def _center_tick_labels(self, sx):
+        """日付目盛りラベルを、その縦線を中心に左右均等になるよう配置し直す。
+        _center_milestone_labelsと同じ理由で、中央揃えのオフセット（ラベル幅の
+        半分）は現在の横方向の拡縮率(sx)で割ってシーン座標に変換する必要がある。"""
+        scene = self.header.scene()
+        if scene is None or sx <= 0:
+            return
+        for label, line_x in getattr(scene, "gantt_tick_labels", []):
+            width_px = label.boundingRect().width()
+            label.setPos(line_x - (width_px / 2) / sx, label.y())
 
 
 def _pack_lanes(tasks):
@@ -546,6 +558,11 @@ def build_gantt_scenes(df, display, color_by="team"):
     elif total_days > 120:
         tick_step_days = 14
 
+    # マイルストーンラベルと同じ理由（ItemIgnoresTransformationsを立てた項目の
+    # setPosはシーン座標のままズームの影響を受けるため、「中央揃え」を維持する
+    # オフセットは実際の表示倍率が分かるタイミング(FrozenGanttPane._sync_panes)
+    # でしか正しく計算できない）で、ここでは対象を後で拾えるよう参照だけ残す。
+    header_scene.gantt_tick_labels = []
     tick_date = axis_start
     # 最初の目盛りを月曜に揃える
     tick_date = tick_date + timedelta(days=(7 - tick_date.weekday()) % 7)
@@ -556,10 +573,11 @@ def build_gantt_scenes(df, display, color_by="team"):
         header_line.setZValue(-2)
         body_line = body_scene.addLine(x, TOP_MARGIN, x, chart_bottom, QPen(_GRID_COLOR, 1))
         body_line.setZValue(-2)
-        _add_fixed_size_label(
-            header_scene, tick_date.strftime("%m-%d"), task_font,
-            (x + 2, TOP_MARGIN - _TICK_LABEL_OFFSET),
+        label = _add_fixed_size_label(
+            header_scene, tick_date.strftime("%m/%d"), task_font,
+            (x, TOP_MARGIN - _TICK_LABEL_OFFSET),
         )
+        header_scene.gantt_tick_labels.append((label, x))
         tick_date += timedelta(days=tick_step_days)
 
     year_font = QFont(task_font)
