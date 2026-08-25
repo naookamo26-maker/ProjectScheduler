@@ -30,10 +30,10 @@ from collections import namedtuple
 from datetime import timedelta
 
 from PySide6.QtCore import QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPen, QTransform
+from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainterPath, QPen, QTransform
 from PySide6.QtWidgets import (
     QGraphicsItem,
-    QGraphicsRectItem,
+    QGraphicsPathItem,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
     QGraphicsView,
@@ -44,6 +44,9 @@ from PySide6.QtWidgets import (
 DAY_WIDTH = 10
 ROW_HEIGHT = 26
 BAR_MARGIN = 3
+# タスクバーの角丸半径（シーン座標）。隣接するバー同士が隙間なく接している
+# ときでも、角が丸まっていることで境目を視認しやすくする。
+BAR_CORNER_RADIUS = 3
 LEFT_MARGIN = 190
 # ヘッダーは上から (1)マイルストーン名 (2)年 (3)月日 の3段構成のため、
 # 目盛り1段のみだった頃より高さが必要。
@@ -632,9 +635,20 @@ def build_gantt_scenes(df, display, color_by="team"):
             color_hex = color_map.get(r[color_key], _DEFAULT_BAR_COLOR)
 
             bar_height = ROW_HEIGHT - BAR_MARGIN * 2
-            rect = QGraphicsRectItem(QRectF(start_x, y + BAR_MARGIN, width, bar_height))
+            bar_path = QPainterPath()
+            bar_path.addRoundedRect(
+                QRectF(start_x, y + BAR_MARGIN, width, bar_height),
+                BAR_CORNER_RADIUS, BAR_CORNER_RADIUS,
+            )
+            rect = QGraphicsPathItem(bar_path)
             rect.setBrush(QBrush(QColor(color_hex)))
-            rect.setPen(QPen(QColor("#0b0b0b"), 1))
+            border_pen = QPen(QColor("#0b0b0b"), 1)
+            # コズメティックペイン（常に一定の画面上の太さで描く）にしないと、
+            # 横縦で異なる拡縮率（IgnoreAspectRatio）のもとでは、枠線の太さが
+            # 辺の向きによって（横縁は縦方向の拡縮率、縦縁は横方向の拡縮率の
+            # 影響を受けて）不揃いに見えてしまう。
+            border_pen.setCosmetic(True)
+            rect.setPen(border_pen)
             rect.setFlag(QGraphicsItem.ItemIsSelectable, True)
             team_name = team_names.get(r["Team_ID"], str(r["Team_ID"]))
             workflow_name = workflow_names.get(r["Workflow_ID"], str(r["Workflow_ID"]))
