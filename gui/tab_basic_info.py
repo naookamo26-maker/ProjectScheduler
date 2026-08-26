@@ -707,6 +707,12 @@ class BasicInfoTab(QWidget):
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(0, 0, 0, 0)
 
+        title = QLabel("リソースヒストグラム")
+        title_font = title.font()
+        title_font.setBold(True)
+        title.setFont(title_font)
+        panel_layout.addWidget(title)
+
         self.histogram_status_label = QLabel("")
         self.histogram_status_label.setWordWrap(True)
         panel_layout.addWidget(self.histogram_status_label)

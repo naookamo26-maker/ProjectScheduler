@@ -13,6 +13,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from gui.resource_histogram import (  # noqa: E402
+    ROW_UNIT_HEIGHT,
+    TOP_MARGIN,
+    TOP_PADDING_ROWS,
+    _compute_top_margin,
     compute_step_segments,
     histogram_axis_range,
     shared_boundaries,
@@ -153,3 +157,27 @@ def test_shared_boundaries_ignores_change_dates_outside_range():
     bps_a = [(_d(-5), 2), (_d(20), 4)]
     result = shared_boundaries({"a": bps_a}, D0, _d(10))
     assert result == [D0, _d(10)]
+
+
+# -- _compute_top_margin ------------------------------------------------------
+
+def test_compute_top_margin_uses_the_fixed_default_for_small_totals():
+    """合計値が小さいプロジェクトでは、見た目を変えないよう既定値
+    （TOP_MARGIN）のまま使う。"""
+    small_range = (5 + TOP_PADDING_ROWS) * ROW_UNIT_HEIGHT
+    assert _compute_top_margin(small_range) == TOP_MARGIN
+
+
+def test_compute_top_margin_grows_proportionally_for_large_totals():
+    """回帰テスト: 合計値が大きい（バーの縦幅が大きい）プロジェクトでは、
+    fit_all()で縦方向を大きく縮小しても、マイルストーンラベル
+    （ItemIgnoresTransformationsで縮小されない）がバーと重ならないよう、
+    上余白をバー全体の高さに対する一定割合まで広げる。"""
+    large_range = (45 + TOP_PADDING_ROWS) * ROW_UNIT_HEIGHT
+    margin = _compute_top_margin(large_range)
+    assert margin > TOP_MARGIN
+    assert margin == large_range * 0.12
+
+
+def test_compute_top_margin_never_shrinks_below_the_fixed_default():
+    assert _compute_top_margin(0) == TOP_MARGIN
