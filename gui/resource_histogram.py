@@ -34,11 +34,16 @@ DAY_WIDTH = 6
 ROW_UNIT_HEIGHT = 22
 LEFT_MARGIN = 50
 TOP_MARGIN = 36
+# 最も高いバーの上端と目盛りエリア上端(TOP_MARGIN)が接してしまうと窮屈な
+# 見た目になるため、最大値の上にさらに1行分の空白（見出し・ラベル用の
+# 余白ではなく、純粋な視覚的な余白）を確保する。
+TOP_PADDING_ROWS = 1
 _GRID_COLOR = QColor("#e1e0d9")
 _AXIS_TEXT_COLOR = QColor("#52514e")
 _MILESTONE_COLOR = QColor("#c0392b")
 _PROJECT_START_COLOR = QColor("#52514e")
 _PANE_BG = QColor("#fdfcf9")
+_MILESTONE_LINE_Z = 10  # バー（既定のzValue=0）より前面に描画する
 
 _AXIS_MARGIN_DAYS = 3
 # マイルストーン・変動点のどちらも無いプロジェクトでは表示範囲を決める材料が
@@ -208,7 +213,7 @@ def build_histogram_scene(segments_by_key, mode, color_map, labels_by_key,
         max_value = max((v for _s, _e, v in segments), default=0)
         band_items = [(s, e, 0, v, key) for s, e, v in segments]
 
-    chart_bottom = TOP_MARGIN + max(max_value, 1) * ROW_UNIT_HEIGHT
+    chart_bottom = TOP_MARGIN + (max(max_value, 1) + TOP_PADDING_ROWS) * ROW_UNIT_HEIGHT
     chart_right = x_of(range_end)
 
     widest_band_by_key = {}
@@ -269,15 +274,24 @@ def build_histogram_scene(segments_by_key, mode, color_map, labels_by_key,
         tick_date += timedelta(days=step)
 
     # -- マイルストーン・開発開始日の縦線 -------------------------------------------
+    # gui/gantt_view.py のマイルストーン線（幅2のダッシュ線）と同じ見た目にし、
+    # バー（既定のzValue=0）より前面（_MILESTONE_LINE_Z）に描画することで、
+    # バーに隠れず常に視認できるようにする。
     milestone_font = QFont(axis_font)
     milestone_font.setBold(True)
     x = x_of(project_start)
-    scene.addItem(_grid_line(x, TOP_MARGIN, x, chart_bottom, _PROJECT_START_COLOR, dashed=True))
+    scene.addItem(_grid_line(
+        x, TOP_MARGIN, x, chart_bottom, _PROJECT_START_COLOR,
+        dashed=True, width=2, z_value=_MILESTONE_LINE_Z,
+    ))
     for _mid, mlabel, mdate in milestone_markers:
         if not (range_start <= mdate <= range_end):
             continue
         x = x_of(mdate)
-        scene.addItem(_grid_line(x, TOP_MARGIN, x, chart_bottom, _MILESTONE_COLOR, dashed=True))
+        scene.addItem(_grid_line(
+            x, TOP_MARGIN, x, chart_bottom, _MILESTONE_COLOR,
+            dashed=True, width=2, z_value=_MILESTONE_LINE_Z,
+        ))
         _add_label(scene, mlabel, milestone_font, (x + 2, TOP_MARGIN - 14), QBrush(_MILESTONE_COLOR))
 
     scene.setBackgroundBrush(QBrush(_PANE_BG))
@@ -286,14 +300,14 @@ def build_histogram_scene(segments_by_key, mode, color_map, labels_by_key,
     return scene
 
 
-def _grid_line(x1, y1, x2, y2, color=None, dashed=False):
-    pen = QPen(color or _GRID_COLOR, 1, Qt.DashLine if dashed else Qt.SolidLine)
+def _grid_line(x1, y1, x2, y2, color=None, dashed=False, width=1, z_value=-1):
+    pen = QPen(color or _GRID_COLOR, width, Qt.DashLine if dashed else Qt.SolidLine)
     line = QGraphicsPathItem()
     path = QPainterPath(QPointF(x1, y1))
     path.lineTo(QPointF(x2, y2))
     line.setPath(path)
     line.setPen(pen)
-    line.setZValue(-1)
+    line.setZValue(z_value)
     return line
 
 

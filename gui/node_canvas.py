@@ -128,10 +128,10 @@ def compute_combined_layout(tasks, dependencies, templates, gap_x=NODE_WIDTH + 6
     タスク同士の縦方向の並び（アクティブなタスクの流れを見やすくするための
     並び）にテンプレートが割り込むと視認性が落ちるため、**まずタスクだけで
     `compute_auto_layout` により整列し、テンプレートの有無で結果が変わらない
-    ようにする**。テンプレートは横方向だけ対象タスク（workflow_task_id）の
-    1つ上流の列に揃え、縦方向はタスク群の最上段よりさらに `template_margin`
-    分上の帯に、同じ列同士は`gap_y`間隔で積み上げて配置する（他の列のタスクと
-    高さが重ならないよう、タスクの並びより明確に上へ離す）。
+    ようにする**。テンプレートの配置自体は `compute_template_positions` に委譲する
+    （タスクの座標が「自動整列し直した直後の値」か「DB保存済みの値（手動で
+    ドラッグしたものを含む）」かによらず、同じロジックで対象タスクの近くに
+    配置できるようにするため——`WorkflowGraphScene.reload`参照）。
 
     テンプレートの座標はDBに保存しない（保存用カラムを持たないため）。
     タスクや依存関係・テンプレートが変わるたび、この関数で毎回計算し直す
@@ -143,21 +143,41 @@ def compute_combined_layout(tasks, dependencies, templates, gap_x=NODE_WIDTH + 6
     Returns: {task_id または ("template", template_id): (x, y)}
     """
     positions = dict(compute_auto_layout(tasks, dependencies, gap_x, gap_y))
-    if not templates:
-        return positions
+    positions.update(compute_template_positions(positions, templates, gap_x, gap_y, template_margin))
+    return positions
 
-    task_depth = compute_task_depths(tasks, dependencies)
-    min_task_y = min((y for _x, y in positions.values()), default=0)
+
+def compute_template_positions(task_positions, templates, gap_x=NODE_WIDTH + 60, gap_y=NODE_HEIGHT + 30,
+                                template_margin=TEMPLATE_LAYOUT_MARGIN):
+    """task_positions: {workflow_task_id: (x, y)}（実際に配置されている座標。
+    `compute_auto_layout`が計算し直した直後の値でも、DB保存済みの値
+    ——手動でドラッグしたものを含む——でもよい）。
+
+    各テンプレートを、対象タスク（workflow_task_id）の1つ上流の列（同じx）に
+    揃え、縦方向はタスク群の最上段よりさらに `template_margin` 分上の帯に
+    配置する。同じx（同じ対象タスクを指す複数テンプレート、または
+    たまたま同じxのタスクを指す複数テンプレート）はgap_y間隔で積み上げ、
+    重ならないようにする。対象タスクの座標が渡されていない（データ不整合）
+    テンプレートは除外する。
+
+    Returns: {("template", template_id): (x, y)}
+    """
+    if not templates or not task_positions:
+        return {}
+    min_task_y = min(y for _x, y in task_positions.values())
     band_top = min_task_y - template_margin
 
     columns = {}
     for tpl in templates:
-        target_depth = task_depth.get(tpl["workflow_task_id"], 0)
+        target_pos = task_positions.get(tpl["workflow_task_id"])
+        if target_pos is None:
+            continue
+        x = target_pos[0] - gap_x
         label = f'{tpl["depends_on_workflow_name"]} / {tpl["depends_on_task_name"]}'
-        columns.setdefault(target_depth - 1, []).append((label, tpl["id"]))
+        columns.setdefault(x, []).append((label, tpl["id"]))
 
-    for column, entries in columns.items():
-        x = column * gap_x
+    positions = {}
+    for x, entries in columns.items():
         for i, (_label, template_id) in enumerate(sorted(entries, key=lambda e: e[0])):
             positions[("template", template_id)] = (x, band_top - i * gap_y)
     return positions
@@ -392,8 +412,23 @@ class WorkflowGraphScene(QGraphicsScene):
             succ.edges.append(edge)
             self.adjacency.setdefault(d["predecessor_task_id"], []).append(d["successor_task_id"])
 
-        for tpl in self.db.list_dependency_templates(self.workflow_id):
+        # 依存テンプレートの疑似ノードはDBに座標を保存しないため、読み込み時は
+        # 毎回ここで計算し直す必要がある（さもないと全ノードが既定位置(0,0)に
+        # 重なって表示されてしまう）。auto_arrangeとは異なりタスクの座標は
+        # 「今読み込んだDB保存済みの値（手動でドラッグしたものを含む）」を
+        # そのまま使い、タスク側の位置は変更しない（ファイルを開いただけで
+        # ドラッグ位置がリセットされないようにするため）。
+        templates = self.db.list_dependency_templates(self.workflow_id)
+        task_positions = {t["id"]: (t["canvas_x"], t["canvas_y"]) for t in tasks}
+        template_positions = compute_template_positions(task_positions, templates)
+        for tpl in templates:
             self._add_template_scene_item(tpl)
+            node = self.template_nodes.get(tpl["id"])
+            pos = template_positions.get(("template", tpl["id"]))
+            if node is None or pos is None:
+                continue
+            node.setPos(*pos)
+            self.template_edges[tpl["id"]].update_path()
 
         if self.on_changed:
             self.on_changed()

@@ -14,8 +14,9 @@
 
 from datetime import date, timedelta
 
-from PySide6.QtCore import QDate, Qt, QTimer
+from PySide6.QtCore import QDate, QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -196,7 +197,33 @@ class BasicInfoTab(QWidget):
         # （gui/tab_jobs.py の _apply_initial_splitter_sizes と同じ理由）。
         QTimer.singleShot(0, self._apply_initial_splitter_sizes)
 
+        # チームを選択した後、チーム欄（ツリー＋ツールバー）の外をクリックしたら
+        # 選択を解除し、ヒストグラムを全チーム表示に戻す（アプリ全体のマウス
+        # クリックを監視する必要があるため、QApplication単位のイベントフィルタで
+        # 実装する。自分がこのタブの表示中でなければ何もしないので、他タブへの
+        # 影響はない）。
+        QApplication.instance().installEventFilter(self)
+
         self.refresh_all()
+
+    def eventFilter(self, obj, event):
+        if (
+            event.type() == QEvent.MouseButtonPress
+            and self.teams_tree.isVisible()
+            and self._selected_team_tree_item() is not None
+            and isinstance(obj, QWidget)
+            and not self._is_within_teams_panel(obj)
+        ):
+            self.teams_tree.clearSelection()
+        return super().eventFilter(obj, event)
+
+    def _is_within_teams_panel(self, widget):
+        w = widget
+        while w is not None:
+            if w is self._teams_panel:
+                return True
+            w = w.parentWidget()
+        return False
 
     def _apply_initial_splitter_sizes(self):
         total2 = self._row2_splitter.width()
@@ -433,6 +460,14 @@ class BasicInfoTab(QWidget):
         for col in range(2):
             tree.resizeColumnToContents(col)
 
+    def _selected_team_tree_item(self):
+        """teams_tree の実際の選択状態（ハイライト）を返す。currentItem()は
+        空欄部分クリックで選択が解除されても値が残り続けてしまい、「チームを
+        選んだ後、選択を解除しても全チーム表示のヒストグラムに戻れない」
+        原因になるため使わない（SingleSelectionのため高々1件）。"""
+        selected = self.teams_tree.selectedItems()
+        return selected[0] if selected else None
+
     def _resolve_team_item(self, item):
         """選択中の項目（チーム自身、またはその子＝既定値／容量変更点）から、
         対象のチーム項目とそのUserRoleデータを返す（gui/tab_jobs.py の
@@ -459,7 +494,7 @@ class BasicInfoTab(QWidget):
             set_current_tree_item_keeping_focus(self.teams_tree, item)
 
     def _add_capacity_change_selected(self):
-        _item, data = self._resolve_team_item(self.teams_tree.currentItem())
+        _item, data = self._resolve_team_item(self._selected_team_tree_item())
         if data is None:
             QMessageBox.information(self, "追加", "変動点を追加するチームを選択してください。")
             return
@@ -489,7 +524,7 @@ class BasicInfoTab(QWidget):
         self._refresh_histogram()
 
     def _delete_capacity_change_selected(self):
-        item = self.teams_tree.currentItem()
+        item = self._selected_team_tree_item()
         data = item.data(0, Qt.UserRole) if item is not None else None
         if data is None or data.get("kind") != "capacity_change":
             QMessageBox.information(
@@ -552,7 +587,7 @@ class BasicInfoTab(QWidget):
         self._refresh_histogram()
 
     def _delete_team_selected(self):
-        _item, data = self._resolve_team_item(self.teams_tree.currentItem())
+        _item, data = self._resolve_team_item(self._selected_team_tree_item())
         if data is None:
             QMessageBox.information(self, "削除", "削除するチームを選択してください。")
             return
@@ -605,7 +640,8 @@ class BasicInfoTab(QWidget):
         group_layout = QVBoxLayout(group)
 
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._build_teams_panel())
+        self._teams_panel = self._build_teams_panel()
+        splitter.addWidget(self._teams_panel)
         splitter.addWidget(self._build_histogram_panel())
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 7)
@@ -652,7 +688,7 @@ class BasicInfoTab(QWidget):
         all_changes = [c for changes in changes_by_team.values() for c in changes]
         range_start, range_end = histogram_axis_range(proj["start_date"], milestones, all_changes)
 
-        _item, data = self._resolve_team_item(self.teams_tree.currentItem())
+        _item, data = self._resolve_team_item(self._selected_team_tree_item())
         colors = team_color_map(teams)
         labels = {t["id"]: t["name"] for t in teams}
         milestone_markers = [
