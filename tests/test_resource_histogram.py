@@ -16,6 +16,7 @@ from gui.resource_histogram import (  # noqa: E402
     ROW_UNIT_HEIGHT,
     TOP_MARGIN,
     TOP_PADDING_ROWS,
+    _LABEL_TOP,
     _compute_top_margin,
     compute_step_segments,
     histogram_axis_range,
@@ -181,3 +182,24 @@ def test_compute_top_margin_grows_proportionally_for_large_totals():
 
 def test_compute_top_margin_never_shrinks_below_the_fixed_default():
     assert _compute_top_margin(0) == TOP_MARGIN
+
+
+def test_milestone_label_gap_to_bars_stays_proportional_for_large_totals():
+    """回帰テスト: 上余白(top_margin)がデータ量に応じて拡大しても、ラベルの
+    位置がtop_marginの下端からの固定オフセット（例: top_margin - 14）の
+    ままでは、ラベル・バー間の間隔（シーン座標）は常に一定
+    （TOP_PADDING_ROWS * ROW_UNIT_HEIGHT のみ）にしかならず、拡大した余白が
+    実際には全く活用されない（fit_all()後、合計値の大きいプロジェクトで
+    ラベルが依然としてバーと重なって見えてしまう）。ラベルをシーン最上部
+    近くの固定位置（_LABEL_TOP）に置くことで、間隔がグラフ全体の高さに対して
+    一定割合を保つ（＝fit_all()後もビューポート高さに対して概ね一定の実余白を
+    保つ）ことを確認する。"""
+    for max_value in (3, 45):
+        bar_height_range = (max_value + TOP_PADDING_ROWS) * ROW_UNIT_HEIGHT
+        top_margin = _compute_top_margin(bar_height_range)
+        total_height = top_margin + bar_height_range
+        bar_top = top_margin + TOP_PADDING_ROWS * ROW_UNIT_HEIGHT
+        gap = bar_top - _LABEL_TOP
+        assert gap / total_height >= 0.05, (
+            f"max_value={max_value}: 間隔がグラフ全体に対して狭すぎる（重なりうる）"
+        )

@@ -47,6 +47,12 @@ _MILESTONE_COLOR = QColor("#c0392b")
 _PROJECT_START_COLOR = QColor("#52514e")
 _PANE_BG = QColor("#fdfcf9")
 _MILESTONE_LINE_Z = 10  # バー（既定のzValue=0）より前面に描画する
+# マイルストーン・開発開始日のラベルと、その縦線の描き始めのY座標。
+# top_marginの下端からの固定オフセットではなく、シーンの最上部近くに固定
+# することで、top_marginがデータ量に応じて拡大した際、ラベル・バー間の
+# 間隔（実質的にtop_marginそのもの）もきちんと拡大されるようにする
+# （_compute_top_margin参照）。
+_LABEL_TOP = 4
 
 _AXIS_MARGIN_DAYS = 3
 # マイルストーン・変動点のどちらも無いプロジェクトでは表示範囲を決める材料が
@@ -295,11 +301,19 @@ def build_histogram_scene(segments_by_key, mode, color_map, labels_by_key,
     # gui/gantt_view.py のマイルストーン線（幅2のダッシュ線）と同じ見た目にし、
     # バー（既定のzValue=0）より前面（_MILESTONE_LINE_Z）に描画することで、
     # バーに隠れず常に視認できるようにする。
+    # ラベルは、上余白（top_margin）の下端から一定オフセットではなく、シーンの
+    # 最上部近く（_LABEL_TOP）に固定で置く。top_marginが大きく育っても、
+    # ラベルがバー側に張り付いたままでは意味が無く（top_marginがどれだけ
+    # 大きくなっても、ラベルからバーまでの実際の間隔＝シーン座標の差は
+    # 「top_margin - (top_margin - 14)」＝14で常に一定になってしまう）、
+    # ラベル・バー間の間隔がtop_marginの拡大にきちんと連動するようにする。
+    # 縦線もラベルに合わせてこの高さから描き始める（gui/gantt_view.pyの
+    # マイルストーン線がヘッダー領域まで伸びているのと同じ考え方）。
     milestone_font = QFont(axis_font)
     milestone_font.setBold(True)
     x = x_of(project_start)
     scene.addItem(_grid_line(
-        x, top_margin, x, chart_bottom, _PROJECT_START_COLOR,
+        x, _LABEL_TOP, x, chart_bottom, _PROJECT_START_COLOR,
         dashed=True, width=2, z_value=_MILESTONE_LINE_Z,
     ))
     for _mid, mlabel, mdate in milestone_markers:
@@ -307,10 +321,10 @@ def build_histogram_scene(segments_by_key, mode, color_map, labels_by_key,
             continue
         x = x_of(mdate)
         scene.addItem(_grid_line(
-            x, top_margin, x, chart_bottom, _MILESTONE_COLOR,
+            x, _LABEL_TOP, x, chart_bottom, _MILESTONE_COLOR,
             dashed=True, width=2, z_value=_MILESTONE_LINE_Z,
         ))
-        _add_label(scene, mlabel, milestone_font, (x + 2, top_margin - 14), QBrush(_MILESTONE_COLOR))
+        _add_label(scene, mlabel, milestone_font, (x + 2, _LABEL_TOP), QBrush(_MILESTONE_COLOR))
 
     scene.setBackgroundBrush(QBrush(_PANE_BG))
     scene.histogram_mode = mode if band_items else "empty"
