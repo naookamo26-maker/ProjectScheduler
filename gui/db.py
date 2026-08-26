@@ -372,27 +372,28 @@ class ProjectDatabase:
 
     def list_milestones(self):
         rows = self._conn.execute(
-            "SELECT id, name, end_date FROM milestones ORDER BY end_date, name"
+            "SELECT id, name, end_date, note FROM milestones ORDER BY end_date, name"
         ).fetchall()
         return [dict(r) for r in rows]
 
-    @undoable(lambda self, name, end_date: f"マイルストーン「{name}」を追加")
-    def add_milestone(self, name, end_date):
+    @undoable(lambda self, name, end_date, note="": f"マイルストーン「{name}」を追加")
+    def add_milestone(self, name, end_date, note=""):
         try:
             cur = self._conn.execute(
-                "INSERT INTO milestones(name, end_date) VALUES (?, ?)", (name, end_date)
+                "INSERT INTO milestones(name, end_date, note) VALUES (?, ?, ?)",
+                (name, end_date, note),
             )
         except sqlite3.IntegrityError as e:
             raise DuplicateNameError(f"マイルストーン名 '{name}' は既に使用されています") from e
         self._commit()
         return cur.lastrowid
 
-    @undoable(lambda self, milestone_id, name, end_date: f"マイルストーン「{name}」を変更")
-    def update_milestone(self, milestone_id, name, end_date):
+    @undoable(lambda self, milestone_id, name, end_date, note="": f"マイルストーン「{name}」を変更")
+    def update_milestone(self, milestone_id, name, end_date, note=""):
         try:
             self._conn.execute(
-                "UPDATE milestones SET name = ?, end_date = ? WHERE id = ?",
-                (name, end_date, milestone_id),
+                "UPDATE milestones SET name = ?, end_date = ?, note = ? WHERE id = ?",
+                (name, end_date, note, milestone_id),
             )
         except sqlite3.IntegrityError as e:
             raise DuplicateNameError(f"マイルストーン名 '{name}' は既に使用されています") from e
@@ -509,27 +510,27 @@ class ProjectDatabase:
 
     def list_holidays(self):
         rows = self._conn.execute(
-            "SELECT h.id, h.date, h.team_id, t.name AS team_name "
+            "SELECT h.id, h.date, h.team_id, h.note, t.name AS team_name "
             "FROM holidays h LEFT JOIN teams t ON t.id = h.team_id "
             "ORDER BY h.date"
         ).fetchall()
         return [dict(r) for r in rows]
 
-    @undoable(lambda self, date, team_id=None: f"休業日（{date}）を追加")
-    def add_holiday(self, date, team_id=None):
+    @undoable(lambda self, date, team_id=None, note="": f"休業日（{date}）を追加")
+    def add_holiday(self, date, team_id=None, note=""):
         exists = self._conn.execute(
             "SELECT 1 FROM holidays WHERE date = ? AND team_id IS ?", (date, team_id)
         ).fetchone()
         if exists:
             raise DuplicateNameError("同じ日付・チームの休業日が既に登録されています")
         cur = self._conn.execute(
-            "INSERT INTO holidays(date, team_id) VALUES (?, ?)", (date, team_id)
+            "INSERT INTO holidays(date, team_id, note) VALUES (?, ?, ?)", (date, team_id, note)
         )
         self._commit()
         return cur.lastrowid
 
-    @undoable(lambda self, holiday_id, date, team_id=None: f"休業日（{date}）を変更")
-    def update_holiday(self, holiday_id, date, team_id=None):
+    @undoable(lambda self, holiday_id, date, team_id=None, note="": f"休業日（{date}）を変更")
+    def update_holiday(self, holiday_id, date, team_id=None, note=""):
         exists = self._conn.execute(
             "SELECT 1 FROM holidays WHERE date = ? AND team_id IS ? AND id != ?",
             (date, team_id, holiday_id),
@@ -537,8 +538,8 @@ class ProjectDatabase:
         if exists:
             raise DuplicateNameError("同じ日付・チームの休業日が既に登録されています")
         self._conn.execute(
-            "UPDATE holidays SET date = ?, team_id = ? WHERE id = ?",
-            (date, team_id, holiday_id),
+            "UPDATE holidays SET date = ?, team_id = ?, note = ? WHERE id = ?",
+            (date, team_id, note, holiday_id),
         )
         self._commit()
 

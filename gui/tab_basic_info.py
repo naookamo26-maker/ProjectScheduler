@@ -124,7 +124,7 @@ class AddTeamDialog(QDialog):
 
 
 class AddHolidayDialog(QDialog):
-    """休業日追加ダイアログ。日付と対象チーム（未設定＝全社共通）を入力してから追加する。"""
+    """休業日追加ダイアログ。日付と対象チーム（未設定＝全チーム共通）を入力してから追加する。"""
 
     def __init__(self, team_options, default_date, parent=None):
         super().__init__(parent)
@@ -137,7 +137,7 @@ class AddHolidayDialog(QDialog):
         self.date_edit.setDisplayFormat("yyyy-MM-dd")
         form.addRow("日付", self.date_edit)
 
-        self.team_combo = make_fk_combo(team_options, allow_blank=True, blank_label="（全社共通）")
+        self.team_combo = make_fk_combo(team_options, allow_blank=True, blank_label="（全チーム共通）")
         form.addRow("対象チーム", self.team_combo)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -169,15 +169,16 @@ class BasicInfoTab(QWidget):
         layout.addWidget(self._build_project_group())
 
         self.milestones_section = CrudSection(
-            "マイルストーン", ["マイルストーン名", "締切日"],
+            "マイルストーン", ["マイルストーン名", "締切日", "備考"],
             on_add=self._add_milestone, on_delete=self._delete_milestone,
         )
-        self.milestones_section.table.itemChanged.connect(self._on_milestone_name_changed)
+        self.milestones_section.table.itemChanged.connect(self._on_milestone_cell_changed)
 
         self.holidays_section = CrudSection(
-            "休業日", ["日付", "対象チーム（未設定＝全社共通）"],
+            "休業日", ["日付", "対象チーム（未設定＝全チーム共通）", "備考"],
             on_add=self._add_holiday, on_delete=self._delete_holiday,
         )
+        self.holidays_section.table.itemChanged.connect(self._on_holiday_note_changed)
 
         row2 = QSplitter(Qt.Horizontal)
         row2.addWidget(self.milestones_section)
@@ -262,6 +263,7 @@ class BasicInfoTab(QWidget):
                 on_session_end=self._resort_milestones_later,
             )
             table.setCellWidget(row, 1, date_edit)
+            table.setItem(row, 2, QTableWidgetItem(ms["note"]))
         table.blockSignals(False)
         auto_size_columns(table)
 
@@ -293,25 +295,28 @@ class BasicInfoTab(QWidget):
         self.refresh_milestones()
         self._refresh_histogram()
 
-    def _on_milestone_name_changed(self, item):
-        if item.column() != 0:
+    def _on_milestone_cell_changed(self, item):
+        if item.column() not in (0, 2):
             return
         table = self.milestones_section.table
         ms_id = row_id(table, item.row())
         if ms_id is None:
             return
+        name = table.item(item.row(), 0).text()
+        note = table.item(item.row(), 2).text()
         date_edit = table.cellWidget(item.row(), 1)
         try:
-            self.db.update_milestone(ms_id, item.text(), _to_iso(date_edit.date()))
+            self.db.update_milestone(ms_id, name, _to_iso(date_edit.date()), note)
         except DuplicateNameError as e:
             QMessageBox.warning(self, "変更できません", str(e))
             self.refresh_milestones()
             return
-        # 名前は締切日に次ぐ第2ソートキー（db.list_milestones参照）のため、
-        # 同じ締切日の別マイルストーンとの前後関係が変わりうる。表示順を
-        # 締切日順に合わせ直す（このメソッド自体がitemChangedシグナル内から
-        # 呼ばれているため、ウィジェットの再構築は次のイベントループへ遅延させる）。
-        QTimer.singleShot(0, self.refresh_milestones)
+        if item.column() == 0:
+            # 名前は締切日に次ぐ第2ソートキー（db.list_milestones参照）のため、
+            # 同じ締切日の別マイルストーンとの前後関係が変わりうる。表示順を
+            # 締切日順に合わせ直す（このメソッド自体がitemChangedシグナル内から
+            # 呼ばれているため、ウィジェットの再構築は次のイベントループへ遅延させる）。
+            QTimer.singleShot(0, self.refresh_milestones)
         self._refresh_histogram()
 
     def _resort_milestones_later(self):
@@ -326,7 +331,8 @@ class BasicInfoTab(QWidget):
         for row in range(table.rowCount()):
             if row_id(table, row) == milestone_id:
                 name = table.item(row, 0).text()
-                self.db.update_milestone(milestone_id, name, _to_iso(qdate))
+                note = table.item(row, 2).text()
+                self.db.update_milestone(milestone_id, name, _to_iso(qdate), note)
                 self._refresh_histogram()
                 return
 
@@ -697,17 +703,19 @@ class BasicInfoTab(QWidget):
             bind_undo_session(date_edit, self.db, "休業日の日付を変更")
             table.setCellWidget(row, 0, date_edit)
 
-            combo = make_fk_combo(team_options, hol["team_id"], allow_blank=True, blank_label="（全社共通）")
+            combo = make_fk_combo(team_options, hol["team_id"], allow_blank=True, blank_label="（全チーム共通）")
             combo.currentIndexChanged.connect(
                 lambda idx, eid=hol["id"]: self._on_holiday_changed(eid)
             )
             table.setCellWidget(row, 1, combo)
+
+            table.setItem(row, 2, QTableWidgetItem(hol["note"]))
         table.blockSignals(False)
         auto_size_columns(table)
 
     def _add_holiday(self):
-        # 「追加」連打で全社共通・同日の重複エラーが出ないよう、空いている日付を
-        # 既定値として提案する（既定は全社共通＝チーム未設定。ダイアログ側で
+        # 「追加」連打で全チーム共通・同日の重複エラーが出ないよう、空いている日付を
+        # 既定値として提案する（既定は全チーム共通＝チーム未設定。ダイアログ側で
         # 変更可能なので、実際に重複した場合はダイアログ内で警告して再入力させる）。
         existing = {h["date"] for h in self.db.list_holidays() if h["team_id"] is None}
         d = date.today()
@@ -740,12 +748,28 @@ class BasicInfoTab(QWidget):
             if row_id(table, row) == holiday_id:
                 date_edit = table.cellWidget(row, 0)
                 combo = table.cellWidget(row, 1)
+                note = table.item(row, 2).text()
                 try:
-                    self.db.update_holiday(holiday_id, _to_iso(date_edit.date()), combo.currentData())
+                    self.db.update_holiday(holiday_id, _to_iso(date_edit.date()), combo.currentData(), note)
                 except DuplicateNameError as e:
                     QMessageBox.warning(self, "変更できません", str(e))
                     self.refresh_holidays()
                 return
+
+    def _on_holiday_note_changed(self, item):
+        if item.column() != 2:
+            return
+        table = self.holidays_section.table
+        hol_id = row_id(table, item.row())
+        if hol_id is None:
+            return
+        date_edit = table.cellWidget(item.row(), 0)
+        combo = table.cellWidget(item.row(), 1)
+        try:
+            self.db.update_holiday(hol_id, _to_iso(date_edit.date()), combo.currentData(), item.text())
+        except DuplicateNameError as e:
+            QMessageBox.warning(self, "変更できません", str(e))
+            self.refresh_holidays()
 
     # -- 全体再読み込み ----------------------------------------------------------
 
