@@ -1039,6 +1039,45 @@ def test_multiple_templates_on_the_same_task_stack_without_overlapping_or_moving
     assert len(remaining_ys) == 2
 
 
+def test_reload_positions_dependency_template_nodes_without_overlapping_tasks(window, qapp):
+    """回帰テスト: 依存テンプレート追加時は正しく配置されるが、ファイルを
+    開いた際（WorkflowGraphScene.reload）は疑似ノードの座標がDBに保存
+    されないため計算し直されず、既定位置(0,0)のままタスクノードと重なって
+    しまっていた。reload()を呼んだ後も、テンプレートの疑似ノードがタスクの
+    1列上流に正しく配置され、タスク自身の座標（DB保存済み）は変わらないこと
+    を確認する。"""
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf1_id = window.db.add_workflow("WF1")
+    wf2_id = window.db.add_workflow("WF2")
+    task_x = window.db.add_workflow_task(wf2_id, "X", team_id, 1)
+
+    wf_tab.refresh_workflows(select_id=wf1_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    node = scene.add_task("A", team_id, 1, 0, 0)
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    scene.add_dependency_template_node(node.workflow_task_id, wf2_id, task_x)
+    qapp.processEvents()
+    task_pos_before = scene.nodes[node.workflow_task_id].pos()
+
+    # reload()はファイルを開いた時・ワークフローを選び直した時に呼ばれる。
+    # ここでは直接呼んで同じ状況を再現する。
+    scene.reload()
+    qapp.processEvents()
+
+    task_node = scene.nodes[node.workflow_task_id]
+    template_id = next(iter(scene.template_nodes))
+    template_node = scene.template_nodes[template_id]
+
+    assert task_node.pos() == task_pos_before  # タスクの座標（DB保存済み）は変わらない
+    assert (template_node.pos().x(), template_node.pos().y()) != (0, 0)
+    assert template_node.pos().x() < task_node.pos().x()  # タスクの1列上流
+
+
 # -- ワークフロー設計タブ: 複製・名前変更（ダブルクリック） ---------------------------
 
 
