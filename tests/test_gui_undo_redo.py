@@ -917,6 +917,48 @@ def test_gantt_tab_reuses_result_until_the_db_changes(window, qapp):
     assert window.tab_gantt._result_df is not None
 
 
+def test_gantt_chart_draws_overrun_tasks_with_a_red_border(window, qapp):
+    """締切に間に合わないタスクのバーは、赤く太い枠線で描かれること。
+
+    塗りつぶしはチーム／ワークフローの色分けをそのまま残し、枠線だけで
+    「間に合っていない」を重ねて表す。"""
+    from gui.gantt_view import _NORMAL_BORDER_WIDTH, _OVERRUN_BORDER_COLOR, _OVERRUN_BORDER_WIDTH
+
+    window.db.set_project("枠線テスト", "2026-01-05")
+    team_id = window.db.add_team("チームA", 1)  # 同時1本のみ
+    ms_id = window.db.add_milestone("マイルストーン1", "2026-01-09")  # 同じ週の金曜
+    # チャートは「対象」で選んだワークフロー1件分だけを描くため、
+    # 間に合うタスクと間に合わないタスクが同じ図に載るよう1つにまとめる
+    wf_id = window.db.add_workflow("WF")
+    window.db.add_workflow_task(wf_id, "タスク", team_id, 2)
+    for i in range(3):
+        window.db.add_job(f"ジョブ{i}", wf_id, ms_id, 100)
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    df = window.tab_gantt._result_df
+    assert (df["Deadline_Overrun_Days"] > 0).any()
+
+    # 描画されたバーを、ツールチップの内容から超過あり/なしに振り分ける
+    body_scene = window.tab_gantt.view.scene()  # 本体ペインのシーンを返す
+    pens = {"overrun": [], "normal": []}
+    for item in body_scene.items():
+        tooltip = item.toolTip()
+        if not tooltip or not hasattr(item, "pen"):
+            continue
+        key = "overrun" if "締切を" in tooltip else "normal"
+        pens[key].append(item.pen())
+
+    assert pens["overrun"], "超過タスクのバーが描かれていない"
+    for pen in pens["overrun"]:
+        assert pen.color() == _OVERRUN_BORDER_COLOR
+        assert pen.widthF() == _OVERRUN_BORDER_WIDTH
+    for pen in pens["normal"]:
+        assert pen.color() != _OVERRUN_BORDER_COLOR
+        assert pen.widthF() == _NORMAL_BORDER_WIDTH
+
+
 def test_gantt_tab_reports_deadline_overrun_in_status(window, qapp):
     """締切に間に合わないタスクがある場合、結果は表示したうえで、その件数を
     状況表示で知らせること（締切超過はエラーではなく結果として返るため、

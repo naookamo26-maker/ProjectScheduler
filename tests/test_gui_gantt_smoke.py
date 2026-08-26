@@ -10,6 +10,8 @@ end-to-endで検証するスモークテスト。PySide6のQGraphicsシーン等
     pytest tests/test_gui_gantt_smoke.py -v
 """
 
+import json
+import re
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -863,17 +865,13 @@ def test_validate_for_generation_passes_minimal_project(tmp_path):
 
 def test_generate_gantt_minimal_project(tmp_path):
     db = _build_minimal_project(tmp_path / "project.pschedule")
-    md_path = tmp_path / "schedule_gantt.md"
     html_path = tmp_path / "schedule_gantt.html"
 
-    result_df = generate_gantt(
-        db, mermaid_output_path=str(md_path), plotly_output_path=str(html_path), verbose=False,
-    )
+    result_df = generate_gantt(db, plotly_output_path=str(html_path), verbose=False)
 
     assert len(result_df) == 2
-    assert md_path.exists() and md_path.stat().st_size > 0
     assert html_path.exists() and html_path.stat().st_size > 0
-    assert "デザイン" in md_path.read_text(encoding="utf-8")
+    assert "デザイン" in html_path.read_text(encoding="utf-8")
     db.close()
 
 
@@ -981,6 +979,27 @@ def test_team_with_no_working_days_fails_with_clear_error(tmp_path):
     db.close()
 
 
+def test_html_output_marks_overrun_tasks(tmp_path):
+    """締切超過タスクが、HTMLガントチャート側でも識別できる形で出力されること。
+
+    バーの枠線を赤く太くする判定はブラウザ側のJavaScriptが `overrun` を見て
+    行うため、埋め込まれるタスクデータにその値が入っていることを確認する。"""
+    db, _team_id = _build_tight_single_team_project(tmp_path / "project.pschedule", team_max_lines=1)
+    html_path = tmp_path / "schedule_gantt.html"
+    result_df = generate_gantt(db, plotly_output_path=str(html_path), verbose=False)
+
+    overruns = result_df[result_df["Deadline_Overrun_Days"] > 0]
+    assert not overruns.empty
+    html = html_path.read_text(encoding="utf-8")
+    tasks_json = re.search(r"const TASKS = (\[.*?\]);\n", html, re.S).group(1)
+    tasks = json.loads(tasks_json)
+    assert sum(1 for t in tasks if t["overrun"] > 0) == len(overruns)
+    # 超過件数の注意書きと、強調に使う色の定義がページに含まれていること
+    assert "締切に間に合わないタスク" in html
+    assert "OVERRUN_BORDER_COLOR" in html
+    db.close()
+
+
 def test_team_capacity_change_relieves_overflow_from_its_start_date(tmp_path):
     """同時ライン数が最初は1のままでも、開発開始日からライン数3に変更する
     team_capacity_changes を追加すれば、同じ締切でも間に合うようになること
@@ -1002,15 +1021,11 @@ def test_sample_pschedule_generates_full_schedule(tmp_path):
     db = ProjectDatabase.open_existing(str(SAMPLE_DB))
     assert validate_for_generation(db) == []
 
-    md_path = tmp_path / "schedule_gantt.md"
     html_path = tmp_path / "schedule_gantt.html"
-    result_df = generate_gantt(
-        db, mermaid_output_path=str(md_path), plotly_output_path=str(html_path), verbose=False,
-    )
+    result_df = generate_gantt(db, plotly_output_path=str(html_path), verbose=False)
 
     # data/Project_Schedule_Sample_GameDev_v22.xlsx をCLIで直接実行した場合と
     # 同じ340行になることを確認する（DB移行・GUI側の変換で欠落/重複が無いこと）。
     assert len(result_df) == 340
-    assert md_path.stat().st_size > 0
     assert html_path.stat().st_size > 0
     db.close()

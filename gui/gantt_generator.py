@@ -237,7 +237,7 @@ def compute_schedule(db, **scheduler_kwargs):
     return result_df, build_display(db)
 
 
-def generate_gantt(db, mermaid_output_path=None, plotly_output_path=None, **scheduler_kwargs):
+def generate_gantt(db, plotly_output_path=None, **scheduler_kwargs):
     """build_frames() の結果を project_scheduler.run_resource_constrained_scheduler_from_frames()
     にそのまま渡す。SchedulingError系（循環依存・リソース不足・マイルストーン不整合等）は
     そのまま呼び出し元に伝播させる（GUI側でダイアログに変換する）。"""
@@ -246,6 +246,6 @@ def generate_gantt(db, mermaid_output_path=None, plotly_output_path=None, **sche
         frames["project"], frames["teams"], frames["milestones"], frames["workflows"],
         frames["jobs"], frames["job_tasks"], frames["holidays"], frames["external_dependencies"],
         frames["workflow_names"], df_team_capacity=frames["team_capacity"],
-        mermaid_output_path=mermaid_output_path, plotly_output_path=plotly_output_path,
+        plotly_output_path=plotly_output_path,
         **scheduler_kwargs,
     )

@@ -74,6 +74,16 @@ _GRID_COLOR = QColor("#e1e0d9")
 _MILESTONE_COLOR = QColor("#c0392b")
 _PROJECT_START_COLOR = QColor("#52514e")
 _DEFAULT_BAR_COLOR = "#cbc9c2"
+# マイルストーンの締切に間に合わないタスクの強調。塗りつぶしはチーム／ワーク
+# フローの色分けをそのまま残したいので、枠線だけを赤く太くして重ねて表す。
+_OVERRUN_BORDER_COLOR = QColor("#c5221f")
+_OVERRUN_BORDER_WIDTH = 3
+_NORMAL_BORDER_COLOR = QColor("#0b0b0b")
+_NORMAL_BORDER_WIDTH = 1
+# 本体シーンの重ね順: 目盛り・区切り線(-2〜-1) < 通常のバー(0) <
+# 締切超過のバー(1) < タスク名ラベル(2)
+_OVERRUN_BAR_Z = 1
+_TASK_LABEL_Z = 2
 _PANE_BG = QColor("#fdfcf9")
 
 # build_gantt_scenes() の戻り値。header/column/body はそれぞれの担当分だけの
@@ -497,6 +507,11 @@ def build_gantt_scenes(df, display, color_by="team"):
     チームを見分けたい）または "workflow"（チーム別表示用——1チームに
     絞り込まれている代わりに、どのワークフローの仕事かを見分けたい）。
 
+    マイルストーンの締切に間に合わないタスク（Deadline_Overrun_Days > 0）は、
+    塗りつぶしの色（＝チーム／ワークフローの識別）はそのままに、枠線を赤く
+    太くして強調する。色分けの軸を潰さずに「間に合っていない」を重ねて
+    表せるため。
+
     3つのシーンは同じ座標系（LEFT_MARGIN/TOP_MARGIN起点、x_of()による日付
     ->x座標変換）を共有しているが、日付軸・マイルストーン・目盛り線の縦線
     などペインをまたいで見える要素は、各ペインが実際に描く区間だけを別々の
@@ -658,15 +673,25 @@ def build_gantt_scenes(df, display, color_by="team"):
                 QRectF(start_x, y + BAR_MARGIN, width, bar_height),
                 BAR_CORNER_RADIUS, BAR_CORNER_RADIUS,
             )
+            overrun_days = int(r.get("Deadline_Overrun_Days", 0) or 0)
+
             rect = QGraphicsPathItem(bar_path)
             rect.setBrush(QBrush(QColor(color_hex)))
-            border_pen = QPen(QColor("#0b0b0b"), 1)
+            if overrun_days > 0:
+                border_pen = QPen(_OVERRUN_BORDER_COLOR, _OVERRUN_BORDER_WIDTH)
+            else:
+                border_pen = QPen(_NORMAL_BORDER_COLOR, _NORMAL_BORDER_WIDTH)
             # コズメティックペイン（常に一定の画面上の太さで描く）にしないと、
             # 横縦で異なる拡縮率（IgnoreAspectRatio）のもとでは、枠線の太さが
             # 辺の向きによって（横縁は縦方向の拡縮率、縦縁は横方向の拡縮率の
-            # 影響を受けて）不揃いに見えてしまう。
+            # 影響を受けて）不揃いに見えてしまう。締切超過の強調は「太さ」で
+            # 表すため、拡縮によらず一定であることが特に重要になる。
             border_pen.setCosmetic(True)
             rect.setPen(border_pen)
+            # 赤枠が隣のバーやジョブ区切り線に隠れないよう、超過タスクだけ手前に
+            # 重ねる（枠線はバーの輪郭の内外にまたがって描かれるため）。
+            if overrun_days > 0:
+                rect.setZValue(_OVERRUN_BAR_Z)
             rect.setFlag(QGraphicsItem.ItemIsSelectable, True)
             team_name = team_names.get(r["Team_ID"], str(r["Team_ID"]))
             workflow_name = workflow_names.get(r["Workflow_ID"], str(r["Workflow_ID"]))
@@ -675,6 +700,7 @@ def build_gantt_scenes(df, display, color_by="team"):
                 f'ワークフロー: {workflow_name}\n'
                 f'チーム: {team_name}\n'
                 f'{r["Start_Date"].strftime("%Y-%m-%d")} 〜 {r["End_Date"].strftime("%Y-%m-%d")}'
+                + (f'\n⚠ マイルストーンの締切を{overrun_days}日超過' if overrun_days > 0 else "")
                 + ("\n※リソース制約により前倒し" if r["Resource_Adjusted"] else "")
             )
             body_scene.addItem(rect)
@@ -690,6 +716,10 @@ def build_gantt_scenes(df, display, color_by="team"):
                 task_label = _add_fixed_size_label(
                     body_scene, task_name, task_font,
                     (center_x, center_y),
+                    # バー（既定0、締切超過は赤枠を隣に隠されないよう1）より
+                    # 必ず前面に置く。同じ z だと描画順しだいでバーがラベルを
+                    # 覆ってしまう。
+                    z_value=_TASK_LABEL_Z,
                 )
                 body_scene.gantt_task_labels.append(
                     (task_label, center_x, center_y, width, bar_height, task_name, task_font)

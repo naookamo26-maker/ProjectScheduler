@@ -23,56 +23,55 @@
 6. 循環依存は明示的に検出してエラーにする。
 
 v5での変更点:
-7. Mermaidガントチャートの `title` 行を廃止（チャート上部にタイトルを表示しない）。
-8. リソース制約による前倒しタスクの赤色強調（crit）表示は既定でOFFに変更。
-   必要な場合のみ highlight_resource_adjusted=True で有効化する。
-9. ワークフロー単位のガントチャートに加え、チーム単位のガントチャートも
-   同じMarkdownファイル内に生成する（担当チームの稼働状況を横断的に見せる）。
-10. ワークフローIDだけでは何の制作物か分かりづらいため、Excel側に任意の
-    "Workflow_Names" シート（Workflow_ID / Workflow_Name）を追加できるように
-    対応。指定があればガントチャートの見出しにその名前を使う（未指定時はID）。
-    同様に Teams シートの Team_Name 列があればチーム別チャートの見出しに使う。
+7. ワークフローIDだけでは何の制作物か分かりづらいため、Excel側に任意の
+   "Workflow_Names" シート（Workflow_ID / Workflow_Name）を追加できるように
+   対応。指定があればガントチャートの見出しにその名前を使う（未指定時はID）。
+   同様に Teams シートの Team_Name 列があればチーム別チャートの見出しに使う。
 
 v6での変更点:
-11. すべてのガントチャート（ワークフロー別・チーム別いずれも）の冒頭に
-    「マイルストーン」セクションを追加し、プロジェクト開始日と各マイルストーン
-    （Milestonesシート）を milestone（◆マーク）として表示するようにした。
-12. 上記のマイルストーン群はプロジェクト全体で共通（同じID・同じ日付）なので、
-    すべてのチャートに同じマイルストーンを含めることで、Mermaid側が自動計算する
-    表示期間（軸の範囲）もチャート間で揃うようにした（横並び比較がしやすい）。
+8. すべてのガントチャートに、プロジェクト開始日と各マイルストーン
+   （Milestonesシート）を表示するようにした。
+9. 上記のマイルストーン群はプロジェクト全体で共通（同じID・同じ日付）なので、
+   すべてのチャートに同じマイルストーンを含めることで、表示期間（軸の範囲）も
+   チャート間で揃うようにした（横並び比較がしやすい）。
 
 v7での変更点:
-13. 従来の「ALAP（締切から逆算した最遅日程）でリソース平準化した後、依存元が
+10. 従来の「ALAP（締切から逆算した最遅日程）でリソース平準化した後、依存元が
     終わり次第すぐ着手するASAP方向へ前倒しする」という2段階方式を廃止した。
     このASAP前倒しパスが、締切までまだ余裕があるタスクまで軒並みプロジェクト
     開始直後に詰め込んでしまい、非現実的な偏りを生む原因になっていたため。
-14. 代わりに、各タスクの「依存関係のみを考慮した最速日程（ASAP）」と
+11. 代わりに、各タスクの「依存関係のみを考慮した最速日程（ASAP）」と
     「締切から逆算した最遅日程（ALAP）」の両方を求め、その間（スラック）の
     どこに配置するかを distribution_ratio（既定0.5）で制御する方式にした。
     基準点にチームの空きが無い場合は締切側・着手可能日側の順に探索範囲を
     広げる。結果として、締切に間に合わせつつプロジェクト全体期間になるべく
     分散した日程になる（v8以降、それでも収まらない場合は締切を超過した日程を
-    返し、超過日数を Deadline_Overrun_Days 列で報告する。下記16〜18を参照）。
-15. ログ出力のレベル名（INFO/WARNING/ERROR等）を日本語（情報/警告/エラー等）に
+    返し、超過日数を Deadline_Overrun_Days 列で報告する。下記14を参照）。
+12. ログ出力のレベル名（INFO/WARNING/ERROR等）を日本語（情報/警告/エラー等）に
     変更した。
 
 v8での変更点（大規模プロジェクトへの対応）:
-16. リソース平準化の処理順を、優先度付きの *前方向* トポロジカル順
+13. リソース平準化の処理順を、優先度付きの *前方向* トポロジカル順
     （_build_leveling_order）に修正した。v7で平準化を前進型に変えた際、
     逆方向Kahn順（優先度の高いものが先頭に来る）をそのまま reversed() して
     使っていたため、優先度の高いジョブほど *最後* にラインを確保することに
     なり、Priorityの効果が反転していた。
-17. マイルストーンの締切に間に合わないタスクを ResourceOverflowError に
+14. マイルストーンの締切に間に合わないタスクを ResourceOverflowError に
     せず、可能な限り早い日程へ配置したうえで Deadline_Overrun_Days 列
     （超過日数）として結果に返すようにした。1タスクの超過で全体の日程が
     まったく得られなくなる（＝何がどれだけ間に合わないのかも分からない）
     のを避けるため。ResourceOverflowError は、締切を無視しても置き場所が
     見つからない場合にのみ送出する。
-18. 稼働日の判定と営業日の加減算を _WorkCalendar（チーム別の稼働日を
+15. 稼働日の判定と営業日の加減算を _WorkCalendar（チーム別の稼働日を
     序数添字の配列として事前計算）に置き換え、チームの使用ライン数も
     numpy配列で持つようにした。日付は内部では序数(int)のまま扱う。
     参照表の事前辞書化（_parse_tasks）と合わせて、16,000タスク規模で
     スケジューリング所要時間が約9分の1になっている。
+16. Mermaidガントチャート（Markdown）の出力を廃止した。規模が大きくなると
+    Mermaid側のレンダラーが持つ文字数上限に掛かって表示できず、実用に
+    ならないため。出力はインタラクティブHTML（Plotly製）に一本化する。
+17. マイルストーンの締切に間に合わないタスクを、HTMLガントチャートと
+    GUIのガントチャートタブの両方で赤く太い枠線で強調するようにした。
 """
 
 import hashlib
@@ -1081,197 +1080,6 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
     return scheduled, adjusted
 
 
-def _wrap_label(text, width):
-    """
-    Mermaidのgantt task labelは現状 <br/> や \\n による改行に対応していない
-    （2023年時点でMermaid本体の未解決issue）。将来的なレンダラー側の対応や、
-    表示環境によっては効く場合もあるためベストエフォートで <br/> を挿入する。
-    効かない場合でも、Mermaidはバーからテキストがはみ出す形で全文表示するため
-    テキスト自体が読めなくなることはない。
-    """
-    if not width or len(text) <= width:
-        return text
-    chunks = [text[i:i + width] for i in range(0, len(text), width)]
-    return "<br/>".join(chunks)
-
-
-def _generate_mermaid_gantt_blocks(result_df, group_col, group_name_map, tick_interval,
-                                    label_wrap_width, highlight_resource_adjusted, id_prefix,
-                                    milestone_markers=None):
-    """
-    result_df を group_col（"Workflow_ID" または "Team_ID"）でグルーピングし、
-    グループごとに1つのMermaid ganttブロックを生成する（見出し行のリストを返す）。
-
-    各ブロックの先頭に「マイルストーン」セクションを差し込み、続けて Job_ID で
-    セクション分けしたタスクを並べる。重ならないタスクは displayMode: compact
-    により同じ行にまとめられる。
-
-    milestone_markers: [(id, label, date), ...] のリスト。全ブロックに同じものを
-    差し込むことで、Mermaidが自動計算する表示期間（軸の範囲）をブロック間で
-    揃える役割も兼ねる（比較しやすくするため）。
-    """
-    milestone_markers = milestone_markers or []
-    lines = []
-    weekday_line = ["    weekday monday"] if "week" in tick_interval else []
-
-    group_order = result_df.groupby(group_col)["Start_Date"].min().sort_values().index.tolist()
-    for group_id in group_order:
-        group_df = result_df[result_df[group_col] == group_id]
-        display_name = group_name_map.get(str(group_id), str(group_id))
-        lines.append(f"## {display_name}")
-        lines.append("")
-        lines.append("```mermaid")
-        lines.append("---")
-        lines.append("displayMode: compact")
-        lines.append("---")
-        lines.append("gantt")
-        lines.append("    dateFormat YYYY-MM-DD")
-        lines.append(f"    tickInterval {tick_interval}")
-        lines += weekday_line
-        lines.append("")
-
-        used_ids = set()
-
-        def _unique_id(raw_id):
-            uid = "".join(c if c.isalnum() else "_" for c in raw_id)
-            base_id, i = uid, 2
-            while uid in used_ids:
-                uid = f"{base_id}_{i}"
-                i += 1
-            used_ids.add(uid)
-            return uid
-
-        if milestone_markers:
-            # 全ブロック共通のマイルストーン群を先頭セクションとして表示する。
-            # プロジェクト全体で同じ日付集合を含めることで、チャート間の
-            # 表示期間（軸の範囲）が揃う。
-            lines.append("    section マイルストーン")
-            for ms_id, ms_label, ms_date in milestone_markers:
-                m_id = _unique_id(f"{id_prefix}_MS_{ms_id}")
-                m_label = str(ms_label).replace(":", "-")
-                m_date = ms_date.strftime("%Y-%m-%d")
-                lines.append(f"    {m_label} :milestone, {m_id}, {m_date}, 0d")
-            lines.append("")
-
-        job_order = group_df.groupby("Job_ID")["Start_Date"].min().sort_values().index.tolist()
-        for job_id in job_order:
-            job_group = group_df[group_df["Job_ID"] == job_id].sort_values("Start_Date")
-            job_name = str(job_group.iloc[0]["Job_Name"]).replace(":", "-")
-            lines.append(f"    section {job_name}")
-            for _, r in job_group.iterrows():
-                task_id = _unique_id(f"{id_prefix}_{r['Job_ID']}_{r['Task_ID']}")
-                status = "crit, " if (highlight_resource_adjusted and r["Resource_Adjusted"]) else ""
-                task_label = _wrap_label(str(r["Task_Name"]).replace(":", "-"), label_wrap_width)
-                start = r["Start_Date"].strftime("%Y-%m-%d")
-                end = r["End_Date"].strftime("%Y-%m-%d")
-                lines.append(f"    {task_label} :{status}{task_id}, {start}, {end}")
-            lines.append("")
-
-        lines.append("```")
-        lines.append("")
-
-    return lines
-
-
-def _generate_mermaid_gantt(result_df, project_name, tick_interval="1week", label_wrap_width=14,
-                             workflow_name_map=None, team_name_map=None,
-                             highlight_resource_adjusted=False, milestone_markers=None):
-    """
-    スケジュール結果のDataFrameから、Mermaid記法のガントチャートを
-    含んだMarkdown文字列を生成する。
-
-    - まず「ワークフロー別」セクションで、ワークフロー（キャラクター/背景/
-      カットシーン等）ごとにガントチャートのMermaidブロックを分割する。
-      続けて「チーム別」セクションで、担当チームごとにも同様に分割する
-      （1ファイル内に複数の```mermaid```ブロック）。
-    - 見出しには Workflow_Name / Team_Name（任意の表示名）があればそれを使い、
-      なければ ID をそのまま使う。
-    - 各ブロックの先頭には「マイルストーン」セクションを差し込み、プロジェクト
-      開始日と各マイルストーン（Milestonesシート）を milestone（◆マーク）として
-      表示する。全ブロックに同じマイルストーン集合を含めることで、Mermaidが
-      自動計算する表示期間（軸の範囲）がブロック間で揃い、比較しやすくなる。
-    - 各ブロック内はJobごとにセクション分けする（1ジョブ=1系統の流れとして
-      タスクを追いやすい）
-    - displayMode: compact を有効化し、同じセクション（Job）内で重ならない
-      タスクは自動的に同じ行へ詰めて縦の長さを抑える
-      （例: Internal_Dependsで並行着手できるタスク同士が重ならなければ1行にまとまる）
-    - tick_interval で目盛りの粒度を指定できる（例: "1week", "2week", "1month"）
-    - highlight_resource_adjusted=True の場合のみ、リソース制約により前倒しされた
-      タスク（Resource_Adjusted=True）を crit（赤色強調）にする（既定はOFF）
-    - label_wrap_width 文字を超えるタスク名は <br/> でベストエフォートに折り返す
-      （Mermaid側の対応状況によっては効かない場合がある。詳細は _wrap_label 参照）
-    - チャート自体にタイトル（title行）は付けない。プロジェクト名は
-      Markdown冒頭の見出しにのみ表示する。
-    """
-    workflow_name_map = workflow_name_map or {}
-    team_name_map = team_name_map or {}
-    milestone_markers = milestone_markers or []
-
-    lines = [
-        f"# {project_name} スケジュール",
-        "",
-        "ワークフロー別・チーム別の2種類のガントチャートを掲載している。",
-        "各チャート内はJobごとにセクション分けしたうえで、重ならないタスクは",
-        "同じ行にまとめて表示している。",
-        "◆マークはマイルストーン（プロジェクト開始日・各締切日）を示す。",
-        "すべてのチャートに同じマイルストーンを含めているため、表示期間は",
-        "チャート間で揃っている（比較しやすいように統一）。",
-    ]
-    if highlight_resource_adjusted:
-        lines += [
-            "赤色（crit）表示は、リソース制約（チームのライン数不足）により、",
-            "本来の理想日程より前倒しされたタスクを示す。",
-        ]
-    lines.append("")
-
-    if result_df.empty:
-        lines += ["（タスクなし）"]
-        return "\n".join(lines)
-
-    lines.append("# ワークフロー別")
-    lines.append("")
-    lines += _generate_mermaid_gantt_blocks(
-        result_df, "Workflow_ID", workflow_name_map, tick_interval,
-        label_wrap_width, highlight_resource_adjusted, id_prefix="WF",
-        milestone_markers=milestone_markers,
-    )
-
-    lines.append("# チーム別")
-    lines.append("")
-    lines += _generate_mermaid_gantt_blocks(
-        result_df, "Team_ID", team_name_map, tick_interval,
-        label_wrap_width, highlight_resource_adjusted, id_prefix="TEAM",
-        milestone_markers=milestone_markers,
-    )
-
-    return "\n".join(lines)
-
-
-def export_mermaid_gantt(result_df, output_path, project_name="プロジェクトスケジュール",
-                          tick_interval="1week", label_wrap_width=14,
-                          workflow_name_map=None, team_name_map=None,
-                          highlight_resource_adjusted=False, milestone_markers=None):
-    """result_df（run_resource_constrained_schedulerの戻り値）からMermaidガントチャートの
-    Markdownファイルを書き出す（ワークフロー別・チーム別それぞれに分割し、
-    各チャート内はJobごとにセクション分け、compact表示）。
-
-    workflow_name_map / team_name_map: {ID: 表示名} の辞書。省略時はIDをそのまま表示する。
-    highlight_resource_adjusted: Trueならリソース制約による前倒しタスクを赤色（crit）表示する（既定False）。
-    milestone_markers: [(id, label, date), ...] のリスト。各チャートの先頭に
-        マイルストーンとして表示し、全チャート共通で含めることで表示期間を揃える。
-    """
-    content = _generate_mermaid_gantt(
-        result_df, project_name, tick_interval=tick_interval,
-        label_wrap_width=label_wrap_width,
-        workflow_name_map=workflow_name_map, team_name_map=team_name_map,
-        highlight_resource_adjusted=highlight_resource_adjusted,
-        milestone_markers=milestone_markers,
-    )
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(content)
-    logger.info(f"Mermaidガントチャートを書き出しました: {output_path}")
-    return output_path
-
 
 _PLOTLY_GANTT_HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="ja">
@@ -1303,6 +1111,15 @@ _PLOTLY_GANTT_HTML_TEMPLATE = """<!DOCTYPE html>
   .workflow-section h2 { font-size: 16px; margin: 0 0 2px; }
   .workflow-meta { color: #898781; font-size: 12px; margin-bottom: 6px; }
   .empty-note { color: #898781; font-size: 13px; padding: 16px 0; }
+  #overrun-note {
+    border: 1px solid #c5221f; border-left-width: 5px; border-radius: 6px;
+    padding: 10px 14px; margin-bottom: 18px; background: #fdf3f2;
+    color: #7c1512; font-size: 13px;
+  }
+  #overrun-note .swatch {
+    display: inline-block; width: 22px; height: 12px; vertical-align: -1px;
+    background: #e8e2b0; border: 3px solid #c5221f; margin: 0 4px;
+  }
 </style>
 </head>
 <body>
@@ -1311,6 +1128,7 @@ _PLOTLY_GANTT_HTML_TEMPLATE = """<!DOCTYPE html>
   ジョブ単位で1行にまとめ（時間が重なるタスクだけ行を分ける）、作業開始が早い順に上から並べている。
   チームのチェックを外すとそのチームのタスクを非表示にし、行の高さも詰めて再描画する。
 </div>
+<div id="overrun-note"></div>
 <div id="filter-panel">
   <div class="filter-title">チームで絞り込み</div>
 </div>
@@ -1323,6 +1141,12 @@ const WORKFLOWS = __WORKFLOWS_JSON__;
 const MILESTONES = __MILESTONES_JSON__;
 
 const ROW_HEIGHT = 26;
+const BAR_BORDER_COLOR = '#0b0b0b';
+const BAR_BORDER_WIDTH = 0.5;
+// 締切超過タスクの強調（赤く太い枠線）。塗りつぶしの色ではなく枠線を変える
+// ことで、チーム別の色分けを保ったまま重ねて表現できる。
+const OVERRUN_BORDER_COLOR = '#c5221f';
+const OVERRUN_BORDER_WIDTH = 3;
 
 function teamColor(teamId) {
   const t = TEAMS.find(function (t) { return t.id === teamId; });
@@ -1376,12 +1200,15 @@ function groupBy(arr, keyFn) {
 
 function hoverText(t) {
   var adj = t.adjusted ? "あり（リソース制約）" : "なし";
+  var overrun = t.overrun > 0
+    ? "<br><b>締切超過: " + t.overrun + "日</b>"
+    : "";
   return "<b>" + t.job_name + " ＞ " + t.task_name + "</b><br>" +
     "ワークフロー: " + t.workflow_name + "<br>" +
     "チーム: " + t.team_name + "<br>" +
     "優先度: " + t.priority + "<br>" +
     "開始: " + t.start + " ／ 終了: " + t.end + "<br>" +
-    "リソース調整: " + adj;
+    "リソース調整: " + adj + overrun;
 }
 
 function getSelectedTeamIds() {
@@ -1485,6 +1312,9 @@ function renderWorkflow(wf) {
   var cursor = 0;
   var tickvals = [], ticktext = [], separators = [];
   var bases = [], xs = [], ys = [], colors = [], texts = [], hovertexts = [];
+  // 締切を超過したタスクだけ、枠線を赤く太くして目立たせる（塗りはチーム色の
+  // ままにして、どのチームの作業かは引き続き分かるようにする）。
+  var lineColors = [], lineWidths = [];
 
   jobEntries.forEach(function (job, jobIdx) {
     if (jobIdx > 0) separators.push(cursor - 0.5);
@@ -1498,6 +1328,8 @@ function renderWorkflow(wf) {
       xs.push(endMs - startMs);
       ys.push(rowIndex);
       colors.push(teamColor(t.team_id));
+      lineColors.push(t.overrun > 0 ? OVERRUN_BORDER_COLOR : BAR_BORDER_COLOR);
+      lineWidths.push(t.overrun > 0 ? OVERRUN_BORDER_WIDTH : BAR_BORDER_WIDTH);
       texts.push(t.task_name);
       hovertexts.push(hoverText(t));
     });
@@ -1512,7 +1344,7 @@ function renderWorkflow(wf) {
   var trace = {
     type: 'bar', orientation: 'h',
     base: bases, x: xs, y: ys,
-    marker: { color: colors },
+    marker: { color: colors, line: { color: lineColors, width: lineWidths } },
     text: texts, textposition: 'inside', insidetextanchor: 'start',
     textfont: { size: 11, color: '#0b0b0b' },
     constraintext: 'both',
@@ -1559,12 +1391,31 @@ function renderWorkflow(wf) {
   Plotly.react(container, [trace], layout, { displaylogo: false, responsive: true });
 }
 
+function buildOverrunNote() {
+  // 締切超過は例外ではなく結果として返ってくるため、件数を明示しないと
+  // 赤枠に気付かないまま見過ごされてしまう。件数が0なら何も表示しない。
+  var note = document.getElementById('overrun-note');
+  var overruns = TASKS.filter(function (t) { return t.overrun > 0; });
+  if (overruns.length === 0) {
+    note.style.display = 'none';
+    return;
+  }
+  var worst = overruns.reduce(function (m, t) { return Math.max(m, t.overrun); }, 0);
+  note.innerHTML =
+    '<b>マイルストーンの締切に間に合わないタスクが ' + overruns.length + ' 件あります'
+    + '（最大 ' + worst + ' 日超過）。</b><br>'
+    + '該当タスクは<span class="swatch"></span>のように<b>赤く太い枠線</b>で表示しています'
+    + '（バーにマウスを乗せると超過日数を確認できます）。'
+    + 'チームのライン数・依存関係・締切のいずれかを見直してください。';
+}
+
 function renderAll() {
   WORKFLOWS.forEach(renderWorkflow);
 }
 
 buildFilterPanel();
 buildWorkflowSections();
+buildOverrunNote();
 renderAll();
 </script>
 </body>
@@ -1579,10 +1430,10 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
     ブラウザで直接開けるインタラクティブなガントチャート（単一HTMLファイル、
     Plotly製）を書き出す。
 
-    - **ワークフローごとに別々のガントチャートに分割**する（Mermaid版と同様）。
+    - **ワークフローごとに別々のガントチャートに分割**する。
     - 各チャート内は「ジョブ単位で1行」にまとめる。ジョブ名は1回だけ表示し、
       時間的に重なるタスクがある場合だけレーン（行）を追加する（重ならない
-      タスクは同じ行に詰める、Mermaidのcompact表示と同じ考え方）。ジョブの
+      タスクは同じ行に詰める）。ジョブの
       境界には横線を入れて区切る。バー内にはタスク名を表示する。
     - 各チャート内のジョブは、そのジョブの最初のタスクの開始日が早い順に
       上から並べる。
@@ -1591,7 +1442,10 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
       縮める**（Plotlyの凡例クリックによる表示/非表示とは異なり、非表示分の
       余白が残らない）。チェックボックスの色見本がチーム別配色を兼ねる。
     - バーにマウスを乗せるとジョブ名・タスク名・ワークフロー・優先度・
-      開始/終了日・リソース調整有無を表示する。
+      開始/終了日・リソース調整有無・締切超過日数を表示する。
+    - **マイルストーンの締切に間に合わないタスク**（Deadline_Overrun_Days > 0）は、
+      塗りつぶしはチーム色のまま、**枠線を赤く太く**して強調する。件数と最大
+      超過日数はチャート上部に赤い枠で併記する。
     - プロジェクト開始日と各マイルストーン（milestone_markers）を縦の破線として
       全チャート共通で重ねる（表示期間もチャート間で揃える）。
     - チーム色は固定12色のカテゴリカルパレット（team_order の登場順に割り当て）。
@@ -1661,6 +1515,7 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
             "start": r["Start_Date"].strftime("%Y-%m-%d"),
             "end": r["End_Date"].strftime("%Y-%m-%d"),
             "adjusted": bool(r["Resource_Adjusted"]),
+            "overrun": int(r.get("Deadline_Overrun_Days", 0) or 0),
         }
         for _, r in result_df.iterrows()
     ]
@@ -1690,12 +1545,8 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
 def run_resource_constrained_scheduler(excel_file, verbose=True,
                                         auto_exclude_weekends=True,
                                         auto_exclude_jp_holidays=True,
-                                        mermaid_output_path=None,
-                                        mermaid_tick_interval="1week",
-                                        mermaid_label_wrap_width=14,
                                         plotly_output_path=None,
                                         project_name=None,
-                                        highlight_resource_adjusted=False,
                                         distribution_ratio=0.7):
     """
     リソース制約付きスケジューリングを実行し、結果を DataFrame で返す。
@@ -1714,25 +1565,13 @@ def run_resource_constrained_scheduler(excel_file, verbose=True,
         auto_exclude_jp_holidays: True の場合、日本の祝日（振替休日含む）を自動的に除外する。
             土日・祝日以外の休業日（年末年始休業、チーム独自の研修日等）は、
             従来通り Holidays シートに明記する。
-        mermaid_output_path: 指定すると、その日程を Mermaid ガントチャート形式の
-            Markdown ファイルとして書き出す（例: "schedule_gantt.md"）。
-            ワークフローごとにガントチャートを分割し、各チャート内はJobごとに
-            セクション分けしたうえで、displayMode: compact で重ならないタスクは
-            同じ行に詰めて表示する。省略時はファイル出力を行わない。
-        mermaid_tick_interval: Mermaidガントチャートの目盛り粒度（例: "1day", "1week",
-            "2week", "1month"）。既定は "1week"。
-        mermaid_label_wrap_width: この文字数を超えるタスク名は <br/> でベストエフォートに
-            折り返す（Mermaid側のレンダラー対応状況によっては効かない場合がある）。
         plotly_output_path: 指定すると、サーバー不要でブラウザから直接開ける
             インタラクティブなガントチャート（単一HTMLファイル、Plotly製）を
             書き出す（例: "schedule_gantt.html"）。チーム別に色分けし、凡例
             クリックでチーム単位の表示/非表示切り替え（簡易フィルタリング）が
             できる。省略時はファイル出力を行わない。
-        project_name: Markdown冒頭の見出しに使うプロジェクト名。
+        project_name: HTML冒頭の見出しに使うプロジェクト名。
             省略時は Project シートの Project_Name を使う。
-        highlight_resource_adjusted: True の場合、リソース制約により前倒しされた
-            タスク（Resource_Adjusted=True）を crit（赤色強調）表示する。
-            既定は False（赤色表示なし）。
         distribution_ratio: 0.0〜1.0。各タスクをASAP（最速）〜ALAP（締切ギリギリ）の
             どのあたりに配置するかの基準点。
               - 0.0: 依存関係が満たされ次第すぐ着手（従来のASAP前倒しに近い、前に詰まりやすい）
@@ -1744,10 +1583,9 @@ def run_resource_constrained_scheduler(excel_file, verbose=True,
             リソースが足りず間に合わない場合は、可能な限り早い日程に配置した
             うえで Deadline_Overrun_Days 列に超過日数を入れて返す。
 
-    生成されるガントチャートには、プロジェクト開始日と各マイルストーン
-    （Milestonesシート）が「マイルストーン」セクションに milestone（◆）として
-    自動的に含まれる。すべてのチャートに同じマイルストーン集合を含めるため、
-    Mermaidが自動計算する表示期間（軸の範囲）もチャート間で揃う。
+    生成されるガントチャートには、プロジェクト開始日と各マイルストーンが
+    縦の破線として自動的に含まれる。すべてのチャートに同じマイルストーン集合を
+    含めるため、表示期間（軸の範囲）もチャート間で揃う。
 
     戻り値の DataFrame は、各タスクの Start_Date / End_Date に加えて
     Deadline_Overrun_Days 列（マイルストーンの締切をどれだけ超過したか。
@@ -1765,12 +1603,8 @@ def run_resource_constrained_scheduler(excel_file, verbose=True,
         *frames, verbose=verbose,
         auto_exclude_weekends=auto_exclude_weekends,
         auto_exclude_jp_holidays=auto_exclude_jp_holidays,
-        mermaid_output_path=mermaid_output_path,
-        mermaid_tick_interval=mermaid_tick_interval,
-        mermaid_label_wrap_width=mermaid_label_wrap_width,
         plotly_output_path=plotly_output_path,
         project_name=project_name,
-        highlight_resource_adjusted=highlight_resource_adjusted,
         distribution_ratio=distribution_ratio,
     )
 
@@ -1782,12 +1616,8 @@ def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, 
                                                      verbose=True,
                                                      auto_exclude_weekends=True,
                                                      auto_exclude_jp_holidays=True,
-                                                     mermaid_output_path=None,
-                                                     mermaid_tick_interval="1week",
-                                                     mermaid_label_wrap_width=14,
                                                      plotly_output_path=None,
                                                      project_name=None,
-                                                     highlight_resource_adjusted=False,
                                                      distribution_ratio=0.7):
     """
     run_resource_constrained_scheduler() のDataFrame直接指定版。Excel読み込みを
@@ -1809,12 +1639,8 @@ def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, 
         *frames, verbose=verbose,
         auto_exclude_weekends=auto_exclude_weekends,
         auto_exclude_jp_holidays=auto_exclude_jp_holidays,
-        mermaid_output_path=mermaid_output_path,
-        mermaid_tick_interval=mermaid_tick_interval,
-        mermaid_label_wrap_width=mermaid_label_wrap_width,
         plotly_output_path=plotly_output_path,
         project_name=project_name,
-        highlight_resource_adjusted=highlight_resource_adjusted,
         distribution_ratio=distribution_ratio,
     )
 
@@ -1852,9 +1678,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
                               df_holidays, df_extdeps, df_wf_names, df_team_capacity,
                               verbose=True,
                               auto_exclude_weekends=True, auto_exclude_jp_holidays=True,
-                              mermaid_output_path=None, mermaid_tick_interval="1week",
-                              mermaid_label_wrap_width=14, plotly_output_path=None,
-                              project_name=None, highlight_resource_adjusted=False,
+                              plotly_output_path=None, project_name=None,
                               distribution_ratio=0.7):
     """run_resource_constrained_scheduler() / run_resource_constrained_scheduler_from_frames()
     が共有するスケジューリング本体（_load_data* による検証・整形済みのDataFrameを受け取る）。"""
@@ -1878,7 +1702,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
         }
 
     # ガントチャートに表示するマイルストーン群（プロジェクト開始日 + 各マイルストーン）。
-    # 全チャートに同じ集合を差し込むことで、Mermaidが自動計算する表示期間（軸の範囲）を
+    # 全チャートに同じ集合を差し込むことで、表示期間（軸の範囲）を
     # チャート間で揃える（比較しやすくするため）。
     milestone_markers = [("PROJECT_START", "プロジェクト開始", project_start)]
     for ms_id, ms_row in df_ms.iterrows():
@@ -1900,14 +1724,6 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
             "Workflow_ID", "Milestone_ID", "Start_Date", "End_Date",
             "Resource_Adjusted", "Deadline_Overrun_Days"
         ])
-        if mermaid_output_path:
-            export_mermaid_gantt(result_df, mermaid_output_path, project_name,
-                                  tick_interval=mermaid_tick_interval,
-                                  label_wrap_width=mermaid_label_wrap_width,
-                                  workflow_name_map=workflow_name_map,
-                                  team_name_map=team_name_map,
-                                  highlight_resource_adjusted=highlight_resource_adjusted,
-                                  milestone_markers=milestone_markers)
         if plotly_output_path:
             export_plotly_gantt(result_df, plotly_output_path, project_name,
                                  team_name_map=team_name_map,
@@ -1981,15 +1797,6 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
                 f"{r['Start_Date'].strftime('%Y-%m-%d')} ～ {r['End_Date'].strftime('%Y-%m-%d')}{mark}"
             )
 
-    if mermaid_output_path:
-        export_mermaid_gantt(result_df, mermaid_output_path, project_name,
-                              tick_interval=mermaid_tick_interval,
-                              label_wrap_width=mermaid_label_wrap_width,
-                              workflow_name_map=workflow_name_map,
-                              team_name_map=team_name_map,
-                              highlight_resource_adjusted=highlight_resource_adjusted,
-                              milestone_markers=milestone_markers)
-
     if plotly_output_path:
         export_plotly_gantt(result_df, plotly_output_path, project_name,
                              team_name_map=team_name_map,
@@ -2010,36 +1817,22 @@ if __name__ == "__main__":
         help="入力Excelファイルのパス（既定: サンプルデータ）",
     )
     parser.add_argument(
-        "-o", "--output", default="output/schedule_gantt.md",
-        help="Mermaidガントチャートの出力先Markdownパス",
-    )
-    parser.add_argument(
-        "--html-output", default="output/schedule_gantt.html",
+        "-o", "--output", "--html-output", dest="output",
+        default="output/schedule_gantt.html",
         help="サーバー不要で開けるPlotly製インタラクティブガントチャート"
              "（チーム別色分け）の出力先HTMLパス。空文字を指定すると出力しない",
     )
     parser.add_argument(
-        "--tick-interval", default="1week",
-        help="ガントチャートの目盛り粒度（例: 1day, 1week, 2week, 1month）",
-    )
-    parser.add_argument(
         "--distribution-ratio", type=float, default=0.7,
         help="ASAP(0.0)〜ALAP(1.0)間の配置基準点（既定0.7）",
-    )
-    parser.add_argument(
-        "--highlight-resource-adjusted", action="store_true",
-        help="リソース制約により前倒しされたタスクを赤色（crit）表示する",
     )
     args = parser.parse_args()
 
     try:
         run_resource_constrained_scheduler(
             args.excel_file,
-            mermaid_output_path=args.output,
-            mermaid_tick_interval=args.tick_interval,
-            plotly_output_path=args.html_output or None,
+            plotly_output_path=args.output or None,
             distribution_ratio=args.distribution_ratio,
-            highlight_resource_adjusted=args.highlight_resource_adjusted,
         )
     except SchedulingError as e:
         logger.error(f"スケジューリングに失敗しました: {e}")

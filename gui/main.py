@@ -324,19 +324,25 @@ class MainWindow(QMainWindow):
         if not out_dir:
             return
 
-        md_path = str(Path(out_dir) / "schedule_gantt.md")
         html_path = str(Path(out_dir) / "schedule_gantt.html")
         try:
-            generate_gantt(
-                self.db, mermaid_output_path=md_path, plotly_output_path=html_path, verbose=False,
-            )
+            result_df = generate_gantt(self.db, plotly_output_path=html_path, verbose=False)
         except SchedulingError as e:
             QMessageBox.critical(self, "生成に失敗しました", str(e))
             return
 
-        QMessageBox.information(
-            self, "生成完了", f"ガントチャートを書き出しました:\n\n{md_path}\n{html_path}",
-        )
+        message = f"ガントチャートを書き出しました:\n\n{html_path}"
+        overruns = result_df[result_df["Deadline_Overrun_Days"] > 0]
+        if not overruns.empty:
+            # 締切超過は例外ではなく結果として返るため、ここで明示しないと
+            # 「生成完了」だけを見て見過ごされてしまう。
+            worst = int(overruns["Deadline_Overrun_Days"].max())
+            message += (
+                f"\n\n※ マイルストーンの締切に間に合わないタスクが{len(overruns)}件あります"
+                f"（最大{worst}日超過）。該当タスクはチャート上で赤く太い枠線で"
+                f"表示しています。"
+            )
+        QMessageBox.information(self, "生成完了", message)
 
     def _open_database(self, db):
         # 旧DBを閉じるのは、旧タブを差し替え終えた後にする。タブの差し替えでは
