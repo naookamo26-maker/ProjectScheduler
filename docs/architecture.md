@@ -327,6 +327,17 @@ GUIで編集できる項目はすべてUndo/Redoで元に戻せる。個々の�
   呼ぶ代わりに使う）。これを怠ると、フォーカスがセルウィジェット内に残った
   まま`begin_undo_group()`だけが開始され、対応する`focusOutEvent`が来ないまま
   DB接続だけ閉じられるような経路（アプリ終了時等）でクラッシュしうる。
+
+  `set_current_tree_item_keeping_focus()`はこの往復のためにセルウィジェットへ
+  一瞬フォーカスを入れてすぐ戻すため、`bind_undo_session()`の
+  `focusInEvent`/`focusOutEvent`（`begin_undo_group`/`end_undo_group`）も
+  素通りで発火する。`end_undo_group()`は「実際に内容が変わったか」を`bool`で
+  返し、`_UndoSessionMixin.focusOutEvent`はこれが`True`の時だけ
+  `on_session_end`コールバックを呼ぶ。こうしないと、値を何も変えていない
+  プログラム的な選択変更のたびに、並べ替え用の再構築
+  （例: `gui/tab_basic_info.py`の`_resort_team_capacity_changes_later`）が
+  無条件に走ってしまい、選択・スクロール位置を失う（＝直前に選択・追加した
+  行を見失う）。
 - **キャンバスの選択はタブ切り替えでも維持する**: ノードグラフの選択・
   フォーカスと違い、ノード・依存関係の視覚的な選択状態は、Undo/Redoの対象で
   なくても失われるべきではない。ワークフロー選択のたびに`WorkflowGraphScene`を

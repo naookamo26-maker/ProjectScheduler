@@ -417,7 +417,8 @@ def test_open_ended_group_collapses_changes_until_it_is_closed(tmp_path):
     assert db.list_teams()[0]["max_lines"] == 6  # DBは変更のたびに最新
     assert len(manager._undo_stack) == steps_before  # まだ記録されない
 
-    db.end_undo_group()
+    changed = db.end_undo_group()
+    assert changed is True  # gui/widgets_common.py の on_session_end 呼び出し判定に使う
     assert len(manager._undo_stack) == steps_before + 1
     assert manager.undo_label() == "チームの同時ライン数を変更"
 
@@ -427,7 +428,10 @@ def test_open_ended_group_collapses_changes_until_it_is_closed(tmp_path):
 
 
 def test_open_ended_group_records_nothing_when_the_value_is_unchanged(tmp_path):
-    """フォーカスを出入りしただけ（値が変わっていない）なら記録しないこと。"""
+    """フォーカスを出入りしただけ（値が変わっていない）なら記録しないこと。
+    戻り値（False）は、gui/widgets_common.py の bind_undo_session が
+    on_session_end を呼ぶかどうかの判定に使う（値が変わっていないのに
+    並べ替え等の再構築が走ってしまうのを防ぐため）。"""
     db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
     manager, _ = _attach_dummy_undo_manager(db)
     team_id = db.add_team("チームA", 1)
@@ -435,8 +439,19 @@ def test_open_ended_group_records_nothing_when_the_value_is_unchanged(tmp_path):
     steps_before = len(manager._undo_stack)
     db.begin_undo_group("チームの同時ライン数を変更")
     db.update_team(team_id, "チームA", 1)  # 同じ値に設定＝実質変化なし
-    db.end_undo_group()
+    changed = db.end_undo_group()
+    assert changed is False
     assert len(manager._undo_stack) == steps_before
+    db.close()
+
+
+def test_end_undo_group_returns_false_when_nothing_was_open(tmp_path):
+    """begin_undo_group() を呼んでいない状態で end_undo_group() を呼んでも
+    何もせず False を返すこと（bind_undo_sessionを付けていないウィジェットの
+    フォーカス喪失や、二重にend_undo_groupが呼ばれるケースでの安全策）。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    _attach_dummy_undo_manager(db)
+    assert db.end_undo_group() is False
     db.close()
 
 

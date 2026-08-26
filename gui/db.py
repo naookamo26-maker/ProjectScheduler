@@ -196,14 +196,21 @@ class ProjectDatabase:
         self._open_group = (label, self.serialize_state(), self.undo_manager.capture_ui_state())
 
     def end_undo_group(self):
-        """begin_undo_group() で開いた単位を確定する（開いていなければ何もしない）。"""
+        """begin_undo_group() で開いた単位を確定する（開いていなければ何もしない）。
+        実際に内容が変わってUndoエントリを積んだ場合は True、変わらなかった
+        （開いてすらいなかった場合を含む）場合は False を返す——
+        gui/widgets_common.py の bind_undo_session が、フォーカスが素通り
+        しただけ（値は変わっていない）で on_session_end を呼ばないようにする
+        ために使う。"""
         if self._open_group is None:
-            return
+            return False
         label, before_db, before_ui = self._open_group
         self._open_group = None
         after_db = self.serialize_state()
         if after_db != before_db:
             self.undo_manager.push(before_db, before_ui, after_db, label)
+            return True
+        return False
 
     @contextmanager
     def suspend_undo_recording(self):

@@ -23,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtCore import QDate, Qt  # noqa: E402
+from PySide6.QtWidgets import QApplication, QDialog  # noqa: E402
 
 from gui.db import ProjectDatabase  # noqa: E402
 from gui.tab_gantt import GanttTab  # noqa: E402
@@ -204,6 +204,89 @@ def test_teams_tree_capacity_changes_are_inline_editable_children(window, qapp):
     lines_spin.setValue(9)
     qapp.processEvents()
     assert window.db.list_team_capacity_changes(team_id)[0]["lines"] == 9
+
+
+def test_add_capacity_change_opens_dialog_for_date_and_lines(window, qapp):
+    """「＋ 変動点」は、以前は既定日を自動提案してすぐ追加していたが、
+    ダイアログを開いて適用開始日とライン数を入力させてから追加すること。"""
+    from gui.tab_basic_info import AddCapacityChangeDialog
+
+    bi = window.tab_basic_info
+    window.tabs.setCurrentWidget(bi)
+    team_id = window.db.add_team("チームA", 2)
+    bi.refresh_all()
+    qapp.processEvents()
+
+    bi._select_team_tree_item(team_id)
+    qapp.processEvents()
+
+    with patch.object(AddCapacityChangeDialog, "exec", return_value=QDialog.Accepted), \
+         patch.object(AddCapacityChangeDialog, "values", return_value=("2026-03-01", 7)):
+        bi._add_capacity_change_selected()
+    qapp.processEvents()
+
+    changes = window.db.list_team_capacity_changes(team_id)
+    assert len(changes) == 1
+    assert changes[0]["start_date"] == "2026-03-01"
+    assert changes[0]["lines"] == 7
+
+
+def test_add_capacity_change_selects_new_row_visibly_and_keeps_it_editable(window, qapp):
+    """回帰テスト: 「＋ 変動点」追加直後、(1) 余計なツリー再構築が走らず
+    （選択・スクロール位置を失わない）、(2) 追加した行が画面内に見えており、
+    (3) その場で適用開始日をすぐ変更できること。以前は、追加直後の選択操作
+    （setCurrentItem）がセルウィジェットへのフォーカス出入りを誘発し、
+    「実際には何も変わっていないのに」並べ替え用の再構築
+    （_resort_team_capacity_changes_later）が走ってしまい、選択・スクロール
+    位置を失う（＝追加した行を見失う）とともに、直後の日付編集が不安定に
+    なる不具合があった。"""
+    from gui.tab_basic_info import AddCapacityChangeDialog
+
+    bi = window.tab_basic_info
+    window.tabs.setCurrentWidget(bi)
+    team_id = window.db.add_team("チームA", 2)
+    for i in range(1, 15):
+        window.db.add_team_capacity_change(team_id, f"2026-01-{i + 1:02d}", i + 1)
+    bi.refresh_all()
+    qapp.processEvents()
+
+    bi._select_team_tree_item(team_id)
+    qapp.processEvents()
+    bi.teams_tree.verticalScrollBar().setValue(bi.teams_tree.verticalScrollBar().maximum())
+    qapp.processEvents()
+
+    refresh_calls = []
+    original_refresh = bi.refresh_teams
+    def counting_refresh():
+        refresh_calls.append(1)
+        original_refresh()
+    bi.refresh_teams = counting_refresh
+    try:
+        with patch.object(AddCapacityChangeDialog, "exec", return_value=QDialog.Accepted), \
+             patch.object(AddCapacityChangeDialog, "values", return_value=("2026-03-01", 9)):
+            bi._add_capacity_change_selected()
+        qapp.processEvents()
+        qapp.processEvents()  # 余計な再構築があれば、その QTimer.singleShot(0, ...) も処理させる
+
+        assert len(refresh_calls) == 1, "追加直後に余計なツリー再構築が走っている"
+    finally:
+        bi.refresh_teams = original_refresh
+
+    selected = bi.teams_tree.selectedItems()
+    assert selected, "追加した変動点が選択されていない"
+    data = selected[0].data(0, Qt.UserRole)
+    assert data["kind"] == "capacity_change"
+
+    rect = bi.teams_tree.visualItemRect(selected[0])
+    viewport_height = bi.teams_tree.viewport().height()
+    assert 0 <= rect.top() and rect.bottom() <= viewport_height, "追加直後の項目が画面外（見失っている）"
+
+    # 追加直後、その場で適用開始日を変更できること。
+    date_edit = bi.teams_tree.itemWidget(selected[0], 0)
+    date_edit.setDate(QDate(2026, 3, 5))
+    qapp.processEvents()
+    changed = next(c for c in window.db.list_team_capacity_changes(team_id) if c["id"] == data["change_id"])
+    assert changed["start_date"] == "2026-03-05"
 
 
 def test_selecting_a_capacity_change_child_resolves_to_its_parent_team(window, qapp):
