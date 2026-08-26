@@ -16,7 +16,7 @@ CRUD本体（gui/db.py）から分離しているのは、この2つが「増え
 4. `docs/db_design.md` のテーブル一覧を追随させる。
 """
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 
 _SCHEMA_SQL = """
 CREATE TABLE schema_meta (
@@ -33,7 +33,8 @@ CREATE TABLE project (
 CREATE TABLE milestones (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
-    end_date TEXT NOT NULL
+    end_date TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE teams (
@@ -53,7 +54,8 @@ CREATE TABLE team_capacity_changes (
 CREATE TABLE holidays (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL,
-    team_id INTEGER REFERENCES teams(id) ON DELETE CASCADE
+    team_id INTEGER REFERENCES teams(id) ON DELETE CASCADE,
+    note TEXT NOT NULL DEFAULT ''
 );
 CREATE UNIQUE INDEX ux_holidays_team ON holidays(date, team_id) WHERE team_id IS NOT NULL;
 
@@ -214,6 +216,15 @@ def migrate(conn):
                     (o["job_id"], o["depends_on_job_id"]),
                 )
         version = "5"
+
+    if version == "5":
+        # v6: milestones/holidays に note（備考）を追加。既存行は空文字のまま扱う。
+        # テーブル自体が無い（テスト用の簡略化した旧スキーマ等）場合は何もしない。
+        for table in ("milestones", "holidays"):
+            cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if cols and "note" not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+        version = "6"
 
     conn.execute(
         "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)

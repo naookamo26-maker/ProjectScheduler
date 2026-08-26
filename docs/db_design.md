@@ -24,10 +24,10 @@ PySide6（Qt）に一切依存しないため、GUIを起動せずに単体で�
 |---|---|
 | `schema_meta` | スキーマバージョン管理用。`ProjectDatabase.open_existing`が旧バージョンの`.pschedule`を検出すると`_migrate_schema`で自動的に不足カラム等を追加する（例: v1→v2で`workflows.sort_order`を追加） |
 | `project` | プロジェクト名・開始日（常に1行、`id=1`固定） |
-| `milestones` | マイルストーン（名前・締切日） |
+| `milestones` | マイルストーン（名前・締切日・備考） |
 | `teams` | チーム（名前・開発開始日からの既定の同時ライン数） |
 | `team_capacity_changes` | チームの同時ライン数が期間の途中で変わる場合の変更点（適用開始日・その日以降のライン数）。`teams.max_lines`はいつまでも「最初の期間」の値として残る |
-| `holidays` | 休業日（日付、任意でチームを指定。未指定は全社共通） |
+| `holidays` | 休業日（日付、任意でチームを指定。未指定は全チーム共通。備考あり） |
 | `workflows` | ワークフロー（テンプレートの名前と、一覧での表示順`sort_order`） |
 | `workflow_tasks` | ワークフロー内のタスク（名前・担当チーム・所要日数・ノードグラフ上の座標） |
 | `task_dependencies` | ワークフロー内のタスク依存（Internal_Depends相当、predecessor→successor） |
