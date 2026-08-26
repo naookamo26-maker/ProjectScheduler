@@ -56,6 +56,15 @@ def window(qapp):
     w.db.on_change = None
     w.db.undo_manager = None
     w.db.close()
+    # ウィンドウをPython GC任せにせず、この時点でC++側の実体ごと即座に破棄する。
+    # GC任せだと（特に多数のテストを連続実行した場合）破棄がpytestプロセス
+    # 終了時まで遅延することがあり、その際にQtが子ウィジェット（ワークフロー
+    # 一覧等）の破棄に伴うシグナルを発火させ、既に閉じたDBへアクセスして
+    # 例外になることがあるため。
+    import shiboken6
+    w.hide()
+    shiboken6.delete(w)
+    qapp.processEvents()
 
 
 def test_team_add_undo_redo_restores_selection(window, qapp):
@@ -597,3 +606,365 @@ def test_hidden_gantt_tab_is_not_refreshed_during_undo(window, qapp):
         window.on_undo()
         qapp.processEvents()
         mocked.assert_not_called()
+
+
+# -- ワークフロー設計タブ: ノードビュー／テーブルビューの切り替え ---------------------------
+
+
+def test_view_tabs_default_to_node_view(window, qapp):
+    """デフォルトはノードビューであり、テーブルビューへの切り替えタブが
+    用意されていること。"""
+    wf_tab = window.tab_workflows
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    assert wf_tab.view_tabs.currentIndex() == 0
+    assert wf_tab.view_tabs.tabText(0) == "ノードビュー"
+    assert wf_tab.view_tabs.tabText(1) == "テーブルビュー"
+    assert wf_tab.view_tabs.widget(0) is wf_tab.view
+
+
+def test_task_table_orders_tasks_upstream_to_downstream(window, qapp):
+    """テーブルビューのタスク表は、ノードビューの自動整列と同じ「依存の深さ→
+    同じ深さ内は名前順」で、上流を上・下流を下に並べること。"""
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    nodes = {}
+    # わざと深さ順とは逆のアルファベット順で追加し、並び替えが名前ではなく
+    # 深さに基づいていることを確認する。
+    for name in ("D", "C", "B", "A"):
+        nodes[name] = scene.add_task(name, team_id, 1, 0, 0)
+        qapp.processEvents()
+        scene = wf_tab.current_scene
+    # A -> B -> C（直列）、Dは独立（深さ0）。
+    for pred, succ in [("A", "B"), ("B", "C")]:
+        scene = wf_tab.current_scene
+        scene.try_add_edge(scene.nodes[nodes[pred].workflow_task_id], scene.nodes[nodes[succ].workflow_task_id])
+        qapp.processEvents()
+
+    wf_tab.refresh_task_table()
+    table = wf_tab.task_section.table
+    names = [table.item(row, 0).text() for row in range(table.rowCount())]
+    # 深さ0（A, D）が先、深さ1（B）、深さ2（C）の順。同じ深さ内は名前順。
+    assert names == ["A", "D", "B", "C"]
+
+    b_row = names.index("B")
+    assert table.item(b_row, 3).text() == "A"
+    c_row = names.index("C")
+    assert table.item(c_row, 3).text() == "B"
+
+
+def test_task_table_edit_and_delete_reuse_the_node_view_dialog_flow(window, qapp):
+    """テーブルビューの「編集...」「削除」ボタンは、ノードビューと同じ
+    scene操作（Undo・確認ダイアログ込み）を経由すること。"""
+    from gui.widgets_common import row_id as _row_id
+
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    scene.add_task("タスクA", team_id, 3, 0, 0)
+    qapp.processEvents()
+    wf_tab.refresh_task_table()
+
+    row = 0
+    task_id = _row_id(wf_tab.task_section.table, row)
+    stack_before = len(window.undo_manager._undo_stack)
+    wf_tab._delete_task_row(row)
+    qapp.processEvents()
+
+    assert len(window.undo_manager._undo_stack) == stack_before + 1
+    assert window.db.list_workflow_tasks(wf_id) == []
+    assert task_id not in wf_tab.current_scene.nodes
+
+
+def test_add_dependency_template_creates_a_visually_distinct_pseudo_node(window, qapp):
+    """ノードビューに依存テンプレートを追加すると、タスクノードとは別スタイルの
+    疑似ノード・接続線として表示され、テーブルビューの依存テンプレート欄にも
+    反映されること。"""
+    from gui.node_canvas import TEMPLATE_EDGE_COLOR, TemplateDependencyNodeItem
+
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf1_id = window.db.add_workflow("WF1")
+    wf2_id = window.db.add_workflow("WF2")
+    task_a = window.db.add_workflow_task(wf1_id, "A", team_id, 1)
+    task_x = window.db.add_workflow_task(wf2_id, "X", team_id, 1)
+
+    wf_tab.refresh_workflows(select_id=wf1_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    scene.add_dependency_template_node(task_a, wf2_id, task_x)
+    qapp.processEvents()
+
+    assert len(scene.template_nodes) == 1
+    template_id, tnode = next(iter(scene.template_nodes.items()))
+    assert isinstance(tnode, TemplateDependencyNodeItem)
+    assert tnode.target_task_id == task_a
+    assert tnode.pen().color().name() == TEMPLATE_EDGE_COLOR
+    assert tnode.pen().style() == Qt.DashLine
+
+    edge = scene.template_edges[template_id]
+    assert edge.pen().color().name() == TEMPLATE_EDGE_COLOR
+    assert edge.pen().style() == Qt.DashLine
+
+    table = wf_tab.template_section.table
+    assert table.rowCount() == 1
+    assert table.item(0, 0).text() == "A"
+    assert table.item(0, 1).text() == "WF2"
+    assert table.item(0, 2).text() == "X"
+
+
+def test_edit_and_delete_dependency_template_via_scene(window, qapp):
+    """依存テンプレートの変更・削除も、ノードビューの疑似ノード・テーブル
+    ビュー双方に即座に反映されること。"""
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf1_id = window.db.add_workflow("WF1")
+    wf2_id = window.db.add_workflow("WF2")
+    task_a = window.db.add_workflow_task(wf1_id, "A", team_id, 1)
+    task_x = window.db.add_workflow_task(wf2_id, "X", team_id, 1)
+    task_y = window.db.add_workflow_task(wf2_id, "Y", team_id, 1)
+
+    wf_tab.refresh_workflows(select_id=wf1_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    scene.add_dependency_template_node(task_a, wf2_id, task_x)
+    qapp.processEvents()
+    template_id = next(iter(scene.template_nodes))
+
+    scene.update_dependency_template_node(template_id, task_a, wf2_id, task_y)
+    qapp.processEvents()
+    assert scene.template_nodes[template_id].target_task_id == task_a
+    assert wf_tab.template_section.table.item(0, 2).text() == "Y"
+
+    scene.delete_dependency_template_node(template_id)
+    qapp.processEvents()
+    assert scene.template_nodes == {}
+    assert wf_tab.template_section.table.rowCount() == 0
+    assert window.db.list_dependency_templates(wf1_id) == []
+
+
+def test_deleting_a_task_cascades_its_dependency_template_in_one_undo_step(window, qapp):
+    """依存テンプレートの対象タスクを削除すると、DBの外部キー制約で
+    テンプレートも連鎖削除される。この連鎖削除はUndoスナップショットに
+    自動的に含まれるため、タスク削除と同じ1回のUndoで両方が復元されること。
+    キャンバス上の疑似ノードも明示的に取り除かれること。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf1_id = window.db.add_workflow("WF1")
+    wf2_id = window.db.add_workflow("WF2")
+    task_x = window.db.add_workflow_task(wf2_id, "X", team_id, 1)
+
+    wf_tab.refresh_workflows(select_id=wf1_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    node_a = scene.add_task("A", team_id, 1, 0, 0)
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    scene.add_dependency_template_node(node_a.workflow_task_id, wf2_id, task_x)
+    qapp.processEvents()
+    assert len(scene.template_nodes) == 1
+
+    stack_before = len(window.undo_manager._undo_stack)
+    with patch.object(QMessageBox, "question", return_value=QMessageBox.Yes):
+        scene.delete_node(scene.nodes[node_a.workflow_task_id])
+    qapp.processEvents()
+
+    assert len(window.undo_manager._undo_stack) == stack_before + 1
+    assert window.db.list_workflow_tasks(wf1_id) == []
+    assert window.db.list_dependency_templates(wf1_id) == []
+    assert wf_tab.current_scene.template_nodes == {}
+
+    window.on_undo()
+    qapp.processEvents()
+    assert len(window.db.list_workflow_tasks(wf1_id)) == 1
+    assert len(window.db.list_dependency_templates(wf1_id)) == 1
+    assert len(wf_tab.current_scene.template_nodes) == 1
+
+
+def test_mixed_select_delete_of_task_and_unrelated_template_is_one_undo_step(window, qapp):
+    """タスクと、それとは無関係な依存テンプレートの疑似ノードを同時に選択して
+    Deleteしても、1回のUndoでまとめて元に戻ること（無関係なので連鎖削除は
+    起きず、_delete_selected 側の個別処理が両方を担当する）。"""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf1_id = window.db.add_workflow("WF1")
+    wf2_id = window.db.add_workflow("WF2")
+    task_x = window.db.add_workflow_task(wf2_id, "X", team_id, 1)
+
+    wf_tab.refresh_workflows(select_id=wf1_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    node_a = scene.add_task("A", team_id, 1, 0, 0)
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    node_b = scene.add_task("B", team_id, 1, 200, 0)
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    # テンプレートはBに付ける（Aとは無関係）。
+    scene.add_dependency_template_node(node_b.workflow_task_id, wf2_id, task_x)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    template_id = next(iter(scene.template_nodes))
+    scene.nodes[node_a.workflow_task_id].setSelected(True)
+    scene.template_nodes[template_id].setSelected(True)
+    qapp.processEvents()
+
+    stack_before = len(window.undo_manager._undo_stack)
+    wf_tab.view.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier))
+    qapp.processEvents()
+
+    assert len(window.undo_manager._undo_stack) == stack_before + 1
+    remaining = {t["name"] for t in window.db.list_workflow_tasks(wf1_id)}
+    assert remaining == {"B"}
+    assert window.db.list_dependency_templates(wf1_id) == []
+    assert wf_tab.current_scene.template_nodes == {}
+
+    window.on_undo()
+    qapp.processEvents()
+    remaining = {t["name"] for t in window.db.list_workflow_tasks(wf1_id)}
+    assert remaining == {"A", "B"}
+    assert len(window.db.list_dependency_templates(wf1_id)) == 1
+    assert len(wf_tab.current_scene.template_nodes) == 1
+
+
+def test_multiple_templates_on_the_same_task_stack_without_overlapping_or_moving_tasks(window, qapp):
+    """回帰テスト: 同じタスクに複数の依存テンプレートが設定されている場合、
+    疑似ノードは同じ列（対象タスクの1つ上流）に重ならず積み上げられ、
+    タスク側の座標（自動整列）には一切影響しないこと。1件削除すると、
+    残りは詰め直され、タスクの位置はそのまま。"""
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf1_id = window.db.add_workflow("WF1")
+    wf2_id = window.db.add_workflow("WF2")
+    dep_a = window.db.add_workflow_task(wf2_id, "依存先A", team_id, 1)
+    dep_b = window.db.add_workflow_task(wf2_id, "依存先B", team_id, 1)
+    dep_c = window.db.add_workflow_task(wf2_id, "依存先C", team_id, 1)
+
+    wf_tab.refresh_workflows(select_id=wf1_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    node = scene.add_task("対象タスク", team_id, 1, 0, 0)
+    qapp.processEvents()
+    task_pos_before = wf_tab.current_scene.nodes[node.workflow_task_id].pos()
+
+    scene = wf_tab.current_scene
+    scene.add_dependency_template_node(node.workflow_task_id, wf2_id, dep_a)
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    scene.add_dependency_template_node(node.workflow_task_id, wf2_id, dep_b)
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    scene.add_dependency_template_node(node.workflow_task_id, wf2_id, dep_c)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    assert len(scene.template_nodes) == 3
+    # タスク自身の位置は、テンプレートを3件追加しても変わらない。
+    assert scene.nodes[node.workflow_task_id].pos() == task_pos_before
+
+    positions = [tnode.pos() for tnode in scene.template_nodes.values()]
+    xs = {p.x() for p in positions}
+    ys = [p.y() for p in positions]
+    assert len(xs) == 1, "同じ対象タスクなので同じ列（同じx）に揃うはず"
+    assert len(set(ys)) == 3, "3件とも異なる高さに積み上がっているはず（重ならない）"
+    # タスク群の最上段（ここでは対象タスク1件のみ）より、明確な余白を空けて上に配置される。
+    assert max(ys) < task_pos_before.y()
+
+    # 1件削除しても、タスクの位置は変わらず、残り2件は重ならず詰め直される。
+    removed_id = next(iter(scene.template_nodes))
+    scene.delete_dependency_template_node(removed_id)
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    assert len(scene.template_nodes) == 2
+    assert scene.nodes[node.workflow_task_id].pos() == task_pos_before
+    remaining_ys = {tnode.pos().y() for tnode in scene.template_nodes.values()}
+    assert len(remaining_ys) == 2
+
+
+# -- ワークフロー設計タブ: 複製・名前変更（ダブルクリック） ---------------------------
+
+
+def test_workflow_list_has_no_dedicated_rename_button_and_double_click_opens_rename_dialog(window, qapp):
+    """回帰テスト: 「名前変更」専用ボタンは廃止され、一覧の項目をダブル
+    クリックすると同じ名前変更ダイアログが開くこと。"""
+    from PySide6.QtWidgets import QInputDialog, QPushButton
+
+    wf_tab = window.tab_workflows
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    button_labels = {b.text() for b in wf_tab.findChildren(QPushButton)}
+    assert "名前変更" not in button_labels
+    assert "複製" in button_labels
+
+    item = wf_tab.workflow_list.currentItem()
+    assert item is not None
+    with patch.object(QInputDialog, "getText", return_value=("WF1改", True)):
+        wf_tab.workflow_list.itemDoubleClicked.emit(item)
+    qapp.processEvents()
+
+    assert [w["name"] for w in window.db.list_workflows()] == ["WF1改"]
+
+
+def test_duplicate_workflow_copies_content_and_selects_the_copy_as_one_undo_step(window, qapp):
+    """「複製」ボタンは、タスク・依存関係を含めて複製し、複製先を選択状態に
+    する。複製全体が1回のUndoで元に戻り、選択も複製元へ戻ること。"""
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    scene.add_task("タスクA", team_id, 3, 0, 0)
+    qapp.processEvents()
+
+    stack_before = len(window.undo_manager._undo_stack)
+    wf_tab._duplicate_workflow()
+    qapp.processEvents()
+
+    assert len(window.undo_manager._undo_stack) == stack_before + 1
+    names = [w["name"] for w in window.db.list_workflows()]
+    assert names == ["WF1", "WF1のコピー"]
+
+    current_item = wf_tab.workflow_list.currentItem()
+    assert current_item is not None and current_item.text() == "WF1のコピー"
+    new_wf_id = current_item.data(Qt.UserRole)
+    assert [t["name"] for t in window.db.list_workflow_tasks(new_wf_id)] == ["タスクA"]
+
+    window.on_undo()
+    qapp.processEvents()
+    assert [w["name"] for w in window.db.list_workflows()] == ["WF1"]
+    restored_item = wf_tab.workflow_list.currentItem()
+    assert restored_item is not None and restored_item.data(Qt.UserRole) == wf_id

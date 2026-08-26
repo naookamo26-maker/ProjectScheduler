@@ -73,6 +73,81 @@ def test_add_team_can_be_undone_and_redone(tmp_path):
     db.close()
 
 
+def test_duplicate_workflow_copies_tasks_dependencies_and_own_templates(tmp_path):
+    """複製は、配下のタスク・タスク間依存・このワークフロー自身が持つ依存
+    テンプレート（他ワークフローへの依存）をコピーする。ジョブや、他の
+    ワークフローが複製元に依存しているテンプレートはコピーされないこと、
+    名前の衝突は自動的に連番回避されること、Undo1回で全て元に戻ることを
+    確認する。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    manager, _ = _attach_dummy_undo_manager(db)
+
+    team_id = db.add_team("チームA", 1)
+    wf1 = db.add_workflow("WF1")
+    wf2 = db.add_workflow("WF2")
+    wf3 = db.add_workflow("WF3")
+    a = db.add_workflow_task(wf1, "A", team_id, 1)
+    b = db.add_workflow_task(wf1, "B", team_id, 2)
+    db.update_task_position(a, 10, 20)
+    db.update_task_position(b, 200, 20)
+    db.add_task_dependency(wf1, a, b)
+
+    other_task = db.add_workflow_task(wf2, "X", team_id, 1)
+    third_task = db.add_workflow_task(wf3, "Y", team_id, 1)
+    # WF1がWF2へ依存する側のテンプレート（複製に含まれるべき）。
+    db.add_dependency_template(wf1, a, wf2, other_task)
+    # WF3がWF1へ依存する側のテンプレート（複製に含まれてはいけない）。
+    db.add_dependency_template(wf3, third_task, wf1, b)
+
+    job_id = db.add_job("J1", wf1, None, 100)  # 複製に含まれてはいけない
+
+    stack_size_before = len(manager._undo_stack)
+    new_wf_id = db.duplicate_workflow(wf1)
+    assert len(manager._undo_stack) == stack_size_before + 1  # 1つのUndo単位
+
+    workflows = {w["name"]: w["id"] for w in db.list_workflows()}
+    assert workflows["WF1のコピー"] == new_wf_id
+
+    new_tasks = db.list_workflow_tasks(new_wf_id)
+    assert sorted((t["name"], t["default_days"]) for t in new_tasks) == [("A", 1), ("B", 2)]
+    new_a = next(t for t in new_tasks if t["name"] == "A")
+    new_b = next(t for t in new_tasks if t["name"] == "B")
+    assert (new_a["canvas_x"], new_a["canvas_y"]) == (10, 20)  # 座標も複製する
+    assert new_a["id"] not in (a, b)  # 新規採番されている（元の行の使い回しではない）
+
+    new_deps = db.list_task_dependencies(new_wf_id)
+    assert len(new_deps) == 1
+    assert new_deps[0]["predecessor_task_id"] == new_a["id"]
+    assert new_deps[0]["successor_task_id"] == new_b["id"]
+
+    new_templates = db.list_dependency_templates(new_wf_id)
+    assert len(new_templates) == 1  # WF1側のテンプレートのみ複製される
+    assert new_templates[0]["workflow_task_id"] == new_a["id"]
+    assert new_templates[0]["depends_on_workflow_id"] == wf2
+    assert new_templates[0]["depends_on_workflow_task_id"] == other_task
+
+    # 他ワークフロー（WF3）が持つ、複製元WF1への依存テンプレートは複製されない。
+    assert len(db.list_dependency_templates(wf3)) == 1
+
+    assert [j["id"] for j in db.list_jobs()] == [job_id]  # ジョブは増えていない（複製元のジョブのみ）
+
+    # 名前が衝突する場合は連番を付与する。
+    new_wf_id2 = db.duplicate_workflow(wf1)
+    workflows = {w["name"]: w["id"] for w in db.list_workflows()}
+    assert "WF1のコピー (2)" in workflows
+    assert workflows["WF1のコピー (2)"] == new_wf_id2
+
+    manager.undo()
+    assert "WF1のコピー (2)" not in {w["name"] for w in db.list_workflows()}
+    manager.undo()
+    assert db.list_workflows() == [
+        {"id": wf1, "name": "WF1", "sort_order": 0},
+        {"id": wf2, "name": "WF2", "sort_order": 1},
+        {"id": wf3, "name": "WF3", "sort_order": 2},
+    ]
+    db.close()
+
+
 def test_nested_calls_collapse_into_one_undo_entry(tmp_path):
     """add_job_dependency_link は内部で sync_dependency_templates を呼ぶが、
     Undoスタックには1エントリだけ積まれ、Undo1回で両方まとめて元に戻ること。"""
@@ -268,6 +343,7 @@ def test_all_mutating_methods_are_marked_undoable():
     mutating_prefixes = (
         "add_", "update_", "delete_", "set_", "upsert_",
         "clear_", "reorder_", "rename_", "sync_", "enforce_", "cascade_",
+        "duplicate_",
     )
     # 変更系の命名だが、意図的にUndo対象外にしているもの。
     exempt = {
