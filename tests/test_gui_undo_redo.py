@@ -859,6 +859,145 @@ def test_gantt_tab_reports_validation_errors_without_a_modal(window, qapp):
     assert "解決してください" in window.tab_gantt.status_label.text()
 
 
+def _add_many_jobs(db, count):
+    """ジョブ一覧が画面に収まりきらない件数のプロジェクトを作る。"""
+    db.set_project("大量ジョブテスト", "2026-01-05")
+    team_id = db.add_team("チームA", 3)
+    ms_id = db.add_milestone("マイルストーン1", "2027-12-31")
+    wf_id = db.add_workflow("WF1")
+    db.add_workflow_task(wf_id, "タスク", team_id, 3)
+    other_wf_id = db.add_workflow("WF2")
+    db.add_workflow_task(other_wf_id, "タスク", team_id, 3)
+    for i in range(count):
+        db.add_job(f"ジョブ{i:04d}", wf_id, ms_id, 100)
+    return wf_id, other_wf_id, ms_id
+
+
+def test_job_table_only_builds_widgets_for_visible_rows(window, qapp):
+    """ジョブ一覧のセルウィジェットは、画面に見えている行の分だけ作ること。
+
+    全行に QComboBox / QSpinBox を実体として置くと、行数に比例してタブを開く
+    のに時間がかかる（1,916ジョブで約19秒かかっていた）。見えていない行は
+    読み取り専用のテキスト表示で代替する。"""
+    _add_many_jobs(window.db, 120)
+    window.tabs.setCurrentWidget(window.tab_jobs)
+    qapp.processEvents()
+
+    tab = window.tab_jobs
+    table = tab.jobs_section.table
+    assert table.rowCount() == 120
+    assert len(tab._materialized_rows) < table.rowCount(), "全行にウィジェットを作っている"
+
+    # 可視範囲の行にはウィジェットがあり、範囲外の行には無いこと
+    first, last = tab._visible_job_row_range()
+    for row in range(first, last + 1):
+        assert table.cellWidget(row, 1) is not None
+        assert table.cellWidget(row, 3) is not None
+    for row in tab._materialized_rows:
+        assert first <= row <= last
+
+
+def test_job_table_shows_the_same_values_with_and_without_widgets(window, qapp):
+    """セルウィジェットが無い行も、あるときと同じ値を表示していること。"""
+    _add_many_jobs(window.db, 120)
+    window.tabs.setCurrentWidget(window.tab_jobs)
+    qapp.processEvents()
+
+    tab = window.tab_jobs
+    table = tab.jobs_section.table
+    workflow_names = {w["id"]: w["name"] for w in window.db.list_workflows()}
+    jobs = {j["id"]: j for j in window.db.list_jobs()}
+
+    checked_with_widget = checked_without_widget = 0
+    for row in range(table.rowCount()):
+        job = jobs[row_id(table, row)]
+        combo = table.cellWidget(row, 1)
+        if combo is not None:
+            assert combo.currentData() == job["workflow_id"]
+            assert table.cellWidget(row, 3).value() == job["priority"]
+            checked_with_widget += 1
+        else:
+            assert table.item(row, 1).text() == workflow_names[job["workflow_id"]]
+            assert table.item(row, 3).text() == str(job["priority"])
+            checked_without_widget += 1
+    assert checked_with_widget and checked_without_widget
+
+
+def test_job_table_builds_widgets_when_scrolled_into_view(window, qapp):
+    """スクロールで見えるようになった行には、その時点でウィジェットを作ること。"""
+    _add_many_jobs(window.db, 120)
+    window.tabs.setCurrentWidget(window.tab_jobs)
+    qapp.processEvents()
+
+    tab = window.tab_jobs
+    table = tab.jobs_section.table
+    scrollbar = table.verticalScrollBar()
+    assert scrollbar.maximum() > 0, "スクロールできる件数になっていない"
+
+    last_row = table.rowCount() - 1
+    assert table.cellWidget(last_row, 1) is None  # まだ見えていない
+
+    scrollbar.setValue(scrollbar.maximum())
+    qapp.processEvents()
+    assert table.cellWidget(last_row, 1) is not None
+
+    first, last = tab._visible_job_row_range()
+    for row in range(first, last + 1):
+        assert table.cellWidget(row, 1) is not None
+
+
+def test_editing_a_job_survives_scrolling_out_of_view(window, qapp):
+    """編集した行を画面外へスクロールして戻しても、編集後の値が表示されること
+    （ウィジェットを作り直す際に古い値を使ってしまわないこと）。"""
+    wf_id, other_wf_id, _ms_id = _add_many_jobs(window.db, 120)
+    window.tabs.setCurrentWidget(window.tab_jobs)
+    qapp.processEvents()
+
+    tab = window.tab_jobs
+    table = tab.jobs_section.table
+    job_id = row_id(table, 0)
+    combo = table.cellWidget(0, 1)
+    combo.setCurrentIndex(combo.findData(other_wf_id))
+    qapp.processEvents()
+
+    assert {j["id"]: j["workflow_id"] for j in window.db.list_jobs()}[job_id] == other_wf_id
+
+    scrollbar = table.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum()); qapp.processEvents()
+    scrollbar.setValue(0); qapp.processEvents()
+
+    assert table.cellWidget(0, 1).currentData() == other_wf_id
+
+
+def test_focused_job_row_keeps_its_widgets_while_scrolling(window, qapp):
+    """入力フォーカスのある行のウィジェットは、画面外へ出ても外さないこと。
+
+    bind_undo_session はフォーカスの出入りでUndo単位を開閉するため、単位を
+    開いたままウィジェットを破棄すると、閉じられないまま残ってしまう。"""
+    _add_many_jobs(window.db, 120)
+    window.tabs.setCurrentWidget(window.tab_jobs)
+    qapp.processEvents()
+
+    tab = window.tab_jobs
+    table = tab.jobs_section.table
+    priority_spin = table.cellWidget(0, 3)
+    priority_spin.setFocus()
+    qapp.processEvents()
+    assert priority_spin.hasFocus()
+
+    scrollbar = table.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum())
+    qapp.processEvents()
+
+    assert table.cellWidget(0, 3) is priority_spin, "編集中の行のウィジェットが破棄された"
+
+    # フォーカスを持ったままDBを閉じると、bind_undo_session が開いたUndo単位を
+    # 閉じられないまま破棄されることになる（docs/architecture.md 参照）。
+    # 後片付けでそこへ入らないよう、テストの側でフォーカスを外しておく。
+    priority_spin.clearFocus()
+    qapp.processEvents()
+
+
 def _build_schedulable_project(db):
     """ガントチャートを生成できる最小構成（1チーム・1ワークフロー・1ジョブ）。"""
     db.set_project("スケジュールテスト", "2026-01-05")

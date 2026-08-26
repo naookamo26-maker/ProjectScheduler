@@ -234,14 +234,22 @@ class BasicInfoTab(QWidget):
         # （gui/tab_jobs.py の _apply_initial_splitter_sizes と同じ理由）。
         QTimer.singleShot(0, self._apply_initial_splitter_sizes)
 
-        # チームを選択した後、チーム欄（ツリー＋ツールバー）の外をクリックしたら
-        # 選択を解除し、ヒストグラムを全チーム表示に戻す（アプリ全体のマウス
-        # クリックを監視する必要があるため、QApplication単位のイベントフィルタで
-        # 実装する。自分がこのタブの表示中でなければ何もしないので、他タブへの
-        # 影響はない）。
+        self.refresh_all()
+
+    # チームを選択した後、チーム欄（ツリー＋ツールバー）の外をクリックしたら
+    # 選択を解除し、ヒストグラムを全チーム表示に戻す。アプリ全体のマウス
+    # クリックを監視する必要があるためQApplication単位のイベントフィルタで
+    # 実装するが、これはアプリ内で発生する *すべての* イベントを一度Python側へ
+    # 通すことになる。このタブが表示されている間だけ仕掛け、他のタブへ移ったら
+    # 外す（例えばジョブ一覧を1,900行組み立てる間だけで55万回以上呼ばれ、
+    # それだけで2秒以上を無駄にしていた）。
+    def showEvent(self, event):
+        super().showEvent(event)
         QApplication.instance().installEventFilter(self)
 
-        self.refresh_all()
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        QApplication.instance().removeEventFilter(self)
 
     def eventFilter(self, obj, event):
         if (
