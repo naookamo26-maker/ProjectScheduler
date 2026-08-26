@@ -122,8 +122,20 @@ class MainWindow(QMainWindow):
         )
         self.tabs.setEnabled(False)
 
+    def _shutdown_gantt_tab(self):
+        """タブを差し替える/閉じる前に、ガントチャートタブが走らせている
+        スケジューリングの終了を待つ（gui/tab_gantt.py の shutdown を参照）。"""
+        tab = getattr(self, "tab_gantt", None)
+        if tab is not None:
+            try:
+                tab.shutdown()
+            except RuntimeError:
+                pass  # 既にQt側で破棄済み
+            self.tab_gantt = None
+
     def _rebuild_tabs(self):
         """DBオープン後、実際に機能するタブへ差し替える。"""
+        self._shutdown_gantt_tab()
         self.tabs.clear()
 
         self.tab_basic_info = BasicInfoTab(
@@ -460,6 +472,7 @@ class MainWindow(QMainWindow):
             # （フォーカスが外れた入力欄が、閉じたDBへ書き込もうとするのを防ぐ）。
             self.db.on_change = None
             self.db.undo_manager = None
+            self._shutdown_gantt_tab()
             self._build_empty_state_tabs()
             self.db.close()
         super().closeEvent(event)

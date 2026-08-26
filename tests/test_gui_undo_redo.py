@@ -12,6 +12,7 @@ Qt非依存に検証済みのため、ここでは「GUI操作の結果、選択
 
 import os
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -53,6 +54,7 @@ def window(qapp):
     # （gui/main.py の _confirm_discard_unsaved）。テストではダイアログを
     # 操作できず無限にブロックしてしまうため、後片付けはダイアログを経由
     # しない形で行う。
+    w._shutdown_gantt_tab()
     w.db.on_change = None
     w.db.undo_manager = None
     w.db.close()
@@ -855,6 +857,83 @@ def test_gantt_tab_reports_validation_errors_without_a_modal(window, qapp):
 
     assert window.tab_gantt._result_df is None
     assert "解決してください" in window.tab_gantt.status_label.text()
+
+
+def _build_schedulable_project(db):
+    """ガントチャートを生成できる最小構成（1チーム・1ワークフロー・1ジョブ）。"""
+    db.set_project("スケジュールテスト", "2026-01-05")
+    team_id = db.add_team("チームA", 2)
+    ms_id = db.add_milestone("マイルストーン1", "2026-06-30")
+    wf_id = db.add_workflow("WF1")
+    db.add_workflow_task(wf_id, "タスク", team_id, 3)
+    db.add_job("ジョブ1", wf_id, ms_id, 100)
+    return team_id, ms_id, wf_id
+
+
+def _wait_for_schedule(window, qapp, timeout_sec=15.0):
+    """ワーカースレッドのスケジューリング完了までイベントを回して待つ。"""
+    deadline = time.monotonic() + timeout_sec
+    while window.tab_gantt._result_df is None and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    qapp.processEvents()
+
+
+def test_gantt_tab_computes_schedule_in_background(window, qapp):
+    """スケジューリングはワーカースレッドで実行され、完了後に結果が反映されること。
+
+    タスク数が増えるとスケジューリングは数秒かかるため、GUIスレッドで同期実行
+    すると、タブを開くたびにその間ウィンドウ全体が固まってしまう。"""
+    _build_schedulable_project(window.db)
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    # まだイベントを回していないので、この時点では結果は返ってきていない
+    assert window.tab_gantt._result_df is None
+    assert "計算中" in window.tab_gantt.status_label.text()
+
+    _wait_for_schedule(window, qapp)
+    assert window.tab_gantt._result_df is not None
+    assert len(window.tab_gantt._result_df) == 1
+    assert "件のタスクを生成しました" in window.tab_gantt.status_label.text()
+
+
+def test_gantt_tab_reuses_result_until_the_db_changes(window, qapp):
+    """DBの内容が変わっていない間は、タブを開き直してもスケジューリングを
+    やり直さないこと（タブを行き来するだけで毎回数秒かかるのを防ぐ）。"""
+    _build_schedulable_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    seq_before = window.tab_gantt._request_seq
+    window.tab_gantt.refresh_choices()
+    qapp.processEvents()
+    assert window.tab_gantt._request_seq == seq_before  # 再計算していない
+    assert window.tab_gantt._result_df is not None
+
+    window.db.add_team("チームB", 1)  # 内容が変わったら計算し直す
+    window.tab_gantt.refresh_choices()
+    assert window.tab_gantt._request_seq == seq_before + 1
+    _wait_for_schedule(window, qapp)
+    assert window.tab_gantt._result_df is not None
+
+
+def test_gantt_tab_reports_deadline_overrun_in_status(window, qapp):
+    """締切に間に合わないタスクがある場合、結果は表示したうえで、その件数を
+    状況表示で知らせること（締切超過はエラーではなく結果として返るため、
+    明示しないと見過ごされる）。"""
+    window.db.set_project("締切超過テスト", "2026-01-05")
+    team_id = window.db.add_team("チームA", 1)  # 同時1本のみ
+    ms_id = window.db.add_milestone("マイルストーン1", "2026-01-09")  # 同じ週の金曜
+    for i in range(3):
+        wf_id = window.db.add_workflow(f"WF{i}")
+        window.db.add_workflow_task(wf_id, "タスク", team_id, 2)
+        window.db.add_job(f"ジョブ{i}", wf_id, ms_id, 100)
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    assert window.tab_gantt._result_df is not None  # 例外にせず結果は出す
+    assert "締切に間に合いません" in window.tab_gantt.status_label.text()
 
 
 def test_hidden_gantt_tab_is_not_refreshed_during_undo(window, qapp):

@@ -117,19 +117,14 @@ def build_frames(db):
         "Priority": j["priority"],
     } for j in jobs])
 
-    jt_rows = []
-    for j in jobs:
-        for r in db.list_job_tasks_with_overrides(j["id"]):
-            if r["override_id"] is None:
-                continue
-            jt_rows.append({
-                "Job_ID": job_str[j["id"]],
-                "Task_ID": task_str[r["workflow_task_id"]],
-                "Is_Active": "Y" if r["is_active"] else "N",
-                "Override_Days": r["override_days"],
-                "Milestone_ID": ms_str.get(r["override_milestone_id"]),
-                "Team_ID": team_str.get(r["override_team_id"]),
-            })
+    jt_rows = [{
+        "Job_ID": job_str[r["job_id"]],
+        "Task_ID": task_str[r["workflow_task_id"]],
+        "Is_Active": "Y" if r["is_active"] else "N",
+        "Override_Days": r["override_days"],
+        "Milestone_ID": ms_str.get(r["override_milestone_id"]),
+        "Team_ID": team_str.get(r["override_team_id"]),
+    } for r in db.list_all_job_task_overrides()]
     df_jtasks = pd.DataFrame(jt_rows) if jt_rows else None
 
     holidays = db.list_holidays()
@@ -153,32 +148,21 @@ def build_frames(db):
     }
 
 
-def compute_schedule(db, **scheduler_kwargs):
-    """DBの現在の設定でスケジューリングだけを実行し、ファイル出力せずに結果を
-    返す（「ガントチャート」タブでのプレビュー用途、gui/tab_gantt.py参照。
-    メニューの generate_gantt() はファイル出力までを一度に行うのに対し、
-    こちらはタブ内表示に必要な最小限の表示用補助情報だけを添えて返す）。
+def build_display(db):
+    """ガントチャートの表示に必要な補助情報（表示名・色・マイルストーン）を組み立てる。
 
-    Returns: (result_df, display) のタプル。
-      result_df: run_resource_constrained_scheduler_from_frames() の戻り値そのもの。
-      display: 表示用の補助情報を持つ辞書
+    build_frames() と同じくDBを読むので、必ずGUIスレッドから呼ぶこと
+    （スケジューリング本体だけを別スレッドへ逃がす分割については
+    compute_schedule_from_frames() を参照）。
+
+    Returns: 表示用の補助情報を持つ辞書
         - team_names: {Team_ID(文字列): チーム名}
         - team_colors: {Team_ID(文字列): 16進色}
         - workflow_names: {Workflow_ID(文字列): ワークフロー名}
         - workflow_colors: {Workflow_ID(文字列): 16進色}（チーム別表示でバーを
           ワークフロー別に色分けする際に使う。チーム色と同じ固定パレット）
         - milestone_markers: [(id, 名前, pd.Timestamp), ...]（プロジェクト開始日を含む、締切順）
-
-    SchedulingError系の例外はそのまま呼び出し元に伝播させる。
     """
-    frames = build_frames(db)
-    result_df = run_resource_constrained_scheduler_from_frames(
-        frames["project"], frames["teams"], frames["milestones"], frames["workflows"],
-        frames["jobs"], frames["job_tasks"], frames["holidays"], frames["external_dependencies"],
-        frames["workflow_names"], df_team_capacity=frames["team_capacity"],
-        **scheduler_kwargs,
-    )
-
     teams = db.list_teams()
     team_str = {t["id"]: _fmt("TEAM", t["id"]) for t in teams}
     team_names = {team_str[t["id"]]: t["name"] for t in teams}
@@ -207,12 +191,50 @@ def compute_schedule(db, **scheduler_kwargs):
         milestone_markers.append((_fmt("MS", m["id"]), m["name"], pd.to_datetime(m["end_date"])))
     milestone_markers.sort(key=lambda marker: marker[2])
 
-    display = {
+    return {
         "team_names": team_names, "team_colors": team_colors,
         "workflow_names": workflow_names, "workflow_colors": workflow_colors,
         "milestone_markers": milestone_markers,
     }
-    return result_df, display
+
+
+def compute_schedule_from_frames(frames, **scheduler_kwargs):
+    """build_frames() が返したDataFrame群だけを使ってスケジューリングを実行する。
+
+    DBには一切触れないため、**GUIスレッド以外から呼んでも安全**（ガント
+    チャートタブは、タスク数の多いプロジェクトでUIが固まらないよう、この関数を
+    ワーカースレッドで実行する。gui/tab_gantt.py の _ScheduleWorker を参照）。
+    sqlite3の接続はスレッドをまたげず、そもそも計算中にGUI側がDBを書き換えると
+    結果が壊れるため、「DBを読むのはGUIスレッド、計算だけ別スレッド」という
+    分割にしてある。
+
+    SchedulingError系の例外はそのまま呼び出し元に伝播させる。
+    """
+    return run_resource_constrained_scheduler_from_frames(
+        frames["project"], frames["teams"], frames["milestones"], frames["workflows"],
+        frames["jobs"], frames["job_tasks"], frames["holidays"], frames["external_dependencies"],
+        frames["workflow_names"], df_team_capacity=frames["team_capacity"],
+        **scheduler_kwargs,
+    )
+
+
+def compute_schedule(db, **scheduler_kwargs):
+    """DBの現在の設定でスケジューリングだけを実行し、ファイル出力せずに結果を
+    返す（メニューの generate_gantt() はファイル出力までを一度に行うのに対し、
+    こちらはタブ内表示に必要な最小限の表示用補助情報だけを添えて返す）。
+
+    build_frames() → compute_schedule_from_frames() → build_display() を
+    まとめて同期実行する薄いラッパー。GUIから使う場合は、計算部分だけを
+    ワーカースレッドへ逃がすため、この3つを個別に呼ぶ（gui/tab_gantt.py）。
+
+    Returns: (result_df, display) のタプル。
+      result_df: run_resource_constrained_scheduler_from_frames() の戻り値そのもの。
+      display: build_display() の戻り値。
+
+    SchedulingError系の例外はそのまま呼び出し元に伝播させる。
+    """
+    result_df = compute_schedule_from_frames(build_frames(db), **scheduler_kwargs)
+    return result_df, build_display(db)
 
 
 def generate_gantt(db, mermaid_output_path=None, plotly_output_path=None, **scheduler_kwargs):
