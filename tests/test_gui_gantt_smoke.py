@@ -542,6 +542,89 @@ def _build_linear_workflow_job(db):
     }
 
 
+def test_milestone_repair_plan_is_empty_while_consistent(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    ids = _build_linear_workflow_job(db)
+    db.upsert_job_task_override(ids["job"], ids["t3"], is_active=True, override_days=None,
+                                milestone_id=ids["ms_late"], team_id=None)
+    assert db.plan_milestone_consistency_repair() == []
+    db.close()
+
+
+def test_milestone_date_change_that_reverses_order_is_detected_and_repaired(tmp_path):
+    """回帰テスト: タブ3で整合するよう設定した後にタブ1でマイルストーンの締切を
+    動かすと、「先行タスクより早い締切」の状態が後から生まれてしまう。
+    enforce_milestone_floor はタブ3の編集時にしか走らないため、これを検知・
+    再調整できることを確認する。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    ids = _build_linear_workflow_job(db)
+    # タスク3だけ後期MSへ（この時点では 中期MS <= 後期MS で整合している）
+    db.upsert_job_task_override(ids["job"], ids["t3"], is_active=True, override_days=None,
+                                milestone_id=ids["ms_late"], team_id=None)
+    assert db.plan_milestone_consistency_repair() == []
+
+    # 後期MSを、先行タスクが使う中期MSより前へ動かす（前後関係が入れ替わる）
+    db.update_milestone(ids["ms_late"], "後期MS", "2026-02-15")
+
+    plan = db.plan_milestone_consistency_repair()
+    assert len(plan) == 1
+    assert plan[0]["workflow_task_id"] == ids["t3"]
+    assert plan[0]["from_end_date"] == "2026-02-15"
+    assert plan[0]["to_end_date"] == "2026-03-31"  # 先行タスクの中期MSまで引き上げ
+
+    db.apply_milestone_consistency_repair(plan)
+    assert db.plan_milestone_consistency_repair() == []
+    assert db.effective_milestone(ids["job"], ids["t3"])["end_date"] == "2026-03-31"
+    db.close()
+
+
+def test_adding_a_task_dependency_can_break_consistency_and_is_detected(tmp_path):
+    """回帰テスト: マイルストーンの日付を一切変えなくても、タブ2で依存関係を
+    追加するだけで不変条件の判定対象が増え、整合が崩れうる（マイルストーンの
+    設定可能日付を制限しても塞げない経路）。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    team_id = db.add_team("チームA", 1)
+    ms_early = db.add_milestone("早期MS", "2026-01-31")
+    ms_late = db.add_milestone("後期MS", "2026-06-30")
+    wf = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf, "タスク1", team_id, 3)
+    t2 = db.add_workflow_task(wf, "タスク2", team_id, 3)
+    job = db.add_job("ジョブ1", wf, ms_early, 100)
+    # 依存関係がまだ無いので、この組み合わせ自体は不整合ではない
+    db.upsert_job_task_override(job, t1, is_active=True, override_days=None,
+                                milestone_id=ms_late, team_id=None)
+    assert db.plan_milestone_consistency_repair() == []
+
+    # 依存 タスク1 -> タスク2 を追加すると、先行(6/30) > 後続(1/31) になる
+    db.add_task_dependency(wf, t1, t2)
+    plan = db.plan_milestone_consistency_repair()
+    assert len(plan) == 1
+    assert plan[0]["workflow_task_id"] == t2
+    assert plan[0]["to_end_date"] == "2026-06-30"
+
+    db.apply_milestone_consistency_repair(plan)
+    assert db.plan_milestone_consistency_repair() == []
+    db.close()
+
+
+def test_milestone_repair_propagates_through_the_whole_chain(tmp_path):
+    """引き上げた結果がさらに後続へ伝播すること（cascade相当）。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    ids = _build_linear_workflow_job(db)
+    for t in (ids["t2"], ids["t3"]):
+        db.upsert_job_task_override(ids["job"], t, is_active=True, override_days=None,
+                                    milestone_id=ids["ms_early"], team_id=None)
+    # タスク1は既定の中期MS(3/31)。タスク2・3が早期MS(1/31)なので2件とも引き上げ対象。
+    plan = db.plan_milestone_consistency_repair()
+    assert {p["workflow_task_id"] for p in plan} == {ids["t2"], ids["t3"]}
+    assert all(p["to_end_date"] == "2026-03-31" for p in plan)
+
+    db.apply_milestone_consistency_repair(plan)
+    for t in (ids["t2"], ids["t3"]):
+        assert db.effective_milestone(ids["job"], t)["end_date"] == "2026-03-31"
+    db.close()
+
+
 def test_minimum_milestone_end_date_follows_predecessor(tmp_path):
     db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
     ids = _build_linear_workflow_job(db)

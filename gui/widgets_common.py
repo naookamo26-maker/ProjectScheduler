@@ -14,8 +14,11 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDateEdit,
+    QDialog,
+    QDialogButtonBox,
     QGroupBox,
     QHBoxLayout,
+    QLabel,
     QListWidget,
     QMessageBox,
     QPushButton,
@@ -60,18 +63,24 @@ class _UndoSessionMixin:
     """フォーカスの出入りを ProjectDatabase の begin/end_undo_group に繋ぐ。
     bind_undo_session() を呼んだウィジェットでのみ有効になる。"""
 
-    _undo_session = None  # (db, ラベル, セッション終了時のコールバック) または None
+    # (db, ラベル, セッション終了時のコールバック, 確定直前のコールバック) または None
+    _undo_session = None
 
     def focusInEvent(self, event):
         super().focusInEvent(event)
         if self._undo_session is not None:
-            db, label, _on_end = self._undo_session
+            db, label, _on_end, _on_before_commit = self._undo_session
             db.begin_undo_group(label)
 
     def focusOutEvent(self, event):
         super().focusOutEvent(event)
         if self._undo_session is not None:
-            db, _label, on_end = self._undo_session
+            db, _label, on_end, on_before_commit = self._undo_session
+            # Undo単位がまだ開いているうちに呼ぶ。ここでDBを変更すれば、その
+            # 変更はユーザーの編集と同じ1つのUndo単位に合流する（例:
+            # gui/tab_basic_info.py のマイルストーン整合性の再調整）。
+            if on_before_commit is not None:
+                on_before_commit()
             changed = db.end_undo_group()
             # 値が実際には変わっていない（例: setCurrentItem()でプログラム的に
             # フォーカスが素通りしただけ）場合は on_session_end を呼ばない。
@@ -82,14 +91,20 @@ class _UndoSessionMixin:
                 on_end()
 
 
-def bind_undo_session(widget, db, label, on_session_end=None):
+def bind_undo_session(widget, db, label, on_session_end=None, on_before_commit=None):
     """widget にフォーカスがある間の連続した変更を、1つのUndo単位にまとめる。
 
     on_session_end を渡すと、実際に値が変わって編集が終わった（フォーカスが
     外れた）時にのみ呼ばれる。並べ替えを伴う表など、「編集中に作り直すと
     フォーカスが飛んでしまうので、編集が終わってから作り直したい」処理を
-    ここに載せる。"""
-    widget._undo_session = (db, label, on_session_end)
+    ここに載せる。
+
+    on_before_commit は、Undo単位がまだ開いているうちに呼ばれる。ここでDBを
+    変更すると、ユーザーの編集と同じ1つのUndo単位に合流するため、「編集に
+    連動してDBの他の箇所も調整するが、Undoは1回で全部戻したい」処理に使う
+    （on_session_end は単位を閉じた後に呼ばれるので、そこでDBを変更すると
+    別のUndoエントリになってしまう）。"""
+    widget._undo_session = (db, label, on_session_end, on_before_commit)
     return widget
 
 
@@ -331,6 +346,70 @@ def confirm_or_block_delete(parent, usage_count, entity_label, hard_block):
         QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
     )
     return reply == QMessageBox.Yes
+
+
+class MilestoneRepairConfirmDialog(QDialog):
+    """マイルストーンの前後関係が変わった結果、ジョブ側のタスク上書きが
+    「先行タスクより早い締切」になってしまう場合に、何をどう調整するかを
+    提示して実行の可否を確認するダイアログ。
+
+    自動で黙って書き換えると、ジョブタブを開くまで変更に気付けないため、
+    必ずこの確認を挟む（キャンセルすれば、きっかけになった編集ごと取り消す）。"""
+
+    def __init__(self, plan, trigger_label, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("マイルストーンの整合性を調整")
+        self.resize(560, 380)
+
+        layout = QVBoxLayout(self)
+        info = QLabel(
+            f"{trigger_label}により、以下のタスクが「先行タスクより早い締切」に"
+            "なってしまいます。\n"
+            "先行タスクに合わせてマイルストーンを引き上げますか？\n"
+            "（キャンセルすると、この変更自体を取り消します）"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        table = QTableWidget(0, 4)
+        table.setHorizontalHeaderLabels(["ジョブ", "タスク", "現在", "調整後"])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.NoSelection)
+        for item in plan:
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(item["job_name"]))
+            table.setItem(row, 1, QTableWidgetItem(item["task_name"]))
+            table.setItem(row, 2, QTableWidgetItem(item["from_end_date"] or "（未設定）"))
+            table.setItem(row, 3, QTableWidgetItem(item["to_end_date"]))
+        auto_size_columns(table, min_width=70, stretch_last=True)
+        layout.addWidget(table, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("調整して変更")
+        buttons.button(QDialogButtonBox.Cancel).setText("変更を取り消す")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
+def confirm_and_repair_milestone_consistency(db, parent, trigger_label):
+    """マイルストーンの前後関係・依存グラフが変わった直後に呼ぶ。整合性が
+    崩れていれば確認ダイアログを出し、了承されれば再調整を適用する。
+
+    呼び出し側がまだ開いているUndo単位（`db.undo_group`）の中から呼ぶこと。
+    そうすれば、きっかけになった編集と再調整が1回のUndoでまとめて戻る。
+
+    Returns: 変更をそのまま確定してよければ True、ユーザーがキャンセルしたので
+    呼び出し側が変更を取り消すべきなら False（調整不要だった場合も True）。"""
+    plan = db.plan_milestone_consistency_repair()
+    if not plan:
+        return True
+    if MilestoneRepairConfirmDialog(plan, trigger_label, parent).exec() != QDialog.Accepted:
+        return False
+    db.apply_milestone_consistency_repair(plan)
+    return True
 
 
 class CrudSection(QGroupBox):

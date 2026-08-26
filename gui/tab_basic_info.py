@@ -51,6 +51,7 @@ from gui.widgets_common import (
     auto_size_columns,
     bind_undo_session,
     capture_table_state,
+    confirm_and_repair_milestone_consistency,
     confirm_or_block_delete,
     keep_selection_visible,
     make_fk_combo,
@@ -181,12 +182,18 @@ class AddHolidayDialog(QDialog):
 
 
 class BasicInfoTab(QWidget):
-    def __init__(self, db, on_teams_changed=None, parent=None):
+    def __init__(self, db, on_teams_changed=None, on_jobs_changed=None, parent=None):
         super().__init__(parent)
         self.db = db
         # チーム一覧が変わったら他タブ（ワークフロー設計等）のコンボも更新したいので
         # 呼び出し元からコールバックを受け取る。
         self.on_teams_changed = on_teams_changed
+        # マイルストーンの締切変更に伴いジョブ側のタスク上書きを再調整した場合、
+        # ジョブタブの表示も更新してもらう必要がある。
+        self.on_jobs_changed = on_jobs_changed
+        # 締切日の編集セッション中に覚えておく変更前の値
+        # （_repair_milestone_consistency_before_commit 参照）。
+        self._milestone_date_before_edit = None
 
         outer = QVBoxLayout(self)
         scroll = QScrollArea()
@@ -315,9 +322,12 @@ class BasicInfoTab(QWidget):
             )
             # 締切日順の並べ替えは編集中に行わず、編集が終わってから行う
             # （編集中に表を作り直すと、操作中の日付欄が破棄されてフォーカスが飛ぶ）。
+            # 整合性の再調整は、Undo単位がまだ開いているうちに行う必要がある
+            # （on_session_endでは単位が閉じた後になり、Undoが2回に分かれる）。
             bind_undo_session(
                 date_edit, self.db, "マイルストーンの締切日を変更",
                 on_session_end=self._resort_milestones_later,
+                on_before_commit=self._repair_milestone_consistency_before_commit,
             )
             table.setCellWidget(row, 1, date_edit)
             table.setItem(row, 2, QTableWidgetItem(ms["note"]))
@@ -389,9 +399,46 @@ class BasicInfoTab(QWidget):
             if row_id(table, row) == milestone_id:
                 name = table.item(row, 0).text()
                 note = table.item(row, 2).text()
+                previous = self.db.get_milestone(milestone_id)
                 self.db.update_milestone(milestone_id, name, _to_iso(qdate), note)
+                # 締切日が動くとマイルストーン同士の前後関係が入れ替わりうる。
+                # 編集セッションの確定時（_repair_milestone_consistency_before_commit）に
+                # まとめて検査するため、変更前の値だけ覚えておく（日付欄は1回の
+                # 編集で何度も値が変わるので、検査・確認ダイアログは毎回は出さない）。
+                if self._milestone_date_before_edit is None:
+                    self._milestone_date_before_edit = (milestone_id, previous)
                 self._refresh_histogram()
                 return
+
+    def _repair_milestone_consistency_before_commit(self):
+        """マイルストーンの締切日の編集が確定する直前（Undo単位がまだ開いている
+        うち）に呼ばれる。前後関係の入れ替わりでジョブ側のタスク上書きが
+        「先行タスクより早い締切」になってしまう場合、確認の上で引き上げる。
+        キャンセルされた場合は締切日の変更自体を元に戻す（同じUndo単位の中で
+        差し引きゼロになるため、Undoエントリも積まれない）。"""
+        edited = self._milestone_date_before_edit
+        self._milestone_date_before_edit = None
+        if edited is None:
+            return
+        if confirm_and_repair_milestone_consistency(
+            self.db, self, "マイルストーンの締切日の変更",
+        ):
+            self._notify_jobs_changed()
+            return
+
+        milestone_id, previous = edited
+        if previous is not None:
+            self.db.update_milestone(
+                milestone_id, previous["name"], previous["end_date"], previous["note"],
+            )
+        QTimer.singleShot(0, self.refresh_milestones)
+        self._refresh_histogram()
+
+    def _notify_jobs_changed(self):
+        """ジョブ側のデータを書き換えたことを他タブへ伝える（タブ3が開いた
+        ままでも表示が古くならないようにする）。"""
+        if self.on_jobs_changed:
+            self.on_jobs_changed()
 
     # -- チーム（ツリー: 上位＝チーム、子＝既定値＋期間中の変動点＝すべてインライン編集） ---
 

@@ -289,6 +289,58 @@ def test_add_capacity_change_selects_new_row_visibly_and_keeps_it_editable(windo
     assert changed["start_date"] == "2026-03-05"
 
 
+def test_override_combo_keeps_an_inconsistent_milestone_instead_of_wiping_it(window, qapp):
+    """回帰テスト: 設定済みのマイルストーンが「先行タスクより早い締切」に
+    なってしまった場合でも、コンボの選択肢から外さないこと。
+
+    外すと make_fk_combo の findData が -1 になり、コンボは先頭の「（既定）」に
+    フォールバックする。その結果 (1) DBの実際の値と違うものを表示し、
+    (2) 同じ行の別の欄（日数・チーム）を触った瞬間に _on_override_changed が
+    その表示値(None)を書き戻し、マイルストーン上書きを無言で消してしまう。"""
+    jt = window.tab_jobs
+    window.tabs.setCurrentWidget(jt)
+    db = window.db
+
+    team = db.add_team("チームA", 1)
+    ms_mid = db.add_milestone("中期MS", "2026-03-31")
+    ms_late = db.add_milestone("後期MS", "2026-06-30")
+    wf = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf, "タスク1", team, 3)
+    t2 = db.add_workflow_task(wf, "タスク2", team, 3)
+    db.add_task_dependency(wf, t1, t2)
+    job = db.add_job("ジョブ1", wf, ms_mid, 100)
+    db.upsert_job_task_override(job, t2, is_active=True, override_days=None,
+                                milestone_id=ms_late, team_id=None)
+
+    # タブ1側の操作を模して、後期MSを中期MSより前へ動かす（不整合を作る）
+    db.update_milestone(ms_late, "後期MS", "2026-02-15")
+    jt.refresh_jobs(select_id=job)
+    qapp.processEvents()
+
+    table = jt.override_table
+    row_of_t2 = next(r for r in range(table.rowCount())
+                     if table.item(r, 0) and table.item(r, 0).text() == "タスク2")
+    ms_combo = table.cellWidget(row_of_t2, 3)
+
+    # DBの実際の値がそのまま選ばれている（「（既定）」へフォールバックしない）
+    assert ms_combo.currentData() == ms_late
+    assert "後期MS" in ms_combo.currentText()
+
+    # この行の日数だけを変えても、マイルストーン上書きが None で潰されない。
+    # 正しい値が読み戻されるため、既存の enforce_milestone_floor が働いて
+    # 先行タスクの中期MSまで引き上げられる（通知ダイアログ付き）。
+    from PySide6.QtWidgets import QMessageBox
+    with patch.object(QMessageBox, "information", return_value=QMessageBox.Ok):
+        table.cellWidget(row_of_t2, 2).setValue(7)
+        qapp.processEvents()
+    stored = db._conn.execute(
+        "SELECT milestone_id FROM job_task_overrides WHERE job_id=? AND workflow_task_id=?",
+        (job, t2),
+    ).fetchone()
+    assert stored["milestone_id"] is not None, "マイルストーン上書きが無言で消えている"
+    assert stored["milestone_id"] == ms_mid  # 先行タスクに合わせて引き上げ
+
+
 def test_selecting_a_capacity_change_child_resolves_to_its_parent_team(window, qapp):
     """回帰テスト: 変動点（子）を選択した状態で「－ チーム」「＋ 変動点」を
     押しても、親のチームを対象として動作すること（tab_jobs.pyのdep_treeと

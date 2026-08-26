@@ -36,7 +36,12 @@ from PySide6.QtWidgets import (
 )
 
 from gui.db import DuplicateNameError, ProjectDatabaseError
-from gui.widgets_common import NoWheelComboBox, NoWheelListWidget, NoWheelSpinBox
+from gui.widgets_common import (
+    NoWheelComboBox,
+    NoWheelListWidget,
+    NoWheelSpinBox,
+    confirm_and_repair_milestone_consistency,
+)
 
 NODE_WIDTH = 170
 NODE_HEIGHT = 64
@@ -522,6 +527,16 @@ class WorkflowGraphScene(QGraphicsScene):
                 dep_id = self.db.add_task_dependency(self.workflow_id, pred_id, succ_id)
             except ProjectDatabaseError as e:
                 QMessageBox.warning(self.parent_widget, "エラー", str(e))
+                return
+            # 依存関係が増えると「先行タスクの実効マイルストーン <= 後続タスクの
+            # 実効マイルストーン」の判定対象が増えるため、マイルストーンの日付を
+            # 触っていなくてもジョブ側の整合性が崩れうる。まだUndo単位が開いて
+            # いるここで確認・再調整しておく（キャンセルなら依存の追加ごと取り消す
+            # ——同じ単位の中で差し引きゼロになり、Undoエントリも積まれない）。
+            if not confirm_and_repair_milestone_consistency(
+                self.db, self.parent_widget, "この依存関係の追加",
+            ):
+                self.db.delete_task_dependency(dep_id)
                 return
             edge = EdgeItem(dep_id, pred_node, succ_node)
             self.addItem(edge)

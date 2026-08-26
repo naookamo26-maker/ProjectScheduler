@@ -343,7 +343,7 @@ def test_all_mutating_methods_are_marked_undoable():
     mutating_prefixes = (
         "add_", "update_", "delete_", "set_", "upsert_",
         "clear_", "reorder_", "rename_", "sync_", "enforce_", "cascade_",
-        "duplicate_",
+        "duplicate_", "apply_",
     )
     # 変更系の命名だが、意図的にUndo対象外にしているもの。
     exempt = {
@@ -442,6 +442,67 @@ def test_open_ended_group_records_nothing_when_the_value_is_unchanged(tmp_path):
     changed = db.end_undo_group()
     assert changed is False
     assert len(manager._undo_stack) == steps_before
+    db.close()
+
+
+def test_milestone_change_and_consistency_repair_collapse_into_one_undo_step(tmp_path):
+    """マイルストーンの締切変更と、それに伴うジョブ側タスク上書きの再調整が、
+    1回のUndoでまとめて戻ること（GUI側は編集セッションのUndo単位がまだ開いて
+    いるうちに再調整を走らせる——gui/widgets_common.py の on_before_commit）。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    manager, _ = _attach_dummy_undo_manager(db)
+
+    team = db.add_team("チームA", 1)
+    ms_mid = db.add_milestone("中期MS", "2026-03-31")
+    ms_late = db.add_milestone("後期MS", "2026-06-30")
+    wf = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf, "タスク1", team, 3)
+    t2 = db.add_workflow_task(wf, "タスク2", team, 3)
+    db.add_task_dependency(wf, t1, t2)
+    job = db.add_job("ジョブ1", wf, ms_mid, 100)
+    db.upsert_job_task_override(job, t2, is_active=True, override_days=None,
+                                milestone_id=ms_late, team_id=None)
+
+    before = (db.get_milestone(ms_late)["end_date"],
+              db.effective_milestone(job, t2)["end_date"])
+    steps_before = len(manager._undo_stack)
+
+    with db.undo_group("マイルストーンの締切日を変更"):
+        db.update_milestone(ms_late, "後期MS", "2026-02-15")
+        plan = db.plan_milestone_consistency_repair()
+        assert plan, "この変更で不整合が生じるはず"
+        db.apply_milestone_consistency_repair(plan)
+
+    assert len(manager._undo_stack) == steps_before + 1  # 2件に分かれない
+    after = (db.get_milestone(ms_late)["end_date"],
+             db.effective_milestone(job, t2)["end_date"])
+    assert after == ("2026-02-15", "2026-03-31")
+
+    manager.undo()
+    assert (db.get_milestone(ms_late)["end_date"],
+            db.effective_milestone(job, t2)["end_date"]) == before  # 1回で両方戻る
+
+    manager.redo()
+    assert (db.get_milestone(ms_late)["end_date"],
+            db.effective_milestone(job, t2)["end_date"]) == after
+    db.close()
+
+
+def test_cancelled_milestone_repair_leaves_no_undo_entry(tmp_path):
+    """確認ダイアログでキャンセルした場合、GUI側は同じUndo単位の中で締切日を
+    元に戻す。差し引きゼロなのでUndoエントリも積まれないこと。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    manager, _ = _attach_dummy_undo_manager(db)
+
+    ms = db.add_milestone("中期MS", "2026-03-31")
+    steps_before = len(manager._undo_stack)
+
+    with db.undo_group("マイルストーンの締切日を変更"):
+        db.update_milestone(ms, "中期MS", "2026-02-15")
+        db.update_milestone(ms, "中期MS", "2026-03-31")  # キャンセル＝元に戻す
+
+    assert len(manager._undo_stack) == steps_before
+    assert db.get_milestone(ms)["end_date"] == "2026-03-31"
     db.close()
 
 
