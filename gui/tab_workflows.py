@@ -73,17 +73,20 @@ class WorkflowsTab(QWidget):
         toolbar = QHBoxLayout()
         add_btn = QPushButton("＋追加")
         add_btn.clicked.connect(self._add_workflow)
-        rename_btn = QPushButton("名前変更")
-        rename_btn.clicked.connect(self._rename_workflow)
+        duplicate_btn = QPushButton("複製")
+        duplicate_btn.clicked.connect(self._duplicate_workflow)
         delete_btn = QPushButton("－削除")
         delete_btn.clicked.connect(self._delete_workflow)
         toolbar.addWidget(add_btn)
-        toolbar.addWidget(rename_btn)
+        toolbar.addWidget(duplicate_btn)
         toolbar.addWidget(delete_btn)
         left_layout.addLayout(toolbar)
 
         self.workflow_list = NoWheelListWidget()
         self.workflow_list.currentItemChanged.connect(self._on_selection_changed)
+        # 名前変更は専用ボタンを置かず、項目のダブルクリックで行う
+        # （一覧が長くなっても専用ボタンを探させないため）。
+        self.workflow_list.itemDoubleClicked.connect(self._on_workflow_double_clicked)
         # ドラッグで上下の表示順を入れ替えられるようにする（並び順はDBの
         # workflows.sort_orderに保存し、次回開いた時も同じ順序で表示する）。
         self.workflow_list.setDragDropMode(QAbstractItemView.InternalMove)
@@ -300,6 +303,9 @@ class WorkflowsTab(QWidget):
             return
         self.refresh_workflows(select_id=new_id)
 
+    def _on_workflow_double_clicked(self, _item):
+        self._rename_workflow()
+
     def _rename_workflow(self):
         item = self.workflow_list.currentItem()
         if item is None:
@@ -314,6 +320,14 @@ class WorkflowsTab(QWidget):
             QMessageBox.warning(self, "変更できません", str(e))
             return
         self.refresh_workflows(select_id=wf_id)
+
+    def _duplicate_workflow(self):
+        item = self.workflow_list.currentItem()
+        if item is None:
+            return
+        wf_id = item.data(Qt.UserRole)
+        new_id = self.db.duplicate_workflow(wf_id)
+        self.refresh_workflows(select_id=new_id)
 
     def _delete_workflow(self):
         item = self.workflow_list.currentItem()

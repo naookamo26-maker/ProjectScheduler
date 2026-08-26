@@ -589,6 +589,95 @@ class ProjectDatabase:
             raise DuplicateNameError(f"ワークフロー名 '{name}' は既に使用されています") from e
         self._commit()
 
+    @undoable(lambda self, workflow_id: f"ワークフロー「{_entity_name(self._conn, 'workflows', workflow_id)}」を複製")
+    def duplicate_workflow(self, workflow_id):
+        """ワークフロー1件を、配下のタスク・タスク間依存・このワークフロー自身が
+        持つ依存テンプレート（他ワークフローへの依存）ごと複製する。
+
+        複製しないもの:
+        - ジョブ・タスク上書き・ジョブ間依存（ジョブは「ジョブ作成」タブで
+          ワークフローを実体化した別個のデータであり、ワークフロー定義の
+          複製に含めるべきではないため）。
+        - 他のワークフローが「このワークフローに依存する」側として持つ
+          依存テンプレート（複製先を勝手に他ワークフローの依存先に加えると、
+          意図しない副作用になるため）。
+
+        新しいワークフローは元の直後（表示順で隣）に挿入する。名前は
+        「元の名前のコピー」を既定とし、衝突する場合は連番を付与する。"""
+        row = self._conn.execute(
+            "SELECT name, sort_order FROM workflows WHERE id = ?", (workflow_id,)
+        ).fetchone()
+        if row is None:
+            raise ProjectDatabaseError("複製元のワークフローが見つかりません")
+
+        # 「追加」ボタン連打時の衝突回避（gui/widgets_common.py の
+        # unique_default_name）と同じ考え方だが、db.py はQt非依存を保つため
+        # ここでは同じロジックをそのまま持つ（widgets_common.py はPySide6に
+        # 依存しており、db.py からは import できない）。
+        existing_names = {
+            r["name"] for r in self._conn.execute("SELECT name FROM workflows").fetchall()
+        }
+        base_name = f"{row['name']}のコピー"
+        new_name = base_name
+        n = 2
+        while new_name in existing_names:
+            new_name = f"{base_name} ({n})"
+            n += 1
+
+        self._conn.execute(
+            "UPDATE workflows SET sort_order = sort_order + 1 WHERE sort_order > ?",
+            (row["sort_order"],),
+        )
+        cur = self._conn.execute(
+            "INSERT INTO workflows(name, sort_order) VALUES (?, ?)",
+            (new_name, row["sort_order"] + 1),
+        )
+        new_workflow_id = cur.lastrowid
+
+        task_id_map = {}
+        for t in self._conn.execute(
+            "SELECT id, name, team_id, default_days, canvas_x, canvas_y "
+            "FROM workflow_tasks WHERE workflow_id = ? ORDER BY id",
+            (workflow_id,),
+        ).fetchall():
+            cur = self._conn.execute(
+                "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days, "
+                "canvas_x, canvas_y) VALUES (?, ?, ?, ?, ?, ?)",
+                (new_workflow_id, t["name"], t["team_id"], t["default_days"],
+                 t["canvas_x"], t["canvas_y"]),
+            )
+            task_id_map[t["id"]] = cur.lastrowid
+
+        for d in self._conn.execute(
+            "SELECT predecessor_task_id, successor_task_id FROM task_dependencies "
+            "WHERE workflow_id = ?",
+            (workflow_id,),
+        ).fetchall():
+            self._conn.execute(
+                "INSERT INTO task_dependencies(workflow_id, predecessor_task_id, "
+                "successor_task_id) VALUES (?, ?, ?)",
+                (new_workflow_id, task_id_map[d["predecessor_task_id"]],
+                 task_id_map[d["successor_task_id"]]),
+            )
+
+        # 依存先（depends_on_workflow_id/depends_on_workflow_task_id）は他
+        # ワークフローのタスクをそのまま指すため、新しいワークフローのタスクへの
+        # 付け替えは不要（複製元と同じ相手に依存する形で複製する）。
+        for tpl in self._conn.execute(
+            "SELECT workflow_task_id, depends_on_workflow_id, depends_on_workflow_task_id "
+            "FROM workflow_dependency_templates WHERE workflow_id = ?",
+            (workflow_id,),
+        ).fetchall():
+            self._conn.execute(
+                "INSERT INTO workflow_dependency_templates(workflow_id, workflow_task_id, "
+                "depends_on_workflow_id, depends_on_workflow_task_id) VALUES (?, ?, ?, ?)",
+                (new_workflow_id, task_id_map[tpl["workflow_task_id"]],
+                 tpl["depends_on_workflow_id"], tpl["depends_on_workflow_task_id"]),
+            )
+
+        self._commit()
+        return new_workflow_id
+
     def workflow_usage_count(self, workflow_id):
         row = self._conn.execute(
             "SELECT COUNT(*) AS n FROM jobs WHERE workflow_id = ?", (workflow_id,)

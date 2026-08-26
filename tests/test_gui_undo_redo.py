@@ -907,3 +907,64 @@ def test_multiple_templates_on_the_same_task_stack_without_overlapping_or_moving
     assert scene.nodes[node.workflow_task_id].pos() == task_pos_before
     remaining_ys = {tnode.pos().y() for tnode in scene.template_nodes.values()}
     assert len(remaining_ys) == 2
+
+
+# -- ワークフロー設計タブ: 複製・名前変更（ダブルクリック） ---------------------------
+
+
+def test_workflow_list_has_no_dedicated_rename_button_and_double_click_opens_rename_dialog(window, qapp):
+    """回帰テスト: 「名前変更」専用ボタンは廃止され、一覧の項目をダブル
+    クリックすると同じ名前変更ダイアログが開くこと。"""
+    from PySide6.QtWidgets import QInputDialog, QPushButton
+
+    wf_tab = window.tab_workflows
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    button_labels = {b.text() for b in wf_tab.findChildren(QPushButton)}
+    assert "名前変更" not in button_labels
+    assert "複製" in button_labels
+
+    item = wf_tab.workflow_list.currentItem()
+    assert item is not None
+    with patch.object(QInputDialog, "getText", return_value=("WF1改", True)):
+        wf_tab.workflow_list.itemDoubleClicked.emit(item)
+    qapp.processEvents()
+
+    assert [w["name"] for w in window.db.list_workflows()] == ["WF1改"]
+
+
+def test_duplicate_workflow_copies_content_and_selects_the_copy_as_one_undo_step(window, qapp):
+    """「複製」ボタンは、タスク・依存関係を含めて複製し、複製先を選択状態に
+    する。複製全体が1回のUndoで元に戻り、選択も複製元へ戻ること。"""
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    scene.add_task("タスクA", team_id, 3, 0, 0)
+    qapp.processEvents()
+
+    stack_before = len(window.undo_manager._undo_stack)
+    wf_tab._duplicate_workflow()
+    qapp.processEvents()
+
+    assert len(window.undo_manager._undo_stack) == stack_before + 1
+    names = [w["name"] for w in window.db.list_workflows()]
+    assert names == ["WF1", "WF1のコピー"]
+
+    current_item = wf_tab.workflow_list.currentItem()
+    assert current_item is not None and current_item.text() == "WF1のコピー"
+    new_wf_id = current_item.data(Qt.UserRole)
+    assert [t["name"] for t in window.db.list_workflow_tasks(new_wf_id)] == ["タスクA"]
+
+    window.on_undo()
+    qapp.processEvents()
+    assert [w["name"] for w in window.db.list_workflows()] == ["WF1"]
+    restored_item = wf_tab.workflow_list.currentItem()
+    assert restored_item is not None and restored_item.data(Qt.UserRole) == wf_id
