@@ -72,17 +72,23 @@ class _UndoSessionMixin:
         super().focusOutEvent(event)
         if self._undo_session is not None:
             db, _label, on_end = self._undo_session
-            db.end_undo_group()
-            if on_end is not None:
+            changed = db.end_undo_group()
+            # 値が実際には変わっていない（例: setCurrentItem()でプログラム的に
+            # フォーカスが素通りしただけ）場合は on_session_end を呼ばない。
+            # 呼んでしまうと、並べ替え用の再構築（例: gui/tab_basic_info.py の
+            # _resort_team_capacity_changes_later）が編集していないのに走り、
+            # 選択やスクロール位置を失わせてしまう。
+            if on_end is not None and changed:
                 on_end()
 
 
 def bind_undo_session(widget, db, label, on_session_end=None):
     """widget にフォーカスがある間の連続した変更を、1つのUndo単位にまとめる。
 
-    on_session_end を渡すと、編集が終わった（フォーカスが外れた）時に呼ばれる。
-    並べ替えを伴う表など、「編集中に作り直すとフォーカスが飛んでしまうので、
-    編集が終わってから作り直したい」処理をここに載せる。"""
+    on_session_end を渡すと、実際に値が変わって編集が終わった（フォーカスが
+    外れた）時にのみ呼ばれる。並べ替えを伴う表など、「編集中に作り直すと
+    フォーカスが飛んでしまうので、編集が終わってから作り直したい」処理を
+    ここに載せる。"""
     widget._undo_session = (db, label, on_session_end)
     return widget
 

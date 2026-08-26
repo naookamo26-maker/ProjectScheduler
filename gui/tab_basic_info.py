@@ -124,6 +124,36 @@ class AddTeamDialog(QDialog):
         return self.name_edit.text(), self.lines_spin.value()
 
 
+class AddCapacityChangeDialog(QDialog):
+    """チームの同時ライン数の変動点を追加するダイアログ。適用開始日と、
+    その日以降のライン数を入力してから追加する（値そのものは追加後も
+    チームツリー上でインライン編集できる）。"""
+
+    def __init__(self, default_date, default_lines, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("同時ライン数の変動点を追加")
+
+        form = QFormLayout(self)
+
+        self.date_edit = NoWheelDateEdit(default_date)
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        form.addRow("適用開始日", self.date_edit)
+
+        self.lines_spin = NoWheelSpinBox()
+        self.lines_spin.setRange(1, 999)
+        self.lines_spin.setValue(default_lines)
+        form.addRow("同時ライン数", self.lines_spin)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def values(self):
+        return _to_iso(self.date_edit.date()), self.lines_spin.value()
+
+
 class AddHolidayDialog(QDialog):
     """休業日追加ダイアログ。日付と対象チーム（未設定＝全チーム共通）を入力してから追加する。"""
 
@@ -514,11 +544,18 @@ class BasicInfoTab(QWidget):
             base = _to_qdate(project_start).addDays(1)
         while _to_iso(base) in existing_dates:
             base = base.addDays(1)
-        try:
-            new_id = self.db.add_team_capacity_change(team_id, _to_iso(base), team["max_lines"])
-        except DuplicateNameError as e:
-            QMessageBox.warning(self, "追加できません", str(e))
-            return
+
+        dialog = AddCapacityChangeDialog(base, team["max_lines"], self)
+        while True:
+            if dialog.exec() != QDialog.Accepted:
+                return
+            start_date, lines = dialog.values()
+            try:
+                new_id = self.db.add_team_capacity_change(team_id, start_date, lines)
+            except DuplicateNameError as e:
+                QMessageBox.warning(self, "追加できません", str(e))
+                continue
+            break
         self.refresh_teams()
         self._select_capacity_change_item(team_id, new_id)
         self._refresh_histogram()
@@ -564,8 +601,23 @@ class BasicInfoTab(QWidget):
     def _resort_team_capacity_changes_later(self):
         """適用開始日を変更すると並び順が変わりうるため、編集セッション
         （フォーカスが外れたタイミング）の終わりに並べ直す（編集中に作り
-        直すとウィジェットが破棄されフォーカスが飛んでしまうため）。"""
-        QTimer.singleShot(0, self.refresh_teams)
+        直すとウィジェットが破棄されフォーカスが飛んでしまうため）。並べ
+        直すとツリーが作り直され選択・スクロール位置が失われるため、
+        編集していた項目を選び直して見えている位置へ戻し、見失わないように
+        する（対象が特定できない場合のみ、元のスクロール位置をそのまま戻す）。"""
+        selected = self._selected_team_tree_item()
+        saved_data = selected.data(0, Qt.UserRole) if selected is not None else None
+        scrollbar = self.teams_tree.verticalScrollBar()
+        scroll_value = scrollbar.value()
+
+        def _resort():
+            self.refresh_teams()
+            if saved_data is not None:
+                self._select_team_tree_item_by_data(saved_data)
+            else:
+                scrollbar.setValue(scroll_value)
+
+        QTimer.singleShot(0, _resort)
 
     def _add_team(self):
         existing = {t["name"] for t in self.db.list_teams()}
@@ -654,6 +706,12 @@ class BasicInfoTab(QWidget):
         panel = QWidget()
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(0, 0, 0, 0)
+
+        title = QLabel("リソースヒストグラム")
+        title_font = title.font()
+        title_font.setBold(True)
+        title.setFont(title_font)
+        panel_layout.addWidget(title)
 
         self.histogram_status_label = QLabel("")
         self.histogram_status_label.setWordWrap(True)
