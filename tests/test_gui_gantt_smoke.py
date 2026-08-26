@@ -578,6 +578,43 @@ def test_milestone_date_change_that_reverses_order_is_detected_and_repaired(tmp_
     db.close()
 
 
+def test_moving_a_predecessor_milestone_later_raises_the_successor(tmp_path):
+    """回帰テスト: 崩れ方には2方向ある。
+    (a) 後続タスクのマイルストーンが前へ動く（別テストで検証済み）
+    (b) 先行タスクのマイルストーンが後ろへ動く（このテスト）
+    どちらも「先行 > 後続」になるが、引き上げ対象は常に後続側。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    team_id = db.add_team("チームA", 1)
+    ms_a = db.add_milestone("α版", "2026-03-01")
+    ms_b = db.add_milestone("β版", "2026-06-01")
+    wf = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf, "設計", team_id, 5)
+    t2 = db.add_workflow_task(wf, "実装", team_id, 5)
+    db.add_task_dependency(wf, t1, t2)
+    job = db.add_job("ジョブ1", wf, None, 100)
+    # 設計・実装ともに個別設定（ジョブ既定は未設定）
+    db.upsert_job_task_override(job, t1, is_active=True, override_days=None,
+                                milestone_id=ms_a, team_id=None)
+    db.upsert_job_task_override(job, t2, is_active=True, override_days=None,
+                                milestone_id=ms_b, team_id=None)
+    assert db.plan_milestone_consistency_repair() == []
+
+    # 先行タスクが使うα版を、後続タスクのβ版(6/1)より後ろへ動かす
+    db.update_milestone(ms_a, "α版", "2026-06-15")
+
+    plan = db.plan_milestone_consistency_repair()
+    assert len(plan) == 1
+    assert plan[0]["workflow_task_id"] == t2          # 引き上げ対象は後続側
+    assert plan[0]["from_end_date"] == "2026-06-01"
+    assert plan[0]["to_end_date"] == "2026-06-15"
+    assert plan[0]["to_milestone_id"] == ms_a         # 先行タスクのマイルストーンへ揃える
+
+    db.apply_milestone_consistency_repair(plan)
+    assert db.plan_milestone_consistency_repair() == []
+    assert db.effective_milestone(job, t2)["milestone_id"] == ms_a
+    db.close()
+
+
 def test_adding_a_task_dependency_can_break_consistency_and_is_detected(tmp_path):
     """回帰テスト: マイルストーンの日付を一切変えなくても、タブ2で依存関係を
     追加するだけで不変条件の判定対象が増え、整合が崩れうる（マイルストーンの
