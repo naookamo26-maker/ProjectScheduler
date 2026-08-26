@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QGraphicsItem,
     QGraphicsPathItem,
     QGraphicsPolygonItem,
+    QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
     QGraphicsView,
@@ -44,20 +45,35 @@ ANCHOR_RADIUS = 8
 # 要素との境目を視認しやすくする狙い。
 NODE_CORNER_RADIUS = 6
 
+# タスク間の依存線（グレー実線）や、チームカラー（project_scheduler.py の
+# _TEAM_COLOR_PALETTE、いずれも彩度を抑えたパステル調）と紛れないよう、
+# 依存テンプレート（他ワークフローへの依存）の疑似ノード・接続線は彩度の高い
+# マゼンタ系の点線にする。
+TEMPLATE_EDGE_COLOR = "#c2158c"
+TEMPLATE_NODE_FILL_COLOR = "#fbe6f4"
+TEMPLATE_NODE_HEADER_HEIGHT = 20
+# タスクノードはチーム名・日数を含め3行分の高さ（NODE_HEIGHT）を要するが、
+# 疑似ノードは見出しバーの下に依存先ワークフロー名・依存先タスク名の2行
+# だけで足りるため、タスクと同じ高さを流用せず専用の余白詰めの高さにする。
+TEMPLATE_NODE_CONTENT_HEIGHT = 44
+TEMPLATE_NODE_HEIGHT = TEMPLATE_NODE_HEADER_HEIGHT + TEMPLATE_NODE_CONTENT_HEIGHT
+# 依存テンプレートの疑似ノードは、タスク同士の縦方向の並び（アクティブな
+# タスクの流れ）を邪魔しないよう、タスクの整列とは別扱いで、タスク群の
+# 上端よりさらに上に余白を空けて配置する（compute_combined_layout参照）。
+TEMPLATE_LAYOUT_MARGIN = NODE_HEIGHT + 60
+
 _ADD_TEAM_SENTINEL = "__add_new_team__"
 
 
-def compute_auto_layout(tasks, dependencies, gap_x=NODE_WIDTH + 60, gap_y=NODE_HEIGHT + 30):
+def compute_task_depths(tasks, dependencies):
     """タスク・依存関係一覧から、依存の深さ（predecessorを持たないタスク=0、
-    以降predecessorの深さの最大+1）でレイヤー分けし、左→右に深さ順、各レイヤー
-    内は上→下に並べる座標を計算する（純粋関数、Qt/DB非依存）。
-
-    新規ワークフローの初期表示や、既存Excelからの移行データ（座標情報を
-    持たない）に初期レイアウトを与えるために使う。
+    以降predecessorの深さの最大+1）を計算する（純粋関数、Qt/DB非依存）。
+    ノードグラフの自動整列（compute_auto_layout/compute_combined_layout）と、
+    テーブルビューでのタスクの並び順（上流→下流）の両方から共有する。
 
     tasks: [{"id": ...}, ...]
     dependencies: [{"predecessor_task_id": ..., "successor_task_id": ...}, ...]
-    Returns: {task_id: (x, y)}
+    Returns: {task_id: depth}
     """
     task_ids = [t["id"] for t in tasks]
     preds = {tid: [] for tid in task_ids}
@@ -81,7 +97,18 @@ def compute_auto_layout(tasks, dependencies, gap_x=NODE_WIDTH + 60, gap_y=NODE_H
 
     for tid in task_ids:
         calc_depth(tid, set())
+    return depth
 
+
+def compute_auto_layout(tasks, dependencies, gap_x=NODE_WIDTH + 60, gap_y=NODE_HEIGHT + 30):
+    """タスクの依存の深さでレイヤー分けし、左→右に深さ順、各レイヤー内は
+    上→下（名前順）に並べる座標を計算する。
+
+    新規ワークフローの初期表示や、既存Excelからの移行データ（座標情報を
+    持たない）に初期レイアウトを与えるために使う。
+    Returns: {task_id: (x, y)}
+    """
+    depth = compute_task_depths(tasks, dependencies)
     layers = {}
     for t in tasks:
         layers.setdefault(depth[t["id"]], []).append(t)
@@ -90,6 +117,49 @@ def compute_auto_layout(tasks, dependencies, gap_x=NODE_WIDTH + 60, gap_y=NODE_H
     for layer_depth, layer_tasks in layers.items():
         for i, t in enumerate(sorted(layer_tasks, key=lambda t: t["name"])):
             positions[t["id"]] = (layer_depth * gap_x, i * gap_y)
+    return positions
+
+
+def compute_combined_layout(tasks, dependencies, templates, gap_x=NODE_WIDTH + 60, gap_y=NODE_HEIGHT + 30,
+                             template_margin=TEMPLATE_LAYOUT_MARGIN):
+    """タスクの自動整列に、依存テンプレート（他ワークフローへの依存）の
+    疑似ノードを重ねて配置する。
+
+    タスク同士の縦方向の並び（アクティブなタスクの流れを見やすくするための
+    並び）にテンプレートが割り込むと視認性が落ちるため、**まずタスクだけで
+    `compute_auto_layout` により整列し、テンプレートの有無で結果が変わらない
+    ようにする**。テンプレートは横方向だけ対象タスク（workflow_task_id）の
+    1つ上流の列に揃え、縦方向はタスク群の最上段よりさらに `template_margin`
+    分上の帯に、同じ列同士は`gap_y`間隔で積み上げて配置する（他の列のタスクと
+    高さが重ならないよう、タスクの並びより明確に上へ離す）。
+
+    テンプレートの座標はDBに保存しない（保存用カラムを持たないため）。
+    タスクや依存関係・テンプレートが変わるたび、この関数で毎回計算し直す
+    という割り切り（詳細はdocs/architecture.md参照）。
+
+    戻り値のキーは、タスクは workflow_task_id（int）のまま、テンプレートは
+    ("template", template_id) というタプルにし、テーブル同士のIDが衝突
+    しても混同しないようにする。
+    Returns: {task_id または ("template", template_id): (x, y)}
+    """
+    positions = dict(compute_auto_layout(tasks, dependencies, gap_x, gap_y))
+    if not templates:
+        return positions
+
+    task_depth = compute_task_depths(tasks, dependencies)
+    min_task_y = min((y for _x, y in positions.values()), default=0)
+    band_top = min_task_y - template_margin
+
+    columns = {}
+    for tpl in templates:
+        target_depth = task_depth.get(tpl["workflow_task_id"], 0)
+        label = f'{tpl["depends_on_workflow_name"]} / {tpl["depends_on_task_name"]}'
+        columns.setdefault(target_depth - 1, []).append((label, tpl["id"]))
+
+    for column, entries in columns.items():
+        x = column * gap_x
+        for i, (_label, template_id) in enumerate(sorted(entries, key=lambda e: e[0])):
+            positions[("template", template_id)] = (x, band_top - i * gap_y)
     return positions
 
 
@@ -174,6 +244,59 @@ class TaskNodeItem(QGraphicsPathItem):
         self.on_moved(self.workflow_task_id, self.pos().x(), self.pos().y())
 
 
+class TemplateDependencyNodeItem(QGraphicsPathItem):
+    """依存テンプレート（他ワークフローへの依存）1件を表す疑似ノード。
+
+    タスクノード（角丸・チーム色・ドラッグ移動可・接続アンカー付き）とは
+    一目で区別できるよう、角丸なしの破線枠・上部に「依存テンプレート」の
+    見出しバーを持つデザインにする。ドラッグ移動も接続アンカーも持たせない
+    （他ワークフローのタスクへドラッグ接続する操作自体が存在しないため）。
+    座標はauto_arrangeが毎回計算し直すだけでDBには保存しない
+    （WorkflowGraphScene参照）。"""
+
+    def __init__(self, template_id, target_task_id, workflow_name, task_name):
+        path = QPainterPath()
+        path.addRect(QRectF(0, 0, NODE_WIDTH, TEMPLATE_NODE_HEIGHT))
+        super().__init__(path)
+        self.template_id = template_id
+        self.target_task_id = target_task_id
+
+        self.setFlags(QGraphicsItem.ItemIsSelectable)
+        self.setBrush(QBrush(QColor(TEMPLATE_NODE_FILL_COLOR)))
+        self.setPen(QPen(QColor(TEMPLATE_EDGE_COLOR), 1.5, Qt.DashLine))
+
+        header = QGraphicsRectItem(0, 0, NODE_WIDTH, TEMPLATE_NODE_HEADER_HEIGHT, self)
+        header.setBrush(QBrush(QColor(TEMPLATE_EDGE_COLOR)))
+        header.setPen(QPen(Qt.NoPen))
+
+        header_text = QGraphicsSimpleTextItem("依存テンプレート", self)
+        header_font = header_text.font()
+        header_font.setBold(True)
+        header_font.setPointSize(max(header_font.pointSize() - 1, 6))
+        header_text.setFont(header_font)
+        header_text.setBrush(QBrush(QColor("#ffffff")))
+        header_text.setPos(6, 3)
+
+        workflow_text = QGraphicsSimpleTextItem(workflow_name, self)
+        font = workflow_text.font()
+        font.setItalic(True)
+        workflow_text.setFont(font)
+        workflow_text.setPos(8, TEMPLATE_NODE_HEADER_HEIGHT + 4)
+
+        task_text = QGraphicsSimpleTextItem(task_name, self)
+        task_text.setPos(8, TEMPLATE_NODE_HEADER_HEIGHT + 24)
+
+    def update_labels(self, workflow_name, task_name):
+        # 子要素は見出し（"依存テンプレート"、固定文言で変更不要）・
+        # 依存先ワークフロー名・依存先タスク名の順。
+        items = [c for c in self.childItems() if isinstance(c, QGraphicsSimpleTextItem)]
+        items[1].setText(workflow_name)
+        items[2].setText(task_name)
+
+    def output_anchor_scene_pos(self):
+        return self.mapToScene(QPointF(NODE_WIDTH, TEMPLATE_NODE_HEIGHT / 2))
+
+
 def _arrow_polygon(tip, direction, size=9):
     import math
 
@@ -189,16 +312,16 @@ def _arrow_polygon(tip, direction, size=9):
 
 
 class EdgeItem(QGraphicsPathItem):
-    def __init__(self, dependency_id, pred_node, succ_node):
+    def __init__(self, dependency_id, pred_node, succ_node, color="#52514e", line_style=Qt.SolidLine):
         super().__init__()
         self.dependency_id = dependency_id
         self.pred_node = pred_node
         self.succ_node = succ_node
-        self.setPen(QPen(QColor("#52514e"), 2))
+        self.setPen(QPen(QColor(color), 2, line_style))
         self.setBrush(Qt.NoBrush)
         self.setZValue(-1)
         self.arrow_item = QGraphicsPolygonItem(self)
-        self.arrow_item.setBrush(QBrush(QColor("#52514e")))
+        self.arrow_item.setBrush(QBrush(QColor(color)))
         self.arrow_item.setPen(QPen(Qt.NoPen))
         self.update_path()
 
@@ -220,14 +343,20 @@ class EdgeItem(QGraphicsPathItem):
 
 
 class WorkflowGraphScene(QGraphicsScene):
-    def __init__(self, db, workflow_id, parent_widget):
+    def __init__(self, db, workflow_id, parent_widget, on_changed=None):
         super().__init__(parent_widget)
         self.db = db
         self.workflow_id = workflow_id
         self.parent_widget = parent_widget
+        # GUI側（gui/tab_workflows.py）へ「タスク・依存関係・依存テンプレートの
+        # いずれかが変わった」ことを通知するフック。テーブルビューの再表示に使う
+        # （引数なしで呼ばれるcallable、またはNone）。
+        self.on_changed = on_changed
         self.nodes = {}  # workflow_task_id -> TaskNodeItem
         self.edges = {}  # dependency_id -> EdgeItem
         self.adjacency = {}  # predecessor_task_id -> [successor_task_id, ...]
+        self.template_nodes = {}  # template_id -> TemplateDependencyNodeItem
+        self.template_edges = {}  # template_id -> EdgeItem
         self.setSceneRect(-2000, -2000, 4000, 4000)
         self.reload()
 
@@ -236,6 +365,8 @@ class WorkflowGraphScene(QGraphicsScene):
         self.nodes.clear()
         self.edges.clear()
         self.adjacency.clear()
+        self.template_nodes.clear()
+        self.template_edges.clear()
 
         colors = team_color_map(self.db.list_teams())
         tasks = self.db.list_workflow_tasks(self.workflow_id)
@@ -261,8 +392,68 @@ class WorkflowGraphScene(QGraphicsScene):
             succ.edges.append(edge)
             self.adjacency.setdefault(d["predecessor_task_id"], []).append(d["successor_task_id"])
 
+        for tpl in self.db.list_dependency_templates(self.workflow_id):
+            self._add_template_scene_item(tpl)
+
+        if self.on_changed:
+            self.on_changed()
+
     def _on_node_moved(self, workflow_task_id, x, y):
         self.db.update_task_position(workflow_task_id, x, y)
+
+    # -- 依存テンプレート（他ワークフローへの依存）の疑似ノード ------------------------
+
+    def _add_template_scene_item(self, tpl):
+        """list_dependency_templates() の1行から疑似ノード・接続線を作り、
+        シーンに追加する（reload/add/updateで共有）。対象タスクが見つからない
+        場合（データ不整合）は何もしない。"""
+        target_node = self.nodes.get(tpl["workflow_task_id"])
+        if target_node is None:
+            return
+        node = TemplateDependencyNodeItem(
+            tpl["id"], tpl["workflow_task_id"],
+            tpl["depends_on_workflow_name"], tpl["depends_on_task_name"],
+        )
+        self.addItem(node)
+        self.template_nodes[tpl["id"]] = node
+        edge = EdgeItem(tpl["id"], node, target_node, color=TEMPLATE_EDGE_COLOR, line_style=Qt.DashLine)
+        self.addItem(edge)
+        self.template_edges[tpl["id"]] = edge
+
+    def _remove_template_scene_item(self, template_id):
+        edge = self.template_edges.pop(template_id, None)
+        if edge is not None:
+            self.removeItem(edge)
+        node = self.template_nodes.pop(template_id, None)
+        if node is not None:
+            self.removeItem(node)
+
+    def add_dependency_template_node(self, workflow_task_id, depends_on_workflow_id, depends_on_workflow_task_id):
+        with self.db.undo_group("依存テンプレートを追加"):
+            template_id = self.db.add_dependency_template(
+                self.workflow_id, workflow_task_id, depends_on_workflow_id, depends_on_workflow_task_id,
+            )
+            tpl = next(t for t in self.db.list_dependency_templates(self.workflow_id) if t["id"] == template_id)
+            self._add_template_scene_item(tpl)
+            self.auto_arrange()
+
+    def update_dependency_template_node(self, template_id, workflow_task_id,
+                                         depends_on_workflow_id, depends_on_workflow_task_id):
+        with self.db.undo_group("依存テンプレートを変更"):
+            self.db.update_dependency_template(
+                template_id, workflow_task_id, depends_on_workflow_id, depends_on_workflow_task_id,
+            )
+            # 対象タスクや依存先が変わりうるため、疑似ノードは作り直す。
+            self._remove_template_scene_item(template_id)
+            tpl = next(t for t in self.db.list_dependency_templates(self.workflow_id) if t["id"] == template_id)
+            self._add_template_scene_item(tpl)
+            self.auto_arrange()
+
+    def delete_dependency_template_node(self, template_id):
+        with self.db.undo_group("依存テンプレートを削除"):
+            self.db.delete_dependency_template(template_id)
+            self._remove_template_scene_item(template_id)
+            self.auto_arrange()
 
     def _would_create_cycle(self, pred_id, succ_id):
         if pred_id == succ_id:
@@ -373,13 +564,25 @@ class WorkflowGraphScene(QGraphicsScene):
         複数選択でまとめて削除する場合（_delete_selected）も、1件ずつ順に
         この処理を通すことで連鎖的な橋渡しが正しく働く。例えばA→B→C→D→Eから
         B・Dをまとめて削除すると、Bの処理でA→Cが繋がり、続くDの処理はその
-        時点の後続関係（C→E）を見るため、最終的にA→C→Eになる。"""
+        時点の後続関係（C→E）を見るため、最終的にA→C→Eになる。
+
+        このタスクを対象とする依存テンプレート（workflow_task_id側）は、
+        DBスキーマのON DELETE CASCADEによりdelete_workflow_task内で自動的に
+        削除される。DB側はUndoスナップショットに含まれるため特別な対応は
+        不要だが、キャンバス上の疑似ノード・接続線はQtの管理下にあり自動的には
+        消えないため、ここで明示的に取り除く。"""
         pred_nodes = [edge.pred_node for edge in node.edges if edge.succ_node is node]
         succ_nodes = [edge.succ_node for edge in node.edges if edge.pred_node is node]
+        attached_template_ids = [
+            template_id for template_id, tnode in self.template_nodes.items()
+            if tnode.target_task_id == node.workflow_task_id
+        ]
         with self.db.undo_group("タスクを削除"):
             for edge in list(node.edges):
                 self.delete_edge(edge)
             self.db.delete_workflow_task(node.workflow_task_id)
+            for template_id in attached_template_ids:
+                self._remove_template_scene_item(template_id)
             del self.nodes[node.workflow_task_id]
             self.removeItem(node)
             for pred_node in pred_nodes:
@@ -401,20 +604,37 @@ class WorkflowGraphScene(QGraphicsScene):
         return node
 
     def auto_arrange(self):
-        """ノード情報（タスクの追加・編集・削除、依存関係の追加・削除）が
-        変わるたびに呼び出し、依存の深さに基づく自動レイアウトへ整列し直す
-        （compute_auto_layout、gui/node_canvas.py冒頭参照）。手動でドラッグした
-        位置は、次に何か編集するとリセットされる。"""
+        """ノード情報（タスクの追加・編集・削除、依存関係・依存テンプレートの
+        追加・削除）が変わるたびに呼び出し、依存の深さに基づく自動レイアウトへ
+        整列し直す（compute_combined_layout、gui/node_canvas.py冒頭参照）。
+        手動でドラッグした位置は、次に何か編集するとリセットされる。
+
+        タスクの座標はDBに保存する（次回ワークフローを開いた時も維持する
+        ため）が、依存テンプレートの疑似ノードはDBに保存用カラムを持たない
+        ため、その場でQt側の位置を更新するだけにとどめる。"""
         with self.db.undo_group("レイアウトを自動調整"):
             tasks = self.db.list_workflow_tasks(self.workflow_id)
             deps = self.db.list_task_dependencies(self.workflow_id)
-            positions = compute_auto_layout(tasks, deps)
-            for task_id, (x, y) in positions.items():
-                node = self.nodes.get(task_id)
-                if node is None:
-                    continue
-                node.setPos(x, y)
-                self.db.update_task_position(task_id, x, y)
+            templates = self.db.list_dependency_templates(self.workflow_id)
+            positions = compute_combined_layout(tasks, deps, templates)
+            for key, (x, y) in positions.items():
+                if isinstance(key, tuple):
+                    _kind, template_id = key
+                    node = self.template_nodes.get(template_id)
+                    if node is None:
+                        continue
+                    node.setPos(x, y)
+                    edge = self.template_edges.get(template_id)
+                    if edge is not None:
+                        edge.update_path()
+                else:
+                    node = self.nodes.get(key)
+                    if node is None:
+                        continue
+                    node.setPos(x, y)
+                    self.db.update_task_position(key, x, y)
+        if self.on_changed:
+            self.on_changed()
 
     def refresh_colors(self):
         """チームマスタが変わった際、既存ノードの色を再計算する。"""
@@ -424,6 +644,8 @@ class WorkflowGraphScene(QGraphicsScene):
             if node:
                 node.set_color(colors.get(t["team_id"], "#cbc9c2"))
                 node.update_labels(t["name"], t["team_name"], t["default_days"])
+        if self.on_changed:
+            self.on_changed()
 
 
 class TaskNodeEditDialog(QDialog):
@@ -511,6 +733,194 @@ class TaskNodeEditDialog(QDialog):
         return {item.data(Qt.UserRole) for item in self.predecessor_list.selectedItems()}
 
 
+class DependencyTemplateDialog(QDialog):
+    """依存テンプレート（ワークフローペア単位の既定タスク対応）の追加・編集ダイアログ。
+    「このワークフローのタスク」は現在選択中のワークフロー内のタスクに固定し、
+    依存先ワークフロー→依存先タスクをカスケードのドロップダウンで選ばせる
+    （追加・編集のいずれも同じ3つのドロップダウンから後から選び直せる）。
+
+    ノードビュー（右クリックメニュー・疑似ノードの編集）とテーブルビュー
+    （依存テンプレート欄）の両方から共通で使う。"""
+
+    def __init__(self, db, workflow_id, parent=None, initial=None):
+        super().__init__(parent)
+        self.db = db
+        self.workflow_id = workflow_id
+        self.setWindowTitle("依存テンプレートを編集" if initial else "依存テンプレートを追加")
+
+        form = QFormLayout(self)
+
+        self.task_combo = NoWheelComboBox()
+        for t in db.list_workflow_tasks(workflow_id):
+            self.task_combo.addItem(t["name"], t["id"])
+        form.addRow("このワークフローのタスク", self.task_combo)
+
+        self.target_workflow_combo = NoWheelComboBox()
+        for wf in db.list_workflows():
+            if wf["id"] != workflow_id:
+                self.target_workflow_combo.addItem(wf["name"], wf["id"])
+        self.target_workflow_combo.currentIndexChanged.connect(self._reload_target_tasks)
+
+        self.target_task_combo = NoWheelComboBox()
+
+        form.addRow("依存先ワークフロー", self.target_workflow_combo)
+        form.addRow("依存先タスク", self.target_task_combo)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+        if initial is not None:
+            task_id, target_workflow_id, target_task_id = initial
+            idx = self.task_combo.findData(task_id)
+            if idx >= 0:
+                self.task_combo.setCurrentIndex(idx)
+            idx = self.target_workflow_combo.findData(target_workflow_id)
+            if idx >= 0:
+                self.target_workflow_combo.setCurrentIndex(idx)
+        self._reload_target_tasks()
+        if initial is not None:
+            idx = self.target_task_combo.findData(initial[2])
+            if idx >= 0:
+                self.target_task_combo.setCurrentIndex(idx)
+
+    def _reload_target_tasks(self):
+        self.target_task_combo.clear()
+        target_workflow_id = self.target_workflow_combo.currentData()
+        if target_workflow_id is None:
+            return
+        for t in self.db.list_workflow_tasks(target_workflow_id):
+            self.target_task_combo.addItem(t["name"], t["id"])
+
+    def values(self):
+        return (
+            self.task_combo.currentData(),
+            self.target_workflow_combo.currentData(),
+            self.target_task_combo.currentData(),
+        )
+
+
+# -- ダイアログを開いてDB/シーンへ反映する共通ロジック ---------------------------------
+#
+# ノードビュー（gui/node_canvas.py の WorkflowGraphView、右クリックメニュー）と
+# テーブルビュー（gui/tab_workflows.py の CrudSection、＋追加/編集...ボタン）の
+# 両方から同じ関数を呼び、挙動が2箇所で食い違わないようにする。
+
+
+def add_task_via_dialog(scene, parent, x=0.0, y=0.0):
+    db = scene.db
+    if not db.list_teams():
+        QMessageBox.information(
+            parent, "チーム未登録",
+            "先にチームを1つ以上登録してください（このダイアログからも追加できます）。",
+        )
+    dialog = TaskNodeEditDialog(db, "タスクを追加", workflow_id=scene.workflow_id)
+    if dialog.exec() != QDialog.Accepted:
+        return
+    name, team_id, days = dialog.values()
+    if not name or team_id is None or team_id == _ADD_TEAM_SENTINEL:
+        QMessageBox.warning(parent, "入力エラー", "タスク名とチームを指定してください。")
+        return
+    with db.undo_group(f"タスク「{name}」を追加"):
+        node = scene.add_task(name, team_id, days, x, y)
+        apply_predecessors(scene, node, dialog.selected_predecessor_ids())
+
+
+def edit_task_via_dialog(scene, parent, node):
+    db = scene.db
+    current = next(t for t in db.list_workflow_tasks(scene.workflow_id) if t["id"] == node.workflow_task_id)
+    dialog = TaskNodeEditDialog(
+        db, "タスクを編集", name=current["name"], team_id=current["team_id"],
+        days=current["default_days"], workflow_id=scene.workflow_id,
+        task_id=node.workflow_task_id,
+    )
+    if dialog.exec() != QDialog.Accepted:
+        return
+    name, team_id, days = dialog.values()
+    if not name or team_id is None or team_id == _ADD_TEAM_SENTINEL:
+        QMessageBox.warning(parent, "入力エラー", "タスク名とチームを指定してください。")
+        return
+    with db.undo_group(f"タスク「{name}」を編集"):
+        try:
+            db.update_workflow_task(node.workflow_task_id, name, team_id, days)
+        except DuplicateNameError as e:
+            QMessageBox.warning(parent, "変更できません", str(e))
+            return
+        colors = team_color_map(db.list_teams())
+        team = next(t for t in db.list_teams() if t["id"] == team_id)
+        node.update_labels(name, team["name"], days)
+        node.set_color(colors.get(team_id, "#cbc9c2"))
+        apply_predecessors(scene, node, dialog.selected_predecessor_ids())
+        scene.auto_arrange()
+
+
+def apply_predecessors(scene, node, predecessor_task_ids):
+    """タスク追加・編集ダイアログで選択された先行タスク集合を、実際の
+    task_dependencies行に反映する（追加分・削除分の差分のみ処理）。
+    循環依存になる追加は scene.try_add_edge が警告して拒否する。"""
+    current_pred_ids = {
+        edge.pred_node.workflow_task_id for edge in node.edges if edge.succ_node is node
+    }
+    for pred_id in predecessor_task_ids - current_pred_ids:
+        pred_node = scene.nodes.get(pred_id)
+        if pred_node is not None:
+            scene.try_add_edge(pred_node, node)
+    for pred_id in current_pred_ids - predecessor_task_ids:
+        edge = next(
+            (e for e in node.edges
+             if e.succ_node is node and e.pred_node.workflow_task_id == pred_id),
+            None,
+        )
+        if edge is not None:
+            scene.delete_edge(edge)
+
+
+def add_template_via_dialog(scene, parent):
+    db = scene.db
+    if not db.list_workflow_tasks(scene.workflow_id):
+        QMessageBox.information(parent, "タスク未登録", "先にこのワークフローにタスクを1つ以上追加してください。")
+        return
+    other_workflows = [w for w in db.list_workflows() if w["id"] != scene.workflow_id]
+    if not other_workflows:
+        QMessageBox.information(parent, "依存先ワークフローがありません", "他のワークフローを先に作成してください。")
+        return
+    dialog = DependencyTemplateDialog(db, scene.workflow_id, parent)
+    if dialog.exec() != QDialog.Accepted:
+        return
+    workflow_task_id, target_workflow_id, target_task_id = dialog.values()
+    if None in (workflow_task_id, target_workflow_id, target_task_id):
+        QMessageBox.warning(parent, "入力エラー", "すべての項目を選択してください。")
+        return
+    try:
+        scene.add_dependency_template_node(workflow_task_id, target_workflow_id, target_task_id)
+    except ProjectDatabaseError as e:
+        QMessageBox.warning(parent, "追加できません", str(e))
+
+
+def edit_template_via_dialog(scene, parent, template_id):
+    db = scene.db
+    current = next(t for t in db.list_dependency_templates(scene.workflow_id) if t["id"] == template_id)
+    dialog = DependencyTemplateDialog(
+        db, scene.workflow_id, parent,
+        initial=(
+            current["workflow_task_id"],
+            current["depends_on_workflow_id"],
+            current["depends_on_workflow_task_id"],
+        ),
+    )
+    if dialog.exec() != QDialog.Accepted:
+        return
+    workflow_task_id, target_workflow_id, target_task_id = dialog.values()
+    if None in (workflow_task_id, target_workflow_id, target_task_id):
+        QMessageBox.warning(parent, "入力エラー", "すべての項目を選択してください。")
+        return
+    try:
+        scene.update_dependency_template_node(template_id, workflow_task_id, target_workflow_id, target_task_id)
+    except ProjectDatabaseError as e:
+        QMessageBox.warning(parent, "変更できません", str(e))
+
+
 class WorkflowGraphView(QGraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -560,13 +970,13 @@ class WorkflowGraphView(QGraphicsView):
     def mouseDoubleClickEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
         item = self.scene().itemAt(scene_pos, self.transform()) if self.scene() else None
-        node = None
-        if isinstance(item, TaskNodeItem):
-            node = item
-        elif item is not None and isinstance(item.parentItem(), TaskNodeItem):
-            node = item.parentItem()
+        node, template_node = self._resolve_hit(item)
         if node is not None:
             self._edit_node(node)
+            event.accept()
+            return
+        if template_node is not None:
+            edit_template_via_dialog(self.scene(), self, template_node.template_id)
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
@@ -658,46 +1068,63 @@ class WorkflowGraphView(QGraphicsView):
         super().keyPressEvent(event)
 
     def _delete_selected(self):
-        """選択中のタスク・依存関係をまとめて削除する。
+        """選択中のタスク・依存関係・依存テンプレート疑似ノードをまとめて削除する。
 
         複数選択に対する一括操作は1つのUndo単位にまとめる（選択項目ごとに
         Undoが分かれると、1回のDeleteを取り消すのに複数回のUndoが必要に
-        なってしまう）。
+        なってしまう）。種類を問わず、選択されていたものは常に1つのUndo単位に
+        まとめるため、ラベルは組み合わせ爆発を避けて「選択した項目を削除」に
+        統一する。
 
-        タスクを削除するとそのタスクに繋がる依存関係も一緒に消えるため、
-        タスクを先に処理し、依存関係は「まだ残っているもの」だけを削除する
-        （タスクとその依存線を同時に選択した場合に、同じ依存線を二重に
-        削除しようとして落ちるのを防ぐ）。
+        タスクを削除するとそのタスクに繋がる依存関係・依存テンプレートも
+        一緒に消えるため、タスクを先に処理し、依存関係・依存テンプレートは
+        「まだ残っているもの」だけを削除する（同時選択時の二重削除を防ぐ）。
 
         参照されているタスクが選択に含まれる場合の確認ダイアログは、ノードの
         数だけ繰り返さず、選択範囲全体でまとめて1回だけ出す
-        （WorkflowGraphScene.confirm_delete_nodes 参照）。"""
+        （WorkflowGraphScene.confirm_delete_nodes 参照）。依存テンプレート
+        疑似ノードの削除は、テーブルビュー側の削除と同様に無確認のままとし、
+        この確認ダイアログの要否・件数には影響させない。"""
         scene = self.scene()
         if scene is None:
             return
         selected = list(scene.selectedItems())
         nodes = [i for i in selected if isinstance(i, TaskNodeItem)]
         edges = [i for i in selected if isinstance(i, EdgeItem)]
-        if not nodes and not edges:
+        template_nodes = [i for i in selected if isinstance(i, TemplateDependencyNodeItem)]
+        if not nodes and not edges and not template_nodes:
             return
         if not scene.confirm_delete_nodes(nodes):
             return
-        with scene.db.undo_group("選択したタスク・依存関係を削除"):
+        with scene.db.undo_group("選択した項目を削除"):
             for node in nodes:
                 if node.workflow_task_id in scene.nodes:
                     scene._delete_node_unconfirmed(node)
+            for tnode in template_nodes:
+                if tnode.template_id in scene.template_nodes:
+                    scene.delete_dependency_template_node(tnode.template_id)
             for edge in edges:
                 if edge.dependency_id in scene.edges:
                     scene.delete_edge(edge)
 
+    def _resolve_hit(self, item):
+        """クリック/ダブルクリック位置のアイテムから、タスクノード・依存
+        テンプレート疑似ノードのどちらか（またはどちらでもない）を判定する。
+        両ノードとも子要素（ラベル等）をクリックした場合を考慮し、親を辿る。"""
+        if isinstance(item, TaskNodeItem):
+            return item, None
+        if isinstance(item, TemplateDependencyNodeItem):
+            return None, item
+        if item is not None and isinstance(item.parentItem(), TaskNodeItem):
+            return item.parentItem(), None
+        if item is not None and isinstance(item.parentItem(), TemplateDependencyNodeItem):
+            return None, item.parentItem()
+        return None, None
+
     def contextMenuEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
         item = self.scene().itemAt(scene_pos, self.transform()) if self.scene() else None
-        node = None
-        if isinstance(item, TaskNodeItem):
-            node = item
-        elif item is not None and isinstance(item.parentItem(), TaskNodeItem):
-            node = item.parentItem()
+        node, template_node = self._resolve_hit(item)
 
         menu = QMenu(self)
         if node is not None:
@@ -708,75 +1135,25 @@ class WorkflowGraphView(QGraphicsView):
                 self._edit_node(node)
             elif chosen == delete_action:
                 self.scene().delete_node(node)
-        else:
-            add_action = menu.addAction("タスクを追加...")
+        elif template_node is not None:
+            edit_action = menu.addAction("編集...")
+            delete_action = menu.addAction("削除")
             chosen = menu.exec(event.globalPos())
-            if chosen == add_action:
+            if chosen == edit_action:
+                edit_template_via_dialog(self.scene(), self, template_node.template_id)
+            elif chosen == delete_action:
+                self.scene().delete_dependency_template_node(template_node.template_id)
+        else:
+            add_task_action = menu.addAction("タスクを追加...")
+            add_template_action = menu.addAction("依存テンプレートを追加...")
+            chosen = menu.exec(event.globalPos())
+            if chosen == add_task_action:
                 self._add_task_at(scene_pos)
+            elif chosen == add_template_action:
+                add_template_via_dialog(self.scene(), self)
 
     def _add_task_at(self, scene_pos):
-        db = self.scene().db
-        if not db.list_teams():
-            QMessageBox.information(
-                self, "チーム未登録",
-                "先にチームを1つ以上登録してください（このダイアログからも追加できます）。",
-            )
-        dialog = TaskNodeEditDialog(db, "タスクを追加", workflow_id=self.scene().workflow_id)
-        if dialog.exec() != QDialog.Accepted:
-            return
-        name, team_id, days = dialog.values()
-        if not name or team_id is None or team_id == _ADD_TEAM_SENTINEL:
-            QMessageBox.warning(self, "入力エラー", "タスク名とチームを指定してください。")
-            return
-        with db.undo_group(f"タスク「{name}」を追加"):
-            node = self.scene().add_task(name, team_id, days, scene_pos.x(), scene_pos.y())
-            self._apply_predecessors(node, dialog.selected_predecessor_ids())
+        add_task_via_dialog(self.scene(), self, scene_pos.x(), scene_pos.y())
 
     def _edit_node(self, node):
-        db = self.scene().db
-        current = next(t for t in db.list_workflow_tasks(self.scene().workflow_id)
-                        if t["id"] == node.workflow_task_id)
-        dialog = TaskNodeEditDialog(
-            db, "タスクを編集", name=current["name"], team_id=current["team_id"],
-            days=current["default_days"], workflow_id=self.scene().workflow_id,
-            task_id=node.workflow_task_id,
-        )
-        if dialog.exec() != QDialog.Accepted:
-            return
-        name, team_id, days = dialog.values()
-        if not name or team_id is None or team_id == _ADD_TEAM_SENTINEL:
-            QMessageBox.warning(self, "入力エラー", "タスク名とチームを指定してください。")
-            return
-        with db.undo_group(f"タスク「{name}」を編集"):
-            try:
-                db.update_workflow_task(node.workflow_task_id, name, team_id, days)
-            except DuplicateNameError as e:
-                QMessageBox.warning(self, "変更できません", str(e))
-                return
-            colors = team_color_map(db.list_teams())
-            team = next(t for t in db.list_teams() if t["id"] == team_id)
-            node.update_labels(name, team["name"], days)
-            node.set_color(colors.get(team_id, "#cbc9c2"))
-            self._apply_predecessors(node, dialog.selected_predecessor_ids())
-            self.scene().auto_arrange()
-
-    def _apply_predecessors(self, node, predecessor_task_ids):
-        """タスク編集ダイアログで選択された先行タスク集合を、実際の
-        task_dependencies行に反映する（追加分・削除分の差分のみ処理）。
-        循環依存になる追加は scene.try_add_edge が警告して拒否する。"""
-        scene = self.scene()
-        current_pred_ids = {
-            edge.pred_node.workflow_task_id for edge in node.edges if edge.succ_node is node
-        }
-        for pred_id in predecessor_task_ids - current_pred_ids:
-            pred_node = scene.nodes.get(pred_id)
-            if pred_node is not None:
-                scene.try_add_edge(pred_node, node)
-        for pred_id in current_pred_ids - predecessor_task_ids:
-            edge = next(
-                (e for e in node.edges
-                 if e.succ_node is node and e.pred_node.workflow_task_id == pred_id),
-                None,
-            )
-            if edge is not None:
-                scene.delete_edge(edge)
+        edit_task_via_dialog(self.scene(), self, node)
