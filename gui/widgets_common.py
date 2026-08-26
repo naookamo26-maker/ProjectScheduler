@@ -287,13 +287,19 @@ def make_fk_combo(options, current_id=None, allow_blank=False, blank_label="（�
     return combo
 
 
-def auto_size_columns(table, min_width=90):
+def auto_size_columns(table, min_width=90, stretch_last=False):
     """データ読み込み後に呼び出し、列幅を内容に合わせて自動調整する。
-    列が狭くなりすぎないよう min_width で下限を設ける。"""
+    列が狭くなりすぎないよう min_width で下限を設ける。
+
+    stretch_last=True の場合、最後の列は内容幅を無視し、表の右側に残る
+    余白をすべて使うよう広げる（備考欄のような自由記述の列を、内容の
+    有無にかかわらず広く使いたい場合向け）。"""
     table.resizeColumnsToContents()
     for col in range(table.columnCount()):
         if table.columnWidth(col) < min_width:
             table.setColumnWidth(col, min_width)
+    if stretch_last:
+        table.horizontalHeader().setStretchLastSection(True)
 
 
 def confirm_or_block_delete(parent, usage_count, entity_label, hard_block):

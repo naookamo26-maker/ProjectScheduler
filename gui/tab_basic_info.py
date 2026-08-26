@@ -292,7 +292,7 @@ class BasicInfoTab(QWidget):
             table.setCellWidget(row, 1, date_edit)
             table.setItem(row, 2, QTableWidgetItem(ms["note"]))
         table.blockSignals(False)
-        auto_size_columns(table)
+        auto_size_columns(table, stretch_last=True)
 
     def _add_milestone(self):
         existing = {ms["name"] for ms in self.db.list_milestones()}
@@ -747,7 +747,7 @@ class BasicInfoTab(QWidget):
 
             table.setItem(row, 2, QTableWidgetItem(hol["note"]))
         table.blockSignals(False)
-        auto_size_columns(table)
+        auto_size_columns(table, stretch_last=True)
 
     def _add_holiday(self):
         # 「追加」連打で全チーム共通・同日の重複エラーが出ないよう、空いている日付を
