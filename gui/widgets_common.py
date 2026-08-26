@@ -366,10 +366,16 @@ class MilestoneRepairConfirmDialog(QDialog):
             f"{trigger_label}により、以下のタスクが「先行タスクより早い締切」に"
             "なってしまいます。\n"
             "先行タスクに合わせてマイルストーンを引き上げますか？\n"
-            "（キャンセルすると、この変更自体を取り消します）"
+            "（マイルストーン自体が先行タスクのものに差し替わります。"
+            "キャンセルすると、この変更自体を取り消します）"
         )
         info.setWordWrap(True)
         layout.addWidget(info)
+
+        def label_of(name, end_date):
+            if name is None and end_date is None:
+                return "（未設定）"
+            return f"{name}（{end_date}）"
 
         table = QTableWidget(0, 4)
         table.setHorizontalHeaderLabels(["ジョブ", "タスク", "現在", "調整後"])
@@ -381,8 +387,10 @@ class MilestoneRepairConfirmDialog(QDialog):
             table.insertRow(row)
             table.setItem(row, 0, QTableWidgetItem(item["job_name"]))
             table.setItem(row, 1, QTableWidgetItem(item["task_name"]))
-            table.setItem(row, 2, QTableWidgetItem(item["from_end_date"] or "（未設定）"))
-            table.setItem(row, 3, QTableWidgetItem(item["to_end_date"]))
+            table.setItem(row, 2, QTableWidgetItem(
+                label_of(item["from_milestone_name"], item["from_end_date"])))
+            table.setItem(row, 3, QTableWidgetItem(
+                label_of(item["to_milestone_name"], item["to_end_date"])))
         auto_size_columns(table, min_width=70, stretch_last=True)
         layout.addWidget(table, 1)
 

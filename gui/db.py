@@ -1105,11 +1105,16 @@ class ProjectDatabase:
     # plan_/apply_ の2段構えにしているのは、実行前に「何がどう調整されるか」を
     # ユーザーへ提示して確認を取るため（GUI側で確認ダイアログを出す）。
 
-    def _milestone_repair_plan_for_job(self, job):
+    def _milestone_repair_plan_for_job(self, job, milestone_names):
         """1ジョブ分の再調整計画。enforce_milestone_floor と同じ判定
         （実効マイルストーンが未設定、または先行タスクの最も遅い実効
         マイルストーンより早ければ、そこまで引き上げる）を、依存の深さ順に
-        伝播させて計算する。書き込みは一切行わない。"""
+        伝播させて計算する。書き込みは一切行わない。
+
+        milestone_names: {milestone_id: 名前}。確認ダイアログで「どのマイル
+        ストーンへ変わるか」まで見せるため、日付だけでなく名前も計画に含める
+        （引き上げでは締切日だけでなくマイルストーン自体が先行タスクのものに
+        差し替わるので、名前が見えないと変更内容が伝わらない）。"""
         wf_id = job["workflow_id"]
         tasks = self.list_workflow_tasks(wf_id)
         preds = self._task_predecessors_map(wf_id)
@@ -1153,7 +1158,10 @@ class ProjectDatabase:
                 "job_id": job["id"], "job_name": job["name"],
                 "workflow_task_id": tid, "task_name": t["name"],
                 "from_end_date": current[0] if current else None,
+                "from_milestone_id": current[1] if current else None,
+                "from_milestone_name": milestone_names.get(current[1]) if current else None,
                 "to_end_date": floor[0], "to_milestone_id": floor[1],
+                "to_milestone_name": milestone_names.get(floor[1]),
             })
             # 引き上げた結果をさらに後続へ伝播させる（cascade相当）
             effective[tid] = floor
@@ -1164,9 +1172,10 @@ class ProjectDatabase:
         いるタスクの再調整計画を返す（書き込みは行わない）。空リストなら
         整合しており、何もする必要がない。適用は
         apply_milestone_consistency_repair(plan)。"""
+        milestone_names = {m["id"]: m["name"] for m in self.list_milestones()}
         plan = []
         for job in self.list_jobs():
-            plan.extend(self._milestone_repair_plan_for_job(job))
+            plan.extend(self._milestone_repair_plan_for_job(job, milestone_names))
         return plan
 
     @undoable("マイルストーンの整合性を再調整")

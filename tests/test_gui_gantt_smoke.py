@@ -608,6 +608,11 @@ def test_moving_a_predecessor_milestone_later_raises_the_successor(tmp_path):
     assert plan[0]["from_end_date"] == "2026-06-01"
     assert plan[0]["to_end_date"] == "2026-06-15"
     assert plan[0]["to_milestone_id"] == ms_a         # 先行タスクのマイルストーンへ揃える
+    # 引き上げでは締切日だけでなくマイルストーン自体が差し替わるため、
+    # 確認ダイアログが「どのマイルストーンへ変わるか」を出せるよう名前も含める。
+    assert plan[0]["from_milestone_id"] == ms_b
+    assert plan[0]["from_milestone_name"] == "β版"
+    assert plan[0]["to_milestone_name"] == "α版"
 
     db.apply_milestone_consistency_repair(plan)
     assert db.plan_milestone_consistency_repair() == []
