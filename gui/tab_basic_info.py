@@ -19,17 +19,30 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QGraphicsScene,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPushButton,
     QScrollArea,
+    QSplitter,
     QTableWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from gui.db import DuplicateNameError, ReferencedEntityError
+from gui.node_canvas import team_color_map
+from gui.resource_histogram import (
+    ResourceHistogramView,
+    build_histogram_scene,
+    histogram_axis_range,
+    team_capacity_breakpoints,
+)
 from gui.widgets_common import (
     CrudSection,
     NoWheelDateEdit,
@@ -38,10 +51,12 @@ from gui.widgets_common import (
     bind_undo_session,
     capture_table_state,
     confirm_or_block_delete,
+    keep_selection_visible,
     make_fk_combo,
     restore_table_state,
     row_id,
     select_row_by_id,
+    set_current_tree_item_keeping_focus,
     set_row_id,
     unique_default_name,
 )
@@ -54,118 +69,6 @@ def _to_qdate(iso_str):
 
 def _to_iso(qdate):
     return qdate.toString("yyyy-MM-dd")
-
-
-def _readonly_item(text):
-    item = QTableWidgetItem(text)
-    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-    return item
-
-
-class TeamCapacityDialog(QDialog):
-    """チームの同時ライン数が期間の途中で変わる場合の変更点（適用開始日・
-    ライン数）を追加・削除するダイアログ。開発開始日からの既定値そのものは
-    チーム一覧本体の「同時ライン数」列で編集するため、ここでは以降の
-    変更点のみを扱う（＋削除・追加のみで、値そのものは表内で直接編集する）。"""
-
-    def __init__(self, db, team, parent=None):
-        super().__init__(parent)
-        self.db = db
-        self.team = team
-        self.setWindowTitle(f"「{team['name']}」の同時ライン数の変動")
-        self.resize(420, 340)
-
-        layout = QVBoxLayout(self)
-        info = QLabel(
-            f"開発開始日からの既定値: {team['max_lines']}ライン"
-            "（この値自体はチーム一覧の「同時ライン数」列で変更してください）\n"
-            "ここでは、途中でライン数が変わる日付とその日以降のライン数を追加できます。"
-        )
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        self.section = CrudSection(
-            "変更点（適用開始日順）", ["適用開始日", "ライン数"],
-            on_add=self._add_change, on_delete=self._delete_change,
-        )
-        layout.addWidget(self.section, 1)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Close)
-        # QDialogButtonBox(Close) の役割はRejectRoleのため rejected が発火する。
-        buttons.rejected.connect(self.accept)
-        layout.addWidget(buttons)
-
-        self._refresh()
-
-    def _refresh(self):
-        table = self.section.table
-        table.blockSignals(True)
-        table.setRowCount(0)
-        for c in self.db.list_team_capacity_changes(self.team["id"]):
-            row = table.rowCount()
-            table.insertRow(row)
-            set_row_id(table, row, c["id"])
-
-            date_edit = NoWheelDateEdit(_to_qdate(c["start_date"]))
-            date_edit.setCalendarPopup(True)
-            date_edit.setDisplayFormat("yyyy-MM-dd")
-            date_edit.dateChanged.connect(
-                lambda _qdate, cid=c["id"]: self._on_change_edited(cid)
-            )
-            table.setCellWidget(row, 0, date_edit)
-
-            lines_spin = NoWheelSpinBox()
-            lines_spin.setRange(1, 999)
-            lines_spin.setValue(c["lines"])
-            lines_spin.valueChanged.connect(
-                lambda _val, cid=c["id"]: self._on_change_edited(cid)
-            )
-            table.setCellWidget(row, 1, lines_spin)
-        table.blockSignals(False)
-        auto_size_columns(table)
-
-    def _add_change(self):
-        # 既定日は、既存の変更点のうち最も遅い日付の翌日（無ければ開発開始日の翌日）を提案する。
-        existing = self.db.list_team_capacity_changes(self.team["id"])
-        if existing:
-            base = _to_qdate(existing[-1]["start_date"]).addDays(1)
-        else:
-            proj = self.db.get_project()
-            base = _to_qdate(proj["start_date"] or date.today().isoformat()).addDays(1)
-        existing_dates = {c["start_date"] for c in existing}
-        while _to_iso(base) in existing_dates:
-            base = base.addDays(1)
-        try:
-            self.db.add_team_capacity_change(self.team["id"], _to_iso(base), self.team["max_lines"])
-        except DuplicateNameError as e:
-            QMessageBox.warning(self, "追加できません", str(e))
-            return
-        self._refresh()
-
-    def _delete_change(self, row):
-        change_id = row_id(self.section.table, row)
-        self.db.delete_team_capacity_change(change_id)
-        self._refresh()
-
-    def _on_change_edited(self, change_id):
-        table = self.section.table
-        for row in range(table.rowCount()):
-            if row_id(table, row) == change_id:
-                date_edit = table.cellWidget(row, 0)
-                lines_spin = table.cellWidget(row, 1)
-                try:
-                    self.db.update_team_capacity_change(
-                        change_id, _to_iso(date_edit.date()), lines_spin.value()
-                    )
-                except DuplicateNameError as e:
-                    QMessageBox.warning(self, "変更できません", str(e))
-                    self._refresh()
-                    return
-                # 適用開始日を変更すると並び順が変わりうるため、次のイベント
-                # ループで並べ直す（このメソッド自体がdate_editのdateChanged
-                # シグナル内から呼ばれているため、ウィジェットの再構築を遅延させる）。
-                QTimer.singleShot(0, self._refresh)
-                return
 
 
 class AddMilestoneDialog(QDialog):
@@ -270,25 +173,38 @@ class BasicInfoTab(QWidget):
             on_add=self._add_milestone, on_delete=self._delete_milestone,
         )
         self.milestones_section.table.itemChanged.connect(self._on_milestone_name_changed)
-        layout.addWidget(self.milestones_section)
-
-        self.teams_section = CrudSection(
-            "チーム", ["チーム名", "同時ライン数（開発開始日からの既定値）", "期間中の変動"],
-            on_add=self._add_team, on_delete=self._delete_team,
-            on_edit=self._edit_team_capacity, edit_dblclick_columns={2},
-        )
-        self.teams_section.table.itemChanged.connect(self._on_team_name_changed)
-        layout.addWidget(self.teams_section)
 
         self.holidays_section = CrudSection(
             "休業日", ["日付", "対象チーム（未設定＝全社共通）"],
             on_add=self._add_holiday, on_delete=self._delete_holiday,
         )
-        layout.addWidget(self.holidays_section)
 
-        layout.addStretch(1)
+        row2 = QSplitter(Qt.Horizontal)
+        row2.addWidget(self.milestones_section)
+        row2.addWidget(self.holidays_section)
+        row2.setStretchFactor(0, 1)
+        row2.setStretchFactor(1, 1)
+        layout.addWidget(row2)
+        self._row2_splitter = row2
+
+        layout.addWidget(self._build_team_and_histogram_group(), 1)
+
+        # コンストラクタ時点（実際のウィジェット幅が確定する前）にsetSizes()を
+        # 呼んでも比率が反映されない（表示後の最初のレイアウトで上書きされる）
+        # ため、レイアウト確定後（次のイベントループ）に改めて設定し直す
+        # （gui/tab_jobs.py の _apply_initial_splitter_sizes と同じ理由）。
+        QTimer.singleShot(0, self._apply_initial_splitter_sizes)
 
         self.refresh_all()
+
+    def _apply_initial_splitter_sizes(self):
+        total2 = self._row2_splitter.width()
+        if total2 > 0:
+            self._row2_splitter.setSizes([total2 // 2, total2 - total2 // 2])
+        total3 = self._team_histogram_splitter.width()
+        if total3 > 0:
+            left = round(total3 * 3 / 10)
+            self._team_histogram_splitter.setSizes([left, total3 - left])
 
     # -- プロジェクト概要 -----------------------------------------------------
 
@@ -311,6 +227,7 @@ class BasicInfoTab(QWidget):
 
     def _on_project_changed(self):
         self.db.set_project(self.project_name_edit.text(), _to_iso(self.start_date_edit.date()))
+        self._refresh_histogram()
 
     def refresh_project(self):
         proj = self.db.get_project()
@@ -364,6 +281,7 @@ class BasicInfoTab(QWidget):
             break
         self.refresh_milestones()
         select_row_by_id(self.milestones_section.table, new_id)
+        self._refresh_histogram()
 
     def _delete_milestone(self, row):
         table = self.milestones_section.table
@@ -373,6 +291,7 @@ class BasicInfoTab(QWidget):
             return
         self.db.delete_milestone(ms_id)
         self.refresh_milestones()
+        self._refresh_histogram()
 
     def _on_milestone_name_changed(self, item):
         if item.column() != 0:
@@ -393,12 +312,14 @@ class BasicInfoTab(QWidget):
         # 締切日順に合わせ直す（このメソッド自体がitemChangedシグナル内から
         # 呼ばれているため、ウィジェットの再構築は次のイベントループへ遅延させる）。
         QTimer.singleShot(0, self.refresh_milestones)
+        self._refresh_histogram()
 
     def _resort_milestones_later(self):
         """締切日順の表示を保つよう並べ直す。日付欄の編集が終わった時点で呼ぶ
         （このメソッド自体がフォーカス喪失の処理中から呼ばれるため、ウィジェットの
         再構築は次のイベントループへ遅延させる）。"""
         QTimer.singleShot(0, self.refresh_milestones)
+        self._refresh_histogram()
 
     def _on_milestone_date_changed(self, milestone_id, qdate):
         table = self.milestones_section.table
@@ -406,46 +327,204 @@ class BasicInfoTab(QWidget):
             if row_id(table, row) == milestone_id:
                 name = table.item(row, 0).text()
                 self.db.update_milestone(milestone_id, name, _to_iso(qdate))
+                self._refresh_histogram()
                 return
 
-    # -- チーム ------------------------------------------------------------------
+    # -- チーム（ツリー: 上位＝チーム、子＝既定値＋期間中の変動点＝すべてインライン編集） ---
+
+    def _build_teams_panel(self):
+        panel = QWidget()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+
+        toolbar = QHBoxLayout()
+        add_team_btn = QPushButton("＋ チーム")
+        add_team_btn.clicked.connect(self._add_team)
+        del_team_btn = QPushButton("－ チーム")
+        del_team_btn.clicked.connect(self._delete_team_selected)
+        toolbar.addWidget(add_team_btn)
+        toolbar.addWidget(del_team_btn)
+        toolbar.addSpacing(16)
+        add_change_btn = QPushButton("＋ 変動点")
+        add_change_btn.clicked.connect(self._add_capacity_change_selected)
+        del_change_btn = QPushButton("－ 変動点")
+        del_change_btn.clicked.connect(self._delete_capacity_change_selected)
+        toolbar.addWidget(add_change_btn)
+        toolbar.addWidget(del_change_btn)
+        toolbar.addStretch(1)
+        panel_layout.addLayout(toolbar)
+
+        self.teams_tree = QTreeWidget()
+        self.teams_tree.setColumnCount(2)
+        self.teams_tree.setHeaderLabels(["チーム名 ／ 適用開始日", "同時ライン数 ／ ライン数"])
+        self.teams_tree.setSelectionMode(QTreeWidget.SingleSelection)
+        self.teams_tree.itemChanged.connect(self._on_team_name_changed)
+        self.teams_tree.itemSelectionChanged.connect(self._refresh_histogram)
+        keep_selection_visible(self.teams_tree)
+        panel_layout.addWidget(self.teams_tree)
+
+        return panel
 
     def refresh_teams(self):
-        table = self.teams_section.table
-        table.blockSignals(True)
-        table.setRowCount(0)
+        tree = self.teams_tree
+        tree.blockSignals(True)
+        tree.clear()
+        proj = self.db.get_project()
+        start_date = proj["start_date"] or date.today().isoformat()
         for team in self.db.list_teams():
-            row = table.rowCount()
-            table.insertRow(row)
-            table.setItem(row, 0, QTableWidgetItem(team["name"]))
-            set_row_id(table, row, team["id"])
-            spin = NoWheelSpinBox()
-            spin.setRange(1, 999)
-            spin.setValue(team["max_lines"])
-            spin.valueChanged.connect(
+            top = QTreeWidgetItem([team["name"], ""])
+            top.setFlags(top.flags() | Qt.ItemIsEditable)
+            top.setData(0, Qt.UserRole, {"kind": "team", "team_id": team["id"]})
+            tree.addTopLevelItem(top)
+
+            # 開発開始日からの既定値は team_capacity_changes に実体を持たない
+            # （teams.max_lines そのもの）ため、他の変動点と同じ見た目で表示する
+            # 合成の子行として追加する（日付は開発開始日で固定・削除不可）。
+            default_child = QTreeWidgetItem([start_date, ""])
+            default_child.setFlags(default_child.flags() & ~Qt.ItemIsEditable)
+            default_child.setData(0, Qt.UserRole, {"kind": "default_capacity", "team_id": team["id"]})
+            top.addChild(default_child)
+
+            default_spin = NoWheelSpinBox()
+            default_spin.setRange(1, 999)
+            default_spin.setValue(team["max_lines"])
+            default_spin.valueChanged.connect(
                 lambda value, eid=team["id"]: self._on_team_lines_changed(eid, value)
             )
-            bind_undo_session(spin, self.db, "チームの同時ライン数を変更")
-            table.setCellWidget(row, 1, spin)
+            bind_undo_session(default_spin, self.db, "チームの同時ライン数を変更")
+            tree.setItemWidget(default_child, 1, default_spin)
 
-            changes = self.db.list_team_capacity_changes(team["id"])
-            summary = (
-                "、".join(f"{c['start_date']}〜{c['lines']}ライン" for c in changes)
-                if changes else "（変動なし。「編集...」から追加）"
-            )
-            table.setItem(row, 2, _readonly_item(summary))
-        table.blockSignals(False)
-        auto_size_columns(table)
+            for c in self.db.list_team_capacity_changes(team["id"]):
+                child = QTreeWidgetItem(["", ""])
+                child.setFlags(child.flags() & ~Qt.ItemIsEditable)
+                child.setData(0, Qt.UserRole, {
+                    "kind": "capacity_change", "team_id": team["id"], "change_id": c["id"],
+                })
+                top.addChild(child)
 
-    def _edit_team_capacity(self, row):
-        table = self.teams_section.table
-        team_id = row_id(table, row)
+                date_edit = NoWheelDateEdit(_to_qdate(c["start_date"]))
+                date_edit.setCalendarPopup(True)
+                date_edit.setDisplayFormat("yyyy-MM-dd")
+                date_edit.dateChanged.connect(
+                    lambda _qdate, cid=c["id"], it=child: self._on_team_capacity_change_edited(cid, it)
+                )
+                bind_undo_session(
+                    date_edit, self.db, "同時ライン数の変更点を変更",
+                    on_session_end=self._resort_team_capacity_changes_later,
+                )
+                tree.setItemWidget(child, 0, date_edit)
+
+                lines_spin = NoWheelSpinBox()
+                lines_spin.setRange(1, 999)
+                lines_spin.setValue(c["lines"])
+                lines_spin.valueChanged.connect(
+                    lambda _val, cid=c["id"], it=child: self._on_team_capacity_change_edited(cid, it)
+                )
+                bind_undo_session(lines_spin, self.db, "同時ライン数の変更点を変更")
+                tree.setItemWidget(child, 1, lines_spin)
+            top.setExpanded(True)
+        tree.blockSignals(False)
+        for col in range(2):
+            tree.resizeColumnToContents(col)
+
+    def _resolve_team_item(self, item):
+        """選択中の項目（チーム自身、またはその子＝既定値／容量変更点）から、
+        対象のチーム項目とそのUserRoleデータを返す（gui/tab_jobs.py の
+        _selected_link と同じ「子は親へ辿る」考え方）。未選択なら (None, None)。"""
+        if item is None:
+            return None, None
+        data = item.data(0, Qt.UserRole)
+        if data is not None and data.get("kind") in ("capacity_change", "default_capacity"):
+            item = item.parent()
+            data = item.data(0, Qt.UserRole) if item else None
+        return item, data
+
+    def _find_team_tree_item(self, team_id):
+        for i in range(self.teams_tree.topLevelItemCount()):
+            top = self.teams_tree.topLevelItem(i)
+            data = top.data(0, Qt.UserRole)
+            if data is not None and data.get("team_id") == team_id:
+                return top
+        return None
+
+    def _select_team_tree_item(self, team_id):
+        item = self._find_team_tree_item(team_id)
+        if item is not None:
+            set_current_tree_item_keeping_focus(self.teams_tree, item)
+
+    def _add_capacity_change_selected(self):
+        _item, data = self._resolve_team_item(self.teams_tree.currentItem())
+        if data is None:
+            QMessageBox.information(self, "追加", "変動点を追加するチームを選択してください。")
+            return
+        team_id = data["team_id"]
         team = next((t for t in self.db.list_teams() if t["id"] == team_id), None)
         if team is None:
             return
-        dialog = TeamCapacityDialog(self.db, team, self)
-        dialog.exec()
+        proj = self.db.get_project()
+        project_start = proj["start_date"] or date.today().isoformat()
+        existing = self.db.list_team_capacity_changes(team_id)
+        existing_dates = {c["start_date"] for c in existing}
+        existing_dates.add(project_start)
+        # 既定日は、既存の変更点のうち最も遅い日付の翌日（無ければ開発開始日の翌日）を提案する。
+        if existing:
+            base = _to_qdate(existing[-1]["start_date"]).addDays(1)
+        else:
+            base = _to_qdate(project_start).addDays(1)
+        while _to_iso(base) in existing_dates:
+            base = base.addDays(1)
+        try:
+            new_id = self.db.add_team_capacity_change(team_id, _to_iso(base), team["max_lines"])
+        except DuplicateNameError as e:
+            QMessageBox.warning(self, "追加できません", str(e))
+            return
         self.refresh_teams()
+        self._select_capacity_change_item(team_id, new_id)
+        self._refresh_histogram()
+
+    def _delete_capacity_change_selected(self):
+        item = self.teams_tree.currentItem()
+        data = item.data(0, Qt.UserRole) if item is not None else None
+        if data is None or data.get("kind") != "capacity_change":
+            QMessageBox.information(
+                self, "削除", "削除する変動点を選択してください（既定値の行は削除できません）。"
+            )
+            return
+        team_id = data["team_id"]
+        self.db.delete_team_capacity_change(data["change_id"])
+        self.refresh_teams()
+        self._select_team_tree_item(team_id)
+        self._refresh_histogram()
+
+    def _select_capacity_change_item(self, team_id, change_id):
+        top = self._find_team_tree_item(team_id)
+        if top is None:
+            return
+        for j in range(top.childCount()):
+            child = top.child(j)
+            data = child.data(0, Qt.UserRole)
+            if data is not None and data.get("kind") == "capacity_change" and data.get("change_id") == change_id:
+                set_current_tree_item_keeping_focus(self.teams_tree, child)
+                return
+
+    def _on_team_capacity_change_edited(self, change_id, item):
+        date_edit = self.teams_tree.itemWidget(item, 0)
+        lines_spin = self.teams_tree.itemWidget(item, 1)
+        if date_edit is None or lines_spin is None:
+            return
+        try:
+            self.db.update_team_capacity_change(change_id, _to_iso(date_edit.date()), lines_spin.value())
+        except DuplicateNameError as e:
+            QMessageBox.warning(self, "変更できません", str(e))
+            self.refresh_teams()
+            return
+        self._refresh_histogram()
+
+    def _resort_team_capacity_changes_later(self):
+        """適用開始日を変更すると並び順が変わりうるため、編集セッション
+        （フォーカスが外れたタイミング）の終わりに並べ直す（編集中に作り
+        直すとウィジェットが破棄されフォーカスが飛んでしまうため）。"""
+        QTimer.singleShot(0, self.refresh_teams)
 
     def _add_team(self):
         existing = {t["name"] for t in self.db.list_teams()}
@@ -462,12 +541,16 @@ class BasicInfoTab(QWidget):
                 continue
             break
         self.refresh_teams()
-        select_row_by_id(self.teams_section.table, new_id)
+        self._select_team_tree_item(new_id)
         self._notify_teams_changed()
+        self._refresh_histogram()
 
-    def _delete_team(self, row):
-        table = self.teams_section.table
-        team_id = row_id(table, row)
+    def _delete_team_selected(self):
+        _item, data = self._resolve_team_item(self.teams_tree.currentItem())
+        if data is None:
+            QMessageBox.information(self, "削除", "削除するチームを選択してください。")
+            return
+        team_id = data["team_id"]
         count = self.db.team_usage_count(team_id)
         if not confirm_or_block_delete(self, count, "このチーム", hard_block=True):
             return
@@ -478,17 +561,20 @@ class BasicInfoTab(QWidget):
             return
         self.refresh_teams()
         self._notify_teams_changed()
+        self._refresh_histogram()
 
-    def _on_team_name_changed(self, item):
-        if item.column() != 0:
+    def _on_team_name_changed(self, item, column):
+        if column != 0:
             return
-        table = self.teams_section.table
-        team_id = row_id(table, item.row())
-        if team_id is None:
+        data = item.data(0, Qt.UserRole)
+        if data is None or data.get("kind") != "team":
             return
-        spin = table.cellWidget(item.row(), 1)
+        team_id = data["team_id"]
+        team = next((t for t in self.db.list_teams() if t["id"] == team_id), None)
+        if team is None:
+            return
         try:
-            self.db.update_team(team_id, item.text(), spin.value())
+            self.db.update_team(team_id, item.text(0), team["max_lines"])
         except DuplicateNameError as e:
             QMessageBox.warning(self, "変更できません", str(e))
             self.refresh_teams()
@@ -496,16 +582,98 @@ class BasicInfoTab(QWidget):
         self._notify_teams_changed()
 
     def _on_team_lines_changed(self, team_id, value):
-        table = self.teams_section.table
-        for row in range(table.rowCount()):
-            if row_id(table, row) == team_id:
-                name = table.item(row, 0).text()
-                self.db.update_team(team_id, name, value)
-                return
+        top = self._find_team_tree_item(team_id)
+        if top is None:
+            return
+        self.db.update_team(team_id, top.text(0), value)
+        self._refresh_histogram()
 
     def _notify_teams_changed(self):
         if self.on_teams_changed:
             self.on_teams_changed()
+
+    # -- チーム＋リソースヒストグラム（1つの枠にまとめる） -------------------------------
+
+    def _build_team_and_histogram_group(self):
+        group = QGroupBox("チーム")
+        group_layout = QVBoxLayout(group)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self._build_teams_panel())
+        splitter.addWidget(self._build_histogram_panel())
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 7)
+        group_layout.addWidget(splitter)
+        self._team_histogram_splitter = splitter
+
+        return group
+
+    def _build_histogram_panel(self):
+        panel = QWidget()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.histogram_status_label = QLabel("")
+        self.histogram_status_label.setWordWrap(True)
+        panel_layout.addWidget(self.histogram_status_label)
+
+        self.histogram_view = ResourceHistogramView()
+        panel_layout.addWidget(self.histogram_view, 1)
+
+        return panel
+
+    def _refresh_histogram(self):
+        """チーム・マイルストーン・開発開始日のいずれかが変わるたび、また
+        チームツリーの選択が変わるたびに呼ぶ。ツリーで1件のチーム（または
+        その変動点の子）が選択されていればそのチーム単独の推移を、未選択
+        なら全チーム合計を積み上げ（人数比が分かる）で表示する（表示する
+        のはあくまで計画上の同時ライン数の上限であり、実際のタスク使用状況
+        ではない——詳細はdocs/architecture.md参照）。"""
+        proj = self.db.get_project()
+        teams = self.db.list_teams()
+        if not proj["start_date"] or not teams:
+            self.histogram_status_label.setStyleSheet("color: #b3261e;")
+            self.histogram_status_label.setText(
+                "開発開始日とチームを設定すると、リソースヒストグラムを表示します。"
+            )
+            self.histogram_view.setScene(QGraphicsScene())
+            return
+        self.histogram_status_label.setStyleSheet("")
+        self.histogram_status_label.setText("")
+
+        milestones = self.db.list_milestones()
+        changes_by_team = {t["id"]: self.db.list_team_capacity_changes(t["id"]) for t in teams}
+        all_changes = [c for changes in changes_by_team.values() for c in changes]
+        range_start, range_end = histogram_axis_range(proj["start_date"], milestones, all_changes)
+
+        _item, data = self._resolve_team_item(self.teams_tree.currentItem())
+        colors = team_color_map(teams)
+        labels = {t["id"]: t["name"] for t in teams}
+        milestone_markers = [
+            (m["id"], m["name"], date.fromisoformat(m["end_date"])) for m in milestones
+        ]
+        project_start = date.fromisoformat(proj["start_date"])
+
+        if data is not None:
+            team_id = data["team_id"]
+            team = next(t for t in teams if t["id"] == team_id)
+            segments_by_key = {team_id: team_capacity_breakpoints(
+                team, changes_by_team[team_id], proj["start_date"]
+            )}
+            mode = "single"
+        else:
+            segments_by_key = {
+                t["id"]: team_capacity_breakpoints(t, changes_by_team[t["id"]], proj["start_date"])
+                for t in teams
+            }
+            mode = "stacked"
+
+        scene = build_histogram_scene(
+            segments_by_key, mode, colors, labels, milestone_markers,
+            project_start, range_start, range_end,
+        )
+        self.histogram_view.setScene(scene)
+        self.histogram_view.fit_all()
 
     # -- 休業日 -------------------------------------------------------------------
 
@@ -586,6 +754,7 @@ class BasicInfoTab(QWidget):
         self.refresh_milestones()
         self.refresh_teams()
         self.refresh_holidays()
+        self._refresh_histogram()
 
     def refresh_choices(self):
         """他タブの変更（現状なし）に合わせて表示を更新する共通インターフェース。
@@ -595,9 +764,10 @@ class BasicInfoTab(QWidget):
     # -- Undo/Redo用の選択・フォーカス状態 -------------------------------------------
 
     def capture_ui_state(self):
+        team_item = self.teams_tree.currentItem()
         return {
             "milestones": capture_table_state(self.milestones_section.table),
-            "teams": capture_table_state(self.teams_section.table),
+            "team_selected": team_item.data(0, Qt.UserRole) if team_item else None,
             "holidays": capture_table_state(self.holidays_section.table),
         }
 
@@ -605,5 +775,22 @@ class BasicInfoTab(QWidget):
         if not state:
             return
         restore_table_state(self.milestones_section.table, state.get("milestones"))
-        restore_table_state(self.teams_section.table, state.get("teams"))
+        team_data = state.get("team_selected")
+        if team_data is not None:
+            self._select_team_tree_item_by_data(team_data)
         restore_table_state(self.holidays_section.table, state.get("holidays"))
+
+    def _select_team_tree_item_by_data(self, data):
+        """capture_ui_state が記録したUserRoleデータ（チーム自身、または
+        その子＝容量変更点のどちらか）と一致する項目を選び直す
+        （gui/tab_jobs.py の _select_dep_tree_item と同じ考え方）。"""
+        for i in range(self.teams_tree.topLevelItemCount()):
+            top = self.teams_tree.topLevelItem(i)
+            if top.data(0, Qt.UserRole) == data:
+                set_current_tree_item_keeping_focus(self.teams_tree, top)
+                return
+            for j in range(top.childCount()):
+                child = top.child(j)
+                if child.data(0, Qt.UserRole) == data:
+                    set_current_tree_item_keeping_focus(self.teams_tree, child)
+                    return

@@ -68,12 +68,12 @@ def window(qapp):
 
 
 def test_team_add_undo_redo_restores_selection(window, qapp):
-    """内容と、表の選択（行・列）が復元されること。"""
+    """内容と、ツリーの選択（チーム項目）が復元されること。"""
     bi = window.tab_basic_info
     new_id = window.db.add_team("チームテスト", 2)
     bi.refresh_teams()
-    select_row_by_id(bi.teams_section.table, new_id)
-    bi.teams_section.table.setFocus()
+    bi._select_team_tree_item(new_id)
+    bi.teams_tree.setFocus()
     qapp.processEvents()
 
     window.on_undo()
@@ -85,9 +85,9 @@ def test_team_add_undo_redo_restores_selection(window, qapp):
     qapp.processEvents()
     assert [t["name"] for t in window.db.list_teams()] == ["チームテスト"]
 
-    row = bi.teams_section.table.currentRow()
-    assert row >= 0
-    assert row_id(bi.teams_section.table, row) == new_id
+    item = bi.teams_tree.currentItem()
+    assert item is not None
+    assert item.data(0, Qt.UserRole) == {"kind": "team", "team_id": new_id}
 
 
 def test_spinbox_edits_collapse_into_one_undo_step_at_focus_out(window, qapp):
@@ -100,7 +100,9 @@ def test_spinbox_edits_collapse_into_one_undo_step_at_focus_out(window, qapp):
     window.db.add_team("チームA", 1)
     bi.refresh_all()
     qapp.processEvents()
-    spin = bi.teams_section.table.cellWidget(0, 1)
+    top = bi.teams_tree.topLevelItem(0)
+    default_child = top.child(0)  # 既定値（開発開始日からの同時ライン数）の行
+    spin = bi.teams_tree.itemWidget(default_child, 1)
 
     steps_before = len(window.undo_manager._undo_stack)
     spin.setFocus()
@@ -127,27 +129,155 @@ def test_focus_is_never_moved_into_cell_widgets_by_undo(window, qapp):
 
     これらはCtrl+Zを自分のものとして横取りする（QAbstractSpinBox/QLineEditが
     ShortcutOverrideを受け取る）ため、フォーカスが入ると次のCtrl+Zがメニューまで
-    届かず、Undoが効かなくなったように見える。現在セルの復元は、その列に
-    セルウィジェットがあるとフォーカスを移してしまうので、選択だけを戻す。"""
+    届かず、Undoが効かなくなったように見える。"""
     bi = window.tab_basic_info
     window.db.add_team("チームA", 1)
     bi.refresh_all()
     qapp.processEvents()
 
-    spin = bi.teams_section.table.cellWidget(0, 1)
+    top = bi.teams_tree.topLevelItem(0)
+    default_child = top.child(0)  # 既定値（開発開始日からの同時ライン数）の行
+    spin = bi.teams_tree.itemWidget(default_child, 1)
     spin.setFocus()
     qapp.processEvents()
     spin.stepBy(1)
     qapp.processEvents()
-    bi.project_name_edit.setFocus()  # 編集を確定し、フォーカスを表の外へ
+    bi.project_name_edit.setFocus()  # 編集を確定し、フォーカスをツリーの外へ
     qapp.processEvents()
 
     window.on_undo()
     qapp.processEvents()
     focused = QApplication.focusWidget()
     assert focused is bi.project_name_edit, f"フォーカスが移動している: {type(focused).__name__}"
-    # 選択自体は復元されている
-    assert bi.teams_section.table.currentColumn() == 1
+
+
+def test_teams_tree_shows_default_capacity_as_first_undeletable_child(window, qapp):
+    """開発開始日からの既定値（teams.max_lines）は、他の変動点と同じ見た目の
+    最初の子行として表示され、日付は開発開始日で固定（編集不可）・ライン数は
+    インライン編集可能（NoWheelSpinBox）で、削除ボタンでは削除できないこと。"""
+    bi = window.tab_basic_info
+    window.tabs.setCurrentWidget(bi)
+    window.db.set_project("P", "2026-01-01")
+    team_id = window.db.add_team("チームA", 2)
+    bi.refresh_all()
+    qapp.processEvents()
+
+    top = bi.teams_tree.topLevelItem(0)
+    assert top.childCount() == 1
+    default_child = top.child(0)
+    assert default_child.text(0) == "2026-01-01"
+    assert not (default_child.flags() & Qt.ItemIsEditable)
+    assert default_child.data(0, Qt.UserRole) == {"kind": "default_capacity", "team_id": team_id}
+    spin = bi.teams_tree.itemWidget(default_child, 1)
+    assert spin.value() == 2
+
+    from PySide6.QtWidgets import QMessageBox
+
+    bi.teams_tree.setCurrentItem(default_child)
+    qapp.processEvents()
+    with patch.object(QMessageBox, "information", return_value=QMessageBox.Ok):
+        bi._delete_capacity_change_selected()
+    assert bi.teams_tree.topLevelItem(0).childCount() == 1  # 既定値は削除されない
+
+
+def test_teams_tree_capacity_changes_are_inline_editable_children(window, qapp):
+    """期間中の変動点は、チーム項目の第2子以降として表示され、日付・ライン数
+    ともにツリー上で直接編集できること（専用ダイアログは廃止）。"""
+    bi = window.tab_basic_info
+    window.tabs.setCurrentWidget(bi)
+    team_id = window.db.add_team("チームA", 2)
+    change_id = window.db.add_team_capacity_change(team_id, "2026-03-01", 5)
+    bi.refresh_all()
+    qapp.processEvents()
+
+    top = bi.teams_tree.topLevelItem(0)
+    assert top.childCount() == 2
+    child = top.child(1)
+    assert child.data(0, Qt.UserRole) == {
+        "kind": "capacity_change", "team_id": team_id, "change_id": change_id,
+    }
+    date_edit = bi.teams_tree.itemWidget(child, 0)
+    lines_spin = bi.teams_tree.itemWidget(child, 1)
+    assert date_edit is not None and lines_spin is not None
+    assert lines_spin.value() == 5
+
+    lines_spin.setValue(9)
+    qapp.processEvents()
+    assert window.db.list_team_capacity_changes(team_id)[0]["lines"] == 9
+
+
+def test_selecting_a_capacity_change_child_resolves_to_its_parent_team(window, qapp):
+    """回帰テスト: 変動点（子）を選択した状態で「－ チーム」「＋ 変動点」を
+    押しても、親のチームを対象として動作すること（tab_jobs.pyのdep_treeと
+    同じ「子は親へ辿る」考え方）。ここでは _resolve_team_item の結果と、
+    その選択状態が capture_ui_state/restore_ui_state で往復することを確認する。"""
+    bi = window.tab_basic_info
+    window.tabs.setCurrentWidget(bi)
+    team_id = window.db.add_team("チームA", 2)
+    window.db.add_team_capacity_change(team_id, "2026-03-01", 5)
+    bi.refresh_all()
+    qapp.processEvents()
+
+    child = bi.teams_tree.topLevelItem(0).child(1)  # 第2子＝実際の変動点（第1子は既定値）
+    bi.teams_tree.setCurrentItem(child)
+    qapp.processEvents()
+
+    _item, data = bi._resolve_team_item(bi.teams_tree.currentItem())
+    assert data == {"kind": "team", "team_id": team_id}
+
+    state = bi.capture_ui_state()
+    assert state["team_selected"]["kind"] == "capacity_change"
+    bi.teams_tree.setCurrentItem(None)
+    bi.restore_ui_state(state)
+    qapp.processEvents()
+    restored = bi.teams_tree.currentItem()
+    assert restored is not None
+    assert restored.data(0, Qt.UserRole) == state["team_selected"]
+
+    # 変動点行の日付欄にフォーカスが残ったままだと、Undoセッション
+    # （focusInEventで開始）が閉じられないまま終わってしまうため、
+    # 明示的にフォーカスを外して確定させる（他のテストと同じ後始末）。
+    bi.project_name_edit.setFocus()
+    qapp.processEvents()
+
+
+def test_histogram_shows_placeholder_when_project_incomplete(window, qapp):
+    """開発開始日・チームが揃っていない間は、モーダルではなくパネル内の
+    赤字ラベルで案内し、グラフは空のままであること
+    （gui/tab_gantt.py のエラー表示方針と同じ考え方）。"""
+    bi = window.tab_basic_info
+    window.tabs.setCurrentWidget(bi)
+    qapp.processEvents()
+
+    assert bi.histogram_status_label.text() != ""
+    assert bi.histogram_view.scene() is None or bi.histogram_view.scene().items() == []
+
+
+def test_histogram_switches_between_stacked_and_single_team_on_selection(window, qapp):
+    """チームツリーで何も選択していなければ全チーム積み上げ、1件選択すれば
+    そのチーム単独の表示に切り替わること。"""
+    bi = window.tab_basic_info
+    window.tabs.setCurrentWidget(bi)
+    window.db.set_project("P", "2026-01-01")
+    team_a = window.db.add_team("チームA", 2)
+    window.db.add_team("チームB", 3)
+    bi.refresh_all()
+    qapp.processEvents()
+
+    assert bi.histogram_status_label.text() == ""
+    scene = bi.histogram_view.scene()
+    assert scene is not None
+    assert scene.histogram_mode == "stacked"
+
+    bi._select_team_tree_item(team_a)
+    qapp.processEvents()
+    scene = bi.histogram_view.scene()
+    assert scene.histogram_mode == "single"
+
+    bi.teams_tree.setCurrentItem(None)
+    qapp.processEvents()
+    scene = bi.histogram_view.scene()
+    assert scene.histogram_mode == "stacked"
 
 
 def test_workflow_task_add_is_single_undo_step_and_restores_canvas_selection(window, qapp):

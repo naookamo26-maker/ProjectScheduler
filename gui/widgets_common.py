@@ -228,6 +228,22 @@ def restore_table_state(table, state):
             moved_focus.clearFocus()
 
 
+def set_current_tree_item_keeping_focus(tree, item):
+    """QTreeWidget.setCurrentItem() は、その項目の列にセルウィジェット
+    （スピンボックスや日付欄）が置かれていると、そのウィジェットへフォーカスを
+    移してしまうことがある（restore_table_state と同じ理由）。選択（現在項目）
+    だけを変更し、フォーカスは元の位置に留める（プログラムからの選択変更で
+    ユーザーの入力中の欄からフォーカスを奪わないようにするため）。"""
+    previous_focus = QApplication.focusWidget()
+    tree.setCurrentItem(item)
+    moved_focus = QApplication.focusWidget()
+    if moved_focus is not previous_focus:
+        if previous_focus is not None:
+            previous_focus.setFocus()
+        elif moved_focus is not None:
+            moved_focus.clearFocus()
+
+
 def select_row_by_id(table, entity_id):
     """entity_id に対応する行を選択状態にする（新規追加直後の行を選ぶ用途）。
     見つからない場合は何もしない。"""
