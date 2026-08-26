@@ -126,7 +126,10 @@ class MainWindow(QMainWindow):
         """DBオープン後、実際に機能するタブへ差し替える。"""
         self.tabs.clear()
 
-        self.tab_basic_info = BasicInfoTab(self.db, on_teams_changed=self._on_teams_changed)
+        self.tab_basic_info = BasicInfoTab(
+            self.db, on_teams_changed=self._on_teams_changed,
+            on_jobs_changed=self._on_jobs_changed,
+        )
         self.tabs.addTab(self.tab_basic_info, "基本情報設定")
 
         self.tab_workflows = WorkflowsTab(self.db)
@@ -156,6 +159,12 @@ class MainWindow(QMainWindow):
         DBから最新のチーム一覧を読むため、ここでは表示更新のみでよい）。"""
         if hasattr(self, "tab_workflows"):
             self.tab_workflows.refresh_team_choices()
+
+    def _on_jobs_changed(self):
+        """基本情報設定タブでのマイルストーン整合性の再調整のように、他タブから
+        ジョブ側のデータを書き換えた際、ジョブタブの表示を最新へ合わせる。"""
+        if hasattr(self, "tab_jobs"):
+            self.tab_jobs.refresh_choices()
 
     def _build_menu(self):
         file_menu = self.menuBar().addMenu("ファイル(&F)")

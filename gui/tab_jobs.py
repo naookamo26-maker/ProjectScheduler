@@ -514,6 +514,17 @@ class JobsTab(QWidget):
                 (m["id"], m["name"]) for m in all_milestones
                 if min_end_date is None or m["end_date"] >= min_end_date
             ]
+            # 既に設定済みの値は、下限を下回っていても必ず選択肢に残す。
+            # 外してしまうとコンボが「（既定）」にフォールバックし、DBの実際の
+            # 値と違うものを表示したうえ、同じ行の別の欄を触った瞬間に
+            # _on_override_changed がその表示値（None）を書き戻して上書きを
+            # 無言で消してしまう。整合性が崩れた状態（マイルストーンの締切変更や
+            # 依存関係の追加で後から起こりうる）でも、まず現状を正しく見せる。
+            current_ms_id = r["override_milestone_id"]
+            if current_ms_id is not None and not any(i == current_ms_id for i, _n in milestone_options):
+                current_ms = next((m for m in all_milestones if m["id"] == current_ms_id), None)
+                if current_ms is not None:
+                    milestone_options.insert(0, (current_ms["id"], f'{current_ms["name"]}（要調整）'))
             ms_combo = make_fk_combo(
                 milestone_options, r["override_milestone_id"], allow_blank=True,
                 blank_label=f"（既定: {default_ms_label}）",

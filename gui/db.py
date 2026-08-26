@@ -383,6 +383,12 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_milestone(self, milestone_id):
+        row = self._conn.execute(
+            "SELECT id, name, end_date, note FROM milestones WHERE id = ?", (milestone_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
     @undoable(lambda self, name, end_date, note="": f"マイルストーン「{name}」を追加")
     def add_milestone(self, name, end_date, note=""):
         try:
@@ -1082,6 +1088,114 @@ class ProjectDatabase:
             team_id=existing["team_id"] if existing else None,
         )
         return True
+
+    # -- マイルストーン整合性の一括検査・再調整 -------------------------------------
+    #
+    # enforce_milestone_floor / cascade_milestone_to_successors は「タブ3で
+    # 上書きを編集した瞬間」にしか走らないため、次の2つの経路では不変条件
+    # （先行タスクの実効マイルストーン <= 後続タスクの実効マイルストーン）が
+    # 後から破れてしまう。
+    #
+    # 1. タブ1でマイルストーンの締切日を変え、既存の前後関係が入れ替わる
+    # 2. タブ2で、既にジョブ側でマイルストーンを設定済みのタスク間に
+    #    新しい依存関係を追加する（マイルストーンの日付は変えていない）
+    #
+    # どちらも「不変条件の判定材料（日付・依存グラフ）だけが後から変わる」
+    # ケースで、上書き自体は触られないため既存の再調整が発火しない。
+    # plan_/apply_ の2段構えにしているのは、実行前に「何がどう調整されるか」を
+    # ユーザーへ提示して確認を取るため（GUI側で確認ダイアログを出す）。
+
+    def _milestone_repair_plan_for_job(self, job, milestone_names):
+        """1ジョブ分の再調整計画。enforce_milestone_floor と同じ判定
+        （実効マイルストーンが未設定、または先行タスクの最も遅い実効
+        マイルストーンより早ければ、そこまで引き上げる）を、依存の深さ順に
+        伝播させて計算する。書き込みは一切行わない。
+
+        milestone_names: {milestone_id: 名前}。確認ダイアログで「どのマイル
+        ストーンへ変わるか」まで見せるため、日付だけでなく名前も計画に含める
+        （引き上げでは締切日だけでなくマイルストーン自体が先行タスクのものに
+        差し替わるので、名前が見えないと変更内容が伝わらない）。"""
+        wf_id = job["workflow_id"]
+        tasks = self.list_workflow_tasks(wf_id)
+        preds = self._task_predecessors_map(wf_id)
+
+        # 先行タスクが必ず先に確定するよう、依存の深さ順に処理する
+        # （gui/node_canvas.py の compute_task_depths と同じ考え方。db.pyは
+        # Qt非依存に保つため、共有せずここに小さく持つ）。
+        depth = {}
+
+        def calc_depth(tid, path):
+            if tid in depth:
+                return depth[tid]
+            if tid in path:  # 循環がある場合の保険（通常はキャンバス側で防止済み）
+                return 0
+            ps = preds.get(tid, [])
+            depth[tid] = max((calc_depth(p, path | {tid}) for p in ps), default=-1) + 1
+            return depth[tid]
+
+        for t in tasks:
+            calc_depth(t["id"], set())
+
+        effective = {}
+        for t in tasks:
+            ms = self.effective_milestone(job["id"], t["id"])
+            effective[t["id"]] = (ms["end_date"], ms["milestone_id"]) if ms else None
+
+        plan = []
+        for t in sorted(tasks, key=lambda t: depth[t["id"]]):
+            tid = t["id"]
+            floor = None
+            for p in preds.get(tid, []):
+                pv = effective.get(p)
+                if pv is not None and (floor is None or pv[0] > floor[0]):
+                    floor = pv
+            if floor is None:
+                continue
+            current = effective.get(tid)
+            if current is not None and current[0] >= floor[0]:
+                continue
+            plan.append({
+                "job_id": job["id"], "job_name": job["name"],
+                "workflow_task_id": tid, "task_name": t["name"],
+                "from_end_date": current[0] if current else None,
+                "from_milestone_id": current[1] if current else None,
+                "from_milestone_name": milestone_names.get(current[1]) if current else None,
+                "to_end_date": floor[0], "to_milestone_id": floor[1],
+                "to_milestone_name": milestone_names.get(floor[1]),
+            })
+            # 引き上げた結果をさらに後続へ伝播させる（cascade相当）
+            effective[tid] = floor
+        return plan
+
+    def plan_milestone_consistency_repair(self):
+        """全ジョブを検査し、先行タスクより早い締切のマイルストーンが設定されて
+        いるタスクの再調整計画を返す（書き込みは行わない）。空リストなら
+        整合しており、何もする必要がない。適用は
+        apply_milestone_consistency_repair(plan)。"""
+        milestone_names = {m["id"]: m["name"] for m in self.list_milestones()}
+        plan = []
+        for job in self.list_jobs():
+            plan.extend(self._milestone_repair_plan_for_job(job, milestone_names))
+        return plan
+
+    @undoable("マイルストーンの整合性を再調整")
+    def apply_milestone_consistency_repair(self, plan):
+        """plan_milestone_consistency_repair() が返した計画をそのまま適用する。
+        計画と適用を分けているため、確認ダイアログに出した内容と実際に適用される
+        内容が食い違うことはない。"""
+        for item in plan:
+            existing = self._conn.execute(
+                "SELECT is_active, override_days, team_id FROM job_task_overrides "
+                "WHERE job_id = ? AND workflow_task_id = ?",
+                (item["job_id"], item["workflow_task_id"]),
+            ).fetchone()
+            self.upsert_job_task_override(
+                item["job_id"], item["workflow_task_id"],
+                is_active=bool(existing["is_active"]) if existing else True,
+                override_days=existing["override_days"] if existing else None,
+                milestone_id=item["to_milestone_id"],
+                team_id=existing["team_id"] if existing else None,
+            )
 
     # -- job_external_dependencies ----------------------------------------------
 
