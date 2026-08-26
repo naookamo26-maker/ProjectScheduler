@@ -10,9 +10,13 @@ end-to-endで検証するスモークテスト。PySide6のQGraphicsシーン等
     pytest tests/test_gui_gantt_smoke.py -v
 """
 
+import json
+import re
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -861,17 +865,13 @@ def test_validate_for_generation_passes_minimal_project(tmp_path):
 
 def test_generate_gantt_minimal_project(tmp_path):
     db = _build_minimal_project(tmp_path / "project.pschedule")
-    md_path = tmp_path / "schedule_gantt.md"
     html_path = tmp_path / "schedule_gantt.html"
 
-    result_df = generate_gantt(
-        db, mermaid_output_path=str(md_path), plotly_output_path=str(html_path), verbose=False,
-    )
+    result_df = generate_gantt(db, plotly_output_path=str(html_path), verbose=False)
 
     assert len(result_df) == 2
-    assert md_path.exists() and md_path.stat().st_size > 0
     assert html_path.exists() and html_path.stat().st_size > 0
-    assert "デザイン" in md_path.read_text(encoding="utf-8")
+    assert "デザイン" in html_path.read_text(encoding="utf-8")
     db.close()
 
 
@@ -898,8 +898,8 @@ def test_generate_gantt_rejects_circular_dependency(tmp_path):
 def _build_tight_single_team_project(db_path, team_max_lines):
     """1チーム・独立した3ジョブ（各2日タスク1つ）・共通の厳しい締切（開始日を
     含む1週間）という構成を組み立てる。チームの同時ライン数が1のままでは
-    3タスク×2日＝6team-daysを5営業日に収められず必ずResourceOverflowErrorに
-    なるが、同時ライン数が十分（3以上）あれば並行実行でき、必ず間に合う。"""
+    3タスク×2日＝6team-daysを5営業日に収められず必ず締切を超過するが、
+    同時ライン数が十分（3以上）あれば並行実行でき、必ず間に合う。"""
     db = ProjectDatabase.create_new(str(db_path))
     db.set_project("同時ライン数変動テスト", "2026-01-05")  # 月曜（祝日等と重ならない週）
     team_id = db.add_team("チームA", team_max_lines)
@@ -911,10 +911,92 @@ def _build_tight_single_team_project(db_path, team_max_lines):
     return db, team_id
 
 
-def test_constant_low_team_capacity_overflows_tight_deadline(tmp_path):
+def test_higher_priority_job_wins_contended_capacity(tmp_path):
+    """チームのラインが競合したとき、優先度の高い（Priorityが小さい）ジョブが
+    先に日程を確保し、低いジョブが後ろへ押し出されること。
+
+    v7でリソース平準化を前進型に変えた際、逆方向Kahn順（優先度の高いものが
+    先頭）をそのまま reversed() して使っていたため、優先度の効果が完全に
+    反転していた（優先度1のジョブが最後に配置されていた）。その回帰テスト。
+
+    distribution_ratio=0.0 は「依存関係が満たされ次第すぐ着手」＝全ジョブの
+    希望日が同じ日に重なる設定であり、競合の解決順だけが結果を決める。
+    """
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    db.set_project("優先度テスト", "2026-01-05")  # 月曜
+    team_id = db.add_team("チームA", 1)  # 同時1本しか流せない
+    ms_id = db.add_milestone("マイルストーン1", "2026-06-30")
+    for name, priority in [("低優先ジョブ", 100), ("中優先ジョブ", 50), ("高優先ジョブ", 1)]:
+        wf_id = db.add_workflow(f"WF_{name}")
+        db.add_workflow_task(wf_id, "タスク", team_id, 5)
+        db.add_job(name, wf_id, ms_id, priority)
+
+    result_df = generate_gantt(db, verbose=False, distribution_ratio=0.0)
+
+    order = list(result_df.sort_values("Start_Date")["Priority"])
+    assert order == sorted(order), f"優先度の高い順に並んでいない: {order}"
+    assert (result_df["Deadline_Overrun_Days"] == 0).all()
+    db.close()
+
+
+def test_constant_low_team_capacity_reports_deadline_overrun(tmp_path):
+    """ライン数が足りず締切に間に合わない場合でも、例外にせず日程を返し、
+    間に合わない分を Deadline_Overrun_Days として報告すること。
+
+    1タスクでも入らないと結果が一切得られない（＝何がどれだけ間に合わないのか
+    すら分からない）状態を避けるための契約なので、回帰テストで固定しておく。"""
     db, _team_id = _build_tight_single_team_project(tmp_path / "project.pschedule", team_max_lines=1)
-    with pytest.raises(ResourceOverflowError):
+    result_df = generate_gantt(db, verbose=False)
+
+    assert len(result_df) == 3
+    overruns = result_df[result_df["Deadline_Overrun_Days"] > 0]
+    assert not overruns.empty
+    # 1ラインで直列に並べるため、最後のタスクは締切（金曜）を越えて翌週へずれ込む
+    assert result_df["End_Date"].max() > pd.Timestamp("2026-01-09")
+    db.close()
+
+
+def test_team_with_no_working_days_fails_with_clear_error(tmp_path):
+    """チームの稼働日が1日も無い場合は、無限ループにならず明確なエラーになること。
+
+    稼働日を1日ずつ探して進める旧実装では、この入力は
+    _advance_to_working_day が永久に回り続けて固まっていた。稼働日を事前計算
+    するようになったことで、構築時点で検出できる。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    db.set_project("稼働日なしテスト", "2026-01-05")
+    team_id = db.add_team("チームA", 1)
+    ms_id = db.add_milestone("マイルストーン1", "2026-01-09")
+    wf_id = db.add_workflow("WF")
+    db.add_workflow_task(wf_id, "タスク", team_id, 2)
+    db.add_job("ジョブ", wf_id, ms_id, 100)
+    # 事前計算するカレンダーの範囲を覆う分だけ、全社共通の休業日で塗りつぶす
+    for offset in range(-450, 460):
+        day = date(2026, 1, 5) + timedelta(days=offset)
+        db.add_holiday(day.isoformat(), None)
+
+    with pytest.raises(SchedulingError):
         generate_gantt(db, verbose=False)
+    db.close()
+
+
+def test_html_output_marks_overrun_tasks(tmp_path):
+    """締切超過タスクが、HTMLガントチャート側でも識別できる形で出力されること。
+
+    バーの枠線を赤く太くする判定はブラウザ側のJavaScriptが `overrun` を見て
+    行うため、埋め込まれるタスクデータにその値が入っていることを確認する。"""
+    db, _team_id = _build_tight_single_team_project(tmp_path / "project.pschedule", team_max_lines=1)
+    html_path = tmp_path / "schedule_gantt.html"
+    result_df = generate_gantt(db, plotly_output_path=str(html_path), verbose=False)
+
+    overruns = result_df[result_df["Deadline_Overrun_Days"] > 0]
+    assert not overruns.empty
+    html = html_path.read_text(encoding="utf-8")
+    tasks_json = re.search(r"const TASKS = (\[.*?\]);\n", html, re.S).group(1)
+    tasks = json.loads(tasks_json)
+    assert sum(1 for t in tasks if t["overrun"] > 0) == len(overruns)
+    # 超過件数の注意書きと、強調に使う色の定義がページに含まれていること
+    assert "締切に間に合わないタスク" in html
+    assert "OVERRUN_BORDER_COLOR" in html
     db.close()
 
 
@@ -928,6 +1010,7 @@ def test_team_capacity_change_relieves_overflow_from_its_start_date(tmp_path):
 
     result_df = generate_gantt(db, verbose=False)
     assert len(result_df) == 3
+    assert (result_df["Deadline_Overrun_Days"] == 0).all()
     db.close()
 
 
@@ -938,15 +1021,11 @@ def test_sample_pschedule_generates_full_schedule(tmp_path):
     db = ProjectDatabase.open_existing(str(SAMPLE_DB))
     assert validate_for_generation(db) == []
 
-    md_path = tmp_path / "schedule_gantt.md"
     html_path = tmp_path / "schedule_gantt.html"
-    result_df = generate_gantt(
-        db, mermaid_output_path=str(md_path), plotly_output_path=str(html_path), verbose=False,
-    )
+    result_df = generate_gantt(db, plotly_output_path=str(html_path), verbose=False)
 
     # data/Project_Schedule_Sample_GameDev_v22.xlsx をCLIで直接実行した場合と
     # 同じ340行になることを確認する（DB移行・GUI側の変換で欠落/重複が無いこと）。
     assert len(result_df) == 340
-    assert md_path.stat().st_size > 0
     assert html_path.stat().st_size > 0
     db.close()

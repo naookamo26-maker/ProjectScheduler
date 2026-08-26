@@ -73,8 +73,9 @@ External_Dependencies という多シート構成のExcelを手編集する方�
 - **プロジェクトファイルのドラッグ&ドロップ**: `.pschedule`ファイルを
   ウィンドウにドラッグ&ドロップして開ける。
 - **ガントチャート生成**: DBの内容から直接（Excelファイルを経由せず）
-  `project_scheduler.py` のスケジューリングエンジンを呼び出し、Mermaid
-  Markdown・インタラクティブHTMLの2形式でガントチャートを出力する。
+  `project_scheduler.py` のスケジューリングエンジンを呼び出し、インタラクティブ
+  HTML形式でガントチャートを出力する（Mermaid Markdown出力は、大規模時に
+  レンダラー側の文字数上限で表示できず実用にならないため廃止した）。
 - **サンプルデータのDB化**: 既存のExcelサンプル
   （`data/Project_Schedule_Sample_GameDev_v22.xlsx`）を一度きりの移行
   スクリプト（`scripts/migrate_excel_to_db.py`）でDB形式に変換し、GUIで

@@ -2,9 +2,9 @@
 
 リソース制約付きプロジェクトスケジューラー。プロジェクト/マイルストーン/
 チーム/ワークフロー/ジョブ定義から、チームのライン数（同時並行キャパシティ）
-と休業日を考慮した現実的なスケジュールを算出し、Mermaidガントチャート
-（Markdown）と、サーバー不要でブラウザから直接開けるインタラクティブな
-ガントチャート（単一HTMLファイル、Plotly製・チーム別色分け）として出力する。
+と休業日を考慮した現実的なスケジュールを算出し、サーバー不要でブラウザから
+直接開けるインタラクティブなガントチャート（単一HTMLファイル、Plotly製・
+チーム別色分け）として出力する。
 
 入力データの作成には2通りの方法がある:
 
@@ -29,14 +29,23 @@ python run_gui.py
 
 起動したら「ファイル → 新規プロジェクト...」で `.pschedule` ファイルを新規作成
 するか、「ファイル → プロジェクトを開く...」で既存のファイルを開く。
-サンプルデータをすぐ試したい場合は、リポジトリに同梱の
-[`data/Project_Schedule_Sample_GameDev_v22.pschedule`](data/Project_Schedule_Sample_GameDev_v22.pschedule)
-を開く（既存のExcelサンプルを`scripts/migrate_excel_to_db.py`で変換したもの）。
+サンプルデータをすぐ試したい場合は、リポジトリに同梱の以下のいずれかを開く。
+
+| ファイル | 規模 | 用途 |
+| --- | --- | --- |
+| [`data/Project_Schedule_Sample_GameDev_v22.pschedule`](data/Project_Schedule_Sample_GameDev_v22.pschedule) | 45ジョブ / 340タスク | 機能をひととおり触るための最小構成（既存のExcelサンプルを`scripts/migrate_excel_to_db.py`で変換したもの） |
+| [`data/Project_Schedule_Sample_AAA_Large.pschedule`](data/Project_Schedule_Sample_AAA_Large.pschedule) | 1,916ジョブ / 16,230タスク | AAA級タイトルの制作進行を想定した大規模サンプル。実運用規模での動作確認用 |
+
+大規模サンプルは `scripts/generate_large_sample.py` で生成している（内容は決定的なので、
+同じファイルを何度でも再生成できる）。架空タイトル「エルドラシル・サーガ：黄昏の継承者」の
+2年半の制作計画として、15チーム・10種類の制作パイプライン・6マイルストーン・
+フェーズごとのチーム増減を含む。意図的にやや過密な計画にしてあり、締切に間に合わない
+タスクが約2.5%（413件、最大113日超過）発生する——超過タスクの表示を確認できる。
 
 3タブ（基本情報設定／ワークフロー設計／ジョブ）でデータを入力し、
 `.pschedule`ファイルをウィンドウにドラッグ&ドロップして開くこともできる。
 「ファイル → ガントチャートを生成...」から出力先フォルダを選べば、CLI版と
-同じ Mermaid Markdown / インタラクティブHTML の2形式が書き出される。
+同じインタラクティブHTMLが書き出される。
 保存は明示的に行う（Ctrl+S＝上書き保存、Ctrl+Shift+S＝名前を付けて保存。
 「ファイル」メニューからも実行できる）。未保存の変更があるとタイトルバーの
 ファイル名の前に`*`が表示される。
@@ -60,7 +69,7 @@ Artifactをダウンロードすれば、Pythonのインストール無しで実
 ## 使い方（Excel + CLI）
 
 ```bash
-python project_scheduler.py [Excelファイル] -o output/schedule_gantt.md --html-output output/schedule_gantt.html
+python project_scheduler.py [Excelファイル] -o output/schedule_gantt.html
 ```
 
 引数を省略すると `data/Project_Schedule_Sample_GameDev_v22.xlsx`
@@ -68,31 +77,27 @@ python project_scheduler.py [Excelファイル] -o output/schedule_gantt.md --ht
 
 サンプルデータを実行した出力例は `samples/` 配下にコミット済み:
 
-- [`samples/schedule_gantt.md`](samples/schedule_gantt.md) — Mermaidガントチャート
-  （GitHub上でそのままレンダリングされる）
 - [`samples/schedule_gantt.html`](samples/schedule_gantt.html) — インタラクティブHTML
   ガントチャート（ダウンロードしてブラウザで開く。GitHubのファイルビューでは
   ソースのまま表示される点に注意）
 
 主なオプション:
 
-- `--html-output`: インタラクティブなHTMLガントチャートの出力先
-  （既定 `output/schedule_gantt.html`。空文字を指定すると出力しない）
-- `--tick-interval`: Mermaidガントチャートの目盛り粒度（既定 `1week`）
+- `-o` / `--output`（`--html-output` も同義）: インタラクティブHTMLガント
+  チャートの出力先（既定 `output/schedule_gantt.html`。空文字を指定すると
+  出力しない）
 - `--distribution-ratio`: 各タスクをASAP(0.0)〜ALAP(1.0)のどのあたりに
   配置するかの基準点（既定 `0.7`）
-- `--highlight-resource-adjusted`: リソース制約により前倒しされたタスクを
-  赤色（crit）表示する（Mermaid版のみ）
 
 コードから直接呼び出す場合は `run_resource_constrained_scheduler()` を使う
 （詳細は `project_scheduler.py` のdocstringを参照）。
 
-### インタラクティブHTMLガントチャート（`--html-output`）
+### インタラクティブHTMLガントチャート
 
 `output/schedule_gantt.html` はブラウザにドラッグ&ドロップするだけで開ける
 単一ファイル（Plotly.jsを埋め込み済みでオフラインでも動作、サーバー不要）。
 
-- **ワークフローごとに別々のガントチャートに分割**する（Mermaid版と同様）
+- **ワークフローごとに別々のガントチャートに分割**する
 - 各チャート内は**ジョブ単位で1行**にまとめる。ジョブ名は1回だけ表示し、
   時間的に重なるタスクがある場合だけ行（レーン）を追加する（重ならない
   タスクは同じ行に詰める）。ジョブの境界には横線を入れて区切る
@@ -101,8 +106,11 @@ python project_scheduler.py [Excelファイル] -o output/schedule_gantt.md --ht
 - 画面上部の「チームで絞り込み」パネルでチームのチェックを外すと、その
   チームのタスクを全チャートから除外し、**レーンを詰め直して行の高さも
   縮める**（凡例クリックのように非表示分の余白が残ったままにはならない）
+- **マイルストーンの締切に間に合わないタスク**は、塗りつぶし（チーム色）は
+  そのままに**枠線を赤く太く**して強調する。件数と最大超過日数はチャート上部に
+  赤い枠で併記する
 - バーにマウスを乗せるとジョブ名・タスク名・ワークフロー・優先度・開始/終了日・
-  リソース調整の有無をツールチップ表示する
+  リソース調整の有無・締切超過日数をツールチップ表示する
 - プロジェクト開始日と各マイルストーンを縦の破線で表示する（表示期間は
   全チャート共通）
 
@@ -138,11 +146,17 @@ Excelブック内の各シート:
    逆算した最遅日程（ALAP）を求め、各タスクの「動かせる幅（スラック）」を把握する。
 2. `distribution_ratio` に応じてASAP〜ALAPの間に配置の基準点を置き、
    チームの空きライン数を考慮しながら日程を確定する。基準点に空きがなければ
-   締切側へ自動的に探索範囲を広げるため、マイルストーンの締切には必ず間に合う。
-3. 土日・日本の祝日（自動計算）・`Holidays` シートで指定した休業日は
+   締切側・着手可能日側の順に探索範囲を広げる。
+3. リソースが競合した場合は、**優先度（`Priority`）の高い（値の小さい）ジョブが
+   先に日程を確保**し、低いジョブが後ろへ押し出される。
+4. 土日・日本の祝日（自動計算）・`Holidays` シートで指定した休業日は
    稼働日としてカウントしない。
-4. 循環依存やリソース不足で締切に間に合わない場合はエラーとして検出する
-   （`CircularDependencyError` / `ResourceOverflowError` 等）。
+5. 締切までに収まらないタスクがあっても**エラーにはせず**、可能な限り早い日程へ
+   配置したうえで、超過日数を結果の `Deadline_Overrun_Days` 列で返す
+   （1タスクの超過で全体の日程がまったく得られなくなるのを避けるため）。
+   GUIのガントチャートタブでも、超過件数と最大超過日数を画面上部に表示する。
+6. 循環依存（`CircularDependencyError`）や、締切を無視しても置き場所が
+   見つからない場合（`ResourceOverflowError`）はエラーとして検出する。
 
-出力されるMarkdownには、ワークフロー別・チーム別2種類のMermaidガントチャートが
-含まれ、いずれもプロジェクト開始日と各マイルストーンを◆マークで表示する。
+出力されるHTMLには、ワークフローごとのガントチャートが含まれ、いずれにも
+プロジェクト開始日と各マイルストーンを縦の破線で表示する。

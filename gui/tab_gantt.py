@@ -1,7 +1,7 @@
 """
 タブ4「ガントチャート」（段階2: QGraphicsSceneによる独自バーチャート描画）。
 
-メニューの「ガントチャートを生成」（Markdown/HTMLファイル出力）とは別に、
+メニューの「ガントチャートを生成」（HTMLファイル出力）とは別に、
 DBの現在の設定のまま素早くスケジューリング結果を確認するためのタブ。
 このタブに切り替えるたびに自動的にスケジューリングを実行し直し（refresh_choices、
 gui/main.py の _on_tab_changed から呼ばれる）、選択中の対象（ワークフロー
@@ -9,8 +9,7 @@ gui/main.py の _on_tab_changed から呼ばれる）、選択中の対象（ワ
 参照。gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、
 ホイールズーム・中ボタンパン対応）。
 
-「表示単位」で ワークフロー別／チーム別 を切り替えられる（既存のMermaid版
-HTML出力が両方の粒度でチャートを作るのと同じ考え方）。対象コンボで既に
+「表示単位」で ワークフロー別／チーム別 を切り替えられる。対象コンボで既に
 1件に絞り込まれている軸（ワークフロー別ならワークフロー、チーム別なら
 チーム）ではなく、もう一方の軸で凡例チェックボックスによる絞り込みを行う
 （既に1件に固定された軸をチェックボックスで絞り込んでも意味がないため）。
@@ -29,7 +28,7 @@ HTML出力が両方の粒度でチャートを作るのと同じ考え方）。�
 マイルストーンは縦線として表示する。
 """
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QObject, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
@@ -39,10 +38,47 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.gantt_generator import compute_schedule, validate_for_generation
+from gui.gantt_generator import (
+    build_display,
+    build_frames,
+    compute_schedule_from_frames,
+    validate_for_generation,
+)
 from gui.gantt_view import FrozenGanttPane, build_gantt_scenes
 from gui.widgets_common import NoWheelComboBox
 from project_scheduler import SchedulingError
+
+
+class _ScheduleWorker(QObject):
+    """スケジューリングをGUIスレッドの外で実行するためのワーカー。
+
+    受け取るのは build_frames() が作ったDataFrame群だけで、DB接続は持たない
+    （sqlite3の接続はスレッドをまたげないうえ、計算中にGUI側がDBを書き換えると
+    結果が壊れるため。gui/gantt_generator.py の compute_schedule_from_frames
+    を参照）。
+
+    完了したら結果を、失敗したら例外メッセージを、いずれも要求時の通し番号
+    （seq）付きでシグナルとして返す。呼び出し側は自分が最後に出した要求の
+    番号と照合し、古い要求の結果を捨てる。
+    """
+
+    finished = Signal(int, object)   # (seq, result_df)
+    failed = Signal(int, str)        # (seq, エラーメッセージ)
+
+    def __init__(self, seq, frames):
+        super().__init__()
+        self._seq = seq
+        self._frames = frames
+
+    def run(self):
+        try:
+            result_df = compute_schedule_from_frames(self._frames, verbose=False)
+        except SchedulingError as e:
+            self.failed.emit(self._seq, str(e))
+        except Exception as e:  # noqa: BLE001 - ワーカースレッドで例外を握り潰さない
+            self.failed.emit(self._seq, f"予期しないエラー: {e}")
+        else:
+            self.finished.emit(self._seq, result_df)
 
 
 class GanttTab(QWidget):
@@ -51,6 +87,17 @@ class GanttTab(QWidget):
         self.db = db
         self._result_df = None
         self._display = None
+        # 直近の計算結果がどの時点のDB内容に対応するか（db.revision の値）。
+        # 一致している間は再計算しない（タブを行き来するたびに数秒かかる
+        # スケジューリングを走らせないため）。
+        self._computed_revision = None
+        # 実行中のスケジューリング要求の通し番号。結果が返ってきたときに
+        # 「最後に出した要求のものか」を判定し、古い結果は捨てる。
+        self._request_seq = 0
+        self._thread = None
+        self._worker = None
+        # 計算中の要求に対応する表示用補助情報（結果が返ってきたら _display へ移す）
+        self._pending_display = None
         self._filter_checks = {}  # 絞り込み対象ID(文字列) -> QCheckBox
         self._filter_dim = "team"  # 凡例チェックボックスが対象にしている軸（"team" or "workflow"）
 
@@ -102,6 +149,16 @@ class GanttTab(QWidget):
         """このタブに切り替わるたびに gui/main.py の _on_tab_changed から呼ばれ、
         現在のDB内容でスケジューリングを実行し直す。
 
+        タスク数が増えるとスケジューリングは数秒かかるため、次の2つでUIが
+        固まらないようにしている。
+
+        1. 前回計算した時点からDBの内容が変わっていなければ再計算しない
+           （db.revision で判定）。タブを行き来しただけで毎回計算し直すのを防ぐ。
+        2. 計算本体はワーカースレッドで実行する（_ScheduleWorker）。DBを読むのは
+           GUIスレッド（build_frames）、計算だけ別スレッド、という分割にしている。
+           計算中も画面は操作でき、途中で内容を変えれば新しい要求が古い要求を
+           追い越す（古い結果は通し番号で判定して捨てる）。
+
         失敗した場合はダイアログを出さず、タブ内の status_label に表示するだけに
         留める。このメソッドはユーザーの明示的な操作ではなく「タブが表示される
         たび」「Undo/Redoで表示を作り直すたび」に自動的に呼ばれるため、
@@ -112,25 +169,115 @@ class GanttTab(QWidget):
         ダイアログでエラーを知らせる。"""
         errors = validate_for_generation(self.db)
         if errors:
+            self._cancel_pending_request()
             self._clear_chart_state(
                 "ガントチャートを表示できません。以下を解決してください:\n- " + "\n- ".join(errors),
                 is_error=True,
             )
             return
+
+        if self._result_df is not None and self._computed_revision == self.db.revision:
+            # 前回計算した時点から内容が変わっていないので、表示だけ作り直す。
+            self._apply_result()
+            return
+
+        # DBの読み出しはGUIスレッドで行い、DataFrameだけをワーカーへ渡す。
         try:
-            self._result_df, self._display = compute_schedule(self.db, verbose=False)
-        except SchedulingError as e:
+            frames = build_frames(self.db)
+            display = build_display(self.db)
+        except Exception as e:  # noqa: BLE001 - 未完成なデータでも落とさない
+            self._cancel_pending_request()
             self._clear_chart_state(f"スケジューリングに失敗しました: {e}", is_error=True)
             return
 
+        self._pending_display = display
+        self._request_seq += 1
+        seq = self._request_seq
+        self._start_worker(seq, frames)
+        self._set_status("スケジューリングを計算中です...")
+
+    def _start_worker(self, seq, frames):
+        """ワーカースレッドを起こしてスケジューリングを走らせる。
+
+        実行中の古いスレッドは、結果を捨てる（通し番号で判定）だけで止めずに
+        放置する。スケジューリングはDBに触れない純粋な計算なので、放置しても
+        害はなく、途中で強制終了させるより安全なため（終了は quit()/wait() を
+        shutdown() でまとめて待つ）。"""
+        thread = QThread(self)
+        worker = _ScheduleWorker(seq, frames)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_schedule_finished)
+        worker.failed.connect(self._on_schedule_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._thread = thread
+        self._worker = worker
+        thread.start()
+
+    def _cancel_pending_request(self):
+        """実行中の要求の結果を無視する（通し番号を進めるだけ）。"""
+        self._request_seq += 1
+
+    def shutdown(self):
+        """ウィンドウを閉じる際に、走っているスケジューリングの終了を待つ。
+
+        ワーカーはDBに触れないため放置しても壊れないが、QThreadが動いたまま
+        プロセスを終えるとQt側が警告を出すため、明示的に待ち合わせる。"""
+        self._cancel_pending_request()
+        thread = self._thread
+        if thread is not None:
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    thread.wait(5000)
+            except RuntimeError:
+                # 既にdeleteLater()で破棄済み（＝計算は完了している）
+                pass
+        self._thread = None
+        self._worker = None
+
+    def _on_schedule_finished(self, seq, result_df):
+        if seq != self._request_seq:
+            return  # 追い越された古い要求の結果なので捨てる
+        self._result_df = result_df
+        self._display = self._pending_display
+        self._computed_revision = self.db.revision
+        self._apply_result()
+
+    def _on_schedule_failed(self, seq, message):
+        if seq != self._request_seq:
+            return
+        self._clear_chart_state(f"スケジューリングに失敗しました: {message}", is_error=True)
+
+    def _apply_result(self):
+        """計算済みの結果でタブ内の表示（対象コンボ・凡例・チャート）を作り直す。"""
         self._refresh_group_choices()
         self._refresh_legend()
         self._refresh_chart()
+        self._set_status(*self._result_summary())
 
-        if self._result_df.empty:
-            self._set_status("有効なタスクがありません。")
-        else:
-            self._set_status(f"{len(self._result_df)}件のタスクを生成しました。")
+    def _result_summary(self):
+        """状況表示に出す文言と、エラー扱いにするかどうかを返す。
+
+        締切に間に合わないタスクはエラーではなく結果として返ってくるため
+        （project_scheduler.py の Deadline_Overrun_Days を参照）、件数を
+        ここで明示しないと気付かないまま見過ごされてしまう。"""
+        if self._result_df is None or self._result_df.empty:
+            return "有効なタスクがありません。", False
+        total = len(self._result_df)
+        overruns = self._result_df[self._result_df["Deadline_Overrun_Days"] > 0]
+        if overruns.empty:
+            return f"{total}件のタスクを生成しました。", False
+        worst = int(overruns["Deadline_Overrun_Days"].max())
+        return (
+            f"{total}件のタスクを生成しました。"
+            f"うち{len(overruns)}件がマイルストーンの締切に間に合いません（最大{worst}日超過）。"
+            f"チームのライン数・依存関係・締切を見直してください。",
+            True,
+        )
 
     def _set_status(self, message, is_error=False):
         """状況表示。エラーはダイアログを出さずここに表示するため、通常の
@@ -145,6 +292,7 @@ class GanttTab(QWidget):
         ように誤解させてしまうため。"""
         self._result_df = None
         self._display = None
+        self._computed_revision = None
         self.view.setScene(None)
         self.group_combo.blockSignals(True)
         self.group_combo.clear()

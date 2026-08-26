@@ -111,6 +111,10 @@ class ProjectDatabase:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._dirty = False
+        # 内容が変わるたびに1つ増える通し番号。「前回計算した時点から中身が
+        # 変わったか」を安価に判定するために使う（ガントチャートタブが
+        # スケジューリングをやり直すかどうかの判断など）。
+        self._revision = 0
         # GUI側から差し込む変更通知フック（タイトルバーの未保存マーク更新等に使う）。
         # 引数なしで呼ばれる callable、または None。
         self.on_change = None
@@ -127,6 +131,11 @@ class ProjectDatabase:
         # (ラベル, 操作前のDBスナップショット, 操作前のUI状態) または None。
         self._open_group = None
 
+    @property
+    def revision(self):
+        """内容が変わるたびに増える通し番号（変更検知用。値の大小に意味はない）。"""
+        return self._revision
+
     def close(self):
         self._conn.close()
 
@@ -141,6 +150,7 @@ class ProjectDatabase:
         self._conn.deserialize(blob)
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._dirty = True
+        self._revision += 1
         self._notify_change()
 
     @contextmanager
@@ -353,6 +363,7 @@ class ProjectDatabase:
             )
         self._conn.commit()
         self._dirty = True
+        self._revision += 1
         self._notify_change()
 
     def _notify_change(self):
@@ -929,6 +940,24 @@ class ProjectDatabase:
         result = [dict(r) for r in rows]
         result.sort(key=lambda r: order_index.get(r["workflow_task_id"], len(order)))
         return result
+
+    def list_all_job_task_overrides(self):
+        """全ジョブ分のタスク上書き行を1回のクエリでまとめて返す。
+
+        ガントチャート生成時に list_job_tasks_with_overrides() をジョブ数だけ
+        呼ぶと、ジョブが増えるほどクエリ数とソートが積み上がる。生成時に必要な
+        のは「既定から外れている行」だけなので、上書きテーブル側から引く。
+        ジョブのワークフローに属さない古い上書き行（ジョブのワークフローを
+        差し替えた場合などに残りうる）を拾わないよう、同じ結合条件で絞る。"""
+        rows = self._conn.execute(
+            "SELECT o.job_id, o.workflow_task_id, o.is_active, o.override_days, "
+            "o.milestone_id AS override_milestone_id, o.team_id AS override_team_id "
+            "FROM job_task_overrides o "
+            "JOIN jobs j ON j.id = o.job_id "
+            "JOIN workflow_tasks wt ON wt.id = o.workflow_task_id "
+            "  AND wt.workflow_id = j.workflow_id"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     @undoable("タスク上書きを変更")
     def upsert_job_task_override(self, job_id, workflow_task_id, is_active=True,

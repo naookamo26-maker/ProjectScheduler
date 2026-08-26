@@ -122,8 +122,20 @@ class MainWindow(QMainWindow):
         )
         self.tabs.setEnabled(False)
 
+    def _shutdown_gantt_tab(self):
+        """タブを差し替える/閉じる前に、ガントチャートタブが走らせている
+        スケジューリングの終了を待つ（gui/tab_gantt.py の shutdown を参照）。"""
+        tab = getattr(self, "tab_gantt", None)
+        if tab is not None:
+            try:
+                tab.shutdown()
+            except RuntimeError:
+                pass  # 既にQt側で破棄済み
+            self.tab_gantt = None
+
     def _rebuild_tabs(self):
         """DBオープン後、実際に機能するタブへ差し替える。"""
+        self._shutdown_gantt_tab()
         self.tabs.clear()
 
         self.tab_basic_info = BasicInfoTab(
@@ -312,19 +324,25 @@ class MainWindow(QMainWindow):
         if not out_dir:
             return
 
-        md_path = str(Path(out_dir) / "schedule_gantt.md")
         html_path = str(Path(out_dir) / "schedule_gantt.html")
         try:
-            generate_gantt(
-                self.db, mermaid_output_path=md_path, plotly_output_path=html_path, verbose=False,
-            )
+            result_df = generate_gantt(self.db, plotly_output_path=html_path, verbose=False)
         except SchedulingError as e:
             QMessageBox.critical(self, "生成に失敗しました", str(e))
             return
 
-        QMessageBox.information(
-            self, "生成完了", f"ガントチャートを書き出しました:\n\n{md_path}\n{html_path}",
-        )
+        message = f"ガントチャートを書き出しました:\n\n{html_path}"
+        overruns = result_df[result_df["Deadline_Overrun_Days"] > 0]
+        if not overruns.empty:
+            # 締切超過は例外ではなく結果として返るため、ここで明示しないと
+            # 「生成完了」だけを見て見過ごされてしまう。
+            worst = int(overruns["Deadline_Overrun_Days"].max())
+            message += (
+                f"\n\n※ マイルストーンの締切に間に合わないタスクが{len(overruns)}件あります"
+                f"（最大{worst}日超過）。該当タスクはチャート上で赤く太い枠線で"
+                f"表示しています。"
+            )
+        QMessageBox.information(self, "生成完了", message)
 
     def _open_database(self, db):
         # 旧DBを閉じるのは、旧タブを差し替え終えた後にする。タブの差し替えでは
@@ -460,6 +478,7 @@ class MainWindow(QMainWindow):
             # （フォーカスが外れた入力欄が、閉じたDBへ書き込もうとするのを防ぐ）。
             self.db.on_change = None
             self.db.undo_manager = None
+            self._shutdown_gantt_tab()
             self._build_empty_state_tabs()
             self.db.close()
         super().closeEvent(event)
