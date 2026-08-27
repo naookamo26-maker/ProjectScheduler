@@ -10,7 +10,14 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# 分類: gui（gui/resource_histogram.py はQtGuiに依存するためPySide6が要る）。
+pytestmark = pytest.mark.gui
+
+pytest.importorskip("PySide6")
 
 from gui.resource_histogram import (  # noqa: E402
     ROW_UNIT_HEIGHT,

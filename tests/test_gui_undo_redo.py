@@ -24,6 +24,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 pytest.importorskip("PySide6")
 
+# 分類: gui（PySide6 + offscreen QApplication が必要。最も重い）
+pytestmark = pytest.mark.gui
+
 from PySide6.QtCore import QDate, Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication, QDialog  # noqa: E402
 
