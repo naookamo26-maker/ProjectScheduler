@@ -6,6 +6,12 @@ if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
   exit 0
 fi
 
+# 非同期実行: セッションはこのスクリプトの完了を待たずに始まる。インストール
+# 完了前にテストを実行しようとするとpytest等が見つからない場合があるが、
+# `pytest -m core`程度ならインストールはすぐ終わるため実害は小さい
+# （トレードオフの詳細はCLAUDE.md「テストの実行範囲」参照）。
+echo '{"async": true, "asyncTimeout": 300000}'
+
 cd "$CLAUDE_PROJECT_DIR"
 
 # tests/ の "gui" マーカー（PySide6）を動かすにはQtのシステムライブラリが要る。
