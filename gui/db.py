@@ -960,13 +960,16 @@ class ProjectDatabase:
 
     @undoable(lambda self, job_id: f"ジョブ「{_entity_name(self._conn, 'jobs', job_id)}」を複製")
     def duplicate_job(self, job_id):
-        """ジョブ1件を、タスク上書き（job_task_overrides）ごと複製する。
+        """ジョブ1件を、タスク上書き（job_task_overrides）・依存先ジョブ
+        （job_dependency_links）・そのタスク単位の対応（job_external_dependencies）
+        ごと複製する。
 
         複製しないもの:
-        - 依存先ジョブ（job_dependency_links）・タスク単位の依存
-          （job_external_dependencies）。ジョブ間の依存は個々のジョブの
-          業務上の関係そのものであり、複製先が自動的に同じ相手に依存する
-          形になるのは意図しない副作用になりうるため、手動で設定し直す。
+        - このジョブに依存している側（他ジョブの job_dependency_links /
+          job_external_dependencies で depends_on_job_id がこのジョブを指す
+          もの）。複製先を他ジョブの依存先へ勝手に加えると、意図しない
+          副作用になるため（duplicate_workflow が「他ワークフローが複製元に
+          依存する側のテンプレート」を複製しないのと同じ考え方）。
 
         新しいジョブは元と同じワークフロー・既定マイルストーン・優先度・
         タグを引き継ぐ。名前は「元の名前のコピー」を既定とし、衝突する
@@ -1006,6 +1009,38 @@ class ProjectDatabase:
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (new_job_id, o["workflow_task_id"], o["is_active"], o["override_days"],
                  o["milestone_id"], o["team_id"], o["start_pin_date"]),
+            )
+
+        # 依存先ジョブ（このジョブ→他ジョブ）は、リンクIDを付け替えつつ複製する。
+        # workflow_task_id / depends_on_workflow_task_id は同じワークフロー・
+        # 同じ依存先ジョブを指したまま変わらないため、付け替えが要るのは
+        # source_link_id（複製前のリンクIDのまま残すと複製先ではなく元の
+        # ジョブのリンクを指してしまう）だけ。
+        link_id_map = {}
+        for link in self._conn.execute(
+            "SELECT id, depends_on_job_id FROM job_dependency_links WHERE job_id = ?",
+            (job_id,),
+        ).fetchall():
+            cur = self._conn.execute(
+                "INSERT INTO job_dependency_links(job_id, depends_on_job_id) VALUES (?, ?)",
+                (new_job_id, link["depends_on_job_id"]),
+            )
+            link_id_map[link["id"]] = cur.lastrowid
+
+        for d in self._conn.execute(
+            "SELECT workflow_task_id, depends_on_job_id, depends_on_workflow_task_id, "
+            "source_link_id, is_active FROM job_external_dependencies WHERE job_id = ?",
+            (job_id,),
+        ).fetchall():
+            new_source_link_id = (
+                link_id_map.get(d["source_link_id"]) if d["source_link_id"] is not None else None
+            )
+            self._conn.execute(
+                "INSERT INTO job_external_dependencies(job_id, workflow_task_id, "
+                "depends_on_job_id, depends_on_workflow_task_id, source_link_id, is_active) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (new_job_id, d["workflow_task_id"], d["depends_on_job_id"],
+                 d["depends_on_workflow_task_id"], new_source_link_id, d["is_active"]),
             )
 
         self._commit()

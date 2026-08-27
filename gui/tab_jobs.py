@@ -3,13 +3,15 @@
 
 左右2分割（QSplitter、既定50/50でユーザーがドラッグ調整可）。
 - 左: ジョブ一覧（名前・ワークフロー・既定マイルストーン・優先度・タグ）を
-  縦全体に表示。上部の絞り込み（ワークフロー／マイルストーン／タグ、いずれも
-  チェックボックスのOR条件で、3つの間はAND条件）で一時的に表示件数を絞れる
-  （データは削除されない）。「タグ」列はStretchで残り幅を吸収し、パネル幅に
-  かかわらず横スクロールなしで5列すべてが収まるようにしている。「複製」
-  ボタンで選択中のジョブをタスク上書きごと複製できる（依存先ジョブは
-  複製しない。db.duplicate_job参照）。タグは単純なカンマ区切りのテキスト
-  入力（例:「緊急, 顧客A」）で、保存時に前後の空白除去・重複排除・
+  縦全体に表示。上部の「絞り込み」は折りたたみ可能なセクション（既定は
+  折りたたみ状態。常時展開だと縦幅を取りすぎるため）で、開くとワークフロー
+  ／マイルストーン／タグの3段が現れる（いずれもチェックボックスのOR条件で、
+  3つの間はAND条件。一時的に表示件数を絞るだけでデータは削除されない）。
+  「タグ」列はStretchで残り幅を吸収し、パネル幅にかかわらず横スクロール
+  なしで5列すべてが収まるようにしている。「複製」ボタンで選択中のジョブを
+  タスク上書き・依存先ジョブごと複製できる（このジョブに依存している側は
+  複製先へ引き継がない。db.duplicate_job参照）。タグは単純なカンマ区切りの
+  テキスト入力（例:「緊急, 顧客A」）で、保存時に前後の空白除去・重複排除・
   「, 」区切りへの正規化を行う（gui/db.py の normalize_tags 参照）。
 - 右: 上下2分割（QSplitter）で、選択中ジョブのタスク上書き表と依存先ジョブを
   縦に並べる。
@@ -70,6 +72,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -120,6 +123,37 @@ def _readonly_item(text):
     item = QTableWidgetItem(text)
     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
     return item
+
+
+class _CollapsibleSection(QWidget):
+    """折りたたみ可能なセクション。見出しをクリックすると中身の表示/非表示が
+    切り替わる。ジョブ一覧の絞り込み（ワークフロー／マイルストーン／タグの
+    3段）が常時展開だと縦幅を取りすぎるため、まとめて1つに畳めるようにする。"""
+
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self._toggle_btn = QToolButton()
+        self._toggle_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._toggle_btn.setArrowType(Qt.RightArrow)
+        self._toggle_btn.setText(title)
+        self._toggle_btn.setCheckable(True)
+        self._toggle_btn.setChecked(False)
+        self._toggle_btn.setStyleSheet("QToolButton { border: none; font-weight: bold; }")
+        self._toggle_btn.clicked.connect(self._on_toggled)
+        outer.addWidget(self._toggle_btn)
+
+        self.content = QWidget()
+        self.content_layout = QVBoxLayout(self.content)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self.content.setVisible(False)  # 既定は折りたたんだ状態
+        outer.addWidget(self.content)
+
+    def _on_toggled(self, checked):
+        self._toggle_btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+        self.content.setVisible(checked)
 
 
 class _ChoiceFilterGroup(QGroupBox):
@@ -293,18 +327,22 @@ class JobsTab(QWidget):
         layout = QVBoxLayout(self)
 
         # ワークフロー／マイルストーン／タグの3つの絞り込み（いずれもOR条件の
-        # チェックボックス一覧で、3つの間はAND条件で組み合わせる）。
-        self.workflow_filter = _ChoiceFilterGroup("ワークフローで絞り込み")
+        # チェックボックス一覧で、3つの間はAND条件で組み合わせる）。常時展開だと
+        # 縦幅を取りすぎるため、まとめて1つの折りたたみセクションに収める。
+        self.filters_section = _CollapsibleSection("絞り込み")
+        layout.addWidget(self.filters_section)
+
+        self.workflow_filter = _ChoiceFilterGroup("ワークフロー")
         self.workflow_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
-        layout.addWidget(self.workflow_filter)
+        self.filters_section.content_layout.addWidget(self.workflow_filter)
 
-        self.milestone_filter = _ChoiceFilterGroup("マイルストーンで絞り込み")
+        self.milestone_filter = _ChoiceFilterGroup("マイルストーン")
         self.milestone_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
-        layout.addWidget(self.milestone_filter)
+        self.filters_section.content_layout.addWidget(self.milestone_filter)
 
-        self.tag_filter = _ChoiceFilterGroup("タグで絞り込み")
+        self.tag_filter = _ChoiceFilterGroup("タグ")
         self.tag_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
-        layout.addWidget(self.tag_filter)
+        self.filters_section.content_layout.addWidget(self.tag_filter)
 
         self.jobs_section = CrudSection(
             "ジョブ", ["ジョブ名", "ワークフロー", "既定マイルストーン", "優先度", "タグ"],

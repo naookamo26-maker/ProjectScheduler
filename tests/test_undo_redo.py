@@ -171,10 +171,12 @@ def test_job_tags_are_normalized_on_add_and_update(tmp_path):
     db.close()
 
 
-def test_duplicate_job_copies_task_overrides_but_not_dependency_links(tmp_path):
-    """ジョブの複製は、タスク上書きは引き継ぐが、依存先ジョブ（ジョブ間依存）は
-    引き継がない（複製先が意図せず同じ相手に依存する副作用を避けるため）。
-    名前の衝突は自動的に連番回避されること、Undo1回で全て元に戻ることも確認する。"""
+def test_duplicate_job_copies_task_overrides_and_outgoing_dependencies(tmp_path):
+    """ジョブの複製は、タスク上書き・依存先ジョブ（ジョブ間依存、テンプレート
+    由来のタスク対応・手動追加のタスク対応の両方）を引き継ぐ。一方、他ジョブが
+    このジョブに依存している側（依存されている側）は引き継がない（複製先へ
+    他ジョブが勝手に依存する状態になる副作用を避けるため）。名前の衝突は
+    自動的に連番回避されること、Undo1回で全て元に戻ることも確認する。"""
     db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
     manager, _ = _attach_dummy_undo_manager(db)
 
@@ -182,13 +184,20 @@ def test_duplicate_job_copies_task_overrides_but_not_dependency_links(tmp_path):
     ms = db.add_milestone("MS1", "2026-06-30")
     wf1 = db.add_workflow("WF1")
     wf2 = db.add_workflow("WF2")
-    task = db.add_workflow_task(wf1, "A", team, 1)
-    db.add_workflow_task(wf2, "X", team, 1)
+    task_a = db.add_workflow_task(wf1, "A", team, 1)
+    task_b = db.add_workflow_task(wf1, "B", team, 1)
+    task_x = db.add_workflow_task(wf2, "X", team, 1)
+    task_y = db.add_workflow_task(wf2, "Y", team, 1)
+    db.add_dependency_template(wf1, task_a, wf2, task_x)  # WF1のA -> WF2のX
 
     job_id = db.add_job("J1", wf1, ms, 50, "緊急, 顧客A")
     other_job = db.add_job("J2", wf2, None, 100)
-    db.upsert_job_task_override(job_id, task, is_active=False, override_days=3)
-    db.add_job_dependency_link(job_id, other_job)
+    third_job = db.add_job("J3", wf1, None, 100)
+    db.upsert_job_task_override(job_id, task_a, is_active=False, override_days=3)
+
+    db.add_job_dependency_link(job_id, other_job)  # テンプレート由来のタスク対応が自動生成される
+    db.add_external_dependency(job_id, task_b, other_job, task_y)  # 手動追加分
+    db.add_job_dependency_link(third_job, job_id)  # J3がJ1に依存する側（複製で引き継がれてはいけない）
 
     stack_size_before = len(manager._undo_stack)
     new_job_id = db.duplicate_job(job_id)
@@ -204,11 +213,24 @@ def test_duplicate_job_copies_task_overrides_but_not_dependency_links(tmp_path):
     assert new_job["tags"] == "緊急, 顧客A"
 
     new_overrides = db.list_job_tasks_with_overrides(new_job_id)
-    assert len(new_overrides) == 1
-    assert new_overrides[0]["is_active"] == 0
-    assert new_overrides[0]["override_days"] == 3
+    override = next(o for o in new_overrides if o["task_name"] == "A")
+    assert (override["is_active"], override["override_days"]) == (0, 3)
 
-    assert db.list_job_dependency_links(new_job_id) == []  # 依存先ジョブは複製しない
+    # 依存先ジョブ（このジョブ→他ジョブ）は複製される。
+    new_links = db.list_job_dependency_links(new_job_id)
+    assert [l["depends_on_job_id"] for l in new_links] == [other_job]
+    new_link_id = new_links[0]["id"]
+
+    new_ext_deps = {
+        (d["workflow_task_id"], d["depends_on_workflow_task_id"]): d
+        for d in db.list_external_dependencies(job_id=new_job_id)
+    }
+    assert set(new_ext_deps) == {(task_a, task_x), (task_b, task_y)}
+    assert new_ext_deps[(task_a, task_x)]["source_link_id"] == new_link_id  # 付け替え済み
+    assert new_ext_deps[(task_b, task_y)]["source_link_id"] is None  # 手動追加分はNoneのまま
+
+    # このジョブに依存している側（J3→J1）は複製先には引き継がれない。
+    assert [l["depends_on_job_id"] for l in db.list_job_dependency_links(third_job)] == [job_id]
 
     # 名前が衝突する場合は連番を付与する。
     new_job_id2 = db.duplicate_job(job_id)
@@ -218,7 +240,7 @@ def test_duplicate_job_copies_task_overrides_but_not_dependency_links(tmp_path):
     manager.undo()
     assert "J1のコピー (2)" not in {j["name"] for j in db.list_jobs()}
     manager.undo()
-    assert {j["name"] for j in db.list_jobs()} == {"J1", "J2"}
+    assert {j["name"] for j in db.list_jobs()} == {"J1", "J2", "J3"}
     db.close()
 
 
