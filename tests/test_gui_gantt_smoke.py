@@ -1351,3 +1351,78 @@ def test_colliding_pins_are_both_honoured_and_the_overbooking_is_reported(tmp_pa
     assert "ライン数を超えて" in broken.iloc[0]["Constraint_Violation"]
     assert int(broken.iloc[0]["Constraint_Violation_Days"]) == 0  # 日数の概念が無い
     db.close()
+
+
+def test_pin_conflicting_with_a_cross_job_dependency_is_reported(tmp_path):
+    """ジョブをまたぐ依存（job_external_dependencies）でも、固定日が先行ジョブの
+    完了より前なら診断されること。ワークフロー内の依存と同じ経路で検出される。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    db.set_project("ジョブ間の矛盾", "2026-01-05")
+    team_id = db.add_team("チームA", 5)
+    ms_id = db.add_milestone("マイルストーン1", "2026-06-30")
+    wf_a = db.add_workflow("WF_A")
+    wf_b = db.add_workflow("WF_B")
+    task_a = db.add_workflow_task(wf_a, "上流", team_id, 5)
+    task_b = db.add_workflow_task(wf_b, "下流", team_id, 3)
+    job_a = db.add_job("ジョブA", wf_a, ms_id, 1)
+    job_b = db.add_job("ジョブB", wf_b, ms_id, 1)
+    db.add_job_dependency_link(job_b, job_a)
+    db.add_external_dependency(job_b, task_b, job_a, task_a)
+
+    # 制約なしでは ジョブA の完了(1/12)を待つ
+    assert _rows(db)["下流"]["start"] == "2026-01-12"
+
+    db.set_task_constraint(job_b, task_b, "START_ON", "2026-01-06")
+    rows = _rows(db)
+    assert rows["下流"]["start"] == "2026-01-06"          # 固定は動かさない
+    assert "依存タスクの着手可能日(2026-01-12)" in rows["下流"]["violation"]
+    assert rows["上流"]["violation"] == ""                 # 先行側は巻き添えにしない
+    db.close()
+
+
+def test_reversed_pins_are_reported_on_the_successor(tmp_path):
+    """先行・後続の両方を固定し、後続のほうが早い日付にした場合。
+    どちらも動かさず、破れている辺（後続の固定）だけを診断する。"""
+    db, job_id, t1, t2 = _build_constraint_project(tmp_path / "p.pschedule")
+    db.set_task_constraint(job_id, t1, "START_ON", "2026-03-02")
+    db.set_task_constraint(job_id, t2, "START_ON", "2026-02-02")
+
+    rows = _rows(db)
+    assert rows["A"]["start"] == "2026-03-02"   # 先行の固定も守られる
+    assert rows["B"]["start"] == "2026-02-02"   # 後続の固定も守られる
+    assert rows["A"]["violation"] == ""
+    assert "START_ON(2026-02-02) は依存タスク" in rows["B"]["violation"]
+    db.close()
+
+
+def test_contradictory_constraints_on_one_task_are_reported(tmp_path):
+    """1つのタスクに両立しない制約（この日以降に開始せよ、かつその前に終われ）を
+    置いた場合も、保存を拒まず結果として矛盾を返すこと。"""
+    db, job_id, t1, _t2 = _build_constraint_project(tmp_path / "p.pschedule")
+    db.set_task_constraint(job_id, t1, "SNET", "2026-03-02")
+    db.set_task_constraint(job_id, t1, "FNLT", "2026-02-20")
+
+    rows = _rows(db)
+    assert rows["A"]["start"] == "2026-03-02"    # 下限（SNET）が満たされ、
+    assert "FNLT(2026-02-20) を" in rows["A"]["violation"]   # 上限の破れが報告される
+    db.close()
+
+
+def test_a_dependency_can_only_be_broken_by_a_pin(tmp_path):
+    """固定を使わない限り、依存の順序は必ず守られること。
+
+    平準化のパス2は、依存元の確定日程から求めた earliest_start を
+    探索1〜4のすべてで下限として使うため、制約をどう置いても
+    「後続が先行の完了より前に始まる」状態は作れない
+    （＝依存の破れを診断するのは START_ON の経路だけでよい）。
+    """
+    db, job_id, t1, t2 = _build_constraint_project(tmp_path / "p.pschedule")
+    # 後続を極端に前倒ししたくなる制約（SNLT/FNLT）を置いても、
+    db.set_task_constraint(job_id, t1, "SNET", "2026-03-02")
+    db.set_task_constraint(job_id, t2, "SNLT", "2026-01-06")
+    db.set_task_constraint(job_id, t2, "FNLT", "2026-01-09")
+
+    rows = _rows(db)
+    assert rows["B"]["start"] >= rows["A"]["end"]   # 依存の順序は保たれる
+    assert rows["B"]["violation"]                    # 破れたのは B 自身の制約のほう
+    db.close()
