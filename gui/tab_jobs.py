@@ -13,6 +13,9 @@
     チームは、上書き用のスピンボックス/コンボボックスの特殊表示
     （「既定（n日）」「（既定: 値）」）に統合し、専用の列は持たない。
     既定値のままの行はDBに保存しない（差分のみ保持、gui/db.py参照）。
+    ジョブ一覧のセルウィジェット（ワークフロー・マイルストーンのコンボ、
+    優先度のスピンボックス）は、**画面に見えている行の分だけ**実体化する
+    （後述の「セルウィジェットの遅延生成」）。
   - 依存先ジョブ: ツリー表示で1セクションに統合。トップレベルが依存先
     ジョブ、その子がタスク単位の対応（依存先の先行タスク→本ジョブの
     後続タスク）。別ウィンドウにすると一覧性が悪いため、ツリーをその場で
@@ -23,10 +26,30 @@
     追加・編集・削除、依存先ジョブの追加、ジョブのワークフロー再割当ての
     いずれからもこの同期が呼ばれるほか、このタブがアクティブになった際にも
     念のため呼び直す（refresh_choices参照）。
+
+## セルウィジェットの遅延生成
+
+ジョブ一覧は行数がそのままジョブ数になるため、大規模プロジェクトでは
+数千行になりうる。全行に QComboBox / QSpinBox を実体として置くと、タブを
+開くだけで行数に比例した時間ウィンドウが固まる（1,916ジョブで約19秒。
+内訳は insertRow の繰り返し7.2秒、コンボの項目追加4.4秒、
+setCellWidget 1.5秒）。そこで次の2点で行数への依存を切っている。
+
+1. 行は `setRowCount()` で一度に確保する（1行ずつ `insertRow()` すると
+   その都度ジオメトリ再計算が走り、行数の増加に対して急激に遅くなる）。
+2. セルウィジェットは**可視範囲（＋上下マージン）の行にだけ**作り、範囲外
+   へ出た行からは取り外す（`_sync_job_row_widgets`）。範囲外の行は、同じ
+   内容を読み取り専用のテキストとして表示しておく。スクロールに追従して
+   入れ替えるため、ユーザーからは常にウィジェットが並んで見える。
+
+編集中の行（セルウィジェットがフォーカスを持っている行）は、範囲外へ出ても
+取り外さない。`bind_undo_session` はフォーカスの出入りでUndo単位を開閉する
+ため、単位を開いたままウィジェットを破棄すると閉じられなくなるため。
 """
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -65,6 +88,20 @@ from gui.widgets_common import (
     set_row_id,
     unique_default_name,
 )
+
+
+# セルウィジェットを用意しておく、可視範囲の上下の余分な行数。スクロール
+# のたびに作り直す行を減らしつつ、素早くスクロールしてもテキスト表示のまま
+# の行が見えないだけの余裕を持たせる。
+_VISIBLE_ROW_MARGIN = 12
+
+# 既定マイルストーン未設定の表示（コンボの空欄と、ウィジェットが無い行の
+# テキスト表示とで文言を揃える必要があるため定数にしてある）。
+_BLANK_MILESTONE_LABEL = "（未設定）"
+
+# コンボボックスの▼やスピンボックスの▲▼のぶん、テキスト幅より少し広くする
+# （列幅は読み取り専用テキストの幅を基準に自動調整されるため）。
+_CELL_WIDGET_EXTRA_WIDTH = 34
 
 
 def _readonly_item(text):
@@ -182,6 +219,12 @@ class JobsTab(QWidget):
         self._workflow_checks = {}  # workflow_id -> QCheckBox（ジョブ一覧の絞り込み用）
         self._sort_column = 0
         self._sort_ascending = True
+        # セルウィジェットの遅延生成用（モジュール冒頭の説明を参照）
+        self._materialized_rows = set()   # 実体化済みの行番号
+        self._job_by_id = {}              # job_id -> 直近に読み込んだジョブの内容
+        self._row_by_job_id = {}          # job_id -> 行番号
+        self._workflow_options = []       # [(id, 表示名), ...]
+        self._milestone_options = []
 
         layout = QVBoxLayout(self)
 
@@ -214,6 +257,11 @@ class JobsTab(QWidget):
         # 「既定マイルストーン」列（内容の長さが最も変動する）に残り幅を吸収させ、
         # パネル幅にかかわらず横スクロールなしで4列すべてが収まるようにする。
         jobs_header.setSectionResizeMode(2, QHeaderView.Stretch)
+        # スクロールや表示領域の変化に追従して、見えている行にだけ
+        # セルウィジェットを用意する。
+        jobs_scrollbar = self.jobs_section.table.verticalScrollBar()
+        jobs_scrollbar.valueChanged.connect(self._sync_job_row_widgets)
+        jobs_scrollbar.rangeChanged.connect(lambda _min, _max: self._sync_job_row_widgets())
 
         override_group = QGroupBox("タスク上書き（選択中のジョブ）")
         override_layout = QVBoxLayout(override_group)
@@ -339,49 +387,150 @@ class JobsTab(QWidget):
 
         table = self.jobs_section.table
         table.blockSignals(True)
-        table.setRowCount(0)
-        workflow_options = [(w["id"], w["name"]) for w in self.db.list_workflows()]
-        milestone_options = [(m["id"], m["name"]) for m in self.db.list_milestones()]
-        select_row = -1
+        table.setRowCount(0)  # 既存のセルウィジェットもここで破棄される
+        self._materialized_rows.clear()
+
+        self._workflow_options = [(w["id"], w["name"]) for w in self.db.list_workflows()]
+        self._milestone_options = [(m["id"], m["name"]) for m in self.db.list_milestones()]
+        workflow_names = dict(self._workflow_options)
+        milestone_names = dict(self._milestone_options)
+
         sort_key = _JOB_SORT_KEYS[self._sort_column]
-        jobs = sorted(self.db.list_jobs(), key=sort_key, reverse=not self._sort_ascending)
-        for job in jobs:
-            if job["workflow_id"] not in visible_workflow_ids:
-                continue
-            row = table.rowCount()
-            table.insertRow(row)
+        jobs = [
+            job for job in sorted(self.db.list_jobs(), key=sort_key,
+                                   reverse=not self._sort_ascending)
+            if job["workflow_id"] in visible_workflow_ids
+        ]
+        self._job_by_id = {job["id"]: job for job in jobs}
+        self._row_by_job_id = {job["id"]: row for row, job in enumerate(jobs)}
+
+        # 1行ずつ insertRow() すると、その都度ジオメトリの再計算が走って行数の
+        # 増加に対して急激に遅くなる（1,900行で約7秒）。先に行数を確定させる。
+        table.setRowCount(len(jobs))
+        select_row = -1
+        for row, job in enumerate(jobs):
             table.setItem(row, 0, QTableWidgetItem(job["name"]))
             set_row_id(table, row, job["id"])
+            # セルウィジェットは可視範囲の行にだけ後から載せる。それ以外の行は
+            # 同じ内容を読み取り専用のテキストとして見せておく。
+            table.setItem(row, 1, _readonly_item(workflow_names.get(job["workflow_id"], "")))
+            table.setItem(row, 2, _readonly_item(
+                milestone_names.get(job["default_milestone_id"], _BLANK_MILESTONE_LABEL)))
+            table.setItem(row, 3, _readonly_item(str(job["priority"])))
             if job["id"] == select_id:
                 select_row = row
-
-            wf_combo = make_fk_combo(workflow_options, job["workflow_id"])
-            wf_combo.currentIndexChanged.connect(
-                lambda _idx, jid=job["id"]: self._on_job_field_changed(jid)
-            )
-            table.setCellWidget(row, 1, wf_combo)
-
-            ms_combo = make_fk_combo(milestone_options, job["default_milestone_id"], allow_blank=True)
-            ms_combo.currentIndexChanged.connect(
-                lambda _idx, jid=job["id"]: self._on_job_field_changed(jid)
-            )
-            table.setCellWidget(row, 2, ms_combo)
-
-            priority_spin = NoWheelSpinBox()
-            priority_spin.setRange(1, 999)
-            priority_spin.setValue(job["priority"])
-            priority_spin.valueChanged.connect(
-                lambda _val, jid=job["id"]: self._on_job_field_changed(jid)
-            )
-            bind_undo_session(priority_spin, self.db, "ジョブの優先度を変更")
-            table.setCellWidget(row, 3, priority_spin)
         table.blockSignals(False)
+
         auto_size_columns(table)
+        for column in (1, 2, 3):
+            table.setColumnWidth(column, table.columnWidth(column) + _CELL_WIDGET_EXTRA_WIDTH)
+        self._sync_job_row_widgets()
 
         if select_row >= 0:
             table.setCurrentCell(select_row, 0)
         else:
             self._on_job_selection_changed(table.currentRow(), 0, -1, -1)
+
+    # -- セルウィジェットの遅延生成（モジュール冒頭の説明を参照） -----------------------
+
+    def _visible_job_row_range(self):
+        """セルウィジェットを用意しておく行の範囲（両端を含む）を返す。
+        行が1つも無ければ空の範囲 (0, -1) を返す。"""
+        table = self.jobs_section.table
+        count = table.rowCount()
+        if count == 0:
+            return 0, -1
+        first = table.rowAt(0)
+        if first < 0:  # 先頭が余白（行が画面より少ない等）なら0行目から
+            first = 0
+        last = table.rowAt(max(0, table.viewport().height() - 1))
+        if last < 0:  # 最終行より下が余白なら最後の行まで
+            last = count - 1
+        return max(0, first - _VISIBLE_ROW_MARGIN), min(count - 1, last + _VISIBLE_ROW_MARGIN)
+
+    def _sync_job_row_widgets(self):
+        """可視範囲の行にセルウィジェットを用意し、範囲外の行からは取り外す。"""
+        first, last = self._visible_job_row_range()
+        wanted = set(range(first, last + 1))
+        for row in sorted(self._materialized_rows - wanted):
+            self._release_job_row_widgets(row)
+        for row in sorted(wanted - self._materialized_rows):
+            self._build_job_row_widgets(row)
+
+    def _build_job_row_widgets(self, row):
+        """1行分のセルウィジェット（コンボ2つとスピンボックス）を作って載せる。"""
+        table = self.jobs_section.table
+        job_id = row_id(table, row)
+        job = self._job_by_id.get(job_id)
+        if job is None:
+            return
+
+        wf_combo = make_fk_combo(self._workflow_options, job["workflow_id"])
+        wf_combo.currentIndexChanged.connect(
+            lambda _idx, jid=job_id: self._on_job_field_changed(jid)
+        )
+        table.setCellWidget(row, 1, wf_combo)
+
+        ms_combo = make_fk_combo(self._milestone_options, job["default_milestone_id"],
+                                  allow_blank=True, blank_label=_BLANK_MILESTONE_LABEL)
+        ms_combo.currentIndexChanged.connect(
+            lambda _idx, jid=job_id: self._on_job_field_changed(jid)
+        )
+        table.setCellWidget(row, 2, ms_combo)
+
+        priority_spin = NoWheelSpinBox()
+        priority_spin.setRange(1, 999)
+        priority_spin.setValue(job["priority"])
+        priority_spin.valueChanged.connect(
+            lambda _val, jid=job_id: self._on_job_field_changed(jid)
+        )
+        bind_undo_session(priority_spin, self.db, "ジョブの優先度を変更")
+        table.setCellWidget(row, 3, priority_spin)
+
+        self._materialized_rows.add(row)
+
+    def _release_job_row_widgets(self, row):
+        """1行分のセルウィジェットを取り外し、同じ内容をテキスト表示に戻す。"""
+        if self._job_row_has_focus(row):
+            # 編集中の行は残す。bind_undo_session はフォーカスの出入りでUndo単位を
+            # 開閉するため、開いたまま破棄すると単位を閉じられなくなる。
+            return
+        table = self.jobs_section.table
+        table.blockSignals(True)
+        for column, text in (
+            (1, self._cell_widget_text(row, 1)),
+            (2, self._cell_widget_text(row, 2)),
+            (3, self._cell_widget_text(row, 3)),
+        ):
+            if text is not None:
+                table.setItem(row, column, _readonly_item(text))
+            table.removeCellWidget(row, column)  # ウィジェットはここで破棄される
+        table.blockSignals(False)
+        self._materialized_rows.discard(row)
+
+    def _cell_widget_text(self, row, column):
+        """取り外す直前のセルウィジェットが表示している文字列（無ければNone）。
+
+        DBやキャッシュではなくウィジェット自身から取るのは、編集直後で
+        まだ書き戻し前という状態でも、見た目が食い違わないようにするため。"""
+        widget = self.jobs_section.table.cellWidget(row, column)
+        if widget is None:
+            return None
+        if isinstance(widget, NoWheelSpinBox):
+            return str(widget.value())
+        return widget.currentText()
+
+    def _job_row_has_focus(self, row):
+        """その行のセルウィジェット（またはその子）が入力フォーカスを持っているか。"""
+        focus = QApplication.focusWidget()
+        if focus is None:
+            return False
+        table = self.jobs_section.table
+        for column in (1, 2, 3):
+            widget = table.cellWidget(row, column)
+            if widget is not None and (widget is focus or widget.isAncestorOf(focus)):
+                return True
+        return False
 
     def _add_job(self):
         if not self.db.list_workflows():
@@ -421,21 +570,38 @@ class JobsTab(QWidget):
 
     def _write_job(self, job_id, name_override=None):
         table = self.jobs_section.table
-        for row in range(table.rowCount()):
-            if row_id(table, row) == job_id:
-                name = name_override if name_override is not None else table.item(row, 0).text()
-                workflow_id = table.cellWidget(row, 1).currentData()
-                milestone_id = table.cellWidget(row, 2).currentData()
-                priority = table.cellWidget(row, 3).value()
-                try:
-                    self.db.update_job(job_id, name, workflow_id, milestone_id, priority)
-                except DuplicateNameError as e:
-                    QMessageBox.warning(self, "変更できません", str(e))
-                    self.refresh_jobs(select_id=job_id)
-                    return
-                if job_id == self.current_job_id:
-                    self._refresh_overrides()
-                return
+        row = self._row_by_job_id.get(job_id)
+        job = self._job_by_id.get(job_id)
+        if row is None or job is None or row >= table.rowCount():
+            return
+
+        name = name_override if name_override is not None else table.item(row, 0).text()
+        # セルウィジェットは可視範囲の行にしか無い（モジュール冒頭の説明を参照）。
+        # 無い行はユーザーが今その値を編集したわけではないので、直近に読み込んだ
+        # 値をそのまま書き戻す。
+        workflow_widget = table.cellWidget(row, 1)
+        milestone_widget = table.cellWidget(row, 2)
+        priority_widget = table.cellWidget(row, 3)
+        workflow_id = (workflow_widget.currentData() if workflow_widget is not None
+                       else job["workflow_id"])
+        milestone_id = (milestone_widget.currentData() if milestone_widget is not None
+                        else job["default_milestone_id"])
+        priority = priority_widget.value() if priority_widget is not None else job["priority"]
+
+        try:
+            self.db.update_job(job_id, name, workflow_id, milestone_id, priority)
+        except DuplicateNameError as e:
+            QMessageBox.warning(self, "変更できません", str(e))
+            self.refresh_jobs(select_id=job_id)
+            return
+        # 行が可視範囲から外れて再び戻ってきたときに、古い値でウィジェットを
+        # 作り直さないようキャッシュも更新しておく。
+        self._job_by_id[job_id] = dict(
+            job, name=name, workflow_id=workflow_id,
+            default_milestone_id=milestone_id, priority=priority,
+        )
+        if job_id == self.current_job_id:
+            self._refresh_overrides()
 
     # -- タスク上書き ------------------------------------------------------------
 

@@ -57,6 +57,7 @@ python run_gui.py
 - [`docs/architecture.md`](docs/architecture.md) — アーキテクチャ
 - [`docs/db_design.md`](docs/db_design.md) — DB設計（`.pschedule`のテーブル定義）
 - [`docs/packaging.md`](docs/packaging.md) — Windows `.exe` パッケージング手順
+- [`docs/roadmap.md`](docs/roadmap.md) — 今後の検討事項（未着手の課題と設計方針の記録）
 
 ### Windows向け `.exe`
 
