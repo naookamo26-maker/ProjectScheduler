@@ -16,10 +16,15 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
-import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# 分類: scheduler（Qt非依存だがpandas/numpyが必要）。pandas未導入の環境では
+# collectごとskipし、`pytest -m core`が依存追加なしで通るようにする。
+pytestmark = pytest.mark.scheduler
+
+pd = pytest.importorskip("pandas")
 
 from gui.db import (  # noqa: E402
     DuplicateNameError,

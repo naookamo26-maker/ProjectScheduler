@@ -17,6 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from gui.db import ProjectDatabase  # noqa: E402
 from gui.undo_manager import UndoManager  # noqa: E402
 
+# 分類: core（Qt非依存・pandas非依存。pytestだけで動く）
+pytestmark = pytest.mark.core
+
 
 def _attach_dummy_undo_manager(db, ui_states=None, on_restore=None):
     """ダミーのUndoManagerをdbに接続する（Qtに依存せず、DB層のUndo/Redoの
