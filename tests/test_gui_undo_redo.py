@@ -1724,3 +1724,49 @@ def test_gantt_tab_reports_unsatisfiable_constraints_in_the_status_line(window, 
     assert is_error
     assert "日付制約を満たせません" in message
     assert "FNLT(2026-01-06)" in message
+
+
+def test_contradictory_constraint_is_flagged_where_it_is_entered(window, qapp):
+    """自己矛盾は入力だけで分かるので、ガントチャートタブまで行かせずに
+    その場（ダイアログと一覧の行）で気付けること。"""
+    from gui.tab_jobs import TaskConstraintDialog, constraint_summary, constraint_tooltip
+
+    jobs_tab = window.tab_jobs
+    team_id = window.db.add_team("チームA", 1)
+    ms_id = window.db.add_milestone("MS1", "2026-06-30")
+    wf_id = window.db.add_workflow("WF1")
+    task_id = window.db.add_workflow_task(wf_id, "タスク1", team_id, 3)
+    job_id = window.db.add_job("ジョブ1", wf_id, ms_id, 1)
+
+    window.tabs.setCurrentWidget(jobs_tab)
+    jobs_tab.refresh_jobs(select_id=job_id)
+    qapp.processEvents()
+
+    # ダイアログ: 日付を選んだ瞬間に警告が出る（OKは押せるまま）
+    dialog = TaskConstraintDialog("タスク", {"SNET": "2026-02-02"}, parent=window)
+    assert dialog.warning_label.text() == ""
+    dialog._rows["FNLT"][0].setChecked(True)
+    dialog._rows["FNLT"][1].setDate(QDate(2026, 1, 20))    # SNETより前に終われと言っている
+    assert "成立しません" in dialog.warning_label.text()
+    assert "FNLT(2026-01-20)" in dialog.warning_label.text()
+    dialog._rows["FNLT"][1].setDate(QDate(2026, 3, 20))    # 直すと消える
+    assert dialog.warning_label.text() == ""
+    dialog.deleteLater()
+
+    # 一覧の行: 保存済みの矛盾にも印が付き、理由がツールチップで読める
+    window.db.replace_task_constraints(
+        job_id, task_id, {"SNET": "2026-03-02", "FNLT": "2026-02-20"})
+    jobs_tab._refresh_overrides()
+    qapp.processEvents()
+    button = jobs_tab.override_table.cellWidget(0, 5)
+    assert button.text().startswith("⚠")
+    assert "この組み合わせは成立しません" in button.toolTip()
+
+    # 矛盾していない設定には印を付けない
+    window.db.replace_task_constraints(
+        job_id, task_id, {"SNET": "2026-02-02", "FNLT": "2026-03-02"})
+    jobs_tab._refresh_overrides()
+    qapp.processEvents()
+    assert not jobs_tab.override_table.cellWidget(0, 5).text().startswith("⚠")
+    assert constraint_summary([]) == "—"
+    assert "クリック" in constraint_tooltip([])

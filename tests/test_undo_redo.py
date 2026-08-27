@@ -885,3 +885,39 @@ def test_opening_pre_constraint_schema_adds_the_table(tmp_path):
     db.set_task_constraint(1, None, "SNET", "2026-02-02")
     assert [c["kind"] for c in db.list_task_constraints()] == ["SNET"]
     db.close()
+
+
+def test_find_constraint_contradictions_detects_only_self_contradictions(tmp_path):
+    """制約集合それ自体が成立しない組み合わせだけを検出すること。
+
+    所要日数・休業日・依存関係を一切参照しないので、スケジューラ側の判定
+    （_check_constraint_violations）と食い違いようがない。依存タスクとの
+    矛盾はここでは扱わない（日程を計算しないと分からないため）。
+    """
+    from gui.db import find_constraint_contradictions as find
+
+    assert find({}) == []
+    assert find({"SNET": "2026-02-02"}) == []
+    assert find({"SNET": "2026-02-02", "FNLT": "2026-03-02"}) == []
+    assert find({"START_ON": "2026-02-02", "SNET": "2026-02-02"}) == []
+
+    assert len(find({"SNET": "2026-03-02", "SNLT": "2026-02-20"})) == 1
+    assert len(find({"SNET": "2026-03-02", "FNLT": "2026-02-20"})) == 1
+    assert len(find({"START_ON": "2026-01-05", "SNET": "2026-02-02"})) == 1
+    assert len(find({"START_ON": "2026-03-05", "SNLT": "2026-02-02"})) == 1
+    assert len(find({"START_ON": "2026-03-05", "FNLT": "2026-03-05"})) == 1
+    # 複数同時
+    assert len(find({"SNET": "2026-03-02", "SNLT": "2026-02-20", "FNLT": "2026-02-10"})) == 2
+
+
+def test_contradictory_constraints_can_still_be_saved(tmp_path):
+    """矛盾していても保存はブロックしない。制約は「解が満たすべき条件」で
+    あって解ではないので、意図して矛盾を記録することもありうる。防ぎたいのは
+    「気付かずに設定してしまう」ことだけ。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    job, task = _build_job_with_task(db)
+
+    db.replace_task_constraints(job, task, {"SNET": "2026-03-02", "FNLT": "2026-02-20"})
+    kinds = {c["kind"]: c["date"] for c in db.list_task_constraints(job, workflow_task_id=task)}
+    assert kinds == {"SNET": "2026-03-02", "FNLT": "2026-02-20"}
+    db.close()

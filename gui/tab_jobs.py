@@ -76,6 +76,7 @@ from gui.db import (
     TASK_CONSTRAINT_LABELS,
     DuplicateNameError,
     ProjectDatabaseError,
+    find_constraint_contradictions,
 )
 from gui.widgets_common import (
     CrudSection,
@@ -113,6 +114,9 @@ _CELL_WIDGET_EXTRA_WIDTH = 34
 # 日付制約が1件も無いことを示すボタンの表示。
 _NO_CONSTRAINT_LABEL = "—"
 
+# 制約集合それ自体が成立しない場合に付ける記号（ボタン・ダイアログで共通）。
+_CONTRADICTION_MARK = "⚠"
+
 
 def _readonly_item(text):
     item = QTableWidgetItem(text)
@@ -121,11 +125,34 @@ def _readonly_item(text):
 
 
 def constraint_summary(constraints):
-    """設定済みの日付制約を、表のボタンに載る短さでまとめる。"""
+    """設定済みの日付制約を、表のボタンに載る短さでまとめる。
+
+    制約集合それ自体が成立しえない場合は先頭に警告記号を付ける。設定した
+    直後に気付けるのはここだけ——依存タスクとの矛盾は日程を計算しないと
+    分からないが、自己矛盾は入力だけで分かるので、ガントチャートタブまで
+    行かせる必要が無い。
+    """
     if not constraints:
         return _NO_CONSTRAINT_LABEL
     ordered = sorted(constraints, key=lambda c: TASK_CONSTRAINT_KINDS.index(c["kind"]))
-    return "／".join(f'{c["kind"]} {c["date"][5:]}' for c in ordered)
+    text = "／".join(f'{c["kind"]} {c["date"][5:]}' for c in ordered)
+    if find_constraint_contradictions({c["kind"]: c["date"] for c in constraints}):
+        text = f"{_CONTRADICTION_MARK} {text}"
+    return text
+
+
+def constraint_tooltip(constraints):
+    """ボタンのツールチップ。矛盾があれば理由を、無ければ設定内容を全文で出す。"""
+    if not constraints:
+        return "クリックして日付制約を設定します。"
+    issues = find_constraint_contradictions({c["kind"]: c["date"] for c in constraints})
+    lines = [f'{c["kind"]}（{TASK_CONSTRAINT_LABELS[c["kind"]]}）: {c["date"]}'
+             for c in sorted(constraints, key=lambda c: TASK_CONSTRAINT_KINDS.index(c["kind"]))]
+    if issues:
+        lines.append("")
+        lines.append(f"{_CONTRADICTION_MARK} この組み合わせは成立しません:")
+        lines.extend(f"・{i}" for i in issues)
+    return "\n".join(lines)
 
 
 class TaskConstraintDialog(QDialog):
@@ -171,6 +198,9 @@ class TaskConstraintDialog(QDialog):
             row_layout.addWidget(date_edit, 1)
             form.addRow(f"{kind}（{TASK_CONSTRAINT_LABELS[kind]}）", row)
             self._rows[kind] = (check, date_edit)
+            # 成立しない組み合わせをその場で知らせる（ブロックはしない）。
+            check.toggled.connect(self._update_warning)
+            date_edit.dateChanged.connect(self._update_warning)
 
         # ここで指定するのは日程そのものではなく「解が満たすべき条件」である、
         # という区別が伝わらないと、日程を直接入力するつもりで使われてしまう。
@@ -185,10 +215,34 @@ class TaskConstraintDialog(QDialog):
         hint.setStyleSheet("color: #6b6a66;")
         form.addRow(hint)
 
+        self.warning_label = QLabel()
+        self.warning_label.setStyleSheet("color: #b3261e;")
+        form.addRow(self.warning_label)
+        self._update_warning()
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+
+    def _update_warning(self):
+        """制約集合それ自体が成立しない場合だけ、その場で理由を出す。
+
+        依存タスクとの矛盾（先行より前に後続を固定した等）は日程を計算しないと
+        分からないためここでは扱わない——それはガントチャートタブが診断する。
+        ここで見るのは所要日数も休業日も依存関係も要らない自己矛盾だけなので、
+        スケジューラ側の判定と食い違いようがない。
+        """
+        issues = find_constraint_contradictions(self.values())
+        if not issues:
+            self.warning_label.setText("")
+            self.warning_label.setVisible(False)
+            return
+        self.warning_label.setVisible(True)
+        self.warning_label.setText(
+            f"{_CONTRADICTION_MARK} この組み合わせは成立しません（保存はできます）:\n"
+            + "\n".join(f"・{i}" for i in issues)
+        )
 
     def values(self):
         """{種別: 'YYYY-MM-DD'}。チェックが外れている種別は含まれない（＝解除）。"""
@@ -762,6 +816,12 @@ class JobsTab(QWidget):
             "ジョブ全体の日付制約..." if not job_constraints
             else f"ジョブ全体の日付制約: {constraint_summary(job_constraints)}"
         )
+        if job_constraints:
+            self.job_constraint_btn.setToolTip(constraint_tooltip(job_constraints))
+        self.job_constraint_btn.setStyleSheet(
+            "color: #b3261e;" if find_constraint_contradictions(
+                {c["kind"]: c["date"] for c in job_constraints}) else ""
+        )
 
         for r in self.db.list_job_tasks_with_overrides(self.current_job_id):
             row = table.rowCount()
@@ -834,9 +894,11 @@ class JobsTab(QWidget):
             # 日付制約は1タスクに複数（SNETとFNLTで期間を挟む等）置けるため、
             # セル内で直接編集させずダイアログに寄せる。ボタンの文字がそのまま
             # 現在の設定の要約になる。
-            constraint_btn = QPushButton(
-                constraint_summary(constraints_by_task.get(r["workflow_task_id"], []))
-            )
+            task_constraints = constraints_by_task.get(r["workflow_task_id"], [])
+            constraint_btn = QPushButton(constraint_summary(task_constraints))
+            constraint_btn.setToolTip(constraint_tooltip(task_constraints))
+            if find_constraint_contradictions({c["kind"]: c["date"] for c in task_constraints}):
+                constraint_btn.setStyleSheet("color: #b3261e;")
             constraint_btn.setFlat(True)
             constraint_btn.clicked.connect(
                 lambda _checked=False, tid=r["workflow_task_id"], name=r["task_name"]:

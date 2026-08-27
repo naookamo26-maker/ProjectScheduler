@@ -133,6 +133,54 @@ def normalize_task_constraint(kind, date_str, workflow_task_id=None):
     return kind, parsed.isoformat()
 
 
+def find_constraint_contradictions(constraints):
+    """1つのタスク（またはジョブ全体）に置かれた制約**だけ**を見て、
+    それ自体が成立しえない組み合わせを日本語のメッセージで列挙する。
+
+    constraints は {種別: 'YYYY-MM-DD'}。矛盾が無ければ空リスト。
+
+    **これはスケジュール可能かどうかの判定ではない。** ここで見るのは
+    「この制約集合は、日程を計算するまでもなく矛盾している」ケースだけで、
+    所要日数も休業日も依存関係も一切参照しない。だから
+    スケジューラ側の判定（`_check_constraint_violations`）と食い違いようが
+    なく、「入力同士を矛盾させないためのコード」——本設計が避けたかったもの
+    ——にもならない。
+
+    依存タスクとの矛盾（先行より前に後続を固定した等）は、日程を計算しないと
+    分からないため**ここでは扱わない**。それはスケジューリング実行時の診断結果
+    （`Constraint_Violation`）として報告される。
+
+    用途は警告表示のみで、保存はブロックしない。制約は「解が満たすべき条件」
+    であって解ではないので、意図して矛盾を記録することもありうる。防ぎたいのは
+    「気付かずに設定してしまう」ことだけ。
+    """
+    def when(kind):
+        value = constraints.get(kind)
+        if not value:
+            return None
+        try:
+            return date.fromisoformat(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
+    snet, snlt, fnlt, pin = when("SNET"), when("SNLT"), when("FNLT"), when("START_ON")
+    issues = []
+
+    # 終了日は exclusive（マイルストーンの締切と同じ扱い）なので、
+    # 「開始日 < 終了の上限」でなければ収まる余地がまったく無い。
+    if snet and snlt and snet > snlt:
+        issues.append(f"SNET({snet}) が SNLT({snlt}) より後です（開始できる日がありません）")
+    if snet and fnlt and snet >= fnlt:
+        issues.append(f"SNET({snet}) 以降に開始して FNLT({fnlt}) までに終えることはできません")
+    if pin and snet and pin < snet:
+        issues.append(f"START_ON({pin}) が SNET({snet}) より前です")
+    if pin and snlt and pin > snlt:
+        issues.append(f"START_ON({pin}) が SNLT({snlt}) より後です")
+    if pin and fnlt and pin >= fnlt:
+        issues.append(f"START_ON({pin}) に開始して FNLT({fnlt}) までに終えることはできません")
+    return issues
+
+
 def undoable(label):
     """ProjectDatabaseの変更系メソッドに付け、Undo/Redoの記録対象にするデコレータ。
 
