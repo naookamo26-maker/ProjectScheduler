@@ -1156,12 +1156,13 @@ def test_dependency_ref_round_trips_and_rejects_malformed_text():
         parse_dependency_ref("T_003(+2)")     # 種別が無い
 
 
-# -- 日付制約（task_constraints） -----------------------------------------------------
 
-def _build_constraint_project(db_path, team_lines=5):
+# -- 開始固定日（job_task_overrides.start_pin_date） -----------------------------------
+
+def _build_pin_project(db_path, team_lines=5):
     """A(3日) → B(2日) の2タスク・1ジョブ。開発開始日 2026-01-05 は月曜。"""
     db = ProjectDatabase.create_new(str(db_path))
-    db.set_project("制約検証", "2026-01-05")
+    db.set_project("固定日検証", "2026-01-05")
     team_id = db.add_team("チームA", team_lines)
     ms_id = db.add_milestone("マイルストーン1", "2026-06-30")
     wf_id = db.add_workflow("WF1")
@@ -1172,8 +1173,7 @@ def _build_constraint_project(db_path, team_lines=5):
     return db, job_id, t1, t2
 
 
-def _rows(db, **kwargs):
-    """{タスク名: 行} を返す（日付は 'YYYY-MM-DD' 文字列に丸めた辞書）。"""
+def _pin_rows(db, **kwargs):
     kwargs.setdefault("distribution_ratio", 0.0)
     kwargs.setdefault("auto_exclude_jp_holidays", False)
     result = compute_schedule_from_frames(build_frames(db), verbose=False, **kwargs)
@@ -1188,23 +1188,11 @@ def _rows(db, **kwargs):
     }
 
 
-def test_snet_pushes_the_task_and_its_successors_back(tmp_path):
-    db, job_id, t1, _t2 = _build_constraint_project(tmp_path / "p.pschedule")
-    assert _rows(db)["A"]["start"] == "2026-01-05"
+def test_start_pin_date_pins_the_task_to_the_given_day(tmp_path):
+    db, job_id, _t1, t2 = _build_pin_project(tmp_path / "p.pschedule")
+    db.upsert_job_task_override(job_id, t2, start_pin_date="2026-02-02")
 
-    db.set_task_constraint(job_id, t1, "SNET", "2026-01-20")
-    rows = _rows(db)
-    assert rows["A"]["start"] == "2026-01-20"
-    assert rows["B"]["start"] == "2026-01-23"   # 後続も連動して下がる
-    assert rows["A"]["violation"] == ""
-    db.close()
-
-
-def test_start_on_pins_the_task_to_the_given_day(tmp_path):
-    db, job_id, _t1, t2 = _build_constraint_project(tmp_path / "p.pschedule")
-    db.set_task_constraint(job_id, t2, "START_ON", "2026-02-02")
-
-    rows = _rows(db)
+    rows = _pin_rows(db)
     assert rows["B"]["start"] == "2026-02-02"
     assert rows["A"]["start"] == "2026-01-05"   # 先行タスクは前倒しのまま
     assert rows["B"]["violation"] == ""
@@ -1222,7 +1210,7 @@ def test_pinned_task_reserves_a_contended_line_before_higher_priority_work(tmp_p
     wf_id = db.add_workflow("WF1")
     task = db.add_workflow_task(wf_id, "作業", team_id, 5)
     db.add_job("優先度高", wf_id, ms_id, 1)
-    low = db.add_job("優先度低", wf_id, ms_id, 500)
+    low_job = db.add_job("優先度低", wf_id, ms_id, 500)
 
     def placement():
         result = compute_schedule_from_frames(
@@ -1234,95 +1222,21 @@ def test_pinned_task_reserves_a_contended_line_before_higher_priority_work(tmp_p
     assert placement() == {"優先度高": "2026-01-05", "優先度低": "2026-01-12"}
 
     # 優先度の低いジョブを先頭に固定すると、そちらが先にラインを取る
-    db.set_task_constraint(low, task, "START_ON", "2026-01-05")
+    db.upsert_job_task_override(low_job, task, start_pin_date="2026-01-05")
     assert placement() == {"優先度低": "2026-01-05", "優先度高": "2026-01-12"}
     db.close()
 
 
-def test_unsatisfiable_constraint_is_returned_as_a_result_not_an_exception(tmp_path):
-    """満たせない制約でも日程は必ず返る。ここで例外にすると、1つの制約が
+def test_unsatisfiable_pin_is_returned_as_a_result_not_an_exception(tmp_path):
+    """満たせない固定でも日程は必ず返る。ここで例外にすると、1つの固定が
     矛盾しているだけでプロジェクト全体の日程が得られなくなる。"""
-    db, job_id, t1, _t2 = _build_constraint_project(tmp_path / "p.pschedule")
-    db.set_task_constraint(job_id, t1, "FNLT", "2026-01-06")   # 3日かかるので必ず超過
+    db, job_id, _t1, t2 = _build_pin_project(tmp_path / "p.pschedule")
+    db.upsert_job_task_override(job_id, t2, start_pin_date="2026-01-06")   # 依存より前
 
-    rows = _rows(db)
-    assert rows["A"]["start"] == "2026-01-05"        # 日程自体は返る
-    assert "FNLT(2026-01-06)" in rows["A"]["violation"]
-    assert rows["A"]["violation_days"] == 2
-    assert rows["B"]["violation"] == ""              # 他のタスクは巻き添えにならない
-    db.close()
-
-
-def test_start_on_conflicting_with_a_dependency_is_reported(tmp_path):
-    """固定日が依存タスクの完了より前でも、固定は動かさず（＝入力を書き換えず）
-    矛盾を診断結果として返すこと。"""
-    db, job_id, _t1, t2 = _build_constraint_project(tmp_path / "p.pschedule")
-    db.set_task_constraint(job_id, t2, "START_ON", "2026-01-06")
-
-    rows = _rows(db)
-    assert rows["B"]["start"] == "2026-01-06"        # 固定日は守られる
-    assert "START_ON(2026-01-06)" in rows["B"]["violation"]
-    assert "依存タスク" in rows["B"]["violation"]
-    db.close()
-
-
-def test_fnlt_tightens_the_backward_pass(tmp_path):
-    """FNLT を ALAP（締切からの逆算）に織り込まないと、制約で前倒しされたぶんの
-    スラックが過大に見積もられ、distribution_ratio による配置がずれる。"""
-    db, job_id, t1, _t2 = _build_constraint_project(tmp_path / "p.pschedule")
-    db.update_milestone(1, "マイルストーン1", "2026-02-13")
-
-    # 締切ギリギリ寄せ（ALAP方向）では、締切から逆算した位置に置かれる
-    assert _rows(db, distribution_ratio=1.0)["A"]["end"] == "2026-02-11"
-
-    # FNLT を課すとそちらが上限になる（マイルストーンより手前）
-    db.set_task_constraint(job_id, t1, "FNLT", "2026-01-30")
-    rows = _rows(db, distribution_ratio=1.0)
-    assert rows["A"]["end"] == "2026-01-30"
-    assert rows["A"]["violation"] == ""
-    db.close()
-
-
-def test_job_level_constraint_applies_to_every_task(tmp_path):
-    db, job_id, _t1, _t2 = _build_constraint_project(tmp_path / "p.pschedule")
-    db.set_task_constraint(job_id, None, "SNET", "2026-03-02")
-
-    rows = _rows(db)
-    assert rows["A"]["start"] == "2026-03-02"
-    assert rows["B"]["start"] >= "2026-03-02"
-    db.close()
-
-
-def test_task_level_constraint_overrides_the_job_level_one(tmp_path):
-    db, job_id, t1, _t2 = _build_constraint_project(tmp_path / "p.pschedule")
-    db.set_task_constraint(job_id, None, "SNET", "2026-02-02")
-    db.set_task_constraint(job_id, t1, "SNET", "2026-03-02")
-
-    rows = _rows(db)
-    assert rows["A"]["start"] == "2026-03-02"   # タスク個別が勝つ
-    db.close()
-
-
-def test_constraint_columns_exist_even_without_constraints(tmp_path):
-    """制約を1件も使っていないプロジェクトでも列は常に存在し、空であること
-    （GUI側が列の有無を分岐せずに済むように）。"""
-    db, _job_id, _t1, _t2 = _build_constraint_project(tmp_path / "p.pschedule")
-    result = compute_schedule_from_frames(build_frames(db), verbose=False)
-    assert (result["Constraint_Violation"] == "").all()
-    assert (result["Constraint_Violation_Days"] == 0).all()
-    db.close()
-
-
-def test_malformed_constraint_date_raises_instead_of_being_ignored(tmp_path):
-    """読めない日付の制約を黙って無視すると「制約が無かったこと」になり、
-    意図と違う日程が静かに出る。必ずエラーにすること。"""
-    db, _job_id, _t1, _t2 = _build_constraint_project(tmp_path / "p.pschedule")
-    frames = build_frames(db)
-    frames["task_constraints"] = pd.DataFrame([{
-        "Job_ID": "JOB_001", "Task_ID": "T_001", "Kind": "SNET", "Date": "いつか",
-    }])
-    with pytest.raises(SchedulingError):
-        compute_schedule_from_frames(frames, verbose=False)
+    rows = _pin_rows(db)
+    assert rows["B"]["start"] == "2026-01-06"        # 固定日そのものは必ず守られる
+    assert "依存タスクの着手可能日" in rows["B"]["violation"]
+    assert rows["A"]["violation"] == ""               # 他のタスクは巻き添えにならない
     db.close()
 
 
@@ -1338,8 +1252,8 @@ def test_colliding_pins_are_both_honoured_and_the_overbooking_is_reported(tmp_pa
     task = db.add_workflow_task(wf_id, "作業", team_id, 3)
     job1 = db.add_job("ジョブ1", wf_id, ms_id, 1)
     job2 = db.add_job("ジョブ2", wf_id, ms_id, 2)
-    db.set_task_constraint(job1, task, "START_ON", "2026-01-05")
-    db.set_task_constraint(job2, task, "START_ON", "2026-01-05")
+    db.upsert_job_task_override(job1, task, start_pin_date="2026-01-05")
+    db.upsert_job_task_override(job2, task, start_pin_date="2026-01-05")
 
     result = compute_schedule_from_frames(
         build_frames(db), verbose=False, auto_exclude_jp_holidays=False)
@@ -1369,60 +1283,60 @@ def test_pin_conflicting_with_a_cross_job_dependency_is_reported(tmp_path):
     db.add_job_dependency_link(job_b, job_a)
     db.add_external_dependency(job_b, task_b, job_a, task_a)
 
-    # 制約なしでは ジョブA の完了(1/12)を待つ
-    assert _rows(db)["下流"]["start"] == "2026-01-12"
+    def rows():
+        result = compute_schedule_from_frames(
+            build_frames(db), verbose=False, distribution_ratio=0.0,
+            auto_exclude_jp_holidays=False)
+        return {
+            r["Task_Name"]: (str(r["Start_Date"])[:10], r["Constraint_Violation"])
+            for _, r in result.iterrows()
+        }
 
-    db.set_task_constraint(job_b, task_b, "START_ON", "2026-01-06")
-    rows = _rows(db)
-    assert rows["下流"]["start"] == "2026-01-06"          # 固定は動かさない
-    assert "依存タスクの着手可能日(2026-01-12)" in rows["下流"]["violation"]
-    assert rows["上流"]["violation"] == ""                 # 先行側は巻き添えにしない
-    db.close()
+    # 固定なしでは ジョブA の完了(1/12)を待つ
+    assert rows()["下流"][0] == "2026-01-12"
 
-
-def test_reversed_pins_are_reported_on_the_successor(tmp_path):
-    """先行・後続の両方を固定し、後続のほうが早い日付にした場合。
-    どちらも動かさず、破れている辺（後続の固定）だけを診断する。"""
-    db, job_id, t1, t2 = _build_constraint_project(tmp_path / "p.pschedule")
-    db.set_task_constraint(job_id, t1, "START_ON", "2026-03-02")
-    db.set_task_constraint(job_id, t2, "START_ON", "2026-02-02")
-
-    rows = _rows(db)
-    assert rows["A"]["start"] == "2026-03-02"   # 先行の固定も守られる
-    assert rows["B"]["start"] == "2026-02-02"   # 後続の固定も守られる
-    assert rows["A"]["violation"] == ""
-    assert "START_ON(2026-02-02) は依存タスク" in rows["B"]["violation"]
-    db.close()
-
-
-def test_contradictory_constraints_on_one_task_are_reported(tmp_path):
-    """1つのタスクに両立しない制約（この日以降に開始せよ、かつその前に終われ）を
-    置いた場合も、保存を拒まず結果として矛盾を返すこと。"""
-    db, job_id, t1, _t2 = _build_constraint_project(tmp_path / "p.pschedule")
-    db.set_task_constraint(job_id, t1, "SNET", "2026-03-02")
-    db.set_task_constraint(job_id, t1, "FNLT", "2026-02-20")
-
-    rows = _rows(db)
-    assert rows["A"]["start"] == "2026-03-02"    # 下限（SNET）が満たされ、
-    assert "FNLT(2026-02-20) を" in rows["A"]["violation"]   # 上限の破れが報告される
+    db.upsert_job_task_override(job_b, task_b, start_pin_date="2026-01-06")
+    result = rows()
+    assert result["下流"][0] == "2026-01-06"          # 固定は動かさない
+    assert "依存タスクの着手可能日（2026-01-12）" in result["下流"][1]
+    assert result["上流"][1] == ""                     # 先行側は巻き添えにしない
     db.close()
 
 
 def test_a_dependency_can_only_be_broken_by_a_pin(tmp_path):
-    """固定を使わない限り、依存の順序は必ず守られること。
+    """固定日以外の要因では、依存の順序が破れないこと。平準化のパス2は
+    依存元の確定日程から求めた下限を常に使うため、後続タスクが先行タスクの
+    完了より前に始まる状態は固定を使わない限り作れない。"""
+    db, job_id, _t1, t2 = _build_pin_project(tmp_path / "p.pschedule")
+    # 通常の平準化では、リソースに余裕がある限り依存の順序は保たれる。
+    rows = _pin_rows(db, distribution_ratio=1.0)
+    assert rows["B"]["start"] >= rows["A"]["end"]
+    assert rows["B"]["violation"] == ""
+    db.close()
 
-    平準化のパス2は、依存元の確定日程から求めた earliest_start を
-    探索1〜4のすべてで下限として使うため、制約をどう置いても
-    「後続が先行の完了より前に始まる」状態は作れない
-    （＝依存の破れを診断するのは START_ON の経路だけでよい）。
-    """
-    db, job_id, t1, t2 = _build_constraint_project(tmp_path / "p.pschedule")
-    # 後続を極端に前倒ししたくなる制約（SNLT/FNLT）を置いても、
-    db.set_task_constraint(job_id, t1, "SNET", "2026-03-02")
-    db.set_task_constraint(job_id, t2, "SNLT", "2026-01-06")
-    db.set_task_constraint(job_id, t2, "FNLT", "2026-01-09")
 
-    rows = _rows(db)
-    assert rows["B"]["start"] >= rows["A"]["end"]   # 依存の順序は保たれる
-    assert rows["B"]["violation"]                    # 破れたのは B 自身の制約のほう
+def test_start_pin_date_is_encoded_in_the_job_tasks_frame(tmp_path):
+    """build_frames() は Job_Tasks フレームの Start_Pin_Date 列に載せる
+    （task_constraints相当の別フレームは廃止済み）。"""
+    db, job_id, _t1, t2 = _build_pin_project(tmp_path / "p.pschedule")
+    db.upsert_job_task_override(job_id, t2, start_pin_date="2026-02-02")
+
+    df_jtasks = build_frames(db)["job_tasks"]
+    row = df_jtasks[df_jtasks["Task_ID"] == "T_002"].iloc[0]
+    assert row["Start_Pin_Date"] == "2026-02-02"
+    assert "task_constraints" not in build_frames(db)
+    db.close()
+
+
+def test_malformed_start_pin_date_raises_instead_of_being_ignored(tmp_path):
+    """読めない日付を黙って無視すると「固定が無かったこと」になり、意図と
+    違う日程が静かに出る。必ずエラーにすること。"""
+    db, job_id, _t1, t2 = _build_pin_project(tmp_path / "p.pschedule")
+    db.upsert_job_task_override(job_id, t2, start_pin_date="2026-02-02")
+    frames = build_frames(db)
+    frames["job_tasks"].loc[
+        frames["job_tasks"]["Task_ID"] == "T_002", "Start_Pin_Date"
+    ] = "いつか"
+    with pytest.raises(SchedulingError):
+        compute_schedule_from_frames(frames, verbose=False)
     db.close()

@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from gui.db import ProjectDatabase  # noqa: E402
+from gui.db import ProjectDatabase, ProjectDatabaseError  # noqa: E402
 from gui.undo_manager import UndoManager  # noqa: E402
 
 # 分類: core（Qt非依存・pandas非依存。pytestだけで動く）
@@ -747,7 +747,9 @@ def test_opening_pre_dependency_lag_schema_migrates_to_finish_to_start(tmp_path)
     db.close()
 
 
-# -- 日付制約（task_constraints） -----------------------------------------------------
+
+
+# -- 開始固定日（job_task_overrides.start_pin_date） -----------------------------------
 
 def _build_job_with_task(db):
     team = db.add_team("チームA", 1)
@@ -758,106 +760,56 @@ def _build_job_with_task(db):
     return job, task
 
 
-def test_task_constraint_is_stored_per_job_task_and_kind(tmp_path):
+def test_start_pin_date_is_stored_as_a_diff_only_override(tmp_path):
+    """開始固定日は job_task_overrides の他の列（override_days等）と同じ
+    「差分のみ保持」に乗る。全項目が既定に戻ると行ごと消える。"""
     db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
     job, task = _build_job_with_task(db)
 
-    db.set_task_constraint(job, task, "SNET", "2026-02-02")
-    db.set_task_constraint(job, task, "FNLT", "2026-03-02", note="外注納期")
-    db.set_task_constraint(job, None, "SNET", "2026-01-20")   # ジョブ全体
+    db.upsert_job_task_override(job, task, start_pin_date="2026-02-02")
+    row = db.list_job_tasks_with_overrides(job)[0]
+    assert row["start_pin_date"] == "2026-02-02"
 
-    by_kind = {
-        (c["workflow_task_id"], c["kind"]): (c["date"], c["note"])
-        for c in db.list_task_constraints(job)
-    }
-    assert by_kind[(task, "SNET")] == ("2026-02-02", "")
-    assert by_kind[(task, "FNLT")] == ("2026-03-02", "外注納期")
-    assert by_kind[(None, "SNET")] == ("2026-01-20", "")
-
-    # 同じ (ジョブ, タスク, 種別) は上書きされ、増えない
-    db.set_task_constraint(job, task, "SNET", "2026-02-10")
-    task_level = db.list_task_constraints(job, workflow_task_id=task)
-    assert len(task_level) == 2
-    assert next(c["date"] for c in task_level if c["kind"] == "SNET") == "2026-02-10"
-
-    # workflow_task_id=None を明示すると、ジョブ全体の制約だけが返る
-    job_level = db.list_task_constraints(job, workflow_task_id=None)
-    assert [(c["kind"], c["date"]) for c in job_level] == [("SNET", "2026-01-20")]
+    db.upsert_job_task_override(job, task, start_pin_date=None)
+    row = db.list_job_tasks_with_overrides(job)[0]
+    assert row["start_pin_date"] is None
     db.close()
 
 
-def test_task_constraint_rejects_unknown_kind_and_malformed_date(tmp_path):
-    """壊れた日付を保存できてしまうと、スケジューラ側で黙って NaT になり
-    「制約が無かったこと」になる。書き込み経路で弾くこと。"""
-    from gui.db import ProjectDatabaseError
-
-    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
-    job, task = _build_job_with_task(db)
-
-    with pytest.raises(ProjectDatabaseError):
-        db.set_task_constraint(job, task, "ASAP", "2026-02-02")
-    with pytest.raises(ProjectDatabaseError):
-        db.set_task_constraint(job, task, "SNET", "2026-13-45")
-    with pytest.raises(ProjectDatabaseError):
-        db.set_task_constraint(job, task, "SNET", "2026/02/02")
-    assert db.list_task_constraints(job) == []
-    db.close()
-
-
-def test_job_level_constraint_is_limited_to_bounds(tmp_path):
-    """ジョブ全体の制約は「配下の全タスクに同じ条件を課す」意味なので、
-    その読み方が正しい SNET / FNLT だけを許す。START_ON / SNLT を配ると
-    「すべてのタスクが同じ日に始まる」になってしまう。"""
-    from gui.db import ProjectDatabaseError
-
-    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
-    job, task = _build_job_with_task(db)
-
-    db.set_task_constraint(job, None, "SNET", "2026-02-02")
-    db.set_task_constraint(job, None, "FNLT", "2026-03-02")
-    for kind in ("START_ON", "SNLT"):
-        with pytest.raises(ProjectDatabaseError):
-            db.set_task_constraint(job, None, kind, "2026-02-02")
-        # タスク単位なら同じ種別が設定できる
-        db.set_task_constraint(job, task, kind, "2026-02-02")
-    db.close()
-
-
-def test_replace_task_constraints_is_a_single_undo_step(tmp_path):
-    """編集ダイアログのOKは1回のUndoで元に戻ること（種別ごとに set/clear を
-    呼ぶと最大4段のUndoに割れてしまう）。"""
+def test_start_pin_date_change_is_undoable(tmp_path):
     db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
     manager, _ = _attach_dummy_undo_manager(db)
     job, task = _build_job_with_task(db)
-    db.set_task_constraint(job, task, "SNET", "2026-02-02")
 
-    stack_before = len(manager._undo_stack)
-    db.replace_task_constraints(job, task, {"FNLT": "2026-03-02", "START_ON": "2026-02-16"})
-    assert len(manager._undo_stack) == stack_before + 1
-
-    kinds = {c["kind"]: c["date"] for c in db.list_task_constraints(job, workflow_task_id=task)}
-    assert kinds == {"FNLT": "2026-03-02", "START_ON": "2026-02-16"}  # SNETは解除された
+    db.upsert_job_task_override(job, task, start_pin_date="2026-02-02")
+    assert db.list_job_tasks_with_overrides(job)[0]["start_pin_date"] == "2026-02-02"
 
     manager.undo()
-    kinds = {c["kind"]: c["date"] for c in db.list_task_constraints(job, workflow_task_id=task)}
-    assert kinds == {"SNET": "2026-02-02"}
+    rows = db.list_job_tasks_with_overrides(job)
+    assert rows[0]["start_pin_date"] is None
     db.close()
 
 
-def test_deleting_a_job_removes_its_constraints(tmp_path):
+def test_start_pin_date_rejects_malformed_value(tmp_path):
+    """壊れた日付を保存できてしまうと、スケジューラ側で黙って NaT になり
+    「固定が無かったこと」になる。書き込み経路で弾くこと。"""
     db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
     job, task = _build_job_with_task(db)
-    db.set_task_constraint(job, task, "SNET", "2026-02-02")
-    db.set_task_constraint(job, None, "FNLT", "2026-03-02")
 
-    db.delete_job(job)
-    assert db.list_task_constraints() == []
+    with pytest.raises(ProjectDatabaseError):
+        db.upsert_job_task_override(job, task, start_pin_date="2026/02/02")
+    with pytest.raises(ProjectDatabaseError):
+        db.upsert_job_task_override(job, task, start_pin_date="2026-13-45")
+    assert db.list_job_tasks_with_overrides(job)[0]["start_pin_date"] is None
     db.close()
 
 
-def test_opening_pre_constraint_schema_adds_the_table(tmp_path):
-    """task_constraints が無い旧バージョン(v7)の.pscheduleを開いた際、
-    テーブルが追加され、制約0件のプロジェクトとして扱えること。"""
+def test_opening_pre_start_pin_schema_migrates_existing_start_on_rows(tmp_path):
+    """start_pin_date列もtask_constraintsテーブルも無い旧バージョン(v8)の
+    .pscheduleを開いた際、列が追加され、旧task_constraintsのSTART_ON行が
+    job_task_overrides.start_pin_dateへ引き継がれ、テーブル自体は削除される
+    こと（SNET/SNLT/FNLTやジョブ全体の制約は撤回した機能のデータとして
+    引き継がない）。"""
     import sqlite3
 
     path = tmp_path / "legacy.pschedule"
@@ -872,52 +824,66 @@ def test_opening_pre_constraint_schema_adds_the_table(tmp_path):
         );
         CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
         CREATE TABLE workflow_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
+        CREATE TABLE job_task_overrides (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL, workflow_task_id INTEGER NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            override_days INTEGER, milestone_id INTEGER, team_id INTEGER
+        );
+        CREATE TABLE task_constraints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL, workflow_task_id INTEGER,
+            kind TEXT NOT NULL, date TEXT NOT NULL, note TEXT NOT NULL DEFAULT ''
+        );
         """
     )
-    conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '7')")
+    conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '8')")
     conn.execute("INSERT INTO project(id, project_name, start_date) VALUES (1, '', '')")
     conn.execute("INSERT INTO jobs(name) VALUES ('ジョブ1')")
+    conn.execute("INSERT INTO jobs(name) VALUES ('ジョブ2')")
+    conn.execute("INSERT INTO workflow_tasks(name) VALUES ('タスク1')")
+    conn.execute("INSERT INTO workflow_tasks(name) VALUES ('タスク2')")
+    # ジョブ1・タスク1: 既存の上書き行にSTART_ONが追記されるケース
+    conn.execute(
+        "INSERT INTO job_task_overrides(job_id, workflow_task_id, is_active, override_days) "
+        "VALUES (1, 1, 1, 5)"
+    )
+    conn.execute(
+        "INSERT INTO task_constraints(job_id, workflow_task_id, kind, date) "
+        "VALUES (1, 1, 'START_ON', '2026-02-02')"
+    )
+    # ジョブ2・タスク2: 上書き行が無い状態からSTART_ONだけで新規行ができるケース
+    conn.execute(
+        "INSERT INTO task_constraints(job_id, workflow_task_id, kind, date) "
+        "VALUES (2, 2, 'START_ON', '2026-03-03')"
+    )
+    # 撤回した機能のデータ（ジョブ全体・SNET等）は引き継がれないことも確認する
+    conn.execute(
+        "INSERT INTO task_constraints(job_id, workflow_task_id, kind, date) "
+        "VALUES (1, NULL, 'SNET', '2026-01-01')"
+    )
+    conn.execute(
+        "INSERT INTO task_constraints(job_id, workflow_task_id, kind, date) "
+        "VALUES (1, 1, 'FNLT', '2026-04-01')"
+    )
     conn.commit()
     conn.close()
 
     db = ProjectDatabase.open_existing(str(path))
-    assert db.list_task_constraints() == []
-    db.set_task_constraint(1, None, "SNET", "2026-02-02")
-    assert [c["kind"] for c in db.list_task_constraints()] == ["SNET"]
-    db.close()
-
-
-def test_find_constraint_contradictions_detects_only_self_contradictions(tmp_path):
-    """制約集合それ自体が成立しない組み合わせだけを検出すること。
-
-    所要日数・休業日・依存関係を一切参照しないので、スケジューラ側の判定
-    （_check_constraint_violations）と食い違いようがない。依存タスクとの
-    矛盾はここでは扱わない（日程を計算しないと分からないため）。
-    """
-    from gui.db import find_constraint_contradictions as find
-
-    assert find({}) == []
-    assert find({"SNET": "2026-02-02"}) == []
-    assert find({"SNET": "2026-02-02", "FNLT": "2026-03-02"}) == []
-    assert find({"START_ON": "2026-02-02", "SNET": "2026-02-02"}) == []
-
-    assert len(find({"SNET": "2026-03-02", "SNLT": "2026-02-20"})) == 1
-    assert len(find({"SNET": "2026-03-02", "FNLT": "2026-02-20"})) == 1
-    assert len(find({"START_ON": "2026-01-05", "SNET": "2026-02-02"})) == 1
-    assert len(find({"START_ON": "2026-03-05", "SNLT": "2026-02-02"})) == 1
-    assert len(find({"START_ON": "2026-03-05", "FNLT": "2026-03-05"})) == 1
-    # 複数同時
-    assert len(find({"SNET": "2026-03-02", "SNLT": "2026-02-20", "FNLT": "2026-02-10"})) == 2
-
-
-def test_contradictory_constraints_can_still_be_saved(tmp_path):
-    """矛盾していても保存はブロックしない。制約は「解が満たすべき条件」で
-    あって解ではないので、意図して矛盾を記録することもありうる。防ぎたいのは
-    「気付かずに設定してしまう」ことだけ。"""
-    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
-    job, task = _build_job_with_task(db)
-
-    db.replace_task_constraints(job, task, {"SNET": "2026-03-02", "FNLT": "2026-02-20"})
-    kinds = {c["kind"]: c["date"] for c in db.list_task_constraints(job, workflow_task_id=task)}
-    assert kinds == {"SNET": "2026-03-02", "FNLT": "2026-02-20"}
+    # list_job_tasks_with_overrides() は jobs.workflow_id 等フル構成の
+    # スキーマを要求するため、ここでは生SQLで移行結果だけを確認する。
+    rows = {
+        (r["job_id"], r["workflow_task_id"]): (r["start_pin_date"], r["override_days"])
+        for r in db._conn.execute(
+            "SELECT job_id, workflow_task_id, start_pin_date, override_days "
+            "FROM job_task_overrides"
+        ).fetchall()
+    }
+    assert rows[(1, 1)] == ("2026-02-02", 5)   # 既存の上書きは保持される
+    assert rows[(2, 2)] == ("2026-03-03", None)
+    tables = {
+        r["name"] for r in
+        db._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    assert "task_constraints" not in tables
     db.close()

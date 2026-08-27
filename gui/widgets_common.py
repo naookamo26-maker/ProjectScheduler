@@ -7,7 +7,7 @@
 - confirm_or_block_delete: 削除前の参照整合性チェック用ダイアログ。
 """
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QDate, Qt
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -175,6 +175,56 @@ class NoWheelDateEdit(_UndoSessionMixin, QDateEdit):
             super().wheelEvent(event)
         else:
             event.ignore()
+
+
+# QDateEditには「特殊値」の概念（QAbstractSpinBoxのspecialValueText）が使える
+# が、DefaultAwareSpinBoxの0のような「実際に届く自然な最小値」が日付には無い。
+# 実務でまず使われない過去日（2000-01-01）を「未設定」の特殊値に割り当てる。
+_UNSET_DATE = QDate(2000, 1, 1)
+
+
+class OptionalDateEdit(NoWheelDateEdit):
+    """「日付を指定しない」を1列で表せるQDateEdit。DefaultAwareSpinBoxの
+    日付版——0の代わりに_UNSET_DATE（2000-01-01）を「未設定」の特殊値として
+    扱い、setSpecialValueTextで見た目を「（固定なし）」にする。
+
+    カレンダーポップアップで_UNSET_DATEまで戻るのは非現実的なので、
+    Delete/Backspaceキーで直接「未設定」に戻せるようにする（値を持つ入力欄で
+    Deleteが「クリア」を意味するのは一般的な操作感のため、追加のボタンを
+    UIに増やさずに済む）。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumDate(_UNSET_DATE)
+        self.setSpecialValueText("（固定なし）")
+        self.setCalendarPopup(True)
+        self.setDisplayFormat("yyyy-MM-dd")
+        self.setDate(_UNSET_DATE)
+        self.setToolTip("クリックしてカレンダーから日付を選択、または"
+                         "Deleteキーで固定を解除できます。")
+
+    def value(self):
+        """設定されていれば 'YYYY-MM-DD'、未設定なら None。"""
+        d = self.date()
+        return None if d == _UNSET_DATE else d.toString("yyyy-MM-dd")
+
+    def set_value(self, iso_str):
+        self.setDate(_to_qdate_or_unset(iso_str))
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.setDate(_UNSET_DATE)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+def _to_qdate_or_unset(iso_str):
+    if not iso_str:
+        return _UNSET_DATE
+    d = QDate.fromString(str(iso_str), "yyyy-MM-dd")
+    return d if d.isValid() else _UNSET_DATE
 
 
 class NoWheelListWidget(QListWidget):

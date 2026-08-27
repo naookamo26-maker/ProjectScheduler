@@ -81,104 +81,21 @@ def normalize_dependency_kind(dep_type, lag_days):
     return dep_type, lag_days
 
 
-#: 「引数が省略された」ことを None と区別するための番兵（None 自体が
-#: 「ジョブ全体」という意味を持つ引数があるため）。
-_UNSET = object()
+def _validate_start_pin_date(value):
+    """開始固定日の書式を検証し、'YYYY-MM-DD' または None に正規化する。
 
-#: タスク（またはジョブ全体）に課せる日付制約の種別。
-#: 「制約は入力、日付は出力」——タスクに開始日を直接持たせず、解が満たすべき
-#: 条件としてだけ日付を持つ（docs/architecture.md「日付制約（task_constraints）」）。
-TASK_CONSTRAINT_KINDS = ("SNET", "SNLT", "FNLT", "START_ON")
-
-#: 種別の日本語ラベル（GUI・診断メッセージで共通に使う）。
-TASK_CONSTRAINT_LABELS = {
-    "SNET": "この日以降に開始",
-    "SNLT": "この日までに開始",
-    "FNLT": "この日までに終了",
-    "START_ON": "この日に開始（固定）",
-}
-
-#: ジョブ全体（workflow_task_id が NULL）に課せる種別。
-#: ジョブ全体の制約は「配下の全タスクに同じ条件を課す」という意味で解釈する。
-#: その読み方が正しいのは下限（SNET）と上限（FNLT）だけ——「ジョブ全体を
-#: この日に開始（START_ON）」「ジョブ全体をこの日までに開始（SNLT）」は
-#: 全タスクに配ると「すべてのタスクがその日に始まる」になってしまい、
-#: 誰も意図しない意味になる。曖昧な意味を黙って実装するより、ここで断る。
-JOB_LEVEL_CONSTRAINT_KINDS = ("SNET", "FNLT")
-
-
-def normalize_task_constraint(kind, date_str, workflow_task_id=None):
-    """日付制約の種別・日付を検証し、(kind, 'YYYY-MM-DD') に正規化して返す。
-
-    日付の書式をここで検証するのは、値がそのままスケジューラへ渡り、
-    壊れた日付が `pd.to_datetime` で黙って NaT になって「制約が無かったこと」に
-    なるため（制約が静かに消えるのが最悪の壊れ方）。
+    ここで検証するのは、値がそのままスケジューラへ渡り、壊れた日付が
+    `pd.to_datetime` で黙って NaT になって「固定が無かったこと」になる
+    のを防ぐため（固定が静かに消えるのが最悪の壊れ方）。
     """
-    kind = str(kind or "").strip().upper()
-    if kind not in TASK_CONSTRAINT_KINDS:
-        raise ProjectDatabaseError(
-            f"日付制約の種別 '{kind}' は不正です（{' / '.join(TASK_CONSTRAINT_KINDS)} のいずれか）"
-        )
-    if workflow_task_id is None and kind not in JOB_LEVEL_CONSTRAINT_KINDS:
-        raise ProjectDatabaseError(
-            f"'{kind}' はジョブ全体には設定できません"
-            f"（ジョブ全体に設定できるのは {' / '.join(JOB_LEVEL_CONSTRAINT_KINDS)}）"
-        )
+    if value is None or value == "":
+        return None
     try:
-        parsed = date.fromisoformat(str(date_str).strip())
+        return date.fromisoformat(str(value).strip()).isoformat()
     except (TypeError, ValueError):
         raise ProjectDatabaseError(
-            f"日付制約の日付 '{date_str}' が不正です（YYYY-MM-DD 形式で指定してください）"
+            f"開始固定日 '{value}' が不正です（YYYY-MM-DD 形式で指定してください）"
         ) from None
-    return kind, parsed.isoformat()
-
-
-def find_constraint_contradictions(constraints):
-    """1つのタスク（またはジョブ全体）に置かれた制約**だけ**を見て、
-    それ自体が成立しえない組み合わせを日本語のメッセージで列挙する。
-
-    constraints は {種別: 'YYYY-MM-DD'}。矛盾が無ければ空リスト。
-
-    **これはスケジュール可能かどうかの判定ではない。** ここで見るのは
-    「この制約集合は、日程を計算するまでもなく矛盾している」ケースだけで、
-    所要日数も休業日も依存関係も一切参照しない。だから
-    スケジューラ側の判定（`_check_constraint_violations`）と食い違いようが
-    なく、「入力同士を矛盾させないためのコード」——本設計が避けたかったもの
-    ——にもならない。
-
-    依存タスクとの矛盾（先行より前に後続を固定した等）は、日程を計算しないと
-    分からないため**ここでは扱わない**。それはスケジューリング実行時の診断結果
-    （`Constraint_Violation`）として報告される。
-
-    用途は警告表示のみで、保存はブロックしない。制約は「解が満たすべき条件」
-    であって解ではないので、意図して矛盾を記録することもありうる。防ぎたいのは
-    「気付かずに設定してしまう」ことだけ。
-    """
-    def when(kind):
-        value = constraints.get(kind)
-        if not value:
-            return None
-        try:
-            return date.fromisoformat(str(value).strip())
-        except (TypeError, ValueError):
-            return None
-
-    snet, snlt, fnlt, pin = when("SNET"), when("SNLT"), when("FNLT"), when("START_ON")
-    issues = []
-
-    # 終了日は exclusive（マイルストーンの締切と同じ扱い）なので、
-    # 「開始日 < 終了の上限」でなければ収まる余地がまったく無い。
-    if snet and snlt and snet > snlt:
-        issues.append(f"SNET({snet}) が SNLT({snlt}) より後です（開始できる日がありません）")
-    if snet and fnlt and snet >= fnlt:
-        issues.append(f"SNET({snet}) 以降に開始して FNLT({fnlt}) までに終えることはできません")
-    if pin and snet and pin < snet:
-        issues.append(f"START_ON({pin}) が SNET({snet}) より前です")
-    if pin and snlt and pin > snlt:
-        issues.append(f"START_ON({pin}) が SNLT({snlt}) より後です")
-    if pin and fnlt and pin >= fnlt:
-        issues.append(f"START_ON({pin}) に開始して FNLT({fnlt}) までに終えることはできません")
-    return issues
 
 
 def undoable(label):
@@ -1093,7 +1010,8 @@ class ProjectDatabase:
             "o.id AS override_id, o.is_active, o.override_days, "
             "o.milestone_id AS override_milestone_id, "
             "om.name AS override_milestone_name, "
-            "o.team_id AS override_team_id, ot.name AS override_team_name "
+            "o.team_id AS override_team_id, ot.name AS override_team_name, "
+            "o.start_pin_date "
             "FROM jobs j "
             "JOIN workflow_tasks wt ON wt.workflow_id = j.workflow_id "
             "JOIN teams t ON t.id = wt.team_id "
@@ -1117,7 +1035,8 @@ class ProjectDatabase:
         差し替えた場合などに残りうる）を拾わないよう、同じ結合条件で絞る。"""
         rows = self._conn.execute(
             "SELECT o.job_id, o.workflow_task_id, o.is_active, o.override_days, "
-            "o.milestone_id AS override_milestone_id, o.team_id AS override_team_id "
+            "o.milestone_id AS override_milestone_id, o.team_id AS override_team_id, "
+            "o.start_pin_date "
             "FROM job_task_overrides o "
             "JOIN jobs j ON j.id = o.job_id "
             "JOIN workflow_tasks wt ON wt.id = o.workflow_task_id "
@@ -1127,7 +1046,9 @@ class ProjectDatabase:
 
     @undoable("タスク上書きを変更")
     def upsert_job_task_override(self, job_id, workflow_task_id, is_active=True,
-                                  override_days=None, milestone_id=None, team_id=None):
+                                  override_days=None, milestone_id=None, team_id=None,
+                                  start_pin_date=None):
+        start_pin_date = _validate_start_pin_date(start_pin_date)
         existing = self._conn.execute(
             "SELECT id FROM job_task_overrides WHERE job_id = ? AND workflow_task_id = ?",
             (job_id, workflow_task_id),
@@ -1135,14 +1056,17 @@ class ProjectDatabase:
         if existing:
             self._conn.execute(
                 "UPDATE job_task_overrides SET is_active = ?, override_days = ?, "
-                "milestone_id = ?, team_id = ? WHERE id = ?",
-                (int(is_active), override_days, milestone_id, team_id, existing["id"]),
+                "milestone_id = ?, team_id = ?, start_pin_date = ? WHERE id = ?",
+                (int(is_active), override_days, milestone_id, team_id, start_pin_date,
+                 existing["id"]),
             )
         else:
             self._conn.execute(
                 "INSERT INTO job_task_overrides(job_id, workflow_task_id, is_active, "
-                "override_days, milestone_id, team_id) VALUES (?, ?, ?, ?, ?, ?)",
-                (job_id, workflow_task_id, int(is_active), override_days, milestone_id, team_id),
+                "override_days, milestone_id, team_id, start_pin_date) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (job_id, workflow_task_id, int(is_active), override_days, milestone_id,
+                 team_id, start_pin_date),
             )
         self._commit()
 
@@ -1153,107 +1077,6 @@ class ProjectDatabase:
             "DELETE FROM job_task_overrides WHERE job_id = ? AND workflow_task_id = ?",
             (job_id, workflow_task_id),
         )
-        self._commit()
-
-    # -- task_constraints（日付制約） ---------------------------------------------
-    # 「制約は入力、日付は出力」。タスクに開始日を直接持たせると計算結果と入力が
-    # 同じ列に混ざり、依存関係・所要日数・休業日を変えた瞬間に矛盾する。日付は
-    # 「解が満たすべき条件」としてだけ持ち、矛盾（＝解が見つからないこと）は
-    # 事前の整合性維持ロジックではなく、スケジューリング実行時の診断結果として
-    # 扱う（締切超過と同じ扱い方）。そのため、このテーブルには
-    # 「入力同士を矛盾させないためのコード」が一切要らない。
-
-    def list_task_constraints(self, job_id=None, workflow_task_id=_UNSET):
-        """日付制約を返す。job_id 省略で全件。
-
-        workflow_task_id を明示した場合はその値で絞り込む（None を渡すと
-        「ジョブ全体の制約」だけを返す。省略時とは意味が違うため、既定値は
-        None ではなく専用の番兵にしてある）。
-        """
-        sql = (
-            "SELECT c.id, c.job_id, c.workflow_task_id, c.kind, c.date, c.note, "
-            "j.name AS job_name, wt.name AS task_name "
-            "FROM task_constraints c "
-            "JOIN jobs j ON j.id = c.job_id "
-            "LEFT JOIN workflow_tasks wt ON wt.id = c.workflow_task_id"
-        )
-        where, params = [], []
-        if job_id is not None:
-            where.append("c.job_id = ?")
-            params.append(job_id)
-        if workflow_task_id is not _UNSET:
-            if workflow_task_id is None:
-                where.append("c.workflow_task_id IS NULL")
-            else:
-                where.append("c.workflow_task_id = ?")
-                params.append(workflow_task_id)
-        if where:
-            sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY c.job_id, c.workflow_task_id IS NULL DESC, c.workflow_task_id, c.kind"
-        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
-
-    @undoable("日付制約を設定")
-    def set_task_constraint(self, job_id, workflow_task_id, kind, date_str, note=""):
-        """1件の制約を追加または上書きする（同じ (ジョブ, タスク, 種別) は1件だけ）。
-        workflow_task_id に None を渡すとジョブ全体への制約になる。"""
-        kind, date_str = normalize_task_constraint(kind, date_str, workflow_task_id)
-        existing = self._conn.execute(
-            "SELECT id FROM task_constraints WHERE job_id = ? AND kind = ? AND "
-            + ("workflow_task_id IS NULL" if workflow_task_id is None else "workflow_task_id = ?"),
-            (job_id, kind) if workflow_task_id is None else (job_id, kind, workflow_task_id),
-        ).fetchone()
-        if existing is not None:
-            self._conn.execute(
-                "UPDATE task_constraints SET date = ?, note = ? WHERE id = ?",
-                (date_str, note, existing["id"]),
-            )
-            self._commit()
-            return existing["id"]
-        try:
-            cur = self._conn.execute(
-                "INSERT INTO task_constraints(job_id, workflow_task_id, kind, date, note) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (job_id, workflow_task_id, kind, date_str, note),
-            )
-        except sqlite3.IntegrityError as e:
-            raise ProjectDatabaseError("この日付制約は既に存在するか、不正です") from e
-        self._commit()
-        return cur.lastrowid
-
-    @undoable("日付制約を解除")
-    def clear_task_constraint(self, job_id, workflow_task_id, kind):
-        self._conn.execute(
-            "DELETE FROM task_constraints WHERE job_id = ? AND kind = ? AND "
-            + ("workflow_task_id IS NULL" if workflow_task_id is None else "workflow_task_id = ?"),
-            (job_id, kind) if workflow_task_id is None else (job_id, kind, workflow_task_id),
-        )
-        self._commit()
-
-    @undoable("日付制約を変更")
-    def replace_task_constraints(self, job_id, workflow_task_id, constraints):
-        """1つのタスク（またはジョブ全体）の制約をまとめて差し替える。
-
-        constraints は {種別: (日付, 備考)} または {種別: 日付}。含まれない種別は
-        解除される。編集ダイアログのOKを1つのUndo単位にするための入口
-        （種別ごとに set/clear を呼ぶと4段Undoになってしまう）。
-        """
-        normalized = {}
-        for kind, value in constraints.items():
-            date_str, note = value if isinstance(value, (tuple, list)) else (value, "")
-            kind, date_str = normalize_task_constraint(kind, date_str, workflow_task_id)
-            normalized[kind] = (date_str, note)
-
-        self._conn.execute(
-            "DELETE FROM task_constraints WHERE job_id = ? AND "
-            + ("workflow_task_id IS NULL" if workflow_task_id is None else "workflow_task_id = ?"),
-            (job_id,) if workflow_task_id is None else (job_id, workflow_task_id),
-        )
-        for kind, (date_str, note) in normalized.items():
-            self._conn.execute(
-                "INSERT INTO task_constraints(job_id, workflow_task_id, kind, date, note) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (job_id, workflow_task_id, kind, date_str, note),
-            )
         self._commit()
 
     # -- マイルストーンの整合性（先行/後続タスク間） -----------------------------------

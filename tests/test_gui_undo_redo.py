@@ -1640,10 +1640,12 @@ def test_dependency_edge_is_clickable_along_the_curve(window, qapp):
     assert isinstance(scene.itemAt(anchor_point, view.transform()), AnchorItem)
 
 
-def test_task_constraint_dialog_edits_are_one_undo_step_and_show_in_the_table(window, qapp):
-    """ジョブタブの「日付制約」列がダイアログの結果を要約表示し、Undo1回で
-    元に戻ること。"""
-    from gui.tab_jobs import constraint_summary
+
+def test_start_pin_date_column_edits_the_override_and_is_undoable(window, qapp):
+    """タスク上書き表の「開始固定日」列（OptionalDateEdit）で日付を選ぶと
+    job_task_overrides.start_pin_date に反映され、Undo1回で元に戻ること。
+    Deleteキーで固定を解除できることも確認する。"""
+    from PySide6.QtCore import QDate
 
     jobs_tab = window.tab_jobs
     team_id = window.db.add_team("チームA", 1)
@@ -1657,61 +1659,50 @@ def test_task_constraint_dialog_edits_are_one_undo_step_and_show_in_the_table(wi
     qapp.processEvents()
 
     table = jobs_tab.override_table
+    pin_edit = table.cellWidget(0, 5)
+    assert pin_edit.value() is None
+    assert pin_edit.text() == "（固定なし）"
 
-    def constraint_cell_text():
-        return table.cellWidget(0, 5).text()
-
-    assert constraint_cell_text() == "—"
-
-    window.db.replace_task_constraints(
-        job_id, task_id, {"SNET": "2026-02-02", "FNLT": "2026-03-02"})
-    jobs_tab._refresh_overrides()
+    pin_edit.setDate(QDate(2026, 2, 2))
     qapp.processEvents()
-    # 要約は種別の正準順（SNET→SNLT→FNLT→START_ON）で並ぶ
-    assert constraint_cell_text() == "SNET 02-02／FNLT 03-02"
+    assert window.db.list_job_tasks_with_overrides(job_id)[0]["start_pin_date"] == "2026-02-02"
 
     window.undo_manager.undo()
     qapp.processEvents()
-    assert window.db.list_task_constraints(job_id) == []
-    assert jobs_tab.override_table.cellWidget(0, 5).text() == "—"
+    assert window.db.list_job_tasks_with_overrides(job_id)[0]["start_pin_date"] is None
+    assert jobs_tab.override_table.cellWidget(0, 5).value() is None
 
-    assert constraint_summary([]) == "—"
+    window.undo_manager.redo()
+    qapp.processEvents()
+    pin_edit = jobs_tab.override_table.cellWidget(0, 5)
+    assert pin_edit.value() == "2026-02-02"
 
-
-def test_task_constraint_dialog_offers_fewer_kinds_for_a_whole_job(window, qapp):
-    """ジョブ全体の制約は「配下の全タスクに同じ条件を課す」意味なので、
-    その読み方が成り立つ SNET / FNLT だけをダイアログに出すこと。"""
-    from gui.db import JOB_LEVEL_CONSTRAINT_KINDS, TASK_CONSTRAINT_KINDS
-    from gui.tab_jobs import TaskConstraintDialog
-
-    task_dialog = TaskConstraintDialog("タスク", {}, TASK_CONSTRAINT_KINDS, parent=window)
-    assert set(task_dialog._rows) == set(TASK_CONSTRAINT_KINDS)
-
-    job_dialog = TaskConstraintDialog("ジョブ", {}, JOB_LEVEL_CONSTRAINT_KINDS, parent=window)
-    assert set(job_dialog._rows) == {"SNET", "FNLT"}
-
-    # チェックを外した種別は values() に含まれない（＝解除される）
-    job_dialog._rows["SNET"][0].setChecked(True)
-    job_dialog._rows["SNET"][1].setDate(QDate(2026, 2, 2))
-    job_dialog._rows["FNLT"][0].setChecked(False)
-    assert job_dialog.values() == {"SNET": "2026-02-02"}
-
-    task_dialog.deleteLater()
-    job_dialog.deleteLater()
+    # Deleteキーで固定を解除できる（カレンダーを未設定の特殊値まで戻す必要が無い）。
+    # keyPressEvent()を直接呼ぶだけなのでQtの実フォーカスは動かさない——
+    # setFocus()すると bind_undo_session の Undo単位が開いたままになり、
+    # フィクスチャ側でDBを閉じた後にフォーカス喪失イベントが発火してクラッシュする。
+    from PySide6.QtCore import QEvent, Qt as QtCore_Qt
+    from PySide6.QtGui import QKeyEvent
+    pin_edit.keyPressEvent(QKeyEvent(QEvent.KeyPress, QtCore_Qt.Key_Delete, QtCore_Qt.NoModifier))
+    qapp.processEvents()
+    assert pin_edit.value() is None
 
 
-def test_gantt_tab_reports_unsatisfiable_constraints_in_the_status_line(window, qapp):
-    """満たせない制約は例外ではなく結果として返るため、状況表示で件数を
-    出さないと気付けない。"""
+def test_gantt_tab_reports_unsatisfiable_pin_in_the_status_line(window, qapp):
+    """満たせない開始固定日は例外ではなく結果として返るため、状況表示で
+    件数を出さないと気付けない。"""
     import time
 
     team_id = window.db.add_team("チームA", 1)
     ms_id = window.db.add_milestone("MS1", "2026-06-30")
     wf_id = window.db.add_workflow("WF1")
-    task_id = window.db.add_workflow_task(wf_id, "タスク1", team_id, 3)
+    task_a = window.db.add_workflow_task(wf_id, "タスクA", team_id, 3)
+    task_b = window.db.add_workflow_task(wf_id, "タスクB", team_id, 3)
+    window.db.add_task_dependency(wf_id, task_a, task_b)
     job_id = window.db.add_job("ジョブ1", wf_id, ms_id, 1)
-    window.db.set_project("制約テスト", "2026-01-05")
-    window.db.set_task_constraint(job_id, task_id, "FNLT", "2026-01-06")
+    window.db.set_project("固定日テスト", "2026-01-05")
+    # 依存元(タスクA)より前にタスクBを固定する＝矛盾
+    window.db.upsert_job_task_override(job_id, task_b, start_pin_date="2026-01-06")
 
     window.tabs.setCurrentWidget(window.tab_gantt)
     for _ in range(100):
@@ -1722,51 +1713,5 @@ def test_gantt_tab_reports_unsatisfiable_constraints_in_the_status_line(window, 
 
     message, is_error = window.tab_gantt._result_summary()
     assert is_error
-    assert "日付制約を満たせません" in message
-    assert "FNLT(2026-01-06)" in message
-
-
-def test_contradictory_constraint_is_flagged_where_it_is_entered(window, qapp):
-    """自己矛盾は入力だけで分かるので、ガントチャートタブまで行かせずに
-    その場（ダイアログと一覧の行）で気付けること。"""
-    from gui.tab_jobs import TaskConstraintDialog, constraint_summary, constraint_tooltip
-
-    jobs_tab = window.tab_jobs
-    team_id = window.db.add_team("チームA", 1)
-    ms_id = window.db.add_milestone("MS1", "2026-06-30")
-    wf_id = window.db.add_workflow("WF1")
-    task_id = window.db.add_workflow_task(wf_id, "タスク1", team_id, 3)
-    job_id = window.db.add_job("ジョブ1", wf_id, ms_id, 1)
-
-    window.tabs.setCurrentWidget(jobs_tab)
-    jobs_tab.refresh_jobs(select_id=job_id)
-    qapp.processEvents()
-
-    # ダイアログ: 日付を選んだ瞬間に警告が出る（OKは押せるまま）
-    dialog = TaskConstraintDialog("タスク", {"SNET": "2026-02-02"}, parent=window)
-    assert dialog.warning_label.text() == ""
-    dialog._rows["FNLT"][0].setChecked(True)
-    dialog._rows["FNLT"][1].setDate(QDate(2026, 1, 20))    # SNETより前に終われと言っている
-    assert "成立しません" in dialog.warning_label.text()
-    assert "FNLT(2026-01-20)" in dialog.warning_label.text()
-    dialog._rows["FNLT"][1].setDate(QDate(2026, 3, 20))    # 直すと消える
-    assert dialog.warning_label.text() == ""
-    dialog.deleteLater()
-
-    # 一覧の行: 保存済みの矛盾にも印が付き、理由がツールチップで読める
-    window.db.replace_task_constraints(
-        job_id, task_id, {"SNET": "2026-03-02", "FNLT": "2026-02-20"})
-    jobs_tab._refresh_overrides()
-    qapp.processEvents()
-    button = jobs_tab.override_table.cellWidget(0, 5)
-    assert button.text().startswith("⚠")
-    assert "この組み合わせは成立しません" in button.toolTip()
-
-    # 矛盾していない設定には印を付けない
-    window.db.replace_task_constraints(
-        job_id, task_id, {"SNET": "2026-02-02", "FNLT": "2026-03-02"})
-    jobs_tab._refresh_overrides()
-    qapp.processEvents()
-    assert not jobs_tab.override_table.cellWidget(0, 5).text().startswith("⚠")
-    assert constraint_summary([]) == "—"
-    assert "クリック" in constraint_tooltip([])
+    assert "開始固定日どおりに配置できません" in message
+    assert "依存タスクの着手可能日" in message

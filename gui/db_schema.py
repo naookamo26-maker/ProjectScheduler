@@ -16,7 +16,7 @@ CRUD本体（gui/db.py）から分離しているのは、この2つが「増え
 4. `docs/db_design.md` のテーブル一覧を追随させる。
 """
 
-SCHEMA_VERSION = "8"
+SCHEMA_VERSION = "9"
 
 _SCHEMA_SQL = """
 CREATE TABLE schema_meta (
@@ -103,6 +103,7 @@ CREATE TABLE job_task_overrides (
     override_days INTEGER,
     milestone_id INTEGER REFERENCES milestones(id) ON DELETE SET NULL,
     team_id INTEGER REFERENCES teams(id) ON DELETE SET NULL,
+    start_pin_date TEXT,
     UNIQUE(job_id, workflow_task_id)
 );
 
@@ -124,21 +125,6 @@ CREATE TABLE job_external_dependencies (
     is_active INTEGER NOT NULL DEFAULT 1,
     UNIQUE(job_id, workflow_task_id, depends_on_job_id, depends_on_workflow_task_id)
 );
-
-CREATE TABLE task_constraints (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id           INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    workflow_task_id INTEGER REFERENCES workflow_tasks(id) ON DELETE CASCADE,
-    kind TEXT NOT NULL CHECK (kind IN ('SNET', 'SNLT', 'FNLT', 'START_ON')),
-    date TEXT NOT NULL,
-    note TEXT NOT NULL DEFAULT '',
-    UNIQUE(job_id, workflow_task_id, kind)
-);
--- SQLiteのUNIQUEはNULL同士を「異なる値」として扱うため、上のUNIQUEだけでは
--- ジョブ全体の制約（workflow_task_id IS NULL）の重複を防げない。holidays の
--- ux_holidays_team と同じく、部分インデックスで補う。
-CREATE UNIQUE INDEX ux_task_constraints_job ON task_constraints(job_id, kind)
-    WHERE workflow_task_id IS NULL;
 
 CREATE TABLE workflow_dependency_templates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -288,6 +274,60 @@ def migrate(conn):
                 "WHERE workflow_task_id IS NULL"
             )
         version = "8"
+
+    if version == "8":
+        # v9: 日付制約(task_constraints)を SNET/SNLT/FNLT ごと廃止し、
+        # START_ON だけを job_task_overrides.start_pin_date として残す。
+        #
+        # 経緯: マイルストーン単位で SNET/SNLT/FNLT を一括設定するテンプレート
+        # 機構を検討したが、概念（テンプレート×実効マイルストーンの解決×
+        # 優先順位）が実装コストに見合わないと判断して撤回した。個別ジョブ単位の
+        # SNET/SNLT/FNLT はジョブ数が増えると設定しきれず使われない機能になる
+        # だけなので、START_ON（実績確定・外部都合のピン留め。1ジョブ1タスクに
+        # 閉じた意味を持つ）だけを残す。
+        #
+        # START_ON は「このジョブのこのタスクだけ既定と違う」という他の上書き
+        # （override_days等）と性質が同じなので、専用テーブルを持たず
+        # job_task_overrides に列を足すだけで「差分のみ保持」パターンにそのまま
+        # 乗る。docs/architecture.md「開始固定日（start_pin_date）」参照。
+        cols = [
+            r["name"] for r in
+            conn.execute("PRAGMA table_info(job_task_overrides)").fetchall()
+        ]
+        if cols and "start_pin_date" not in cols:
+            conn.execute(
+                "ALTER TABLE job_task_overrides ADD COLUMN start_pin_date TEXT"
+            )
+        tables = {
+            r["name"] for r in
+            conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        if "task_constraints" in tables:
+            pins = conn.execute(
+                "SELECT job_id, workflow_task_id, date FROM task_constraints "
+                "WHERE kind = 'START_ON' AND workflow_task_id IS NOT NULL"
+            ).fetchall()
+            for p in pins:
+                existing = conn.execute(
+                    "SELECT id FROM job_task_overrides WHERE job_id = ? AND workflow_task_id = ?",
+                    (p["job_id"], p["workflow_task_id"]),
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        "UPDATE job_task_overrides SET start_pin_date = ? WHERE id = ?",
+                        (p["date"], existing["id"]),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO job_task_overrides(job_id, workflow_task_id, "
+                        "is_active, start_pin_date) VALUES (?, ?, 1, ?)",
+                        (p["job_id"], p["workflow_task_id"], p["date"]),
+                    )
+            # ジョブ全体（workflow_task_id IS NULL）のSNET/FNLTと、タスク個別の
+            # SNET/SNLT/FNLTは、この移行では引き継がない対象（撤回した機能の
+            # データ）なので、テーブルごと破棄する。
+            conn.execute("DROP TABLE task_constraints")
+        version = "9"
 
     conn.execute(
         "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)

@@ -120,20 +120,6 @@ class ResourceOverflowError(SchedulingError):
 
 DEFAULT_LOW_PRIORITY = 999  # Priority未指定タスクのフォールバック（最後に処理＝押し出されやすい）
 
-#: 日付制約（task_constraints）の種別。「制約は入力、日付は出力」という分離を
-#: 守るための唯一の入力経路で、いずれも「解が満たすべき条件」を表す。
-#: 終了日は exclusive（マイルストーンの End_Date と同じ扱い）なので、FNLT は
-#: 「その日までに終わる」＝ 終了序数 <= 指定日 になる。
-CONSTRAINT_KINDS = ("SNET", "SNLT", "FNLT", "START_ON")
-
-#: 診断メッセージ用の短い説明。
-CONSTRAINT_LABELS = {
-    "SNET": "この日以降に開始",
-    "SNLT": "この日までに開始",
-    "FNLT": "この日までに終了",
-    "START_ON": "この日に開始（固定）",
-}
-
 #: 依存関係の種別。FS = Finish-to-Start（先行の完了後に開始）、
 #: SS = Start-to-Start（先行の開始に合わせて開始）。
 DEPENDENCY_KINDS = ("FS", "SS")
@@ -311,8 +297,7 @@ def _require_columns(df, required_cols, sheet_name):
 
 def _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
                             df_jtasks=None, df_holidays=None, df_extdeps=None,
-                            df_wf_names=None, df_team_capacity=None,
-                            df_constraints=None):
+                            df_wf_names=None, df_team_capacity=None):
     """
     既に読み込み済みのDataFrame群を検証・整形する（列チェック・インデックス設定・
     任意データの既定値補完）。Excel由来（_load_data経由）・DB由来（GUIの
@@ -378,16 +363,8 @@ def _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
     else:
         df_team_capacity = pd.DataFrame(columns=["Team_ID", "Start_Date", "Lines"])
 
-    # Task_Constraints（任意）: 日付を「入力」として持つ唯一の場所。Task_ID が
-    # 空の行はジョブ全体への制約を表す。0件でも成立する（＝既存データは無変更）。
-    if df_constraints is not None:
-        if not df_constraints.empty:
-            _require_columns(df_constraints, ["Job_ID", "Kind", "Date"], "Task_Constraints")
-    else:
-        df_constraints = pd.DataFrame(columns=["Job_ID", "Task_ID", "Kind", "Date"])
-
     return (df_project, df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_holidays, df_extdeps,
-            df_wf_names, df_team_capacity, df_constraints)
+            df_wf_names, df_team_capacity)
 
 
 def _load_data(excel_file):
@@ -419,14 +396,9 @@ def _load_data(excel_file):
         pd.read_excel(xls, sheet_name="Team_Capacity_Changes")
         if "Team_Capacity_Changes" in xls.sheet_names else None
     )
-    df_constraints = (
-        pd.read_excel(xls, sheet_name="Task_Constraints")
-        if "Task_Constraints" in xls.sheet_names else None
-    )
-
     return _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
                                    df_jtasks, df_holidays, df_extdeps, df_wf_names,
-                                   df_team_capacity, df_constraints)
+                                   df_team_capacity)
 
 
 def _load_project_start(df_project):
@@ -466,42 +438,9 @@ def _build_external_dep_map(df_extdeps):
     return dep_map
 
 
-def _build_constraint_map(df_constraints):
-    """Task_Constraints を {(Job_ID, Task_ID or None): {種別: 日付の序数}} にする。
-
-    Task_ID が空の行は「ジョブ全体」（配下の全タスクに同じ条件を課す）を表す。
-    """
-    constraint_map = {}
-    for _, row in df_constraints.iterrows():
-        job_id, kind = row.get("Job_ID"), row.get("Kind")
-        if not (pd.notna(job_id) and pd.notna(kind)):
-            logger.warning(f"Task_Constraints に不完全な行があります（スキップ）: {row.to_dict()}")
-            continue
-        kind = str(kind).strip().upper()
-        if kind not in CONSTRAINT_KINDS:
-            raise SchedulingError(
-                f"日付制約の種別 '{kind}' は不正です（{' / '.join(CONSTRAINT_KINDS)} のいずれか）"
-            )
-        when = pd.to_datetime(row.get("Date"), errors="coerce")
-        if pd.isna(when):
-            # 日付が読めない制約を黙って無視すると「制約が無かったこと」になり、
-            # 意図と違う日程が静かに出てしまう。必ずエラーにする。
-            raise SchedulingError(
-                f"日付制約（{job_id} / {row.get('Task_ID')} / {kind}）の日付 "
-                f"'{row.get('Date')}' を解釈できません"
-            )
-        task_id = row.get("Task_ID")
-        task_id = None if not pd.notna(task_id) or str(task_id).strip() == "" else task_id
-        constraint_map.setdefault((job_id, task_id), {})[kind] = when.toordinal()
-    return constraint_map
-
-
-def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, df_constraints=None):
+def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps):
     teams_dict = df_teams.set_index("Team_ID")["Max_Lines"].to_dict()
     ext_dep_map = _build_external_dep_map(df_extdeps)
-    constraint_map = (
-        {} if df_constraints is None else _build_constraint_map(df_constraints)
-    )
 
     # ループ内で参照する表は、すべて先に素の辞書・リストへ落としておく
     # （pandasの行アクセスはタスク数が増えるとここが最も重くなるため）。
@@ -524,10 +463,6 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, df_cons
         job_id, job_name = job["Job_ID"], job["Job_Name"]
         wf_id = job["Workflow_ID"]
         job_default_ms = job.get("Default_Milestone_ID", "")
-
-        # ジョブ全体の制約は配下の全タスクに同じ条件として配る（タスク個別の
-        # 同じ種別があればそちらが優先）。
-        job_constraints = constraint_map.get((job_id, None), {})
 
         priority = job.get("Priority")
         if not pd.notna(priority):
@@ -595,13 +530,21 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, df_cons
                         dep_specs[dep_g_id] = (dep_kind, dep_lag)
             ext_deps = ext_dep_map.get((job_id, t_id), [])
 
-            constraints = job_constraints
-            task_constraints = constraint_map.get((job_id, t_id))
-            if task_constraints:
-                constraints = {**job_constraints, **task_constraints}
+            # 開始固定日（実績確定・外部都合のピン留め）。読めない日付を黙って
+            # 無視すると「固定が無かったこと」になり、意図と違う日程が静かに
+            # 出てしまうため、他の日付列同様エラーにする。
+            start_pin_raw = override.get("Start_Pin_Date")
+            start_pin_ord = None
+            if pd.notna(start_pin_raw) and str(start_pin_raw).strip() != "":
+                start_pin = pd.to_datetime(start_pin_raw, errors="coerce")
+                if pd.isna(start_pin):
+                    raise SchedulingError(
+                        f"タスク '{g_id}' の開始固定日 '{start_pin_raw}' を解釈できません"
+                    )
+                start_pin_ord = start_pin.toordinal()
 
             active_tasks[g_id] = {
-                "constraints": constraints,
+                "start_pin_ord": start_pin_ord,
                 "job_id": job_id, "job_name": job_name, "task_id": t_id,
                 "task_name": t["Task_Name"], "days": days,
                 "deps": int_deps + list(ext_deps), "dep_specs": dep_specs,
@@ -934,43 +877,14 @@ def _dep_lower_bounds(t_info, dates, cal, team_id, g_id):
 
 
 def _pinned_start(t_info, cal, team_id):
-    """START_ON があれば固定開始日の序数（稼働日に丸め済み）。無ければ None。
+    """開始固定日（start_pin_ord）があれば序数（稼働日に丸め済み）。無ければ None。
 
     指定日が休業日なら次の稼働日へ送る。ここでエラーにしないのは、休業日の
     設定はあとから変わりうる一方、固定の意図（この日から着手する）は変わらない
     ため——「置けない」ではなく「置いた結果がこうなった」を返すほうが情報が多い。
     """
-    pin = t_info["constraints"].get("START_ON")
+    pin = t_info["start_pin_ord"]
     return None if pin is None else cal.next_working_day(pin, team_id)
-
-
-def _constraint_start_floor(t_info, cal, team_id):
-    """SNET（この日以降に開始）から決まる開始日の下限。無ければ None。"""
-    snet = t_info["constraints"].get("SNET")
-    return None if snet is None else cal.next_working_day(snet, team_id)
-
-
-def _constraint_end_cap(t_info, days, cal, team_id):
-    """SNLT・FNLT から決まる終了日（exclusive）の上限。無ければ None。
-
-    SNLT は「開始」の上限なので、所要日数ぶん進めて終了側の上限に直す
-    （ALAP計算が終了日の上限で組み立てられているため）。
-    """
-    constraints = t_info["constraints"]
-    if not constraints:
-        return None   # 制約を使っていないプロジェクトでは以降を一切踏まない
-    caps = []
-    fnlt = constraints.get("FNLT")
-    if fnlt is not None:
-        caps.append(fnlt)
-    snlt = constraints.get("SNLT")
-    if snlt is not None:
-        latest_start = cal.prev_working_day(snlt, team_id)
-        if latest_start is not None:
-            end_cap = cal.business_end(latest_start, days, team_id)
-            if end_cap is not None:
-                caps.append(end_cap)
-    return min(caps) if caps else None
 
 
 def _build_work_calendar(active_tasks, successors, scheduling_order, project_start,
@@ -1018,14 +932,14 @@ def _build_work_calendar(active_tasks, successors, scheduling_order, project_sta
     max_load = max(team_load.values(), default=0)
 
     ms_ends = [t["ms_end_ord"] for t in active_tasks.values()]
-    # 制約日はプロジェクト開始日より前にも、どのマイルストーンより後ろにも
+    # 開始固定日はプロジェクト開始日より前にも、どのマイルストーンより後ろにも
     # 置きうる（実績の確定・外部都合のピン留め）。範囲に含めておかないと
     # 「カレンダーの範囲外です」で止まる。
-    constraint_ords = [
-        ord_ for t in active_tasks.values() for ord_ in t["constraints"].values()
+    pin_ords = [
+        t["start_pin_ord"] for t in active_tasks.values() if t["start_pin_ord"] is not None
     ]
     start_ord = project_start.toordinal()
-    anchors = [start_ord] + ms_ends + constraint_ords
+    anchors = [start_ord] + ms_ends + pin_ords
     lo = min(anchors) - (max_tail * _CALENDAR_MARGIN_FACTOR + _CALENDAR_MARGIN_DAYS)
     hi = max(anchors) + (
         (max_load + max_lag_tail) * _CALENDAR_MARGIN_FACTOR + _CALENDAR_MARGIN_DAYS
@@ -1079,13 +993,6 @@ def _calc_raw_dates(active_tasks, successors, scheduling_order, cal):
             if cap < t_end:
                 t_end = cap
 
-        # 自分に課された上限（SNLT / FNLT）。ALAP側に織り込まないと、制約で
-        # 前倒しされたぶんのスラックが過大に見積もられ、distribution_ratio に
-        # よる配置と後続タスクの余裕計算が静かにずれる。
-        own_cap = _constraint_end_cap(t_info, days, cal, team_id)
-        if own_cap is not None and own_cap < t_end:
-            t_end = own_cap
-
         t_start = cal.business_start(t_end, days, team_id)
         if t_start is None:
             raise SchedulingError(
@@ -1098,11 +1005,11 @@ def _calc_raw_dates(active_tasks, successors, scheduling_order, cal):
 
 def _calc_asap_dates(active_tasks, leveling_order, project_start_ord, cal):
     """
-    リソース制約を無視した、依存関係と日付制約のみを考慮した最速（ASAP）の理想日程。
-    プロジェクト開始日、各依存タスクから決まる着手可能日（FSなら依存元の
-    完了日、SSなら依存元の開始日。いずれも依存関係に設定されたラグを
-    営業日で加算する）、`SNET`（この日以降に開始）のうち最も遅い日を起点にする。
-    `START_ON`（固定）が付いたタスクはその日そのものを使う。
+    リソース制約を無視した、依存関係と開始固定日のみを考慮した最速（ASAP）の
+    理想日程。プロジェクト開始日と、各依存タスクから決まる着手可能日（FSなら
+    依存元の完了日、SSなら依存元の開始日。いずれも依存関係に設定されたラグを
+    営業日で加算する）のうち、最も遅い日を起点にする。開始固定日（実績確定・
+    外部都合のピン留め）が付いたタスクはその日そのものを使う。
 
     _calc_raw_dates（ALAP＝締切から逆算した最遅日程）とセットで使うことで、
     各タスクの「動かせる幅（スラック）」＝ ASAP〜ALAP の範囲が分かる。
@@ -1117,11 +1024,7 @@ def _calc_asap_dates(active_tasks, leveling_order, project_start_ord, cal):
         t_start = _pinned_start(t_info, cal, team_id)
         if t_start is None:
             dep_ends = _dep_lower_bounds(t_info, asap_dates, cal, team_id, g_id)
-            floors = [project_start_ord] + dep_ends
-            snet = _constraint_start_floor(t_info, cal, team_id)
-            if snet is not None:
-                floors.append(snet)
-            t_start = cal.next_working_day(max(floors), team_id)
+            t_start = cal.next_working_day(max([project_start_ord] + dep_ends), team_id)
         t_end = None if t_start is None else cal.business_end(t_start, t_info["days"], team_id)
         if t_end is None:
             raise SchedulingError(
@@ -1235,13 +1138,8 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
     numpy配列（`usage`）として持ち、空き判定は「使用量 < 実効ライン数」の
     一括比較で行う（_WorkCalendar.build_capacity 参照）。
 
-    日付制約（task_constraints）は次の形で効く。
-
-    - `START_ON`（固定）: パス1で先にラインを予約する（下記）。
-    - `SNET`: 着手可能日の下限に加える。
-    - `SNLT` / `FNLT`: 上限（raw_dates と、パス3の「自分の締切」）に織り込む。
-
-    **固定タスクを先に予約する2パス構成にしている。** 単純にトポロジカル順の
+開始固定日（実績確定・外部都合のピン留め）はパス1で先にラインを予約する
+    （下記）。**固定タスクを先に予約する2パス構成にしている。** 単純にトポロジカル順の
     1パスで回すと、固定タスクの番が来たときには既にその時間帯のラインが他の
     タスクで埋まっていて置けない。固定は「動かせない入力」なのだから、
     探索対象より先にラインを取らせるのが正しい順序になる。
@@ -1361,11 +1259,7 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
         job_id = t_info.get("job_id", g_id)
 
         dep_ends = _dep_lower_bounds(t_info, scheduled, cal, team_id, g_id)
-        floors = [project_start_ord] + dep_ends
-        snet = _constraint_start_floor(t_info, cal, team_id)
-        if snet is not None:
-            floors.append(snet)
-        earliest_start = cal.next_working_day(max(floors), team_id)
+        earliest_start = cal.next_working_day(max([project_start_ord] + dep_ends), team_id)
         if earliest_start is None:
             raise SchedulingError(f"タスク '{g_id}' の着手可能日を求められません")
 
@@ -1405,14 +1299,9 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
         if placed is None:
             placed = find_backward(team_id, target_start - 1, earliest_start, days)
 
-        # 3) それでも見つからなければ、このタスク自身の締切（マイルストーン、
-        #    または SNLT/FNLT のうち厳しいほう）まで探索範囲を広げる
-        #    （依存元の実際の終了が想定より遅れた場合の保険）
-        hard_cap_end = t_info["ms_end_ord"]
-        own_cap = _constraint_end_cap(t_info, days, cal, team_id)
-        if own_cap is not None and own_cap < hard_cap_end:
-            hard_cap_end = own_cap
-        hard_cap_start = cal.business_start(hard_cap_end, days, team_id)
+        # 3) それでも見つからなければ、このタスク自身の締切（ms_end）まで
+        #    探索範囲を広げる（依存元の実際の終了が想定より遅れた場合の保険）
+        hard_cap_start = cal.business_start(t_info["ms_end_ord"], days, team_id)
         if placed is None and hard_cap_start is not None:
             placed = find_forward(team_id, limit_start + 1, hard_cap_start, days)
 
@@ -1975,7 +1864,6 @@ def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, 
                                                      df_jtasks=None, df_holidays=None,
                                                      df_extdeps=None, df_wf_names=None,
                                                      df_team_capacity=None,
-                                                     df_constraints=None,
                                                      verbose=True,
                                                      auto_exclude_weekends=True,
                                                      auto_exclude_jp_holidays=True,
@@ -1997,7 +1885,7 @@ def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, 
     """
     frames = _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
                                      df_jtasks, df_holidays, df_extdeps, df_wf_names,
-                                     df_team_capacity, df_constraints)
+                                     df_team_capacity)
     return _run_scheduler_on_frames(
         *frames, verbose=verbose,
         auto_exclude_weekends=auto_exclude_weekends,
@@ -2009,23 +1897,18 @@ def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, 
 
 
 def _check_constraint_violations(active_tasks, scheduled, cal, overbooked_pins):
-    """満たせなかった日付制約を洗い出して {g_id: (超過日数, 説明)} で返す。
+    """開始固定日が満たせなかったタスクを洗い出して {g_id: (超過日数, 説明)} で返す。
 
-    **制約が満たせないことはエラーではなく結果**として扱う（締切超過と同じ
-    方針）。ここで例外にすると、1つの制約が矛盾しているだけでプロジェクト
-    全体の日程が一切得られなくなり、「何が・どれだけ無理なのか」を確認する
-    ことすらできなくなる。
-
-    制約は「解が満たすべき条件」であって「解」ではないので、依存関係を足しても
-    休業日を変えても制約データ自体は壊れない。壊れるのは解が見つからない場合
-    だけで、それがここで検出される——制約同士を事前に矛盾させないための
-    整合性維持ロジックは要らない、というのがこの設計の要点。
+    **固定日そのものは必ず守られる**（パス1で無条件に予約するため）。破れうる
+    のは「固定した結果、依存関係やライン数と両立しない」ほうであり、それを
+    ここでエラーではなく結果として返す（締切超過と同じ方針）。ここで例外に
+    すると、1つの固定が矛盾しているだけでプロジェクト全体の日程が一切得られ
+    なくなり、「何が・どれだけ無理なのか」を確認することすらできなくなる。
     """
     violations = {}
     for g_id, (start_ord, end_ord) in scheduled.items():
         t_info = active_tasks[g_id]
-        constraints = t_info["constraints"]
-        if not constraints:
+        if t_info["start_pin_ord"] is None:
             continue
         team_id = t_info["team_id"]
         notes = []
@@ -2036,37 +1919,19 @@ def _check_constraint_violations(active_tasks, scheduled, cal, overbooked_pins):
             worst = max(worst, days)
             notes.append(text)
 
-        snet = _constraint_start_floor(t_info, cal, team_id)
-        if snet is not None and start_ord < snet:
-            record(snet - start_ord,
-                   f"SNET({_fmt_ord(constraints['SNET'])}) より "
-                   f"{snet - start_ord}日 早く開始しています")
-
-        snlt = constraints.get("SNLT")
-        if snlt is not None and start_ord > snlt:
-            record(start_ord - snlt,
-                   f"SNLT({_fmt_ord(snlt)}) を {start_ord - snlt}日 超えて開始しています")
-
-        fnlt = constraints.get("FNLT")
-        if fnlt is not None and end_ord > fnlt:
-            record(end_ord - fnlt,
-                   f"FNLT({_fmt_ord(fnlt)}) を {end_ord - fnlt}日 超過しています")
-
-        if "START_ON" in constraints:
-            # 固定日そのものは必ず守られる（パス1で無条件に予約するため）。
-            # 破れうるのは「固定した結果、依存関係やライン数と両立しない」ほう。
-            dep_floor = _dep_lower_bounds(t_info, scheduled, cal, team_id, g_id)
-            if dep_floor:
-                floor = cal.next_working_day(max(dep_floor), team_id)
-                if floor is not None and start_ord < floor:
-                    record(floor - start_ord,
-                           f"START_ON({_fmt_ord(constraints['START_ON'])}) は依存タスクの"
-                           f"着手可能日({_fmt_ord(floor)})より {floor - start_ord}日 前です")
-            if g_id in overbooked_pins:
-                # ライン数の超過に「何日超過」に相当する量は無いので日数は0のまま。
-                # 違反しているかどうかは説明文が空かどうかで判定する。
-                record(0, f"START_ON({_fmt_ord(constraints['START_ON'])}) はチーム "
-                          f"'{team_id}' のライン数を超えて予約しています")
+        pin_label = _fmt_ord(t_info["start_pin_ord"])
+        dep_floor = _dep_lower_bounds(t_info, scheduled, cal, team_id, g_id)
+        if dep_floor:
+            floor = cal.next_working_day(max(dep_floor), team_id)
+            if floor is not None and start_ord < floor:
+                record(floor - start_ord,
+                       f"固定開始日（{pin_label}）が依存タスクの着手可能日（{_fmt_ord(floor)}）"
+                       f"より{floor - start_ord}日早いです")
+        if g_id in overbooked_pins:
+            # ライン数の超過に「何日超過」に相当する量は無いので日数は0のまま。
+            # 違反しているかどうかは説明文が空かどうかで判定する。
+            record(0, f"固定開始日（{pin_label}）がチーム「{team_id}」のライン数を"
+                      f"超えて予約されています")
 
         if notes:
             violations[g_id] = (worst, "／".join(notes))
@@ -2128,7 +1993,6 @@ def _warn_deadline_overruns(result_df, max_listed=10):
 
 def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jtasks,
                               df_holidays, df_extdeps, df_wf_names, df_team_capacity,
-                              df_constraints=None,
                               verbose=True,
                               auto_exclude_weekends=True, auto_exclude_jp_holidays=True,
                               plotly_output_path=None, project_name=None,
@@ -2168,7 +2032,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
     milestone_markers.sort(key=lambda m: m[2])
 
     teams_dict, active_tasks, active_ids = _parse_tasks(
-        df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, df_constraints)
+        df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps)
     team_capacity_schedule = _build_team_capacity_schedule(df_teams, df_team_capacity)
 
     if not active_ids:
@@ -2239,9 +2103,9 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
             # マイルストーンの締切をどれだけ超過したか（暦日、0なら間に合っている）。
             # 終了日は exclusive なので、締切当日ちょうどに終わる場合は超過0になる。
             "Deadline_Overrun_Days": max(0, dates[1] - t["ms_end_ord"]),
-            # 満たせなかった日付制約（task_constraints）。制約は入力・日付は出力
-            # という分離を守るため、矛盾はデータを書き換えて解消せず、結果として
-            # 返す（_check_constraint_violations 参照）。空文字なら制約は全て充足。
+            # 満たせなかった開始固定日（start_pin_ord）。固定は動かして辻褄を
+            # 合わせず、矛盾は結果として返す（_check_constraint_violations 参照）。
+            # 空文字なら固定は無い、または固定は問題なく守られている。
             "Constraint_Violation_Days": violation_days,
             "Constraint_Violation": violation_note,
         })

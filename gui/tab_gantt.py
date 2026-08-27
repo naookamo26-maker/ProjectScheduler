@@ -276,13 +276,13 @@ class GanttTab(QWidget):
                 f"うち{len(overruns)}件がマイルストーンの締切に間に合いません（最大{worst}日超過）。"
                 f"チームのライン数・依存関係・締切を見直してください。"
             )
-        # 満たせない日付制約も、締切超過と同じく例外ではなく結果として返ってくる
-        # （制約は入力・日付は出力という分離を守るため、矛盾はデータを書き換えて
-        # 解消しない）。ここで件数を出さないと気付けない。
+        # 満たせない開始固定日も、締切超過と同じく例外ではなく結果として返って
+        # くる（固定を動かして辻褄を合わせず、矛盾はデータを書き換えて解消
+        # しない）。ここで件数を出さないと気付けない。
         broken = self._result_df[self._result_df["Constraint_Violation"] != ""]
         if not broken.empty:
             notes.append(
-                f"うち{len(broken)}件が日付制約を満たせません"
+                f"うち{len(broken)}件が開始固定日どおりに配置できません"
                 f"（例: {broken.iloc[0]['Task_Name']} — {broken.iloc[0]['Constraint_Violation']}）。"
             )
         if not notes:

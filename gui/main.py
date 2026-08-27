@@ -344,9 +344,9 @@ class MainWindow(QMainWindow):
             )
         broken = result_df[result_df["Constraint_Violation"] != ""]
         if not broken.empty:
-            # 日付制約の矛盾も締切超過と同じく結果として返る（例外にしない）。
+            # 開始固定日の矛盾も締切超過と同じく結果として返る（例外にしない）。
             message += (
-                f"\n\n※ 日付制約を満たせないタスクが{len(broken)}件あります"
+                f"\n\n※ 開始固定日どおりに配置できないタスクが{len(broken)}件あります"
                 f"（例: {broken.iloc[0]['Task_Name']} — "
                 f"{broken.iloc[0]['Constraint_Violation']}）。"
             )

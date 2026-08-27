@@ -132,6 +132,9 @@ def build_frames(db):
         "Override_Days": r["override_days"],
         "Milestone_ID": ms_str.get(r["override_milestone_id"]),
         "Team_ID": team_str.get(r["override_team_id"]),
+        # 開始固定日（実績確定・外部都合のピン留め）。既定値と全く同じ扱いで、
+        # 未設定はNaN（他のOverride_Days等と同じく「上書きなし」を表す）。
+        "Start_Pin_Date": r["start_pin_date"],
     } for r in db.list_all_job_task_overrides()]
     df_jtasks = pd.DataFrame(jt_rows) if jt_rows else None
 
@@ -139,16 +142,6 @@ def build_frames(db):
     df_holidays = pd.DataFrame([{
         "Date": h["date"], "Team_ID": team_str.get(h["team_id"]),
     } for h in holidays]) if holidays else None
-
-    # 日付制約（task_constraints）。Task_ID が None の行はジョブ全体への制約で、
-    # スケジューラ側で配下の全タスクに配られる。
-    constraint_rows = [{
-        "Job_ID": job_str[c["job_id"]],
-        "Task_ID": task_str.get(c["workflow_task_id"]),
-        "Kind": c["kind"],
-        "Date": c["date"],
-    } for c in db.list_task_constraints() if c["job_id"] in job_str]
-    df_constraints = pd.DataFrame(constraint_rows) if constraint_rows else None
 
     ext_deps = [e for e in db.list_external_dependencies() if e["is_active"]]
     df_extdeps = pd.DataFrame([{
@@ -162,7 +155,7 @@ def build_frames(db):
         "project": df_project, "teams": df_teams, "milestones": df_ms, "workflows": df_wf,
         "workflow_names": df_wf_names, "jobs": df_jobs, "job_tasks": df_jtasks,
         "holidays": df_holidays, "external_dependencies": df_extdeps,
-        "team_capacity": df_team_capacity, "task_constraints": df_constraints,
+        "team_capacity": df_team_capacity,
     }
 
 
@@ -232,7 +225,6 @@ def compute_schedule_from_frames(frames, **scheduler_kwargs):
         frames["project"], frames["teams"], frames["milestones"], frames["workflows"],
         frames["jobs"], frames["job_tasks"], frames["holidays"], frames["external_dependencies"],
         frames["workflow_names"], df_team_capacity=frames["team_capacity"],
-        df_constraints=frames["task_constraints"],
         **scheduler_kwargs,
     )
 
@@ -265,7 +257,6 @@ def generate_gantt(db, plotly_output_path=None, **scheduler_kwargs):
         frames["project"], frames["teams"], frames["milestones"], frames["workflows"],
         frames["jobs"], frames["job_tasks"], frames["holidays"], frames["external_dependencies"],
         frames["workflow_names"], df_team_capacity=frames["team_capacity"],
-        df_constraints=frames["task_constraints"],
         plotly_output_path=plotly_output_path,
         **scheduler_kwargs,
     )
