@@ -28,6 +28,7 @@ import os
 import sqlite3
 import tempfile
 from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 
 # 再エクスポート: 呼び出し側・テストからは従来どおり gui.db から参照できるようにする。
@@ -44,6 +45,57 @@ class DuplicateNameError(ProjectDatabaseError):
 
 class ReferencedEntityError(ProjectDatabaseError):
     """参照が残っている行を削除しようとした場合"""
+
+
+#: ワークフロー内の依存関係の種別。値はDBに保存する文字列そのもの。
+#: FS = Finish-to-Start（先行タスクの完了後に開始）
+#: SS = Start-to-Start（先行タスクの開始に合わせて開始）
+DEPENDENCY_KINDS = ("FS", "SS")
+
+#: ラグ（営業日）の許容範囲。上限は「1タスクの所要日数として現実的な桁」に
+#: 合わせた安全弁で、業務上の意味があるわけではない（入力ミスで
+#: 稼働日カレンダーが極端に伸びるのを防ぐためだけの値）。
+MAX_LAG_DAYS = 3650
+
+
+def normalize_dependency_kind(dep_type, lag_days):
+    """依存関係の種別・ラグを検証し、(dep_type, lag_days) に正規化して返す。
+
+    ALTER TABLE で後から足した列にはCHECK制約を付けられない（＝旧ファイルを
+    移行した場合、DB側では不正な値を弾けない）ため、書き込み経路をここに
+    集約して守る。
+    """
+    dep_type = str(dep_type or "FS").strip().upper()
+    if dep_type not in DEPENDENCY_KINDS:
+        raise ProjectDatabaseError(
+            f"依存関係の種別 '{dep_type}' は不正です（{' / '.join(DEPENDENCY_KINDS)} のいずれか）"
+        )
+    try:
+        lag_days = int(lag_days)
+    except (TypeError, ValueError):
+        raise ProjectDatabaseError("ラグは整数（営業日）で指定してください") from None
+    if abs(lag_days) > MAX_LAG_DAYS:
+        raise ProjectDatabaseError(
+            f"ラグ {lag_days} 日は範囲外です（±{MAX_LAG_DAYS}日まで）"
+        )
+    return dep_type, lag_days
+
+
+def _validate_start_pin_date(value):
+    """開始固定日の書式を検証し、'YYYY-MM-DD' または None に正規化する。
+
+    ここで検証するのは、値がそのままスケジューラへ渡り、壊れた日付が
+    `pd.to_datetime` で黙って NaT になって「固定が無かったこと」になる
+    のを防ぐため（固定が静かに消えるのが最悪の壊れ方）。
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return date.fromisoformat(str(value).strip()).isoformat()
+    except (TypeError, ValueError):
+        raise ProjectDatabaseError(
+            f"開始固定日 '{value}' が不正です（YYYY-MM-DD 形式で指定してください）"
+        ) from None
 
 
 def undoable(label):
@@ -661,28 +713,27 @@ class ProjectDatabase:
 
         task_id_map = {}
         for t in self._conn.execute(
-            "SELECT id, name, team_id, default_days, canvas_x, canvas_y "
+            "SELECT id, name, team_id, default_days "
             "FROM workflow_tasks WHERE workflow_id = ? ORDER BY id",
             (workflow_id,),
         ).fetchall():
             cur = self._conn.execute(
-                "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days, "
-                "canvas_x, canvas_y) VALUES (?, ?, ?, ?, ?, ?)",
-                (new_workflow_id, t["name"], t["team_id"], t["default_days"],
-                 t["canvas_x"], t["canvas_y"]),
+                "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days) "
+                "VALUES (?, ?, ?, ?)",
+                (new_workflow_id, t["name"], t["team_id"], t["default_days"]),
             )
             task_id_map[t["id"]] = cur.lastrowid
 
         for d in self._conn.execute(
-            "SELECT predecessor_task_id, successor_task_id FROM task_dependencies "
-            "WHERE workflow_id = ?",
+            "SELECT predecessor_task_id, successor_task_id, dep_type, lag_days "
+            "FROM task_dependencies WHERE workflow_id = ?",
             (workflow_id,),
         ).fetchall():
             self._conn.execute(
                 "INSERT INTO task_dependencies(workflow_id, predecessor_task_id, "
-                "successor_task_id) VALUES (?, ?, ?)",
+                "successor_task_id, dep_type, lag_days) VALUES (?, ?, ?, ?, ?)",
                 (new_workflow_id, task_id_map[d["predecessor_task_id"]],
-                 task_id_map[d["successor_task_id"]]),
+                 task_id_map[d["successor_task_id"]], d["dep_type"], d["lag_days"]),
             )
 
         # 依存先（depends_on_workflow_id/depends_on_workflow_task_id）は他
@@ -723,20 +774,20 @@ class ProjectDatabase:
     def list_workflow_tasks(self, workflow_id):
         rows = self._conn.execute(
             "SELECT wt.id, wt.workflow_id, wt.name, wt.team_id, t.name AS team_name, "
-            "wt.default_days, wt.canvas_x, wt.canvas_y "
+            "wt.default_days "
             "FROM workflow_tasks wt JOIN teams t ON t.id = wt.team_id "
             "WHERE wt.workflow_id = ? ORDER BY wt.id",
             (workflow_id,),
         ).fetchall()
         return [dict(r) for r in rows]
 
-    @undoable(lambda self, workflow_id, name, team_id, default_days, x=0.0, y=0.0: f"タスク「{name}」を追加")
-    def add_workflow_task(self, workflow_id, name, team_id, default_days, x=0.0, y=0.0):
+    @undoable(lambda self, workflow_id, name, team_id, default_days: f"タスク「{name}」を追加")
+    def add_workflow_task(self, workflow_id, name, team_id, default_days):
         try:
             cur = self._conn.execute(
-                "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days, "
-                "canvas_x, canvas_y) VALUES (?, ?, ?, ?, ?, ?)",
-                (workflow_id, name, team_id, default_days, x, y),
+                "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days) "
+                "VALUES (?, ?, ?, ?)",
+                (workflow_id, name, team_id, default_days),
             )
         except sqlite3.IntegrityError as e:
             raise DuplicateNameError(
@@ -757,14 +808,6 @@ class ProjectDatabase:
             raise DuplicateNameError(
                 f"タスク名 '{name}' はこのワークフロー内で既に使用されています"
             ) from e
-        self._commit()
-
-    @undoable("タスクの位置を変更")
-    def update_task_position(self, task_id, x, y):
-        self._conn.execute(
-            "UPDATE workflow_tasks SET canvas_x = ?, canvas_y = ? WHERE id = ?",
-            (x, y, task_id),
-        )
         self._commit()
 
     def workflow_task_usage_count(self, task_id):
@@ -790,26 +833,57 @@ class ProjectDatabase:
 
     def list_task_dependencies(self, workflow_id):
         rows = self._conn.execute(
-            "SELECT id, workflow_id, predecessor_task_id, successor_task_id "
+            "SELECT id, workflow_id, predecessor_task_id, successor_task_id, "
+            "dep_type, lag_days "
             "FROM task_dependencies WHERE workflow_id = ?",
             (workflow_id,),
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_task_dependency(self, dependency_id):
+        """1件を取得する（見つからなければ None）。GUIの編集ダイアログ用。"""
+        row = self._conn.execute(
+            "SELECT id, workflow_id, predecessor_task_id, successor_task_id, "
+            "dep_type, lag_days "
+            "FROM task_dependencies WHERE id = ?",
+            (dependency_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
     @undoable("依存関係を追加")
-    def add_task_dependency(self, workflow_id, predecessor_task_id, successor_task_id):
+    def add_task_dependency(self, workflow_id, predecessor_task_id, successor_task_id,
+                            dep_type="FS", lag_days=0):
         """循環依存のチェックは呼び出し側（gui/node_canvas.py）が事前に行う想定。
-        ここでは構造的制約（自己参照禁止・重複禁止）のみDB制約で守る。"""
+        ここでは構造的制約（自己参照禁止・重複禁止）のみDB制約で守る。
+
+        dep_type / lag_days の既定値（FS・0）は従来の唯一の挙動そのものなので、
+        引数を渡さない既存の呼び出しは意味が変わらない。
+        """
+        dep_type, lag_days = normalize_dependency_kind(dep_type, lag_days)
         try:
             cur = self._conn.execute(
                 "INSERT INTO task_dependencies(workflow_id, predecessor_task_id, "
-                "successor_task_id) VALUES (?, ?, ?)",
-                (workflow_id, predecessor_task_id, successor_task_id),
+                "successor_task_id, dep_type, lag_days) VALUES (?, ?, ?, ?, ?)",
+                (workflow_id, predecessor_task_id, successor_task_id, dep_type, lag_days),
             )
         except sqlite3.IntegrityError as e:
             raise ProjectDatabaseError("この依存関係は既に存在するか、不正です") from e
         self._commit()
         return cur.lastrowid
+
+    @undoable("依存関係の種別・ラグを変更")
+    def update_task_dependency(self, dependency_id, dep_type, lag_days):
+        """種別（FS/SS）とラグ（営業日）だけを差し替える。依存の向き
+        （predecessor/successor）は変更しない——向きを変えることは
+        「別の依存関係」であり、循環依存の再検査が要るため。"""
+        dep_type, lag_days = normalize_dependency_kind(dep_type, lag_days)
+        cur = self._conn.execute(
+            "UPDATE task_dependencies SET dep_type = ?, lag_days = ? WHERE id = ?",
+            (dep_type, lag_days, dependency_id),
+        )
+        if cur.rowcount == 0:
+            raise ProjectDatabaseError("対象の依存関係が見つかりません")
+        self._commit()
 
     @undoable("依存関係を削除")
     def delete_task_dependency(self, dependency_id):
@@ -927,7 +1001,8 @@ class ProjectDatabase:
             "o.id AS override_id, o.is_active, o.override_days, "
             "o.milestone_id AS override_milestone_id, "
             "om.name AS override_milestone_name, "
-            "o.team_id AS override_team_id, ot.name AS override_team_name "
+            "o.team_id AS override_team_id, ot.name AS override_team_name, "
+            "o.start_pin_date "
             "FROM jobs j "
             "JOIN workflow_tasks wt ON wt.workflow_id = j.workflow_id "
             "JOIN teams t ON t.id = wt.team_id "
@@ -951,7 +1026,8 @@ class ProjectDatabase:
         差し替えた場合などに残りうる）を拾わないよう、同じ結合条件で絞る。"""
         rows = self._conn.execute(
             "SELECT o.job_id, o.workflow_task_id, o.is_active, o.override_days, "
-            "o.milestone_id AS override_milestone_id, o.team_id AS override_team_id "
+            "o.milestone_id AS override_milestone_id, o.team_id AS override_team_id, "
+            "o.start_pin_date "
             "FROM job_task_overrides o "
             "JOIN jobs j ON j.id = o.job_id "
             "JOIN workflow_tasks wt ON wt.id = o.workflow_task_id "
@@ -961,7 +1037,9 @@ class ProjectDatabase:
 
     @undoable("タスク上書きを変更")
     def upsert_job_task_override(self, job_id, workflow_task_id, is_active=True,
-                                  override_days=None, milestone_id=None, team_id=None):
+                                  override_days=None, milestone_id=None, team_id=None,
+                                  start_pin_date=None):
+        start_pin_date = _validate_start_pin_date(start_pin_date)
         existing = self._conn.execute(
             "SELECT id FROM job_task_overrides WHERE job_id = ? AND workflow_task_id = ?",
             (job_id, workflow_task_id),
@@ -969,14 +1047,17 @@ class ProjectDatabase:
         if existing:
             self._conn.execute(
                 "UPDATE job_task_overrides SET is_active = ?, override_days = ?, "
-                "milestone_id = ?, team_id = ? WHERE id = ?",
-                (int(is_active), override_days, milestone_id, team_id, existing["id"]),
+                "milestone_id = ?, team_id = ?, start_pin_date = ? WHERE id = ?",
+                (int(is_active), override_days, milestone_id, team_id, start_pin_date,
+                 existing["id"]),
             )
         else:
             self._conn.execute(
                 "INSERT INTO job_task_overrides(job_id, workflow_task_id, is_active, "
-                "override_days, milestone_id, team_id) VALUES (?, ?, ?, ?, ?, ?)",
-                (job_id, workflow_task_id, int(is_active), override_days, milestone_id, team_id),
+                "override_days, milestone_id, team_id, start_pin_date) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (job_id, workflow_task_id, int(is_active), override_days, milestone_id,
+                 team_id, start_pin_date),
             )
         self._commit()
 

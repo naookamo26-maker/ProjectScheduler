@@ -78,6 +78,11 @@ _DEFAULT_BAR_COLOR = "#cbc9c2"
 # フローの色分けをそのまま残したいので、枠線だけを赤く太くして重ねて表す。
 _OVERRUN_BORDER_COLOR = QColor("#c5221f")
 _OVERRUN_BORDER_WIDTH = 3
+# 開始固定日を満たせなかったタスク。締切超過（赤の実線）と区別できるよう、
+# 別の色＋破線にする。件数だけを状況表示に出しても「どれが」が分からないため、
+# バー側にも印を付けて特定できるようにする。
+_CONSTRAINT_BORDER_COLOR = QColor("#b26a00")
+_CONSTRAINT_BORDER_WIDTH = 3
 _NORMAL_BORDER_COLOR = QColor("#0b0b0b")
 _NORMAL_BORDER_WIDTH = 1
 # 本体シーンの重ね順: 目盛り・区切り線(-2〜-1) < 通常のバー(0) <
@@ -510,7 +515,9 @@ def build_gantt_scenes(df, display, color_by="team"):
     マイルストーンの締切に間に合わないタスク（Deadline_Overrun_Days > 0）は、
     塗りつぶしの色（＝チーム／ワークフローの識別）はそのままに、枠線を赤く
     太くして強調する。色分けの軸を潰さずに「間に合っていない」を重ねて
-    表せるため。
+    表せるため。開始固定日を満たせなかったタスク（Constraint_Violation）も
+    同じ考え方で、別の色の破線の枠にする（両方に該当する場合は締切超過を
+    優先。枠線は1本しか引けないため）。
 
     3つのシーンは同じ座標系（LEFT_MARGIN/TOP_MARGIN起点、x_of()による日付
     ->x座標変換）を共有しているが、日付軸・マイルストーン・目盛り線の縦線
@@ -674,11 +681,17 @@ def build_gantt_scenes(df, display, color_by="team"):
                 BAR_CORNER_RADIUS, BAR_CORNER_RADIUS,
             )
             overrun_days = int(r.get("Deadline_Overrun_Days", 0) or 0)
+            constraint_violation = str(r.get("Constraint_Violation") or "")
 
             rect = QGraphicsPathItem(bar_path)
             rect.setBrush(QBrush(QColor(color_hex)))
             if overrun_days > 0:
+                # 両方に該当する場合は締切超過（赤の実線）を優先する。枠線は
+                # 1本しか引けないため、より重い「間に合っていない」を採る
+                # （どちらに該当しているかはツールチップに両方出る）。
                 border_pen = QPen(_OVERRUN_BORDER_COLOR, _OVERRUN_BORDER_WIDTH)
+            elif constraint_violation:
+                border_pen = QPen(_CONSTRAINT_BORDER_COLOR, _CONSTRAINT_BORDER_WIDTH, Qt.DashLine)
             else:
                 border_pen = QPen(_NORMAL_BORDER_COLOR, _NORMAL_BORDER_WIDTH)
             # コズメティックペイン（常に一定の画面上の太さで描く）にしないと、
@@ -690,7 +703,7 @@ def build_gantt_scenes(df, display, color_by="team"):
             rect.setPen(border_pen)
             # 赤枠が隣のバーやジョブ区切り線に隠れないよう、超過タスクだけ手前に
             # 重ねる（枠線はバーの輪郭の内外にまたがって描かれるため）。
-            if overrun_days > 0:
+            if overrun_days > 0 or constraint_violation:
                 rect.setZValue(_OVERRUN_BAR_Z)
             rect.setFlag(QGraphicsItem.ItemIsSelectable, True)
             team_name = team_names.get(r["Team_ID"], str(r["Team_ID"]))
@@ -701,6 +714,7 @@ def build_gantt_scenes(df, display, color_by="team"):
                 f'チーム: {team_name}\n'
                 f'{r["Start_Date"].strftime("%Y-%m-%d")} 〜 {r["End_Date"].strftime("%Y-%m-%d")}'
                 + (f'\n⚠ マイルストーンの締切を{overrun_days}日超過' if overrun_days > 0 else "")
+                + (f'\n⚠ {constraint_violation}' if constraint_violation else "")
                 + ("\n※リソース制約により前倒し" if r["Resource_Adjusted"] else "")
             )
             body_scene.addItem(rect)

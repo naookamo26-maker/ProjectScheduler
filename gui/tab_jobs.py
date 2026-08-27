@@ -77,6 +77,7 @@ from gui.widgets_common import (
     NoWheelComboBox,
     NoWheelListWidget,
     NoWheelSpinBox,
+    OptionalDateEdit,
     auto_size_columns,
     bind_undo_session,
     capture_table_state,
@@ -102,7 +103,6 @@ _BLANK_MILESTONE_LABEL = "（未設定）"
 # コンボボックスの▼やスピンボックスの▲▼のぶん、テキスト幅より少し広くする
 # （列幅は読み取り専用テキストの幅を基準に自動調整されるため）。
 _CELL_WIDGET_EXTRA_WIDTH = 34
-
 
 def _readonly_item(text):
     item = QTableWidgetItem(text)
@@ -265,9 +265,10 @@ class JobsTab(QWidget):
 
         override_group = QGroupBox("タスク上書き（選択中のジョブ）")
         override_layout = QVBoxLayout(override_group)
-        self.override_table = QTableWidget(0, 5)
+
+        self.override_table = QTableWidget(0, 6)
         self.override_table.setHorizontalHeaderLabels(
-            ["タスク名", "有効", "日数", "マイルストーン", "チーム"]
+            ["タスク名", "有効", "日数", "マイルストーン", "チーム", "開始固定日"]
         )
         self.override_table.verticalHeader().setVisible(False)
         self.override_table.setSelectionMode(QTableWidget.NoSelection)
@@ -710,6 +711,17 @@ class JobsTab(QWidget):
                 lambda _idx, tid=r["workflow_task_id"]: self._on_override_changed(tid)
             )
             table.setCellWidget(row, 4, team_combo)
+
+            # 開始固定日（実績確定・外部都合のピン留め）。DefaultAwareSpinBoxと
+            # 同じ発想の1列ウィジェット——未設定を表す特殊値（OptionalDateEdit
+            # 参照）から日付を選ぶと固定になり、Deleteキーで固定なしに戻せる。
+            pin_edit = OptionalDateEdit()
+            pin_edit.set_value(r["start_pin_date"])
+            pin_edit.dateChanged.connect(
+                lambda _date, tid=r["workflow_task_id"]: self._on_override_changed(tid)
+            )
+            bind_undo_session(pin_edit, self.db, "タスクの開始固定日を変更")
+            table.setCellWidget(row, 5, pin_edit)
         table.blockSignals(False)
         auto_size_columns(table, min_width=50)
         table.setColumnWidth(1, 44)  # 「有効」列はチェックボックスのみなので詰める
@@ -741,12 +753,15 @@ class JobsTab(QWidget):
                 override_days = days_val if days_val > 0 else None
                 milestone_id = table.cellWidget(row, 3).currentData()
                 team_id = table.cellWidget(row, 4).currentData()
+                start_pin_date = table.cellWidget(row, 5).value()
 
                 with self.db.undo_group("タスク上書きを変更"):
-                    if not is_active or override_days is not None or milestone_id is not None or team_id is not None:
+                    if (not is_active or override_days is not None or milestone_id is not None
+                            or team_id is not None or start_pin_date is not None):
                         self.db.upsert_job_task_override(
                             self.current_job_id, workflow_task_id, is_active=is_active,
                             override_days=override_days, milestone_id=milestone_id, team_id=team_id,
+                            start_pin_date=start_pin_date,
                         )
                     else:
                         self.db.clear_job_task_override(self.current_job_id, workflow_task_id)

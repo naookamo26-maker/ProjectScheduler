@@ -106,6 +106,10 @@ class GanttTab(QWidget):
         toolbar = QHBoxLayout()
         toolbar.addWidget(QLabel("表示単位:"))
         self.mode_combo = NoWheelComboBox()
+        # 既定のAdjustToContentsOnFirstShowだと、表示後に選択肢の内容が変わって
+        # （対象コンボはワークフロー/チーム名を動的に入れ替える）も幅が追従せず、
+        # 長い名前が見切れる。常に現在の内容に合わせて幅を取り直す。
+        self.mode_combo.setSizeAdjustPolicy(NoWheelComboBox.AdjustToContents)
         self.mode_combo.addItem("ワークフロー別", "workflow")
         self.mode_combo.addItem("チーム別", "team")
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
@@ -113,13 +117,9 @@ class GanttTab(QWidget):
         toolbar.addSpacing(8)
         toolbar.addWidget(QLabel("対象:"))
         self.group_combo = NoWheelComboBox()
+        self.group_combo.setSizeAdjustPolicy(NoWheelComboBox.AdjustToContents)
         self.group_combo.currentIndexChanged.connect(self._refresh_chart)
         toolbar.addWidget(self.group_combo)
-        toolbar.addSpacing(16)
-        toolbar.addWidget(QLabel(
-            "（ホイールでズーム、Ctrl+ホイールで横のみ、Shift+ホイールで縦のみ、中ボタンドラッグでパン、"
-            "Aキーで全体表示、Fキーで選択中のタスクにズーム）"
-        ))
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
 
@@ -268,16 +268,26 @@ class GanttTab(QWidget):
         if self._result_df is None or self._result_df.empty:
             return "有効なタスクがありません。", False
         total = len(self._result_df)
+        notes = []
         overruns = self._result_df[self._result_df["Deadline_Overrun_Days"] > 0]
-        if overruns.empty:
+        if not overruns.empty:
+            worst = int(overruns["Deadline_Overrun_Days"].max())
+            notes.append(
+                f"うち{len(overruns)}件がマイルストーンの締切に間に合いません（最大{worst}日超過）。"
+                f"チームのライン数・依存関係・締切を見直してください。"
+            )
+        # 満たせない開始固定日も、締切超過と同じく例外ではなく結果として返って
+        # くる（固定を動かして辻褄を合わせず、矛盾はデータを書き換えて解消
+        # しない）。ここで件数を出さないと気付けない。
+        broken = self._result_df[self._result_df["Constraint_Violation"] != ""]
+        if not broken.empty:
+            notes.append(
+                f"うち{len(broken)}件が開始固定日どおりに配置できません"
+                f"（例: {broken.iloc[0]['Task_Name']} — {broken.iloc[0]['Constraint_Violation']}）。"
+            )
+        if not notes:
             return f"{total}件のタスクを生成しました。", False
-        worst = int(overruns["Deadline_Overrun_Days"].max())
-        return (
-            f"{total}件のタスクを生成しました。"
-            f"うち{len(overruns)}件がマイルストーンの締切に間に合いません（最大{worst}日超過）。"
-            f"チームのライン数・依存関係・締切を見直してください。",
-            True,
-        )
+        return f"{total}件のタスクを生成しました。" + "".join(notes), True
 
     def _set_status(self, message, is_error=False):
         """状況表示。エラーはダイアログを出さずここに表示するため、通常の

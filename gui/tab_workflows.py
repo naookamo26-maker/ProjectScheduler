@@ -33,6 +33,7 @@ from gui.node_canvas import (
     compute_task_depths,
     edit_task_via_dialog,
     edit_template_via_dialog,
+    format_dependency_kind,
 )
 from gui.widgets_common import (
     CrudSection,
@@ -52,6 +53,9 @@ _HELP_TEXT = (
     "依存テンプレートを追加できます。タスク右端の丸（出力）から別タスク\n"
     "左端の丸（入力）へドラッグすると、依存関係（先に完了すべきタスク →\n"
     "後続タスク）を作成できます。循環する依存関係は自動的に拒否されます。\n\n"
+    "依存関係の線をダブルクリックすると、種別（完了→開始／開始→開始）と\n"
+    "ラグ（間に空ける営業日数）を設定できます。既定は「完了→開始・ラグ0」で、\n"
+    "それ以外を設定した線にだけ「SS+2」のようなラベルが付きます。\n\n"
     "タブ右上の「テーブルビュー」に切り替えると、同じ内容を一覧性の高い\n"
     "表形式で編集できます。"
 )
@@ -214,7 +218,7 @@ class WorkflowsTab(QWidget):
         name_by_id = {t["id"]: t["name"] for t in tasks}
         preds_by_task = {}
         for d in deps:
-            preds_by_task.setdefault(d["successor_task_id"], []).append(d["predecessor_task_id"])
+            preds_by_task.setdefault(d["successor_task_id"], []).append(d)
 
         # ノードビューの自動整列（依存の深さ→同じ深さ内は名前順）と同じ順序で、
         # 上流→下流を上→下に並べる。
@@ -225,9 +229,14 @@ class WorkflowsTab(QWidget):
             table.setItem(row, 0, QTableWidgetItem(t["name"]))
             table.setItem(row, 1, QTableWidgetItem(t["team_name"]))
             table.setItem(row, 2, QTableWidgetItem(f'{t["default_days"]}日'))
-            pred_names = "、".join(
-                sorted(name_by_id[p] for p in preds_by_task.get(t["id"], []) if p in name_by_id)
-            )
+            # 種別・ラグが既定（FS・0）でない依存だけ「タスク名（SS+2）」と併記する。
+            # ノードビューのエッジラベルと同じ基準で、例外だけを目立たせる。
+            pred_names = "、".join(sorted(
+                name_by_id[d["predecessor_task_id"]]
+                + (f'（{kind}）' if (kind := format_dependency_kind(d["dep_type"], d["lag_days"])) else "")
+                for d in preds_by_task.get(t["id"], [])
+                if d["predecessor_task_id"] in name_by_id
+            ))
             table.setItem(row, 3, QTableWidgetItem(pred_names))
             for col in range(4):
                 table.item(row, col).setFlags(table.item(row, col).flags() & ~Qt.ItemIsEditable)

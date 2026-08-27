@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from gui.db import ProjectDatabase  # noqa: E402
+from gui.db import ProjectDatabase, ProjectDatabaseError  # noqa: E402
 from gui.undo_manager import UndoManager  # noqa: E402
 
 # 分類: core（Qt非依存・pandas非依存。pytestだけで動く）
@@ -91,8 +91,6 @@ def test_duplicate_workflow_copies_tasks_dependencies_and_own_templates(tmp_path
     wf3 = db.add_workflow("WF3")
     a = db.add_workflow_task(wf1, "A", team_id, 1)
     b = db.add_workflow_task(wf1, "B", team_id, 2)
-    db.update_task_position(a, 10, 20)
-    db.update_task_position(b, 200, 20)
     db.add_task_dependency(wf1, a, b)
 
     other_task = db.add_workflow_task(wf2, "X", team_id, 1)
@@ -115,7 +113,6 @@ def test_duplicate_workflow_copies_tasks_dependencies_and_own_templates(tmp_path
     assert sorted((t["name"], t["default_days"]) for t in new_tasks) == [("A", 1), ("B", 2)]
     new_a = next(t for t in new_tasks if t["name"] == "A")
     new_b = next(t for t in new_tasks if t["name"] == "B")
-    assert (new_a["canvas_x"], new_a["canvas_y"]) == (10, 20)  # 座標も複製する
     assert new_a["id"] not in (a, b)  # 新規採番されている（元の行の使い回しではない）
 
     new_deps = db.list_task_dependencies(new_wf_id)
@@ -619,3 +616,336 @@ def test_undo_stack_is_capped(tmp_path):
     for i in range(_MAX_STACK_SIZE + 20):
         db.add_team(f"チーム{i}", 1)
     assert len(manager._undo_stack) == _MAX_STACK_SIZE
+
+
+# -- 依存関係の種別（FS/SS）とラグ ---------------------------------------------------
+
+def test_task_dependency_defaults_to_finish_to_start_without_lag(tmp_path):
+    """種別・ラグを指定せずに追加した依存は FS・0（＝この機能が入る前と
+    まったく同じ意味）になること。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    team = db.add_team("チームA", 1)
+    wf = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf, "タスク1", team, 3)
+    t2 = db.add_workflow_task(wf, "タスク2", team, 3)
+    dep_id = db.add_task_dependency(wf, t1, t2)
+
+    dep = db.get_task_dependency(dep_id)
+    assert (dep["dep_type"], dep["lag_days"]) == ("FS", 0)
+    assert db.list_task_dependencies(wf)[0]["dep_type"] == "FS"
+    db.close()
+
+
+def test_update_task_dependency_kind_is_undoable(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    manager, _ = _attach_dummy_undo_manager(db)
+    team = db.add_team("チームA", 1)
+    wf = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf, "タスク1", team, 3)
+    t2 = db.add_workflow_task(wf, "タスク2", team, 3)
+    dep_id = db.add_task_dependency(wf, t1, t2)
+
+    db.update_task_dependency(dep_id, "SS", 2)
+    assert db.get_task_dependency(dep_id)["dep_type"] == "SS"
+    assert db.get_task_dependency(dep_id)["lag_days"] == 2
+
+    manager.undo()
+    dep = db.get_task_dependency(dep_id)
+    assert (dep["dep_type"], dep["lag_days"]) == ("FS", 0)
+
+    manager.redo()
+    dep = db.get_task_dependency(dep_id)
+    assert (dep["dep_type"], dep["lag_days"]) == ("SS", 2)
+    db.close()
+
+
+def test_task_dependency_rejects_unknown_kind_and_out_of_range_lag(tmp_path):
+    """ALTER TABLEで後から足した列にはCHECK制約を付けられないため、
+    不正な値は書き込み経路（gui/db.py）で弾かれること。"""
+    from gui.db import MAX_LAG_DAYS, ProjectDatabaseError
+
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    team = db.add_team("チームA", 1)
+    wf = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf, "タスク1", team, 3)
+    t2 = db.add_workflow_task(wf, "タスク2", team, 3)
+
+    with pytest.raises(ProjectDatabaseError):
+        db.add_task_dependency(wf, t1, t2, dep_type="FF")
+
+    dep_id = db.add_task_dependency(wf, t1, t2)
+    with pytest.raises(ProjectDatabaseError):
+        db.update_task_dependency(dep_id, "SS", MAX_LAG_DAYS + 1)
+    with pytest.raises(ProjectDatabaseError):
+        db.update_task_dependency(dep_id, "SS", "2日")
+    # 弾かれた場合は元の値のまま
+    assert db.get_task_dependency(dep_id)["dep_type"] == "FS"
+    db.close()
+
+
+def test_duplicating_workflow_copies_dependency_kind_and_lag(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    team = db.add_team("チームA", 1)
+    wf = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf, "タスク1", team, 3)
+    t2 = db.add_workflow_task(wf, "タスク2", team, 3)
+    dep_id = db.add_task_dependency(wf, t1, t2, dep_type="SS", lag_days=3)
+    assert db.get_task_dependency(dep_id)["lag_days"] == 3
+
+    copy_id = db.duplicate_workflow(wf)
+    copied = db.list_task_dependencies(copy_id)
+    assert len(copied) == 1
+    assert (copied[0]["dep_type"], copied[0]["lag_days"]) == ("SS", 3)
+    db.close()
+
+
+def test_opening_pre_dependency_lag_schema_migrates_to_finish_to_start(tmp_path):
+    """dep_type/lag_days列が無い旧バージョン(v6)の.pscheduleを開いた際、
+    列が追加され、既存の依存はすべて FS・0（＝従来の唯一の挙動）として
+    扱われること。"""
+    import sqlite3
+
+    path = tmp_path / "legacy.pschedule"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE project (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            project_name TEXT NOT NULL DEFAULT '',
+            start_date TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE workflows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE task_dependencies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_id INTEGER NOT NULL,
+            predecessor_task_id INTEGER NOT NULL,
+            successor_task_id INTEGER NOT NULL
+        );
+        """
+    )
+    conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '6')")
+    conn.execute("INSERT INTO project(id, project_name, start_date) VALUES (1, '', '')")
+    conn.execute("INSERT INTO workflows(name) VALUES ('WF1')")
+    conn.execute(
+        "INSERT INTO task_dependencies(workflow_id, predecessor_task_id, successor_task_id) "
+        "VALUES (1, 10, 20)"
+    )
+    conn.commit()
+    conn.close()
+
+    db = ProjectDatabase.open_existing(str(path))
+    deps = db.list_task_dependencies(1)
+    assert len(deps) == 1
+    assert (deps[0]["dep_type"], deps[0]["lag_days"]) == ("FS", 0)
+    db.close()
+
+
+
+
+# -- 開始固定日（job_task_overrides.start_pin_date） -----------------------------------
+
+def _build_job_with_task(db):
+    team = db.add_team("チームA", 1)
+    ms = db.add_milestone("MS1", "2026-06-30")
+    wf = db.add_workflow("WF1")
+    task = db.add_workflow_task(wf, "タスク1", team, 3)
+    job = db.add_job("ジョブ1", wf, ms, 100)
+    return job, task
+
+
+def test_start_pin_date_is_stored_as_a_diff_only_override(tmp_path):
+    """開始固定日は job_task_overrides の他の列（override_days等）と同じ
+    「差分のみ保持」に乗る。全項目が既定に戻ると行ごと消える。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    job, task = _build_job_with_task(db)
+
+    db.upsert_job_task_override(job, task, start_pin_date="2026-02-02")
+    row = db.list_job_tasks_with_overrides(job)[0]
+    assert row["start_pin_date"] == "2026-02-02"
+
+    db.upsert_job_task_override(job, task, start_pin_date=None)
+    row = db.list_job_tasks_with_overrides(job)[0]
+    assert row["start_pin_date"] is None
+    db.close()
+
+
+def test_start_pin_date_change_is_undoable(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    manager, _ = _attach_dummy_undo_manager(db)
+    job, task = _build_job_with_task(db)
+
+    db.upsert_job_task_override(job, task, start_pin_date="2026-02-02")
+    assert db.list_job_tasks_with_overrides(job)[0]["start_pin_date"] == "2026-02-02"
+
+    manager.undo()
+    rows = db.list_job_tasks_with_overrides(job)
+    assert rows[0]["start_pin_date"] is None
+    db.close()
+
+
+def test_start_pin_date_rejects_malformed_value(tmp_path):
+    """壊れた日付を保存できてしまうと、スケジューラ側で黙って NaT になり
+    「固定が無かったこと」になる。書き込み経路で弾くこと。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    job, task = _build_job_with_task(db)
+
+    with pytest.raises(ProjectDatabaseError):
+        db.upsert_job_task_override(job, task, start_pin_date="2026/02/02")
+    with pytest.raises(ProjectDatabaseError):
+        db.upsert_job_task_override(job, task, start_pin_date="2026-13-45")
+    assert db.list_job_tasks_with_overrides(job)[0]["start_pin_date"] is None
+    db.close()
+
+
+def test_opening_pre_start_pin_schema_migrates_existing_start_on_rows(tmp_path):
+    """start_pin_date列もtask_constraintsテーブルも無い旧バージョン(v8)の
+    .pscheduleを開いた際、列が追加され、旧task_constraintsのSTART_ON行が
+    job_task_overrides.start_pin_dateへ引き継がれ、テーブル自体は削除される
+    こと（SNET/SNLT/FNLTやジョブ全体の制約は撤回した機能のデータとして
+    引き継がない）。"""
+    import sqlite3
+
+    path = tmp_path / "legacy.pschedule"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE project (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            project_name TEXT NOT NULL DEFAULT '',
+            start_date TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+        CREATE TABLE workflow_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
+        CREATE TABLE job_task_overrides (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL, workflow_task_id INTEGER NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            override_days INTEGER, milestone_id INTEGER, team_id INTEGER
+        );
+        CREATE TABLE task_constraints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL, workflow_task_id INTEGER,
+            kind TEXT NOT NULL, date TEXT NOT NULL, note TEXT NOT NULL DEFAULT ''
+        );
+        """
+    )
+    conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '8')")
+    conn.execute("INSERT INTO project(id, project_name, start_date) VALUES (1, '', '')")
+    conn.execute("INSERT INTO jobs(name) VALUES ('ジョブ1')")
+    conn.execute("INSERT INTO jobs(name) VALUES ('ジョブ2')")
+    conn.execute("INSERT INTO workflow_tasks(name) VALUES ('タスク1')")
+    conn.execute("INSERT INTO workflow_tasks(name) VALUES ('タスク2')")
+    # ジョブ1・タスク1: 既存の上書き行にSTART_ONが追記されるケース
+    conn.execute(
+        "INSERT INTO job_task_overrides(job_id, workflow_task_id, is_active, override_days) "
+        "VALUES (1, 1, 1, 5)"
+    )
+    conn.execute(
+        "INSERT INTO task_constraints(job_id, workflow_task_id, kind, date) "
+        "VALUES (1, 1, 'START_ON', '2026-02-02')"
+    )
+    # ジョブ2・タスク2: 上書き行が無い状態からSTART_ONだけで新規行ができるケース
+    conn.execute(
+        "INSERT INTO task_constraints(job_id, workflow_task_id, kind, date) "
+        "VALUES (2, 2, 'START_ON', '2026-03-03')"
+    )
+    # 撤回した機能のデータ（ジョブ全体・SNET等）は引き継がれないことも確認する
+    conn.execute(
+        "INSERT INTO task_constraints(job_id, workflow_task_id, kind, date) "
+        "VALUES (1, NULL, 'SNET', '2026-01-01')"
+    )
+    conn.execute(
+        "INSERT INTO task_constraints(job_id, workflow_task_id, kind, date) "
+        "VALUES (1, 1, 'FNLT', '2026-04-01')"
+    )
+    conn.commit()
+    conn.close()
+
+    db = ProjectDatabase.open_existing(str(path))
+    # list_job_tasks_with_overrides() は jobs.workflow_id 等フル構成の
+    # スキーマを要求するため、ここでは生SQLで移行結果だけを確認する。
+    rows = {
+        (r["job_id"], r["workflow_task_id"]): (r["start_pin_date"], r["override_days"])
+        for r in db._conn.execute(
+            "SELECT job_id, workflow_task_id, start_pin_date, override_days "
+            "FROM job_task_overrides"
+        ).fetchall()
+    }
+    assert rows[(1, 1)] == ("2026-02-02", 5)   # 既存の上書きは保持される
+    assert rows[(2, 2)] == ("2026-03-03", None)
+    tables = {
+        r["name"] for r in
+        db._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    assert "task_constraints" not in tables
+    db.close()
+
+
+# -- ノードグラフの座標（保存しない設計への移行） ------------------------------------
+
+def test_workflow_task_rows_no_longer_have_canvas_columns(tmp_path):
+    """workflow_tasks.canvas_x/canvas_yは撤去済み。座標は表示のたびに
+    依存の深さから計算し直す方式に統一し、保存する意味のないデータを
+    schema・保存ファイルの双方から無くした。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    team = db.add_team("チームA", 1)
+    wf = db.add_workflow("WF1")
+    db.add_workflow_task(wf, "タスク1", team, 3)
+
+    cols = {r["name"] for r in db._conn.execute("PRAGMA table_info(workflow_tasks)").fetchall()}
+    assert "canvas_x" not in cols
+    assert "canvas_y" not in cols
+    assert not hasattr(db, "update_task_position")
+    db.close()
+
+
+def test_opening_pre_canvas_removal_schema_drops_canvas_columns(tmp_path):
+    """canvas_x/canvas_y列がまだ残っている旧バージョン(v9)の.pscheduleを
+    開いた際、列が削除され、他のデータ（タスク名・所要日数等）は保持される
+    こと。"""
+    import sqlite3
+
+    path = tmp_path / "legacy.pschedule"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE project (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            project_name TEXT NOT NULL DEFAULT '',
+            start_date TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE teams (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+        CREATE TABLE workflows (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+        CREATE TABLE workflow_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_id INTEGER NOT NULL, name TEXT NOT NULL,
+            team_id INTEGER NOT NULL, default_days INTEGER NOT NULL,
+            canvas_x REAL NOT NULL DEFAULT 0, canvas_y REAL NOT NULL DEFAULT 0
+        );
+        """
+    )
+    conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '9')")
+    conn.execute("INSERT INTO project(id, project_name, start_date) VALUES (1, '', '')")
+    conn.execute("INSERT INTO teams(name) VALUES ('チームA')")
+    conn.execute("INSERT INTO workflows(name) VALUES ('WF1')")
+    conn.execute(
+        "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days, canvas_x, canvas_y) "
+        "VALUES (1, 'タスク1', 1, 3, 123.0, 456.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    db = ProjectDatabase.open_existing(str(path))
+    cols = {r["name"] for r in db._conn.execute("PRAGMA table_info(workflow_tasks)").fetchall()}
+    assert "canvas_x" not in cols
+    assert "canvas_y" not in cols
+    tasks = db.list_workflow_tasks(1)
+    assert len(tasks) == 1
+    assert (tasks[0]["name"], tasks[0]["default_days"]) == ("タスク1", 3)
+    db.close()

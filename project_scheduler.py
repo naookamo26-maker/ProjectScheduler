@@ -77,6 +77,7 @@ v8での変更点（大規模プロジェクトへの対応）:
 import hashlib
 import heapq
 import logging
+import re
 from datetime import date as date_cls, timedelta
 
 import numpy as np
@@ -118,6 +119,53 @@ class ResourceOverflowError(SchedulingError):
 
 
 DEFAULT_LOW_PRIORITY = 999  # Priority未指定タスクのフォールバック（最後に処理＝押し出されやすい）
+
+#: 依存関係の種別。FS = Finish-to-Start（先行の完了後に開始）、
+#: SS = Start-to-Start（先行の開始に合わせて開始）。
+DEPENDENCY_KINDS = ("FS", "SS")
+
+#: 種別・ラグを指定しない依存関係の意味（＝この機能が入る前の唯一の挙動）。
+DEFAULT_DEPENDENCY = ("FS", 0)
+
+# Internal_Depends 列の1件ぶんの書式: "T_003" / "T_003(SS+2)" / "T_003(FS-1)"。
+# 種別・ラグが既定（FS・0）の依存は括弧を付けず、従来とまったく同じ文字列に
+# なるようにしている（旧Excel・既存の.pscheduleと相互に読み書きできる）。
+_DEP_REF_RE = re.compile(
+    r"^(?P<task>[^()\s]+)"
+    r"(?:\(\s*(?P<kind>[A-Za-z]{2})\s*(?P<lag>[+-]\s*\d+)?\s*\))?$"
+)
+
+
+def format_dependency_ref(task_id, dep_type="FS", lag_days=0):
+    """依存1件を Internal_Depends 列の文字列に変換する。"""
+    dep_type = str(dep_type or "FS").upper()
+    lag_days = int(lag_days or 0)
+    if dep_type == "FS" and lag_days == 0:
+        return str(task_id)
+    if lag_days == 0:
+        return f"{task_id}({dep_type})"
+    return f"{task_id}({dep_type}{lag_days:+d})"
+
+
+def parse_dependency_ref(text):
+    """Internal_Depends 列の1件を (Task_ID, 種別, ラグ営業日) に分解する。
+
+    括弧を伴わない従来どおりの書き方は (Task_ID, "FS", 0) になる。
+    """
+    m = _DEP_REF_RE.match(str(text).strip())
+    if m is None:
+        raise SchedulingError(
+            f"依存関係の書き方 '{text}' を解釈できません"
+            f"（'T_003' / 'T_003(SS+2)' / 'T_003(FS-1)' の形で指定してください）"
+        )
+    kind = (m.group("kind") or "FS").upper()
+    if kind not in DEPENDENCY_KINDS:
+        raise SchedulingError(
+            f"依存関係の種別 '{kind}'（'{text}'）は不正です"
+            f"（{' / '.join(DEPENDENCY_KINDS)} のいずれか）"
+        )
+    lag = m.group("lag")
+    return m.group("task"), kind, int(lag.replace(" ", "")) if lag else 0
 
 # チーム別色分け（Plotlyガントチャート／ガントチャートタブ／ワークフロー設計）
 # 用の固定カテゴリカルパレット（12色、順序固定）。バー内に黒文字（#0b0b0b）を
@@ -348,7 +396,6 @@ def _load_data(excel_file):
         pd.read_excel(xls, sheet_name="Team_Capacity_Changes")
         if "Team_Capacity_Changes" in xls.sheet_names else None
     )
-
     return _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
                                    df_jtasks, df_holidays, df_extdeps, df_wf_names,
                                    df_team_capacity)
@@ -467,17 +514,41 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps):
                 )
 
             internal_depends = t.get("Internal_Depends")
-            int_deps = [
-                f"{job_id}:{d.strip()}"
-                for d in str(internal_depends).split(",")
-                if d.strip() and pd.notna(internal_depends)
-            ]
+            int_deps = []
+            # 既定（FS・ラグ0）以外の依存だけを dep_specs に載せる。ラグを使って
+            # いないプロジェクトでは空のままになり、日程計算のループが従来と
+            # まったく同じ経路を通る（大規模データでの速度を落とさないため）。
+            dep_specs = {}
+            if pd.notna(internal_depends):
+                for ref in str(internal_depends).split(","):
+                    if not ref.strip():
+                        continue
+                    dep_task, dep_kind, dep_lag = parse_dependency_ref(ref)
+                    dep_g_id = f"{job_id}:{dep_task}"
+                    int_deps.append(dep_g_id)
+                    if (dep_kind, dep_lag) != DEFAULT_DEPENDENCY:
+                        dep_specs[dep_g_id] = (dep_kind, dep_lag)
             ext_deps = ext_dep_map.get((job_id, t_id), [])
 
+            # 開始固定日（実績確定・外部都合のピン留め）。読めない日付を黙って
+            # 無視すると「固定が無かったこと」になり、意図と違う日程が静かに
+            # 出てしまうため、他の日付列同様エラーにする。
+            start_pin_raw = override.get("Start_Pin_Date")
+            start_pin_ord = None
+            if pd.notna(start_pin_raw) and str(start_pin_raw).strip() != "":
+                start_pin = pd.to_datetime(start_pin_raw, errors="coerce")
+                if pd.isna(start_pin):
+                    raise SchedulingError(
+                        f"タスク '{g_id}' の開始固定日 '{start_pin_raw}' を解釈できません"
+                    )
+                start_pin_ord = start_pin.toordinal()
+
             active_tasks[g_id] = {
+                "start_pin_ord": start_pin_ord,
                 "job_id": job_id, "job_name": job_name, "task_id": t_id,
                 "task_name": t["Task_Name"], "days": days,
-                "deps": int_deps + list(ext_deps), "milestone": task_ms,
+                "deps": int_deps + list(ext_deps), "dep_specs": dep_specs,
+                "milestone": task_ms,
                 "team_id": team_id, "ms_end": ms_end, "ms_end_ord": ms_end.toordinal(),
                 "priority": priority, "workflow_id": wf_id,
             }
@@ -487,6 +558,8 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps):
         dropped = [d for d in t_data["deps"] if d not in active_ids]
         if dropped:
             logger.warning(f"タスク '{g_id}' の依存先 {dropped} は存在しない、または非アクティブなため無視します")
+            for d in dropped:
+                t_data["dep_specs"].pop(d, None)
         t_data["deps"] = [d for d in t_data["deps"] if d in active_ids]
 
     return teams_dict, active_tasks, active_ids
@@ -724,6 +797,27 @@ class _WorkCalendar:
             return None
         return self.base + int(nth[k])
 
+    def shift_working_days(self, ordinal, days, team_id):
+        """境界としての序数 ordinal を、稼働日換算で days 日ぶん前後へ動かす
+        （依存関係のラグの加算に使う）。範囲外になる場合は None。
+
+        - days > 0 : ordinal 以降の最初の稼働日から数えて days 稼働日ぶん後ろ。
+          「先行タスクの完了後、稼働日で days 日空けてから」という意味になる。
+        - days < 0 : ordinal から遡って |days| 稼働日ぶん前（リード）。
+
+        暦日ではなく稼働日で数えるのは、所要日数・休業日の扱いが他のすべての
+        計算で営業日ベースだからで、ここだけ暦日にすると「2日空ける」が
+        週末をまたぐかどうかで意味を変えてしまう。
+        """
+        if days == 0:
+            return int(ordinal)
+        if days > 0:
+            start = self.next_working_day(ordinal, team_id)
+            if start is None:
+                return None
+            return self.business_end(start, days, team_id)
+        return self.business_start(ordinal, -days, team_id)
+
     def build_capacity(self, team_id, team_capacity_schedule):
         """チームの「実効ライン数」を日ごとに並べた配列を作る（添字は 序数 - base）。
 
@@ -746,6 +840,53 @@ class _WorkCalendar:
         return np.where(work, values[idx], _UNLIMITED_LINES).astype(np.int32)
 
 
+def _dep_spec(active_tasks, succ_id, pred_id):
+    """依存 pred -> succ の (種別, ラグ)。指定が無ければ既定（FS・0）。"""
+    return active_tasks[succ_id]["dep_specs"].get(pred_id, DEFAULT_DEPENDENCY)
+
+
+def _dep_lower_bounds(t_info, dates, cal, team_id, g_id):
+    """依存関係から決まる「このタスクが開始できる最も早い日」の候補を列挙する。
+
+    dates は {g_id: (開始序数, 終了序数exclusive)}（ASAP計算中なら理想日程、
+    平準化中なら確定済みの実際の日程）。dep_specs が空の場合＝ラグも
+    Start-to-Start も使っていない場合は、従来どおり依存元の終了日をそのまま
+    返す高速な経路を通る。
+    """
+    deps = t_info["deps"]
+    specs = t_info["dep_specs"]
+    if not specs:
+        return [dates[d][1] for d in deps if d in dates]
+
+    bounds = []
+    for d in deps:
+        placed = dates.get(d)
+        if placed is None:
+            continue
+        kind, lag = specs.get(d, DEFAULT_DEPENDENCY)
+        anchor = placed[0] if kind == "SS" else placed[1]
+        bound = cal.shift_working_days(anchor, lag, team_id)
+        if bound is None:
+            raise SchedulingError(
+                f"タスク '{g_id}' の依存 '{d}'（{kind}{lag:+d}日）を反映した"
+                f"着手可能日が稼働日カレンダーの範囲を超えました。ラグの値を"
+                f"見直してください。"
+            )
+        bounds.append(bound)
+    return bounds
+
+
+def _pinned_start(t_info, cal, team_id):
+    """開始固定日（start_pin_ord）があれば序数（稼働日に丸め済み）。無ければ None。
+
+    指定日が休業日なら次の稼働日へ送る。ここでエラーにしないのは、休業日の
+    設定はあとから変わりうる一方、固定の意図（この日から着手する）は変わらない
+    ため——「置けない」ではなく「置いた結果がこうなった」を返すほうが情報が多い。
+    """
+    pin = t_info["start_pin_ord"]
+    return None if pin is None else cal.next_working_day(pin, team_id)
+
+
 def _build_work_calendar(active_tasks, successors, scheduling_order, project_start,
                          holidays_all, holidays_by_team, jp_holidays,
                          auto_exclude_weekends, auto_exclude_jp_holidays):
@@ -760,17 +901,30 @@ def _build_work_calendar(active_tasks, successors, scheduling_order, project_sta
 
     いずれも営業日での見積りなので、暦日に換算する分の余裕を掛けて確保する。
     """
-    # tail[g] = g から終端タスクまでの最長所要日数（g 自身を含む）。
+    # tail[g] = g から終端タスクまでの最長所要日数（g 自身と、途中の依存ラグを含む）。
+    # lag_tail[g] = 同じ鎖のうち、ラグだけを積んだ長さ。ラグを使っていない
+    # プロジェクトでは常に0になり、確保する範囲は従来と1日も変わらない。
     # scheduling_order は後続タスクが先に並ぶため、この順で舐めれば
     # 後続の値が必ず先に確定している。
     tail = {}
+    lag_tail = {}
     max_tail = 0
+    max_lag_tail = 0
     for g_id in scheduling_order:
-        succ_tail = max((tail[s] for s in successors[g_id]), default=0)
+        succ_tail = 0
+        succ_lag_tail = 0
+        for s in successors[g_id]:
+            # 負のラグ（リード）は鎖を縮める方向なので、範囲の見積りでは0として扱う。
+            lag = max(_dep_spec(active_tasks, s, g_id)[1], 0)
+            succ_tail = max(succ_tail, tail[s] + lag)
+            succ_lag_tail = max(succ_lag_tail, lag_tail[s] + lag)
         value = active_tasks[g_id]["days"] + succ_tail
         tail[g_id] = value
+        lag_tail[g_id] = succ_lag_tail
         if value > max_tail:
             max_tail = value
+        if succ_lag_tail > max_lag_tail:
+            max_lag_tail = succ_lag_tail
 
     team_load = {}
     for t_info in active_tasks.values():
@@ -778,9 +932,18 @@ def _build_work_calendar(active_tasks, successors, scheduling_order, project_sta
     max_load = max(team_load.values(), default=0)
 
     ms_ends = [t["ms_end_ord"] for t in active_tasks.values()]
+    # 開始固定日はプロジェクト開始日より前にも、どのマイルストーンより後ろにも
+    # 置きうる（実績の確定・外部都合のピン留め）。範囲に含めておかないと
+    # 「カレンダーの範囲外です」で止まる。
+    pin_ords = [
+        t["start_pin_ord"] for t in active_tasks.values() if t["start_pin_ord"] is not None
+    ]
     start_ord = project_start.toordinal()
-    lo = min([start_ord] + ms_ends) - (max_tail * _CALENDAR_MARGIN_FACTOR + _CALENDAR_MARGIN_DAYS)
-    hi = max([start_ord] + ms_ends) + (max_load * _CALENDAR_MARGIN_FACTOR + _CALENDAR_MARGIN_DAYS)
+    anchors = [start_ord] + ms_ends + pin_ords
+    lo = min(anchors) - (max_tail * _CALENDAR_MARGIN_FACTOR + _CALENDAR_MARGIN_DAYS)
+    hi = max(anchors) + (
+        (max_load + max_lag_tail) * _CALENDAR_MARGIN_FACTOR + _CALENDAR_MARGIN_DAYS
+    )
 
     return _WorkCalendar(lo, hi, holidays_all, holidays_by_team, jp_holidays,
                          auto_exclude_weekends, auto_exclude_jp_holidays)
@@ -792,12 +955,45 @@ def _calc_raw_dates(active_tasks, successors, scheduling_order, cal):
     raw_dates = {}
     for g_id in scheduling_order:
         t_info = active_tasks[g_id]
-        succs = successors[g_id]
-        if not succs:
-            t_end = t_info["ms_end_ord"]
-        else:
-            t_end = min(min(raw_dates[s][0] for s in succs), t_info["ms_end_ord"])
-        t_start = cal.business_start(t_end, t_info["days"], t_info["team_id"])
+        team_id = t_info["team_id"]
+        days = t_info["days"]
+
+        # 固定（START_ON）タスクは最遅日程も固定日そのもの。後続タスクの都合で
+        # 前後させる余地は無いので、ここで確定して次へ進む。
+        pin = _pinned_start(t_info, cal, team_id)
+        if pin is not None:
+            pin_end = cal.business_end(pin, days, team_id)
+            if pin_end is None:
+                raise SchedulingError(
+                    f"タスク '{g_id}' の固定開始日から所要日数ぶんの稼働日を確保できません"
+                )
+            raw_dates[g_id] = (pin, pin_end)
+            continue
+
+        # 上限は「自分の締切」と「各後続タスクの最遅開始から逆算した日」の最小値。
+        t_end = t_info["ms_end_ord"]
+        for s in successors[g_id]:
+            kind, lag = _dep_spec(active_tasks, s, g_id)
+            succ_start = raw_dates[s][0]
+            if kind == "SS":
+                # SSは「開始」同士の制約なので、まず後続の最遅開始からラグを
+                # 戻して自分の最遅開始を求め、そこから所要日数ぶん進めて
+                # 終了側の上限に直す。
+                start_cap = cal.shift_working_days(succ_start, -lag, team_id)
+                if start_cap is not None:
+                    start_cap = cal.prev_working_day(start_cap, team_id)
+                cap = None if start_cap is None else cal.business_end(start_cap, days, team_id)
+            else:
+                cap = cal.shift_working_days(succ_start, -lag, team_id)
+            if cap is None:
+                raise SchedulingError(
+                    f"タスク '{g_id}' の最遅日程を求められません（後続 '{s}' への"
+                    f"依存 {kind}{lag:+d}日 が稼働日カレンダーの範囲を超えました）"
+                )
+            if cap < t_end:
+                t_end = cap
+
+        t_start = cal.business_start(t_end, days, team_id)
         if t_start is None:
             raise SchedulingError(
                 f"タスク '{g_id}' の最遅日程を求められません。マイルストーンの締切が"
@@ -809,9 +1005,11 @@ def _calc_raw_dates(active_tasks, successors, scheduling_order, cal):
 
 def _calc_asap_dates(active_tasks, leveling_order, project_start_ord, cal):
     """
-    リソース制約を無視した、依存関係のみを考慮した最速（ASAP）の理想日程。
-    プロジェクト開始日・依存タスク（Internal/External Depends）の完了日のうち
-    遅い方を起点に、できるだけ早く着手する前提で計算する。
+    リソース制約を無視した、依存関係と開始固定日のみを考慮した最速（ASAP）の
+    理想日程。プロジェクト開始日と、各依存タスクから決まる着手可能日（FSなら
+    依存元の完了日、SSなら依存元の開始日。いずれも依存関係に設定されたラグを
+    営業日で加算する）のうち、最も遅い日を起点にする。開始固定日（実績確定・
+    外部都合のピン留め）が付いたタスクはその日そのものを使う。
 
     _calc_raw_dates（ALAP＝締切から逆算した最遅日程）とセットで使うことで、
     各タスクの「動かせる幅（スラック）」＝ ASAP〜ALAP の範囲が分かる。
@@ -823,8 +1021,10 @@ def _calc_asap_dates(active_tasks, leveling_order, project_start_ord, cal):
     for g_id in leveling_order:
         t_info = active_tasks[g_id]
         team_id = t_info["team_id"]
-        dep_ends = [asap_dates[d][1] for d in t_info["deps"] if d in asap_dates]
-        t_start = cal.next_working_day(max([project_start_ord] + dep_ends), team_id)
+        t_start = _pinned_start(t_info, cal, team_id)
+        if t_start is None:
+            dep_ends = _dep_lower_bounds(t_info, asap_dates, cal, team_id, g_id)
+            t_start = cal.next_working_day(max([project_start_ord] + dep_ends), team_id)
         t_end = None if t_start is None else cal.business_end(t_start, t_info["days"], team_id)
         if t_end is None:
             raise SchedulingError(
@@ -938,11 +1138,21 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
     numpy配列（`usage`）として持ち、空き判定は「使用量 < 実効ライン数」の
     一括比較で行う（_WorkCalendar.build_capacity 参照）。
 
+開始固定日（実績確定・外部都合のピン留め）はパス1で先にラインを予約する
+    （下記）。**固定タスクを先に予約する2パス構成にしている。** 単純にトポロジカル順の
+    1パスで回すと、固定タスクの番が来たときには既にその時間帯のラインが他の
+    タスクで埋まっていて置けない。固定は「動かせない入力」なのだから、
+    探索対象より先にラインを取らせるのが正しい順序になる。
+
     Returns:
-        (scheduled, adjusted) のタプル。
+        (scheduled, adjusted, overbooked_pins) のタプル。
         scheduled: {g_id: (開始日の序数, 終了日の序数)}
         adjusted: {g_id: bool}。実際の配置が分散の基準点(target_start)からずれた
             場合（＝チームのライン数不足で動かさざるを得なかった場合）に True。
+            固定タスクは「言われた場所」にあるので常に False。
+        overbooked_pins: 固定した結果、チームのライン数を超えて予約することに
+            なったタスクの g_id の集合（診断結果として返すためのもの。
+            固定を動かして辻褄を合わせることはしない）。
     """
     scheduled = {}
     adjusted = {}
@@ -999,15 +1209,56 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
         lo, hi = start_ord - cal.base, end_ord - cal.base
         used[lo:hi] += cal.work_mask(team_id)[lo:hi]
 
+    def is_overbooked(team_id, start_ord, end_ord):
+        """[start_ord, end_ord) の稼働日に、既に空きラインが無い日があるか。"""
+        used, cap = team_arrays(team_id)
+        lo, hi = start_ord - cal.base, end_ord - cal.base
+        return bool(np.any(used[lo:hi] >= cap[lo:hi]))
+
     job_shift_days = _calc_job_shift_days(active_tasks, asap_dates, raw_dates, distribution_ratio)
 
+    # === パス1: 固定（START_ON）タスクを先に予約する ==============================
+    # トポロジカル順の1パスだけで回すと、固定タスクの番が来たときには既にその
+    # 時間帯のラインが他のタスクで埋まっていて置けない。固定は「動かせない入力」
+    # なのだから、探索対象より先にラインを取らせるのが正しい順序になる。
+    # （この2パス構成は、実績を反映した再計画——完了タスクを実績日で固定して
+    # 残りを平準化する——でそのまま必要になるものと同じ形。）
+    overbooked_pins = set()
     for g_id in leveling_order:
+        t_info = active_tasks[g_id]
+        team_id = t_info["team_id"]
+        pin = _pinned_start(t_info, cal, team_id)
+        if pin is None:
+            continue
+        end_ord = cal.business_end(pin, t_info["days"], team_id)
+        if end_ord is None:
+            raise SchedulingError(
+                f"タスク '{g_id}' の固定開始日 "
+                f"{pd.Timestamp.fromordinal(pin).date()} から所要日数ぶんの"
+                f"稼働日を確保できません"
+            )
+        # 固定同士がぶつかる（同じチーム・同じ期間に固定が集中する）場合は、
+        # 片方を動かして辻褄を合わせることはしない——固定は入力であり、
+        # 動かした時点で入力を書き換えたことになるため。ライン数を超えたまま
+        # 予約し、超過を診断結果として返す。
+        if is_overbooked(team_id, pin, end_ord):
+            overbooked_pins.add(g_id)
+        book(team_id, pin, end_ord)
+        scheduled[g_id] = (pin, end_ord)
+        # 固定タスクは「言われた場所」に置かれているので、リソース制約による
+        # ずれ（Resource_Adjusted）ではない。
+        adjusted[g_id] = False
+
+    # === パス2: 残りをリソース平準化する ==========================================
+    for g_id in leveling_order:
+        if g_id in scheduled:
+            continue  # パス1で固定済み
         t_info = active_tasks[g_id]
         team_id = t_info["team_id"]
         days = t_info["days"]
         job_id = t_info.get("job_id", g_id)
 
-        dep_ends = [scheduled[d][1] for d in t_info["deps"] if d in scheduled]
+        dep_ends = _dep_lower_bounds(t_info, scheduled, cal, team_id, g_id)
         earliest_start = cal.next_working_day(max([project_start_ord] + dep_ends), team_id)
         if earliest_start is None:
             raise SchedulingError(f"タスク '{g_id}' の着手可能日を求められません")
@@ -1077,7 +1328,7 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
         # チームのライン数不足（リソース制約）によって動かさざるを得なかったことを示す
         adjusted[g_id] = (start_ord != target_start)
 
-    return scheduled, adjusted
+    return scheduled, adjusted, overbooked_pins
 
 
 
@@ -1645,6 +1896,72 @@ def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, 
     )
 
 
+def _check_constraint_violations(active_tasks, scheduled, cal, overbooked_pins):
+    """開始固定日が満たせなかったタスクを洗い出して {g_id: (超過日数, 説明)} で返す。
+
+    **固定日そのものは必ず守られる**（パス1で無条件に予約するため）。破れうる
+    のは「固定した結果、依存関係やライン数と両立しない」ほうであり、それを
+    ここでエラーではなく結果として返す（締切超過と同じ方針）。ここで例外に
+    すると、1つの固定が矛盾しているだけでプロジェクト全体の日程が一切得られ
+    なくなり、「何が・どれだけ無理なのか」を確認することすらできなくなる。
+    """
+    violations = {}
+    for g_id, (start_ord, end_ord) in scheduled.items():
+        t_info = active_tasks[g_id]
+        if t_info["start_pin_ord"] is None:
+            continue
+        team_id = t_info["team_id"]
+        notes = []
+        worst = 0
+
+        def record(days, text):
+            nonlocal worst
+            worst = max(worst, days)
+            notes.append(text)
+
+        pin_label = _fmt_ord(t_info["start_pin_ord"])
+        dep_floor = _dep_lower_bounds(t_info, scheduled, cal, team_id, g_id)
+        if dep_floor:
+            floor = cal.next_working_day(max(dep_floor), team_id)
+            if floor is not None and start_ord < floor:
+                record(floor - start_ord,
+                       f"固定開始日（{pin_label}）が依存タスクの着手可能日（{_fmt_ord(floor)}）"
+                       f"より{floor - start_ord}日早いです")
+        if g_id in overbooked_pins:
+            # ライン数の超過に「何日超過」に相当する量は無いので日数は0のまま。
+            # 違反しているかどうかは説明文が空かどうかで判定する。
+            record(0, f"固定開始日（{pin_label}）がチーム「{team_id}」のライン数を"
+                      f"超えて予約されています")
+
+        if notes:
+            violations[g_id] = (worst, "／".join(notes))
+    return violations
+
+
+def _fmt_ord(ordinal):
+    return pd.Timestamp.fromordinal(int(ordinal)).strftime("%Y-%m-%d")
+
+
+def _warn_constraint_violations(result_df, max_listed=10):
+    """満たせなかった日付制約を警告としてまとめて出す（締切超過と同じ扱い）。"""
+    if result_df.empty or "Constraint_Violation" not in result_df.columns:
+        return
+    broken = result_df[result_df["Constraint_Violation"] != ""]
+    if broken.empty:
+        return
+    worst = broken.sort_values("Constraint_Violation_Days", ascending=False)
+    logger.warning(
+        f"満たせなかった日付制約が {len(broken)} 件あります。制約の日付、依存関係、"
+        f"チームのライン数のいずれかを見直してください。"
+    )
+    for _, r in worst.head(max_listed).iterrows():
+        logger.warning(
+            f"  {r['Job_Name']} > {r['Task_Name']}: {r['Constraint_Violation']}"
+        )
+    if len(worst) > max_listed:
+        logger.warning(f"  ...ほか {len(worst) - max_listed} 件")
+
+
 def _warn_deadline_overruns(result_df, max_listed=10):
     """マイルストーンの締切に間に合わなかったタスクを警告としてまとめて出す。
 
@@ -1714,7 +2031,8 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
             milestone_markers.append((str(ms_id), str(ms_name), ms_end))
     milestone_markers.sort(key=lambda m: m[2])
 
-    teams_dict, active_tasks, active_ids = _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps)
+    teams_dict, active_tasks, active_ids = _parse_tasks(
+        df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps)
     team_capacity_schedule = _build_team_capacity_schedule(df_teams, df_team_capacity)
 
     if not active_ids:
@@ -1722,7 +2040,8 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
         result_df = pd.DataFrame(columns=[
             "Job_ID", "Task_ID", "Job_Name", "Task_Name", "Team_ID", "Priority",
             "Workflow_ID", "Milestone_ID", "Start_Date", "End_Date",
-            "Resource_Adjusted", "Deadline_Overrun_Days"
+            "Resource_Adjusted", "Deadline_Overrun_Days",
+            "Constraint_Violation_Days", "Constraint_Violation",
         ])
         if plotly_output_path:
             export_plotly_gantt(result_df, plotly_output_path, project_name,
@@ -1754,10 +2073,12 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
 
     raw_dates = _calc_raw_dates(active_tasks, successors, scheduling_order, cal)
     asap_dates = _calc_asap_dates(active_tasks, leveling_order, project_start_ord, cal)
-    scheduled, adjusted_flags = _run_leveling(
+    scheduled, adjusted_flags, overbooked_pins = _run_leveling(
         active_tasks, leveling_order, team_capacity_schedule, project_start_ord, cal,
         asap_dates=asap_dates, raw_dates=raw_dates, distribution_ratio=distribution_ratio,
     )
+    constraint_violations = _check_constraint_violations(
+        active_tasks, scheduled, cal, overbooked_pins)
 
     rows = []
     for g_id, dates in scheduled.items():
@@ -1766,6 +2087,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
         # 場合に True になる（distribution_ratio による意図的な分散配置そのものは
         # 「調整あり」に含めない）
         resource_adjusted = adjusted_flags.get(g_id, False)
+        violation_days, violation_note = constraint_violations.get(g_id, (0, ""))
         rows.append({
             "Job_ID": t["job_id"],
             "Task_ID": t["task_id"],
@@ -1781,16 +2103,24 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
             # マイルストーンの締切をどれだけ超過したか（暦日、0なら間に合っている）。
             # 終了日は exclusive なので、締切当日ちょうどに終わる場合は超過0になる。
             "Deadline_Overrun_Days": max(0, dates[1] - t["ms_end_ord"]),
+            # 満たせなかった開始固定日（start_pin_ord）。固定は動かして辻褄を
+            # 合わせず、矛盾は結果として返す（_check_constraint_violations 参照）。
+            # 空文字なら固定は無い、または固定は問題なく守られている。
+            "Constraint_Violation_Days": violation_days,
+            "Constraint_Violation": violation_note,
         })
 
     result_df = pd.DataFrame(rows).sort_values(["Start_Date", "Job_ID", "Task_ID"]).reset_index(drop=True)
 
     _warn_deadline_overruns(result_df)
+    _warn_constraint_violations(result_df)
 
     if verbose:
         print("=== リソース制約考慮スケジューリング結果 ===")
         for _, r in result_df.iterrows():
             mark = " ⚠️ [リソース制約により前倒し]" if r["Resource_Adjusted"] else ""
+            if r["Constraint_Violation"]:
+                mark += f" ⚠️ [{r['Constraint_Violation']}]"
             print(
                 f"[{r['Team_ID']}] {r['Job_Name']} > {r['Task_Name']} "
                 f"(優先度{r['Priority']}): "

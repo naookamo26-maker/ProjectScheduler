@@ -22,9 +22,9 @@
 
 | マーカー | 対象モジュール | 必要な依存 | 件数 / 時間 |
 | --- | --- | --- | --- |
-| `core` | `gui/db.py` `gui/db_schema.py` `gui/undo_manager.py` | pytestのみ | 24件 / 約0.2秒 |
-| `scheduler` | `project_scheduler.py` `gui/gantt_generator.py` | + pandas, numpy | 45件 / 約2秒 |
-| `gui` | `gui/`のウィジェット層・描画層 | + PySide6 + システムライブラリ | 67件 / 約8秒 |
+| `core` | `gui/db.py` `gui/db_schema.py` `gui/undo_manager.py` | pytestのみ | 35件 / 約0.5秒 |
+| `scheduler` | `project_scheduler.py` `gui/gantt_generator.py` | + pandas, numpy | 59件 / 約1.5秒 |
+| `gui` | `gui/`のウィジェット層・描画層 | + PySide6 + システムライブラリ | 72件 / 約6秒 |
 
 変更したファイル → 実行するコマンド:
 
@@ -41,7 +41,7 @@
 
 ### 全実行（`pytest`）を行う条件
 
-次のいずれかに当てはまるときだけ、引数なしの`pytest`で136件すべてを回す。
+次のいずれかに当てはまるときだけ、引数なしの`pytest`で166件すべてを回す。
 
 - 利用者から明示的に「全部回して」と指示があったとき。
 - 影響が横断的な変更をしたとき。具体的には、DBスキーマの変更（`gui/db_schema.py`・
@@ -53,7 +53,7 @@
 ### 出力を増やさない
 
 - `pytest.ini`の`addopts`で`-q --no-header --tb=short`が既定になっている。
-  **`-v`は付けない**（136件のテスト名が出力を埋めるだけで、得られる情報は増えない）。
+  **`-v`は付けない**（166件のテスト名が出力を埋めるだけで、得られる情報は増えない）。
 - 失敗を追うときは、全体を回し直さず、失敗したテストだけを名指しで再実行する:
   `pytest tests/test_undo_redo.py::test_foo --tb=long`
 
@@ -76,11 +76,11 @@
 
 | ファイル | 内容 | 読むとき |
 | --- | --- | --- |
-| `docs/architecture.md` (714行) | 全体構成・データフロー・Undo/Redo・各機能の内部設計 | 実装の設計判断に関わるとき。長いので`grep -n '^## ' docs/architecture.md`で目次を出し、該当する節だけを読む |
-| `docs/screens.md` (451行) | タブごとの画面仕様 | GUIの画面仕様を変えるとき。該当タブの節だけ |
-| `docs/db_design.md` (132行) | テーブル定義・設計判断 | スキーマ・永続化を変えるとき |
+| `docs/architecture.md` (888行) | 全体構成・データフロー・Undo/Redo・各機能の内部設計 | 実装の設計判断に関わるとき。長いので`grep -n '^## ' docs/architecture.md`で目次を出し、該当する節だけを読む |
+| `docs/screens.md` (488行) | タブごとの画面仕様 | GUIの画面仕様を変えるとき。該当タブの節だけ |
+| `docs/db_design.md` (183行) | テーブル定義・設計判断 | スキーマ・永続化を変えるとき |
 | `docs/requirements.md` (163行) | 要件定義・スコープ | 仕様の妥当性やスコープ外かどうかを判断するとき |
-| `docs/roadmap.md` (429行) | 今後の検討メモ | 今後の方針を問われたときだけ。通常の実装時には不要 |
+| `docs/roadmap.md` (476行) | 今後の検討メモ | 今後の方針を問われたときだけ。通常の実装時には不要 |
 | `docs/packaging.md` (72行) | `.exe`ビルド手順 | `packaging/`やビルドを触るとき |
 
 コードを読むときは、まず`grep -n`で対象の定義位置を特定し、その周辺だけを読む。

@@ -16,7 +16,7 @@ CRUD本体（gui/db.py）から分離しているのは、この2つが「増え
 4. `docs/db_design.md` のテーブル一覧を追随させる。
 """
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "10"
 
 _SCHEMA_SQL = """
 CREATE TABLE schema_meta (
@@ -71,8 +71,6 @@ CREATE TABLE workflow_tasks (
     name TEXT NOT NULL,
     team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE RESTRICT,
     default_days INTEGER NOT NULL CHECK (default_days >= 1),
-    canvas_x REAL NOT NULL DEFAULT 0,
-    canvas_y REAL NOT NULL DEFAULT 0,
     UNIQUE(workflow_id, name)
 );
 
@@ -81,6 +79,8 @@ CREATE TABLE task_dependencies (
     workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
     predecessor_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
     successor_task_id   INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
+    dep_type TEXT NOT NULL DEFAULT 'FS' CHECK (dep_type IN ('FS', 'SS')),
+    lag_days INTEGER NOT NULL DEFAULT 0,
     UNIQUE(predecessor_task_id, successor_task_id),
     CHECK (predecessor_task_id != successor_task_id)
 );
@@ -101,6 +101,7 @@ CREATE TABLE job_task_overrides (
     override_days INTEGER,
     milestone_id INTEGER REFERENCES milestones(id) ON DELETE SET NULL,
     team_id INTEGER REFERENCES teams(id) ON DELETE SET NULL,
+    start_pin_date TEXT,
     UNIQUE(job_id, workflow_task_id)
 );
 
@@ -225,6 +226,123 @@ def migrate(conn):
             if cols and "note" not in cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN note TEXT NOT NULL DEFAULT ''")
         version = "6"
+
+    if version == "6":
+        # v7: task_dependencies に dep_type（FS/SS）と lag_days（営業日）を追加。
+        # 旧ファイルの依存関係はすべて「FS・ラグ0」＝ 既定値のままで従来と同じ
+        # 意味になるため、列を足すだけで移行は完了する。
+        cols = [
+            r["name"] for r in
+            conn.execute("PRAGMA table_info(task_dependencies)").fetchall()
+        ]
+        if cols and "dep_type" not in cols:
+            # ALTER TABLE ADD COLUMN では CHECK 制約を後付けできないため、
+            # 値の妥当性は gui/db.py 側（_normalize_dependency_kind）で守る。
+            conn.execute(
+                "ALTER TABLE task_dependencies ADD COLUMN dep_type TEXT NOT NULL DEFAULT 'FS'"
+            )
+        if cols and "lag_days" not in cols:
+            conn.execute(
+                "ALTER TABLE task_dependencies ADD COLUMN lag_days INTEGER NOT NULL DEFAULT 0"
+            )
+        version = "7"
+
+    if version == "7":
+        # v8: task_constraints を追加（日付を「入力」として持つための唯一の場所。
+        # タスクに start_date を持たせると計算結果と入力が同じ列に混ざるため、
+        # 制約として別テーブルに分離する。docs/architecture.md 参照）。
+        # 旧ファイルには制約が1件も無い状態として扱えばよいので、テーブルを
+        # 作るだけで移行は完了する。
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_constraints'"
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                "CREATE TABLE task_constraints ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, "
+                "workflow_task_id INTEGER REFERENCES workflow_tasks(id) ON DELETE CASCADE, "
+                "kind TEXT NOT NULL CHECK (kind IN ('SNET', 'SNLT', 'FNLT', 'START_ON')), "
+                "date TEXT NOT NULL, "
+                "note TEXT NOT NULL DEFAULT '', "
+                "UNIQUE(job_id, workflow_task_id, kind))"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX ux_task_constraints_job ON task_constraints(job_id, kind) "
+                "WHERE workflow_task_id IS NULL"
+            )
+        version = "8"
+
+    if version == "8":
+        # v9: 日付制約(task_constraints)を SNET/SNLT/FNLT ごと廃止し、
+        # START_ON だけを job_task_overrides.start_pin_date として残す。
+        #
+        # 経緯: マイルストーン単位で SNET/SNLT/FNLT を一括設定するテンプレート
+        # 機構を検討したが、概念（テンプレート×実効マイルストーンの解決×
+        # 優先順位）が実装コストに見合わないと判断して撤回した。個別ジョブ単位の
+        # SNET/SNLT/FNLT はジョブ数が増えると設定しきれず使われない機能になる
+        # だけなので、START_ON（実績確定・外部都合のピン留め。1ジョブ1タスクに
+        # 閉じた意味を持つ）だけを残す。
+        #
+        # START_ON は「このジョブのこのタスクだけ既定と違う」という他の上書き
+        # （override_days等）と性質が同じなので、専用テーブルを持たず
+        # job_task_overrides に列を足すだけで「差分のみ保持」パターンにそのまま
+        # 乗る。docs/architecture.md「開始固定日（start_pin_date）」参照。
+        cols = [
+            r["name"] for r in
+            conn.execute("PRAGMA table_info(job_task_overrides)").fetchall()
+        ]
+        if cols and "start_pin_date" not in cols:
+            conn.execute(
+                "ALTER TABLE job_task_overrides ADD COLUMN start_pin_date TEXT"
+            )
+        tables = {
+            r["name"] for r in
+            conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        if "task_constraints" in tables:
+            pins = conn.execute(
+                "SELECT job_id, workflow_task_id, date FROM task_constraints "
+                "WHERE kind = 'START_ON' AND workflow_task_id IS NOT NULL"
+            ).fetchall()
+            for p in pins:
+                existing = conn.execute(
+                    "SELECT id FROM job_task_overrides WHERE job_id = ? AND workflow_task_id = ?",
+                    (p["job_id"], p["workflow_task_id"]),
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        "UPDATE job_task_overrides SET start_pin_date = ? WHERE id = ?",
+                        (p["date"], existing["id"]),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO job_task_overrides(job_id, workflow_task_id, "
+                        "is_active, start_pin_date) VALUES (?, ?, 1, ?)",
+                        (p["job_id"], p["workflow_task_id"], p["date"]),
+                    )
+            # ジョブ全体（workflow_task_id IS NULL）のSNET/FNLTと、タスク個別の
+            # SNET/SNLT/FNLTは、この移行では引き継がない対象（撤回した機能の
+            # データ）なので、テーブルごと破棄する。
+            conn.execute("DROP TABLE task_constraints")
+        version = "9"
+
+    if version == "9":
+        # v10: workflow_tasks.canvas_x/canvas_y を削除。ノードグラフの座標は
+        # 「保持しておく意味がないデータ」と判断し、表示のたびに依存の深さから
+        # 計算し直す方式に統一した（依存テンプレートの疑似ノードが元々この
+        # 方式で、以前から座標カラムを持たない。docs/architecture.md参照）。
+        # ドラッグでの並べ替えは引き続きできるが、保存されない一時的な
+        # ものになる。
+        cols = [
+            r["name"] for r in
+            conn.execute("PRAGMA table_info(workflow_tasks)").fetchall()
+        ]
+        if "canvas_x" in cols:
+            conn.execute("ALTER TABLE workflow_tasks DROP COLUMN canvas_x")
+        if "canvas_y" in cols:
+            conn.execute("ALTER TABLE workflow_tasks DROP COLUMN canvas_y")
+        version = "10"
 
     conn.execute(
         "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)

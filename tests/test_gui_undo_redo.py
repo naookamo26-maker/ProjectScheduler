@@ -438,8 +438,9 @@ def test_workflow_task_add_is_single_undo_step_and_restores_canvas_selection(win
     node.setSelected(True)
     qapp.processEvents()
 
-    # add_task内部でauto_arrangeが複数のupdate_task_positionを呼んでも、
-    # 呼び出し全体でUndo1件にまとまっていること。
+    # add_task呼び出し全体（DB書き込みはadd_workflow_task1件のみ。
+    # auto_arrangeは座標をQt側で更新するだけでDBには書き込まない）が
+    # Undo1件にまとまっていること。
     assert len(window.undo_manager._undo_stack) == stack_size_before + 1
     assert window.db.list_workflow_tasks(wf_id) != []
 
@@ -1439,11 +1440,14 @@ def test_multiple_templates_on_the_same_task_stack_without_overlapping_or_moving
 
 def test_reload_positions_dependency_template_nodes_without_overlapping_tasks(window, qapp):
     """回帰テスト: 依存テンプレート追加時は正しく配置されるが、ファイルを
-    開いた際（WorkflowGraphScene.reload）は疑似ノードの座標がDBに保存
-    されないため計算し直されず、既定位置(0,0)のままタスクノードと重なって
-    しまっていた。reload()を呼んだ後も、テンプレートの疑似ノードがタスクの
-    1列上流に正しく配置され、タスク自身の座標（DB保存済み）は変わらないこと
-    を確認する。"""
+    開いた際（WorkflowGraphScene.reload）は疑似ノードの座標が計算し直されず、
+    既定位置(0,0)のままタスクノードと重なってしまっていた（当時はタスクの
+    座標だけDB保存済みの値を使い、疑似ノードだけ毎回計算し直す非対称な設計
+    だったため）。現在はタスク・疑似ノードとも座標をDBに保存せず、reload()の
+    たびに両方をcompute_combined_layoutで計算し直す設計に統一したので、
+    この非対称性自体が起こり得ない。reload()を呼んだ後も、テンプレートの
+    疑似ノードがタスクの1列上流に正しく配置され、タスクの座標も
+    （入力が変わっていないので）計算結果が変わらないことを確認する。"""
     wf_tab = window.tab_workflows
     team_id = window.db.add_team("チームA", 1)
     wf1_id = window.db.add_workflow("WF1")
@@ -1471,7 +1475,7 @@ def test_reload_positions_dependency_template_nodes_without_overlapping_tasks(wi
     template_id = next(iter(scene.template_nodes))
     template_node = scene.template_nodes[template_id]
 
-    assert task_node.pos() == task_pos_before  # タスクの座標（DB保存済み）は変わらない
+    assert task_node.pos() == task_pos_before  # 入力が同じなので計算結果も変わらない
     assert (template_node.pos().x(), template_node.pos().y()) != (0, 0)
     assert template_node.pos().x() < task_node.pos().x()  # タスクの1列上流
 
@@ -1535,3 +1539,183 @@ def test_duplicate_workflow_copies_content_and_selects_the_copy_as_one_undo_step
     assert [w["name"] for w in window.db.list_workflows()] == ["WF1"]
     restored_item = wf_tab.workflow_list.currentItem()
     assert restored_item is not None and restored_item.data(Qt.UserRole) == wf_id
+
+
+def test_edit_dependency_kind_updates_edge_label_and_table(window, qapp):
+    """依存関係の種別・ラグを変更すると、ノードビューのエッジラベルと
+    テーブルビューの「先行タスク」欄の双方に反映され、Undoで戻ること。
+    既定（FS・ラグ0）のエッジにはラベルを出さない。"""
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    task_a = window.db.add_workflow_task(wf_id, "A", team_id, 1)
+    task_b = window.db.add_workflow_task(wf_id, "B", team_id, 1)
+    dep_id = window.db.add_task_dependency(wf_id, task_a, task_b)
+
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    edge = scene.edges[dep_id]
+    assert not edge.label_bg.isVisible()  # 既定はラベル無し
+
+    def pred_cell_text():
+        table = wf_tab.task_section.table
+        for row in range(table.rowCount()):
+            if table.item(row, 0).text() == "B":
+                return table.item(row, 3).text()
+        return None
+
+    assert pred_cell_text() == "A"
+
+    scene.update_edge_kind(dep_id, "SS", 2)
+    qapp.processEvents()
+    assert edge.label_bg.isVisible()
+    assert edge.label_item.text() == "SS+2"
+    assert pred_cell_text() == "A（SS+2）"
+
+    window.undo_manager.undo()
+    qapp.processEvents()
+    dep = window.db.get_task_dependency(dep_id)
+    assert (dep["dep_type"], dep["lag_days"]) == ("FS", 0)
+    assert not wf_tab.current_scene.edges[dep_id].label_bg.isVisible()
+    assert pred_cell_text() == "A"
+
+
+def test_dependency_kind_dialog_reports_the_setting_in_words(window, qapp):
+    """FS/SS・正負のラグの意味を、ダイアログが日本語の一文で言い直すこと
+    （記号だけだと取り違えやすいため）。"""
+    from gui.node_canvas import DependencyKindDialog
+
+    dialog = DependencyKindDialog("A", "B", "FS", 0, window)
+    assert dialog.values() == ("FS", 0)
+    assert "完了後に後続タスクを開始" in dialog.hint.text()
+
+    dialog.lag_spin.setValue(2)
+    assert "2 営業日空けて" in dialog.hint.text()
+
+    dialog.kind_combo.setCurrentIndex(dialog.kind_combo.findData("SS"))
+    dialog.lag_spin.setValue(-3)
+    assert dialog.values() == ("SS", -3)
+    assert "3 営業日早く" in dialog.hint.text()
+    dialog.deleteLater()
+
+
+def test_dependency_edge_is_clickable_along_the_curve(window, qapp):
+    """依存関係の線をダブルクリック/右クリックで編集できるようにするには、
+    2pxのベジェ曲線に当たり判定が付いている必要がある。曲線上および
+    その近傍でエッジとして解決でき、ノードの上では誤認しないこと。"""
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    task_a = window.db.add_workflow_task(wf_id, "A", team_id, 1)
+    task_b = window.db.add_workflow_task(wf_id, "B", team_id, 1)
+    dep_id = window.db.add_task_dependency(wf_id, task_a, task_b)
+
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    view, scene = wf_tab.view, wf_tab.current_scene
+    # タスクをDBへ直接追加したためノードの座標は既定(0,0)のまま重なっている。
+    # 実際の操作（キャンバスからの追加・編集）と同じ配置にしてから判定する。
+    scene.auto_arrange()
+    qapp.processEvents()
+    edge = scene.edges[dep_id]
+
+    for pct in (0.4, 0.5, 0.6):
+        point = edge.path().pointAtPercent(pct)
+        assert view._resolve_edge_hit(scene.itemAt(point, view.transform())) is edge
+
+    near = edge.path().pointAtPercent(0.5)
+    near.setY(near.y() - 5)   # 線から少し外れた位置でも掴める
+    assert view._resolve_edge_hit(scene.itemAt(near, view.transform())) is edge
+
+    node_center = scene.nodes[task_a].sceneBoundingRect().center()
+    assert view._resolve_edge_hit(scene.itemAt(node_center, view.transform())) is None
+
+    # 線の端は出力アンカーの丸と重なる。そこは依存関係を引くドラッグの
+    # 起点なので、エッジではなくアンカーが勝つ（当たり判定を広げても
+    # ドラッグでの依存追加を潰さないこと）。
+    from gui.node_canvas import AnchorItem
+
+    anchor_point = scene.nodes[task_a].output_anchor_scene_pos()
+    assert isinstance(scene.itemAt(anchor_point, view.transform()), AnchorItem)
+
+
+
+def test_start_pin_date_column_edits_the_override_and_is_undoable(window, qapp):
+    """タスク上書き表の「開始固定日」列（OptionalDateEdit）で日付を選ぶと
+    job_task_overrides.start_pin_date に反映され、Undo1回で元に戻ること。
+    Deleteキーで固定を解除できることも確認する。"""
+    from PySide6.QtCore import QDate
+
+    jobs_tab = window.tab_jobs
+    team_id = window.db.add_team("チームA", 1)
+    ms_id = window.db.add_milestone("MS1", "2026-06-30")
+    wf_id = window.db.add_workflow("WF1")
+    task_id = window.db.add_workflow_task(wf_id, "タスク1", team_id, 3)
+    job_id = window.db.add_job("ジョブ1", wf_id, ms_id, 1)
+
+    window.tabs.setCurrentWidget(jobs_tab)
+    jobs_tab.refresh_jobs(select_id=job_id)
+    qapp.processEvents()
+
+    table = jobs_tab.override_table
+    pin_edit = table.cellWidget(0, 5)
+    assert pin_edit.value() is None
+    assert pin_edit.text() == "（固定なし）"
+
+    pin_edit.setDate(QDate(2026, 2, 2))
+    qapp.processEvents()
+    assert window.db.list_job_tasks_with_overrides(job_id)[0]["start_pin_date"] == "2026-02-02"
+
+    window.undo_manager.undo()
+    qapp.processEvents()
+    assert window.db.list_job_tasks_with_overrides(job_id)[0]["start_pin_date"] is None
+    assert jobs_tab.override_table.cellWidget(0, 5).value() is None
+
+    window.undo_manager.redo()
+    qapp.processEvents()
+    pin_edit = jobs_tab.override_table.cellWidget(0, 5)
+    assert pin_edit.value() == "2026-02-02"
+
+    # Deleteキーで固定を解除できる（カレンダーを未設定の特殊値まで戻す必要が無い）。
+    # keyPressEvent()を直接呼ぶだけなのでQtの実フォーカスは動かさない——
+    # setFocus()すると bind_undo_session の Undo単位が開いたままになり、
+    # フィクスチャ側でDBを閉じた後にフォーカス喪失イベントが発火してクラッシュする。
+    from PySide6.QtCore import QEvent, Qt as QtCore_Qt
+    from PySide6.QtGui import QKeyEvent
+    pin_edit.keyPressEvent(QKeyEvent(QEvent.KeyPress, QtCore_Qt.Key_Delete, QtCore_Qt.NoModifier))
+    qapp.processEvents()
+    assert pin_edit.value() is None
+
+
+def test_gantt_tab_reports_unsatisfiable_pin_in_the_status_line(window, qapp):
+    """満たせない開始固定日は例外ではなく結果として返るため、状況表示で
+    件数を出さないと気付けない。"""
+    import time
+
+    team_id = window.db.add_team("チームA", 1)
+    ms_id = window.db.add_milestone("MS1", "2026-06-30")
+    wf_id = window.db.add_workflow("WF1")
+    task_a = window.db.add_workflow_task(wf_id, "タスクA", team_id, 3)
+    task_b = window.db.add_workflow_task(wf_id, "タスクB", team_id, 3)
+    window.db.add_task_dependency(wf_id, task_a, task_b)
+    job_id = window.db.add_job("ジョブ1", wf_id, ms_id, 1)
+    window.db.set_project("固定日テスト", "2026-01-05")
+    # 依存元(タスクA)より前にタスクBを固定する＝矛盾
+    window.db.upsert_job_task_override(job_id, task_b, start_pin_date="2026-01-06")
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    for _ in range(100):
+        qapp.processEvents()
+        if window.tab_gantt._result_df is not None:
+            break
+        time.sleep(0.05)
+
+    message, is_error = window.tab_gantt._result_summary()
+    assert is_error
+    assert "開始固定日どおりに配置できません" in message
+    assert "依存タスクの着手可能日" in message
