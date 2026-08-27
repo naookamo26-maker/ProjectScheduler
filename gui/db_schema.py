@@ -16,7 +16,7 @@ CRUD本体（gui/db.py）から分離しているのは、この2つが「増え
 4. `docs/db_design.md` のテーブル一覧を追随させる。
 """
 
-SCHEMA_VERSION = "9"
+SCHEMA_VERSION = "10"
 
 _SCHEMA_SQL = """
 CREATE TABLE schema_meta (
@@ -71,8 +71,6 @@ CREATE TABLE workflow_tasks (
     name TEXT NOT NULL,
     team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE RESTRICT,
     default_days INTEGER NOT NULL CHECK (default_days >= 1),
-    canvas_x REAL NOT NULL DEFAULT 0,
-    canvas_y REAL NOT NULL DEFAULT 0,
     UNIQUE(workflow_id, name)
 );
 
@@ -328,6 +326,23 @@ def migrate(conn):
             # データ）なので、テーブルごと破棄する。
             conn.execute("DROP TABLE task_constraints")
         version = "9"
+
+    if version == "9":
+        # v10: workflow_tasks.canvas_x/canvas_y を削除。ノードグラフの座標は
+        # 「保持しておく意味がないデータ」と判断し、表示のたびに依存の深さから
+        # 計算し直す方式に統一した（依存テンプレートの疑似ノードが元々この
+        # 方式で、以前から座標カラムを持たない。docs/architecture.md参照）。
+        # ドラッグでの並べ替えは引き続きできるが、保存されない一時的な
+        # ものになる。
+        cols = [
+            r["name"] for r in
+            conn.execute("PRAGMA table_info(workflow_tasks)").fetchall()
+        ]
+        if "canvas_x" in cols:
+            conn.execute("ALTER TABLE workflow_tasks DROP COLUMN canvas_x")
+        if "canvas_y" in cols:
+            conn.execute("ALTER TABLE workflow_tasks DROP COLUMN canvas_y")
+        version = "10"
 
     conn.execute(
         "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)

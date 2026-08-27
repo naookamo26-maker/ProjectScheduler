@@ -713,15 +713,14 @@ class ProjectDatabase:
 
         task_id_map = {}
         for t in self._conn.execute(
-            "SELECT id, name, team_id, default_days, canvas_x, canvas_y "
+            "SELECT id, name, team_id, default_days "
             "FROM workflow_tasks WHERE workflow_id = ? ORDER BY id",
             (workflow_id,),
         ).fetchall():
             cur = self._conn.execute(
-                "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days, "
-                "canvas_x, canvas_y) VALUES (?, ?, ?, ?, ?, ?)",
-                (new_workflow_id, t["name"], t["team_id"], t["default_days"],
-                 t["canvas_x"], t["canvas_y"]),
+                "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days) "
+                "VALUES (?, ?, ?, ?)",
+                (new_workflow_id, t["name"], t["team_id"], t["default_days"]),
             )
             task_id_map[t["id"]] = cur.lastrowid
 
@@ -775,20 +774,20 @@ class ProjectDatabase:
     def list_workflow_tasks(self, workflow_id):
         rows = self._conn.execute(
             "SELECT wt.id, wt.workflow_id, wt.name, wt.team_id, t.name AS team_name, "
-            "wt.default_days, wt.canvas_x, wt.canvas_y "
+            "wt.default_days "
             "FROM workflow_tasks wt JOIN teams t ON t.id = wt.team_id "
             "WHERE wt.workflow_id = ? ORDER BY wt.id",
             (workflow_id,),
         ).fetchall()
         return [dict(r) for r in rows]
 
-    @undoable(lambda self, workflow_id, name, team_id, default_days, x=0.0, y=0.0: f"タスク「{name}」を追加")
-    def add_workflow_task(self, workflow_id, name, team_id, default_days, x=0.0, y=0.0):
+    @undoable(lambda self, workflow_id, name, team_id, default_days: f"タスク「{name}」を追加")
+    def add_workflow_task(self, workflow_id, name, team_id, default_days):
         try:
             cur = self._conn.execute(
-                "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days, "
-                "canvas_x, canvas_y) VALUES (?, ?, ?, ?, ?, ?)",
-                (workflow_id, name, team_id, default_days, x, y),
+                "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days) "
+                "VALUES (?, ?, ?, ?)",
+                (workflow_id, name, team_id, default_days),
             )
         except sqlite3.IntegrityError as e:
             raise DuplicateNameError(
@@ -809,14 +808,6 @@ class ProjectDatabase:
             raise DuplicateNameError(
                 f"タスク名 '{name}' はこのワークフロー内で既に使用されています"
             ) from e
-        self._commit()
-
-    @undoable("タスクの位置を変更")
-    def update_task_position(self, task_id, x, y):
-        self._conn.execute(
-            "UPDATE workflow_tasks SET canvas_x = ?, canvas_y = ? WHERE id = ?",
-            (x, y, task_id),
-        )
         self._commit()
 
     def workflow_task_usage_count(self, task_id):

@@ -41,7 +41,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from gui.db import ProjectDatabase  # noqa: E402
-from gui.node_canvas import compute_auto_layout  # noqa: E402
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parent.parent / "data" / "Project_Schedule_Sample_AAA_Large.pschedule"
 
@@ -508,17 +507,6 @@ def generate(output_path):
             if previous_task_id is not None:
                 db.add_task_dependency(wf_id, previous_task_id, task_id)
             previous_task_id = task_id
-
-    # 座標を明示的に指定していないため、そのままでは全タスクが (0, 0) に
-    # 重なって配置されてしまう（scripts/migrate_excel_to_db.py と同じ理由・
-    # 同じ対処）。依存の深さに基づく簡易レイアウトで初期座標を与える。
-    for wf_name, wf_id in workflow_ids.items():
-        tasks = db.list_workflow_tasks(wf_id)
-        deps = db.list_task_dependencies(wf_id)
-        positions = compute_auto_layout(tasks, deps)
-        for t in tasks:
-            x, y = positions[t["id"]]
-            db.update_task_position(t["id"], x, y)
 
     for wf_name, task_name, dep_wf_name, dep_task_name in DEPENDENCY_TEMPLATES:
         db.add_dependency_template(

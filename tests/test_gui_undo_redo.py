@@ -438,8 +438,9 @@ def test_workflow_task_add_is_single_undo_step_and_restores_canvas_selection(win
     node.setSelected(True)
     qapp.processEvents()
 
-    # add_task内部でauto_arrangeが複数のupdate_task_positionを呼んでも、
-    # 呼び出し全体でUndo1件にまとまっていること。
+    # add_task呼び出し全体（DB書き込みはadd_workflow_task1件のみ。
+    # auto_arrangeは座標をQt側で更新するだけでDBには書き込まない）が
+    # Undo1件にまとまっていること。
     assert len(window.undo_manager._undo_stack) == stack_size_before + 1
     assert window.db.list_workflow_tasks(wf_id) != []
 
@@ -1439,11 +1440,14 @@ def test_multiple_templates_on_the_same_task_stack_without_overlapping_or_moving
 
 def test_reload_positions_dependency_template_nodes_without_overlapping_tasks(window, qapp):
     """回帰テスト: 依存テンプレート追加時は正しく配置されるが、ファイルを
-    開いた際（WorkflowGraphScene.reload）は疑似ノードの座標がDBに保存
-    されないため計算し直されず、既定位置(0,0)のままタスクノードと重なって
-    しまっていた。reload()を呼んだ後も、テンプレートの疑似ノードがタスクの
-    1列上流に正しく配置され、タスク自身の座標（DB保存済み）は変わらないこと
-    を確認する。"""
+    開いた際（WorkflowGraphScene.reload）は疑似ノードの座標が計算し直されず、
+    既定位置(0,0)のままタスクノードと重なってしまっていた（当時はタスクの
+    座標だけDB保存済みの値を使い、疑似ノードだけ毎回計算し直す非対称な設計
+    だったため）。現在はタスク・疑似ノードとも座標をDBに保存せず、reload()の
+    たびに両方をcompute_combined_layoutで計算し直す設計に統一したので、
+    この非対称性自体が起こり得ない。reload()を呼んだ後も、テンプレートの
+    疑似ノードがタスクの1列上流に正しく配置され、タスクの座標も
+    （入力が変わっていないので）計算結果が変わらないことを確認する。"""
     wf_tab = window.tab_workflows
     team_id = window.db.add_team("チームA", 1)
     wf1_id = window.db.add_workflow("WF1")
@@ -1471,7 +1475,7 @@ def test_reload_positions_dependency_template_nodes_without_overlapping_tasks(wi
     template_id = next(iter(scene.template_nodes))
     template_node = scene.template_nodes[template_id]
 
-    assert task_node.pos() == task_pos_before  # タスクの座標（DB保存済み）は変わらない
+    assert task_node.pos() == task_pos_before  # 入力が同じなので計算結果も変わらない
     assert (template_node.pos().x(), template_node.pos().y()) != (0, 0)
     assert template_node.pos().x() < task_node.pos().x()  # タスクの1列上流
 

@@ -91,8 +91,6 @@ def test_duplicate_workflow_copies_tasks_dependencies_and_own_templates(tmp_path
     wf3 = db.add_workflow("WF3")
     a = db.add_workflow_task(wf1, "A", team_id, 1)
     b = db.add_workflow_task(wf1, "B", team_id, 2)
-    db.update_task_position(a, 10, 20)
-    db.update_task_position(b, 200, 20)
     db.add_task_dependency(wf1, a, b)
 
     other_task = db.add_workflow_task(wf2, "X", team_id, 1)
@@ -115,7 +113,6 @@ def test_duplicate_workflow_copies_tasks_dependencies_and_own_templates(tmp_path
     assert sorted((t["name"], t["default_days"]) for t in new_tasks) == [("A", 1), ("B", 2)]
     new_a = next(t for t in new_tasks if t["name"] == "A")
     new_b = next(t for t in new_tasks if t["name"] == "B")
-    assert (new_a["canvas_x"], new_a["canvas_y"]) == (10, 20)  # 座標も複製する
     assert new_a["id"] not in (a, b)  # 新規採番されている（元の行の使い回しではない）
 
     new_deps = db.list_task_dependencies(new_wf_id)
@@ -886,4 +883,69 @@ def test_opening_pre_start_pin_schema_migrates_existing_start_on_rows(tmp_path):
         db._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     }
     assert "task_constraints" not in tables
+    db.close()
+
+
+# -- ノードグラフの座標（保存しない設計への移行） ------------------------------------
+
+def test_workflow_task_rows_no_longer_have_canvas_columns(tmp_path):
+    """workflow_tasks.canvas_x/canvas_yは撤去済み。座標は表示のたびに
+    依存の深さから計算し直す方式に統一し、保存する意味のないデータを
+    schema・保存ファイルの双方から無くした。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    team = db.add_team("チームA", 1)
+    wf = db.add_workflow("WF1")
+    db.add_workflow_task(wf, "タスク1", team, 3)
+
+    cols = {r["name"] for r in db._conn.execute("PRAGMA table_info(workflow_tasks)").fetchall()}
+    assert "canvas_x" not in cols
+    assert "canvas_y" not in cols
+    assert not hasattr(db, "update_task_position")
+    db.close()
+
+
+def test_opening_pre_canvas_removal_schema_drops_canvas_columns(tmp_path):
+    """canvas_x/canvas_y列がまだ残っている旧バージョン(v9)の.pscheduleを
+    開いた際、列が削除され、他のデータ（タスク名・所要日数等）は保持される
+    こと。"""
+    import sqlite3
+
+    path = tmp_path / "legacy.pschedule"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE project (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            project_name TEXT NOT NULL DEFAULT '',
+            start_date TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE teams (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+        CREATE TABLE workflows (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+        CREATE TABLE workflow_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_id INTEGER NOT NULL, name TEXT NOT NULL,
+            team_id INTEGER NOT NULL, default_days INTEGER NOT NULL,
+            canvas_x REAL NOT NULL DEFAULT 0, canvas_y REAL NOT NULL DEFAULT 0
+        );
+        """
+    )
+    conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '9')")
+    conn.execute("INSERT INTO project(id, project_name, start_date) VALUES (1, '', '')")
+    conn.execute("INSERT INTO teams(name) VALUES ('チームA')")
+    conn.execute("INSERT INTO workflows(name) VALUES ('WF1')")
+    conn.execute(
+        "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days, canvas_x, canvas_y) "
+        "VALUES (1, 'タスク1', 1, 3, 123.0, 456.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    db = ProjectDatabase.open_existing(str(path))
+    cols = {r["name"] for r in db._conn.execute("PRAGMA table_info(workflow_tasks)").fetchall()}
+    assert "canvas_x" not in cols
+    assert "canvas_y" not in cols
+    tasks = db.list_workflow_tasks(1)
+    assert len(tasks) == 1
+    assert (tasks[0]["name"], tasks[0]["default_days"]) == ("タスク1", 3)
     db.close()

@@ -217,12 +217,11 @@ class AnchorItem(QGraphicsEllipseItem):
 
 
 class TaskNodeItem(QGraphicsPathItem):
-    def __init__(self, workflow_task_id, name, team_name, color_hex, days, on_moved):
+    def __init__(self, workflow_task_id, name, team_name, color_hex, days):
         path = QPainterPath()
         path.addRoundedRect(QRectF(0, 0, NODE_WIDTH, NODE_HEIGHT), NODE_CORNER_RADIUS, NODE_CORNER_RADIUS)
         super().__init__(path)
         self.workflow_task_id = workflow_task_id
-        self.on_moved = on_moved
         self.edges = []  # 接続中のEdgeItem一覧（移動時の再描画用）
 
         self.setFlags(
@@ -270,10 +269,6 @@ class TaskNodeItem(QGraphicsPathItem):
             for edge in self.edges:
                 edge.update_path()
         return super().itemChange(change, value)
-
-    def mouseReleaseEvent(self, event):
-        super().mouseReleaseEvent(event)
-        self.on_moved(self.workflow_task_id, self.pos().x(), self.pos().y())
 
 
 class TemplateDependencyNodeItem(QGraphicsPathItem):
@@ -459,16 +454,23 @@ class WorkflowGraphScene(QGraphicsScene):
 
         colors = team_color_map(self.db.list_teams())
         tasks = self.db.list_workflow_tasks(self.workflow_id)
+        deps = self.db.list_task_dependencies(self.workflow_id)
+        templates = self.db.list_dependency_templates(self.workflow_id)
+        # 座標はDBに保存しない（ドラッグは保存されない一時的な並べ替えとして
+        # のみ許可する。auto_arrangeと同じ理由・同じ関数、docs/architecture.md
+        # 参照）ため、開くたびに依存の深さに基づくレイアウトを計算し直す。
+        positions = compute_combined_layout(tasks, deps, templates)
+
         for t in tasks:
             node = TaskNodeItem(
                 t["id"], t["name"], t["team_name"], colors.get(t["team_id"], "#cbc9c2"),
-                t["default_days"], on_moved=self._on_node_moved,
+                t["default_days"],
             )
-            node.setPos(t["canvas_x"], t["canvas_y"])
+            x, y = positions.get(t["id"], (0, 0))
+            node.setPos(x, y)
             self.addItem(node)
             self.nodes[t["id"]] = node
 
-        deps = self.db.list_task_dependencies(self.workflow_id)
         for d in deps:
             pred = self.nodes.get(d["predecessor_task_id"])
             succ = self.nodes.get(d["successor_task_id"])
@@ -482,19 +484,10 @@ class WorkflowGraphScene(QGraphicsScene):
             succ.edges.append(edge)
             self.adjacency.setdefault(d["predecessor_task_id"], []).append(d["successor_task_id"])
 
-        # 依存テンプレートの疑似ノードはDBに座標を保存しないため、読み込み時は
-        # 毎回ここで計算し直す必要がある（さもないと全ノードが既定位置(0,0)に
-        # 重なって表示されてしまう）。auto_arrangeとは異なりタスクの座標は
-        # 「今読み込んだDB保存済みの値（手動でドラッグしたものを含む）」を
-        # そのまま使い、タスク側の位置は変更しない（ファイルを開いただけで
-        # ドラッグ位置がリセットされないようにするため）。
-        templates = self.db.list_dependency_templates(self.workflow_id)
-        task_positions = {t["id"]: (t["canvas_x"], t["canvas_y"]) for t in tasks}
-        template_positions = compute_template_positions(task_positions, templates)
         for tpl in templates:
             self._add_template_scene_item(tpl)
             node = self.template_nodes.get(tpl["id"])
-            pos = template_positions.get(("template", tpl["id"]))
+            pos = positions.get(("template", tpl["id"]))
             if node is None or pos is None:
                 continue
             node.setPos(*pos)
@@ -502,9 +495,6 @@ class WorkflowGraphScene(QGraphicsScene):
 
         if self.on_changed:
             self.on_changed()
-
-    def _on_node_moved(self, workflow_task_id, x, y):
-        self.db.update_task_position(workflow_task_id, x, y)
 
     # -- 依存テンプレート（他ワークフローへの依存）の疑似ノード ------------------------
 
@@ -726,11 +716,10 @@ class WorkflowGraphScene(QGraphicsScene):
 
     def add_task(self, name, team_id, days, x, y):
         with self.db.undo_group(f"タスク「{name}」を追加"):
-            task_id = self.db.add_workflow_task(self.workflow_id, name, team_id, days, x, y)
+            task_id = self.db.add_workflow_task(self.workflow_id, name, team_id, days)
             colors = team_color_map(self.db.list_teams())
             team = next(t for t in self.db.list_teams() if t["id"] == team_id)
-            node = TaskNodeItem(task_id, name, team["name"], colors.get(team_id, "#cbc9c2"),
-                                 days, on_moved=self._on_node_moved)
+            node = TaskNodeItem(task_id, name, team["name"], colors.get(team_id, "#cbc9c2"), days)
             node.setPos(x, y)
             self.addItem(node)
             self.nodes[task_id] = node
@@ -740,33 +729,32 @@ class WorkflowGraphScene(QGraphicsScene):
     def auto_arrange(self):
         """ノード情報（タスクの追加・編集・削除、依存関係・依存テンプレートの
         追加・削除）が変わるたびに呼び出し、依存の深さに基づく自動レイアウトへ
-        整列し直す（compute_combined_layout、gui/node_canvas.py冒頭参照）。
-        手動でドラッグした位置は、次に何か編集するとリセットされる。
+        全ノード・疑似ノードを整列し直す（compute_combined_layout、
+        gui/node_canvas.py冒頭参照）。
 
-        タスクの座標はDBに保存する（次回ワークフローを開いた時も維持する
-        ため）が、依存テンプレートの疑似ノードはDBに保存用カラムを持たない
-        ため、その場でQt側の位置を更新するだけにとどめる。"""
-        with self.db.undo_group("レイアウトを自動調整"):
-            tasks = self.db.list_workflow_tasks(self.workflow_id)
-            deps = self.db.list_task_dependencies(self.workflow_id)
-            templates = self.db.list_dependency_templates(self.workflow_id)
-            positions = compute_combined_layout(tasks, deps, templates)
-            for key, (x, y) in positions.items():
-                if isinstance(key, tuple):
-                    _kind, template_id = key
-                    node = self.template_nodes.get(template_id)
-                    if node is None:
-                        continue
-                    node.setPos(x, y)
-                    edge = self.template_edges.get(template_id)
-                    if edge is not None:
-                        edge.update_path()
-                else:
-                    node = self.nodes.get(key)
-                    if node is None:
-                        continue
-                    node.setPos(x, y)
-                    self.db.update_task_position(key, x, y)
+        座標はDBに保存しない——タスク・依存テンプレートの疑似ノードいずれも
+        同じ扱いで、その場でQt側の位置を更新するだけにとどめる。手動で
+        ドラッグした位置は、次に何か編集する・ワークフローを開き直すと
+        この自動レイアウトに揃う（一時的な並べ替えとしてのみ有効）。"""
+        tasks = self.db.list_workflow_tasks(self.workflow_id)
+        deps = self.db.list_task_dependencies(self.workflow_id)
+        templates = self.db.list_dependency_templates(self.workflow_id)
+        positions = compute_combined_layout(tasks, deps, templates)
+        for key, (x, y) in positions.items():
+            if isinstance(key, tuple):
+                _kind, template_id = key
+                node = self.template_nodes.get(template_id)
+                if node is None:
+                    continue
+                node.setPos(x, y)
+                edge = self.template_edges.get(template_id)
+                if edge is not None:
+                    edge.update_path()
+            else:
+                node = self.nodes.get(key)
+                if node is None:
+                    continue
+                node.setPos(x, y)
         if self.on_changed:
             self.on_changed()
 
