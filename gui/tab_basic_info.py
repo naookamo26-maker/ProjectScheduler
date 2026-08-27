@@ -113,7 +113,7 @@ class AddTeamDialog(QDialog):
         form.addRow("チーム名", self.name_edit)
 
         self.lines_spin = NoWheelSpinBox()
-        self.lines_spin.setRange(1, 999)
+        self.lines_spin.setRange(0, 999)
         self.lines_spin.setValue(1)
         form.addRow("同時ライン数（開発開始日からの既定値）", self.lines_spin)
 
@@ -143,7 +143,7 @@ class AddCapacityChangeDialog(QDialog):
         form.addRow("適用開始日", self.date_edit)
 
         self.lines_spin = NoWheelSpinBox()
-        self.lines_spin.setRange(1, 999)
+        self.lines_spin.setRange(0, 999)
         self.lines_spin.setValue(default_lines)
         form.addRow("同時ライン数", self.lines_spin)
 
@@ -509,7 +509,7 @@ class BasicInfoTab(QWidget):
             top.addChild(default_child)
 
             default_spin = NoWheelSpinBox()
-            default_spin.setRange(1, 999)
+            default_spin.setRange(0, 999)
             default_spin.setValue(team["max_lines"])
             default_spin.valueChanged.connect(
                 lambda value, eid=team["id"]: self._on_team_lines_changed(eid, value)
@@ -538,7 +538,7 @@ class BasicInfoTab(QWidget):
                 tree.setItemWidget(child, 0, date_edit)
 
                 lines_spin = NoWheelSpinBox()
-                lines_spin.setRange(1, 999)
+                lines_spin.setRange(0, 999)
                 lines_spin.setValue(c["lines"])
                 lines_spin.valueChanged.connect(
                     lambda _val, cid=c["id"], it=child: self._on_team_capacity_change_edited(cid, it)

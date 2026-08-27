@@ -527,7 +527,7 @@ def test_job_workflow_reassignment_resyncs_dependency_templates(tmp_path):
 
     job = next(j for j in db.list_jobs() if j["id"] == j1)
     wf3 = next(w["id"] for w in db.list_workflows() if w["id"] not in (wf1, wf2))
-    db.update_job(j1, job["name"], wf3, job["default_milestone_id"], job["priority"])
+    db.update_job(j1, job["name"], wf3, job["default_milestone_id"], job["priority"], job["tags"])
 
     # WF3->WF2のテンプレートは存在しないため、自動生成分は削除される
     assert db.list_external_dependencies(job_id=j1) == []

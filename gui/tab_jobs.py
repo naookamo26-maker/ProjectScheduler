@@ -2,9 +2,15 @@
 タブ3「ジョブ作成」。
 
 左右2分割（QSplitter、既定50/50でユーザーがドラッグ調整可）。
-- 左: ジョブ一覧（名前・ワークフロー・既定マイルストーン・優先度）を縦全体に表示。
-  「既定マイルストーン」列はStretchで残り幅を吸収し、パネル幅にかかわらず
-  横スクロールなしで4列すべてが収まるようにしている。
+- 左: ジョブ一覧（名前・ワークフロー・既定マイルストーン・優先度・タグ）を
+  縦全体に表示。上部の絞り込み（ワークフロー／マイルストーン／タグ、いずれも
+  チェックボックスのOR条件で、3つの間はAND条件）で一時的に表示件数を絞れる
+  （データは削除されない）。「タグ」列はStretchで残り幅を吸収し、パネル幅に
+  かかわらず横スクロールなしで5列すべてが収まるようにしている。「複製」
+  ボタンで選択中のジョブをタスク上書きごと複製できる（依存先ジョブは
+  複製しない。db.duplicate_job参照）。タグは単純なカンマ区切りのテキスト
+  入力（例:「緊急, 顧客A」）で、保存時に前後の空白除去・重複排除・
+  「, 」区切りへの正規化を行う（gui/db.py の normalize_tags 参照）。
 - 右: 上下2分割（QSplitter）で、選択中ジョブのタスク上書き表と依存先ジョブを
   縦に並べる。
   - タスク上書き表: 選択ジョブが使うワークフローのタスク一覧をそのまま
@@ -47,7 +53,7 @@ setCellWidget 1.5秒）。そこで次の2点で行数への依存を切って�
 ため、単位を開いたままウィジェットを破棄すると閉じられなくなるため。
 """
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -70,7 +76,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.db import DuplicateNameError, ProjectDatabaseError
+from gui.db import DuplicateNameError, ProjectDatabaseError, normalize_tags
 from gui.widgets_common import (
     CrudSection,
     DefaultAwareSpinBox,
@@ -100,6 +106,12 @@ _VISIBLE_ROW_MARGIN = 12
 # テキスト表示とで文言を揃える必要があるため定数にしてある）。
 _BLANK_MILESTONE_LABEL = "（未設定）"
 
+# ジョブ一覧の絞り込み（マイルストーン／タグ）で「該当が無いジョブ」を
+# まとめるための擬似キー。実在のID・タグ文字列と衝突しないよう None を使う。
+_NO_MILESTONE_FILTER_KEY = None
+_NO_TAG_FILTER_KEY = None
+_NO_TAG_FILTER_LABEL = "（タグなし）"
+
 # コンボボックスの▼やスピンボックスの▲▼のぶん、テキスト幅より少し広くする
 # （列幅は読み取り専用テキストの幅を基準に自動調整されるため）。
 _CELL_WIDGET_EXTRA_WIDTH = 34
@@ -108,6 +120,58 @@ def _readonly_item(text):
     item = QTableWidgetItem(text)
     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
     return item
+
+
+class _ChoiceFilterGroup(QGroupBox):
+    """チェックボックス一覧による絞り込み（OR条件）。ジョブ一覧の
+    ワークフロー／マイルストーン／タグの3つの絞り込みで構造を使い回す。"""
+
+    changed = Signal()
+
+    def __init__(self, title, parent=None):
+        super().__init__(title, parent)
+        self._checks = {}  # key -> QCheckBox
+        layout = QHBoxLayout(self)
+        select_all_btn = QPushButton("すべて表示")
+        select_all_btn.clicked.connect(lambda: self.set_all(True))
+        select_none_btn = QPushButton("すべて解除")
+        select_none_btn.clicked.connect(lambda: self.set_all(False))
+        layout.addWidget(select_all_btn)
+        layout.addWidget(select_none_btn)
+        layout.addSpacing(16)
+        self._checks_layout = QHBoxLayout()
+        layout.addLayout(self._checks_layout)
+        layout.addStretch(1)
+
+    def rebuild(self, items):
+        """items: [(key, label), ...]。既存のチェック状態はキーで可能な限り
+        維持し、新規キーは既定でチェック済み（＝表示）にする。"""
+        previous_checked = {k for k, cb in self._checks.items() if cb.isChecked()}
+        previous_unchecked = {k for k, cb in self._checks.items() if not cb.isChecked()}
+        while self._checks_layout.count():
+            item = self._checks_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._checks = {}
+        for key, label in items:
+            checked = key not in previous_unchecked or key in previous_checked
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(checked)  # connect前に設定し、構築時のstateChangedを発火させない
+            checkbox.stateChanged.connect(lambda _state: self.changed.emit())
+            self._checks_layout.addWidget(checkbox)
+            self._checks[key] = checkbox
+
+    def set_all(self, checked):
+        # 一括変更中に途中でchanged経由のrebuildが走るとループ中のウィジェットが
+        # 差し替わってしまうため、シグナルを止めてから最後にまとめて一度だけ発火する。
+        for checkbox in self._checks.values():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(checked)
+            checkbox.blockSignals(False)
+        self.changed.emit()
+
+    def visible_keys(self):
+        return {k for k, cb in self._checks.items() if cb.isChecked()}
 
 
 class JobDependencyLinkDialog(QDialog):
@@ -208,6 +272,7 @@ _JOB_SORT_KEYS = {
     1: lambda j: j["workflow_name"],
     2: lambda j: (j["milestone_name"] is None, j["milestone_name"] or ""),
     3: lambda j: j["priority"],
+    4: lambda j: j["tags"],
 }
 
 
@@ -216,7 +281,6 @@ class JobsTab(QWidget):
         super().__init__(parent)
         self.db = db
         self.current_job_id = None
-        self._workflow_checks = {}  # workflow_id -> QCheckBox（ジョブ一覧の絞り込み用）
         self._sort_column = 0
         self._sort_ascending = True
         # セルウィジェットの遅延生成用（モジュール冒頭の説明を参照）
@@ -228,25 +292,25 @@ class JobsTab(QWidget):
 
         layout = QVBoxLayout(self)
 
-        filter_group = QGroupBox("ワークフローで絞り込み")
-        self.filter_layout = QHBoxLayout(filter_group)
-        select_all_btn = QPushButton("すべて表示")
-        select_all_btn.clicked.connect(lambda: self._set_all_filters(True))
-        select_none_btn = QPushButton("すべて解除")
-        select_none_btn.clicked.connect(lambda: self._set_all_filters(False))
-        self.filter_layout.addWidget(select_all_btn)
-        self.filter_layout.addWidget(select_none_btn)
-        self.filter_layout.addSpacing(16)
-        self.filter_checks_layout = QHBoxLayout()
-        self.filter_layout.addLayout(self.filter_checks_layout)
-        self.filter_layout.addStretch(1)
-        layout.addWidget(filter_group)
+        # ワークフロー／マイルストーン／タグの3つの絞り込み（いずれもOR条件の
+        # チェックボックス一覧で、3つの間はAND条件で組み合わせる）。
+        self.workflow_filter = _ChoiceFilterGroup("ワークフローで絞り込み")
+        self.workflow_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
+        layout.addWidget(self.workflow_filter)
+
+        self.milestone_filter = _ChoiceFilterGroup("マイルストーンで絞り込み")
+        self.milestone_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
+        layout.addWidget(self.milestone_filter)
+
+        self.tag_filter = _ChoiceFilterGroup("タグで絞り込み")
+        self.tag_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
+        layout.addWidget(self.tag_filter)
 
         self.jobs_section = CrudSection(
-            "ジョブ", ["ジョブ名", "ワークフロー", "既定マイルストーン", "優先度"],
-            on_add=self._add_job, on_delete=self._delete_job,
+            "ジョブ", ["ジョブ名", "ワークフロー", "既定マイルストーン", "優先度", "タグ"],
+            on_add=self._add_job, on_delete=self._delete_job, on_duplicate=self._duplicate_job,
         )
-        self.jobs_section.table.itemChanged.connect(self._on_job_name_changed)
+        self.jobs_section.table.itemChanged.connect(self._on_job_cell_text_changed)
         self.jobs_section.table.currentCellChanged.connect(self._on_job_selection_changed)
         # 列見出しをクリックするとその列で並び替えられる（同じ列を再クリックで昇順/降順切替）。
         jobs_header = self.jobs_section.table.horizontalHeader()
@@ -254,9 +318,9 @@ class JobsTab(QWidget):
         jobs_header.setSortIndicatorShown(True)
         jobs_header.setSortIndicator(self._sort_column, Qt.AscendingOrder)
         jobs_header.sectionClicked.connect(self._on_job_header_clicked)
-        # 「既定マイルストーン」列（内容の長さが最も変動する）に残り幅を吸収させ、
-        # パネル幅にかかわらず横スクロールなしで4列すべてが収まるようにする。
-        jobs_header.setSectionResizeMode(2, QHeaderView.Stretch)
+        # 「タグ」列（内容の長さが最も変動する）に残り幅を吸収させ、パネル幅に
+        # かかわらず横スクロールなしで5列すべてが収まるようにする。
+        jobs_header.setSectionResizeMode(4, QHeaderView.Stretch)
         # スクロールや表示領域の変化に追従して、見えている行にだけ
         # セルウィジェットを用意する。
         jobs_scrollbar = self.jobs_section.table.verticalScrollBar()
@@ -329,43 +393,32 @@ class JobsTab(QWidget):
         if total > 0:
             self.main_splitter.setSizes([total // 2, total - total // 2])
 
-    # -- ワークフロー絞り込み ------------------------------------------------------
+    # -- ワークフロー／マイルストーン／タグの絞り込み ------------------------------------
 
-    def _rebuild_workflow_filter(self):
-        """ワークフロー一覧に合わせて絞り込み用チェックボックスを再構築する。
-        既存のチェック状態はワークフロー名で可能な限り維持し、新規ワークフローは
-        既定で表示（チェック済み）にする。"""
-        previous_checked = {
-            wf_id for wf_id, cb in self._workflow_checks.items() if cb.isChecked()
-        }
-        previous_unchecked = {
-            wf_id for wf_id, cb in self._workflow_checks.items() if not cb.isChecked()
-        }
-        while self.filter_checks_layout.count():
-            item = self.filter_checks_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self._workflow_checks = {}
-        for wf in self.db.list_workflows():
-            checked = wf["id"] not in previous_unchecked or wf["id"] in previous_checked
-            checkbox = QCheckBox(wf["name"])
-            checkbox.setChecked(checked)  # connect前に設定し、構築時のstateChangedを発火させない
-            checkbox.stateChanged.connect(lambda _state: self.refresh_jobs(select_id=self.current_job_id))
-            self.filter_checks_layout.addWidget(checkbox)
-            self._workflow_checks[wf["id"]] = checkbox
+    def _job_tag_keys(self, job):
+        """絞り込み判定に使う、ジョブが持つタグのキー集合。タグが1つも無い
+        ジョブは擬似キー _NO_TAG_FILTER_KEY（＝「（タグなし）」）を持つ扱いにする。"""
+        tags = [t.strip() for t in (job["tags"] or "").split(",") if t.strip()]
+        return set(tags) if tags else {_NO_TAG_FILTER_KEY}
 
-    def _set_all_filters(self, checked):
-        # 一括変更中に途中でrefresh_jobs（＝チェックボックス再構築）が走ると
-        # ループ中のウィジェットが差し替わってしまうため、シグナルを止めてから
-        # 最後にまとめて一度だけ反映する。
-        for checkbox in self._workflow_checks.values():
-            checkbox.blockSignals(True)
-            checkbox.setChecked(checked)
-            checkbox.blockSignals(False)
-        self.refresh_jobs(select_id=self.current_job_id)
-
-    def _visible_workflow_ids(self):
-        return {wf_id for wf_id, cb in self._workflow_checks.items() if cb.isChecked()}
+    def _rebuild_filters(self, jobs):
+        """ワークフロー／マイルストーン／タグの絞り込み用チェックボックスを、
+        現在のDBの内容（渡された絞り込み前のジョブ一覧）に合わせて再構築する。
+        既存のチェック状態はキーで可能な限り維持し、新規キーは既定で表示にする。"""
+        self.workflow_filter.rebuild([(w["id"], w["name"]) for w in self.db.list_workflows()])
+        self.milestone_filter.rebuild(
+            [(m["id"], m["name"]) for m in self.db.list_milestones()]
+            + [(_NO_MILESTONE_FILTER_KEY, _BLANK_MILESTONE_LABEL)]
+        )
+        tag_keys = set()
+        for job in jobs:
+            tag_keys.update(self._job_tag_keys(job))
+        has_no_tag = _NO_TAG_FILTER_KEY in tag_keys
+        tag_keys.discard(_NO_TAG_FILTER_KEY)
+        tag_items = [(tag, tag) for tag in sorted(tag_keys)]
+        if has_no_tag:
+            tag_items.append((_NO_TAG_FILTER_KEY, _NO_TAG_FILTER_LABEL))
+        self.tag_filter.rebuild(tag_items)
 
     # -- ジョブ一覧 --------------------------------------------------------------
 
@@ -383,8 +436,11 @@ class JobsTab(QWidget):
         self.refresh_jobs(select_id=self.current_job_id)
 
     def refresh_jobs(self, select_id=None):
-        self._rebuild_workflow_filter()
-        visible_workflow_ids = self._visible_workflow_ids()
+        all_jobs = self.db.list_jobs()
+        self._rebuild_filters(all_jobs)
+        visible_workflow_ids = self.workflow_filter.visible_keys()
+        visible_milestone_keys = self.milestone_filter.visible_keys()
+        visible_tag_keys = self.tag_filter.visible_keys()
 
         table = self.jobs_section.table
         table.blockSignals(True)
@@ -398,9 +454,10 @@ class JobsTab(QWidget):
 
         sort_key = _JOB_SORT_KEYS[self._sort_column]
         jobs = [
-            job for job in sorted(self.db.list_jobs(), key=sort_key,
-                                   reverse=not self._sort_ascending)
+            job for job in sorted(all_jobs, key=sort_key, reverse=not self._sort_ascending)
             if job["workflow_id"] in visible_workflow_ids
+            and job["default_milestone_id"] in visible_milestone_keys
+            and self._job_tag_keys(job) & visible_tag_keys
         ]
         self._job_by_id = {job["id"]: job for job in jobs}
         self._row_by_job_id = {job["id"]: row for row, job in enumerate(jobs)}
@@ -418,6 +475,10 @@ class JobsTab(QWidget):
             table.setItem(row, 2, _readonly_item(
                 milestone_names.get(job["default_milestone_id"], _BLANK_MILESTONE_LABEL)))
             table.setItem(row, 3, _readonly_item(str(job["priority"])))
+            # タグはシンプルなテキスト入力（カンマ区切り）のため、ワークフロー
+            # ／マイルストーン／優先度と違って専用ウィジェットを持たず、常に
+            # 編集可能なitemとして表示する（ジョブ名列と同じ扱い）。
+            table.setItem(row, 4, QTableWidgetItem(job["tags"]))
             if job["id"] == select_id:
                 select_row = row
         table.blockSignals(False)
@@ -487,6 +548,18 @@ class JobsTab(QWidget):
         )
         bind_undo_session(priority_spin, self.db, "ジョブの優先度を変更")
         table.setCellWidget(row, 3, priority_spin)
+
+        # セルウィジェットの下に読み取り専用テキストのitemが残ったままだと、
+        # ウィジェットの背景越しに文字が二重に見えてしまう（幅・高さが
+        # ぴったり一致しないため隙間から透ける）。ウィジェットを載せた列は
+        # itemのテキストを空にしておく（取り外し時に_release_job_row_widgets
+        # が改めてテキストを書き戻す）。
+        table.blockSignals(True)
+        for column in (1, 2, 3):
+            item = table.item(row, column)
+            if item is not None:
+                item.setText("")
+        table.blockSignals(False)
 
         self._materialized_rows.add(row)
 
@@ -558,18 +631,27 @@ class JobsTab(QWidget):
         self.db.delete_job(job_id)
         self.refresh_jobs()
 
-    def _on_job_name_changed(self, item):
-        if item.column() != 0:
+    def _duplicate_job(self, row):
+        job_id = row_id(self.jobs_section.table, row)
+        new_id = self.db.duplicate_job(job_id)
+        self.refresh_jobs(select_id=new_id)
+
+    def _on_job_cell_text_changed(self, item):
+        column = item.column()
+        if column not in (0, 4):
             return
         job_id = row_id(self.jobs_section.table, item.row())
         if job_id is None:
             return
-        self._write_job(job_id, name_override=item.text())
+        if column == 0:
+            self._write_job(job_id, name_override=item.text())
+        else:
+            self._write_job(job_id, tags_override=item.text())
 
     def _on_job_field_changed(self, job_id):
         self._write_job(job_id)
 
-    def _write_job(self, job_id, name_override=None):
+    def _write_job(self, job_id, name_override=None, tags_override=None):
         table = self.jobs_section.table
         row = self._row_by_job_id.get(job_id)
         job = self._job_by_id.get(job_id)
@@ -588,18 +670,29 @@ class JobsTab(QWidget):
         milestone_id = (milestone_widget.currentData() if milestone_widget is not None
                         else job["default_milestone_id"])
         priority = priority_widget.value() if priority_widget is not None else job["priority"]
+        # タグ列はウィジェットを持たない（常にitemとしてのみ存在する）ため、
+        # 名前列と同様にテキストをそのまま読む。
+        raw_tags = tags_override if tags_override is not None else table.item(row, 4).text()
+        tags = normalize_tags(raw_tags)
 
         try:
-            self.db.update_job(job_id, name, workflow_id, milestone_id, priority)
+            self.db.update_job(job_id, name, workflow_id, milestone_id, priority, tags)
         except DuplicateNameError as e:
             QMessageBox.warning(self, "変更できません", str(e))
             self.refresh_jobs(select_id=job_id)
             return
+        # ユーザーが入力したカンマ区切りの表記ゆれ（空白の有無等）を正規化した
+        # 表示へ書き戻す（例外はitemChangedを再度発火させないようblockSignalsする）。
+        tags_item = table.item(row, 4)
+        if tags_item is not None and tags_item.text() != tags:
+            table.blockSignals(True)
+            tags_item.setText(tags)
+            table.blockSignals(False)
         # 行が可視範囲から外れて再び戻ってきたときに、古い値でウィジェットを
         # 作り直さないようキャッシュも更新しておく。
         self._job_by_id[job_id] = dict(
             job, name=name, workflow_id=workflow_id,
-            default_milestone_id=milestone_id, priority=priority,
+            default_milestone_id=milestone_id, priority=priority, tags=tags,
         )
         if job_id == self.current_job_id:
             self._refresh_overrides()

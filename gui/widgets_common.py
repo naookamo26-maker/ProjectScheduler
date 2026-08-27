@@ -478,12 +478,13 @@ class CrudSection(QGroupBox):
 
     def __init__(
         self, title, column_labels, on_add, on_delete, on_edit=None,
-        edit_dblclick_columns=None, parent=None,
+        edit_dblclick_columns=None, on_duplicate=None, parent=None,
     ):
         super().__init__(title, parent)
         self.on_add = on_add
         self.on_delete = on_delete
         self.on_edit = on_edit
+        self.on_duplicate = on_duplicate
         # on_edit をダブルクリックで開く対象列を限定したい場合に指定する
         # （例: 列0がインライン編集可能なテキストで、別の列だけダイアログを
         # 開かせたいケース）。Noneなら全列で発火（従来互換の挙動）。
@@ -499,6 +500,10 @@ class CrudSection(QGroupBox):
             edit_btn = QPushButton("編集...")
             edit_btn.clicked.connect(self._handle_edit)
             toolbar.addWidget(edit_btn)
+        if on_duplicate is not None:
+            duplicate_btn = QPushButton("複製")
+            duplicate_btn.clicked.connect(self._handle_duplicate)
+            toolbar.addWidget(duplicate_btn)
         del_btn = QPushButton("－ 削除")
         del_btn.clicked.connect(self._handle_delete)
         toolbar.addWidget(del_btn)
@@ -536,6 +541,13 @@ class CrudSection(QGroupBox):
             QMessageBox.information(self, "削除", "削除する行を選択してください。")
             return
         self.on_delete(row)
+
+    def _handle_duplicate(self):
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "複製", "複製する行を選択してください。")
+            return
+        self.on_duplicate(row)
 
     def current_row_id(self):
         row = self.table.currentRow()
