@@ -106,6 +106,10 @@ class GanttTab(QWidget):
         toolbar = QHBoxLayout()
         toolbar.addWidget(QLabel("表示単位:"))
         self.mode_combo = NoWheelComboBox()
+        # 既定のAdjustToContentsOnFirstShowだと、表示後に選択肢の内容が変わって
+        # （対象コンボはワークフロー/チーム名を動的に入れ替える）も幅が追従せず、
+        # 長い名前が見切れる。常に現在の内容に合わせて幅を取り直す。
+        self.mode_combo.setSizeAdjustPolicy(NoWheelComboBox.AdjustToContents)
         self.mode_combo.addItem("ワークフロー別", "workflow")
         self.mode_combo.addItem("チーム別", "team")
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
@@ -113,13 +117,9 @@ class GanttTab(QWidget):
         toolbar.addSpacing(8)
         toolbar.addWidget(QLabel("対象:"))
         self.group_combo = NoWheelComboBox()
+        self.group_combo.setSizeAdjustPolicy(NoWheelComboBox.AdjustToContents)
         self.group_combo.currentIndexChanged.connect(self._refresh_chart)
         toolbar.addWidget(self.group_combo)
-        toolbar.addSpacing(16)
-        toolbar.addWidget(QLabel(
-            "（ホイールでズーム、Ctrl+ホイールで横のみ、Shift+ホイールで縦のみ、中ボタンドラッグでパン、"
-            "Aキーで全体表示、Fキーで選択中のタスクにズーム）"
-        ))
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
 

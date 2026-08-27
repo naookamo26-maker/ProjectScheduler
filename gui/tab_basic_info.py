@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QGraphicsScene,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -474,7 +475,11 @@ class BasicInfoTab(QWidget):
 
         self.teams_tree = QTreeWidget()
         self.teams_tree.setColumnCount(2)
-        self.teams_tree.setHeaderLabels(["チーム名 ／ 適用開始日", "同時ライン数 ／ ライン数"])
+        self.teams_tree.setHeaderLabels(["チーム名 ／ 適用開始日", "ライン数"])
+        # 列幅を1:1にする（両方をStretchにすると残り幅を均等に分け合う）。
+        teams_header = self.teams_tree.header()
+        teams_header.setSectionResizeMode(0, QHeaderView.Stretch)
+        teams_header.setSectionResizeMode(1, QHeaderView.Stretch)
         self.teams_tree.setSelectionMode(QTreeWidget.SingleSelection)
         self.teams_tree.itemChanged.connect(self._on_team_name_changed)
         self.teams_tree.itemSelectionChanged.connect(self._refresh_histogram)
@@ -542,8 +547,6 @@ class BasicInfoTab(QWidget):
                 tree.setItemWidget(child, 1, lines_spin)
             top.setExpanded(True)
         tree.blockSignals(False)
-        for col in range(2):
-            tree.resizeColumnToContents(col)
 
     def _selected_team_tree_item(self):
         """teams_tree の実際の選択状態（ハイライト）を返す。currentItem()は
