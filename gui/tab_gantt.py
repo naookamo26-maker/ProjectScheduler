@@ -268,16 +268,26 @@ class GanttTab(QWidget):
         if self._result_df is None or self._result_df.empty:
             return "有効なタスクがありません。", False
         total = len(self._result_df)
+        notes = []
         overruns = self._result_df[self._result_df["Deadline_Overrun_Days"] > 0]
-        if overruns.empty:
+        if not overruns.empty:
+            worst = int(overruns["Deadline_Overrun_Days"].max())
+            notes.append(
+                f"うち{len(overruns)}件がマイルストーンの締切に間に合いません（最大{worst}日超過）。"
+                f"チームのライン数・依存関係・締切を見直してください。"
+            )
+        # 満たせない日付制約も、締切超過と同じく例外ではなく結果として返ってくる
+        # （制約は入力・日付は出力という分離を守るため、矛盾はデータを書き換えて
+        # 解消しない）。ここで件数を出さないと気付けない。
+        broken = self._result_df[self._result_df["Constraint_Violation"] != ""]
+        if not broken.empty:
+            notes.append(
+                f"うち{len(broken)}件が日付制約を満たせません"
+                f"（例: {broken.iloc[0]['Task_Name']} — {broken.iloc[0]['Constraint_Violation']}）。"
+            )
+        if not notes:
             return f"{total}件のタスクを生成しました。", False
-        worst = int(overruns["Deadline_Overrun_Days"].max())
-        return (
-            f"{total}件のタスクを生成しました。"
-            f"うち{len(overruns)}件がマイルストーンの締切に間に合いません（最大{worst}日超過）。"
-            f"チームのライン数・依存関係・締切を見直してください。",
-            True,
-        )
+        return f"{total}件のタスクを生成しました。" + "".join(notes), True
 
     def _set_status(self, message, is_error=False):
         """状況表示。エラーはダイアログを出さずここに表示するため、通常の

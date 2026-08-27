@@ -342,6 +342,14 @@ class MainWindow(QMainWindow):
                 f"（最大{worst}日超過）。該当タスクはチャート上で赤く太い枠線で"
                 f"表示しています。"
             )
+        broken = result_df[result_df["Constraint_Violation"] != ""]
+        if not broken.empty:
+            # 日付制約の矛盾も締切超過と同じく結果として返る（例外にしない）。
+            message += (
+                f"\n\n※ 日付制約を満たせないタスクが{len(broken)}件あります"
+                f"（例: {broken.iloc[0]['Task_Name']} — "
+                f"{broken.iloc[0]['Constraint_Violation']}）。"
+            )
         QMessageBox.information(self, "生成完了", message)
 
     def _open_database(self, db):

@@ -701,6 +701,7 @@ def build_gantt_scenes(df, display, color_by="team"):
                 f'チーム: {team_name}\n'
                 f'{r["Start_Date"].strftime("%Y-%m-%d")} 〜 {r["End_Date"].strftime("%Y-%m-%d")}'
                 + (f'\n⚠ マイルストーンの締切を{overrun_days}日超過' if overrun_days > 0 else "")
+                + (f'\n⚠ {r["Constraint_Violation"]}' if r.get("Constraint_Violation") else "")
                 + ("\n※リソース制約により前倒し" if r["Resource_Adjusted"] else "")
             )
             body_scene.addItem(rect)

@@ -28,6 +28,7 @@ import os
 import sqlite3
 import tempfile
 from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 
 # 再エクスポート: 呼び出し側・テストからは従来どおり gui.db から参照できるようにする。
@@ -78,6 +79,58 @@ def normalize_dependency_kind(dep_type, lag_days):
             f"ラグ {lag_days} 日は範囲外です（±{MAX_LAG_DAYS}日まで）"
         )
     return dep_type, lag_days
+
+
+#: 「引数が省略された」ことを None と区別するための番兵（None 自体が
+#: 「ジョブ全体」という意味を持つ引数があるため）。
+_UNSET = object()
+
+#: タスク（またはジョブ全体）に課せる日付制約の種別。
+#: 「制約は入力、日付は出力」——タスクに開始日を直接持たせず、解が満たすべき
+#: 条件としてだけ日付を持つ（docs/architecture.md「日付制約（task_constraints）」）。
+TASK_CONSTRAINT_KINDS = ("SNET", "SNLT", "FNLT", "START_ON")
+
+#: 種別の日本語ラベル（GUI・診断メッセージで共通に使う）。
+TASK_CONSTRAINT_LABELS = {
+    "SNET": "この日以降に開始",
+    "SNLT": "この日までに開始",
+    "FNLT": "この日までに終了",
+    "START_ON": "この日に開始（固定）",
+}
+
+#: ジョブ全体（workflow_task_id が NULL）に課せる種別。
+#: ジョブ全体の制約は「配下の全タスクに同じ条件を課す」という意味で解釈する。
+#: その読み方が正しいのは下限（SNET）と上限（FNLT）だけ——「ジョブ全体を
+#: この日に開始（START_ON）」「ジョブ全体をこの日までに開始（SNLT）」は
+#: 全タスクに配ると「すべてのタスクがその日に始まる」になってしまい、
+#: 誰も意図しない意味になる。曖昧な意味を黙って実装するより、ここで断る。
+JOB_LEVEL_CONSTRAINT_KINDS = ("SNET", "FNLT")
+
+
+def normalize_task_constraint(kind, date_str, workflow_task_id=None):
+    """日付制約の種別・日付を検証し、(kind, 'YYYY-MM-DD') に正規化して返す。
+
+    日付の書式をここで検証するのは、値がそのままスケジューラへ渡り、
+    壊れた日付が `pd.to_datetime` で黙って NaT になって「制約が無かったこと」に
+    なるため（制約が静かに消えるのが最悪の壊れ方）。
+    """
+    kind = str(kind or "").strip().upper()
+    if kind not in TASK_CONSTRAINT_KINDS:
+        raise ProjectDatabaseError(
+            f"日付制約の種別 '{kind}' は不正です（{' / '.join(TASK_CONSTRAINT_KINDS)} のいずれか）"
+        )
+    if workflow_task_id is None and kind not in JOB_LEVEL_CONSTRAINT_KINDS:
+        raise ProjectDatabaseError(
+            f"'{kind}' はジョブ全体には設定できません"
+            f"（ジョブ全体に設定できるのは {' / '.join(JOB_LEVEL_CONSTRAINT_KINDS)}）"
+        )
+    try:
+        parsed = date.fromisoformat(str(date_str).strip())
+    except (TypeError, ValueError):
+        raise ProjectDatabaseError(
+            f"日付制約の日付 '{date_str}' が不正です（YYYY-MM-DD 形式で指定してください）"
+        ) from None
+    return kind, parsed.isoformat()
 
 
 def undoable(label):
@@ -1052,6 +1105,107 @@ class ProjectDatabase:
             "DELETE FROM job_task_overrides WHERE job_id = ? AND workflow_task_id = ?",
             (job_id, workflow_task_id),
         )
+        self._commit()
+
+    # -- task_constraints（日付制約） ---------------------------------------------
+    # 「制約は入力、日付は出力」。タスクに開始日を直接持たせると計算結果と入力が
+    # 同じ列に混ざり、依存関係・所要日数・休業日を変えた瞬間に矛盾する。日付は
+    # 「解が満たすべき条件」としてだけ持ち、矛盾（＝解が見つからないこと）は
+    # 事前の整合性維持ロジックではなく、スケジューリング実行時の診断結果として
+    # 扱う（締切超過と同じ扱い方）。そのため、このテーブルには
+    # 「入力同士を矛盾させないためのコード」が一切要らない。
+
+    def list_task_constraints(self, job_id=None, workflow_task_id=_UNSET):
+        """日付制約を返す。job_id 省略で全件。
+
+        workflow_task_id を明示した場合はその値で絞り込む（None を渡すと
+        「ジョブ全体の制約」だけを返す。省略時とは意味が違うため、既定値は
+        None ではなく専用の番兵にしてある）。
+        """
+        sql = (
+            "SELECT c.id, c.job_id, c.workflow_task_id, c.kind, c.date, c.note, "
+            "j.name AS job_name, wt.name AS task_name "
+            "FROM task_constraints c "
+            "JOIN jobs j ON j.id = c.job_id "
+            "LEFT JOIN workflow_tasks wt ON wt.id = c.workflow_task_id"
+        )
+        where, params = [], []
+        if job_id is not None:
+            where.append("c.job_id = ?")
+            params.append(job_id)
+        if workflow_task_id is not _UNSET:
+            if workflow_task_id is None:
+                where.append("c.workflow_task_id IS NULL")
+            else:
+                where.append("c.workflow_task_id = ?")
+                params.append(workflow_task_id)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY c.job_id, c.workflow_task_id IS NULL DESC, c.workflow_task_id, c.kind"
+        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    @undoable("日付制約を設定")
+    def set_task_constraint(self, job_id, workflow_task_id, kind, date_str, note=""):
+        """1件の制約を追加または上書きする（同じ (ジョブ, タスク, 種別) は1件だけ）。
+        workflow_task_id に None を渡すとジョブ全体への制約になる。"""
+        kind, date_str = normalize_task_constraint(kind, date_str, workflow_task_id)
+        existing = self._conn.execute(
+            "SELECT id FROM task_constraints WHERE job_id = ? AND kind = ? AND "
+            + ("workflow_task_id IS NULL" if workflow_task_id is None else "workflow_task_id = ?"),
+            (job_id, kind) if workflow_task_id is None else (job_id, kind, workflow_task_id),
+        ).fetchone()
+        if existing is not None:
+            self._conn.execute(
+                "UPDATE task_constraints SET date = ?, note = ? WHERE id = ?",
+                (date_str, note, existing["id"]),
+            )
+            self._commit()
+            return existing["id"]
+        try:
+            cur = self._conn.execute(
+                "INSERT INTO task_constraints(job_id, workflow_task_id, kind, date, note) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (job_id, workflow_task_id, kind, date_str, note),
+            )
+        except sqlite3.IntegrityError as e:
+            raise ProjectDatabaseError("この日付制約は既に存在するか、不正です") from e
+        self._commit()
+        return cur.lastrowid
+
+    @undoable("日付制約を解除")
+    def clear_task_constraint(self, job_id, workflow_task_id, kind):
+        self._conn.execute(
+            "DELETE FROM task_constraints WHERE job_id = ? AND kind = ? AND "
+            + ("workflow_task_id IS NULL" if workflow_task_id is None else "workflow_task_id = ?"),
+            (job_id, kind) if workflow_task_id is None else (job_id, kind, workflow_task_id),
+        )
+        self._commit()
+
+    @undoable("日付制約を変更")
+    def replace_task_constraints(self, job_id, workflow_task_id, constraints):
+        """1つのタスク（またはジョブ全体）の制約をまとめて差し替える。
+
+        constraints は {種別: (日付, 備考)} または {種別: 日付}。含まれない種別は
+        解除される。編集ダイアログのOKを1つのUndo単位にするための入口
+        （種別ごとに set/clear を呼ぶと4段Undoになってしまう）。
+        """
+        normalized = {}
+        for kind, value in constraints.items():
+            date_str, note = value if isinstance(value, (tuple, list)) else (value, "")
+            kind, date_str = normalize_task_constraint(kind, date_str, workflow_task_id)
+            normalized[kind] = (date_str, note)
+
+        self._conn.execute(
+            "DELETE FROM task_constraints WHERE job_id = ? AND "
+            + ("workflow_task_id IS NULL" if workflow_task_id is None else "workflow_task_id = ?"),
+            (job_id,) if workflow_task_id is None else (job_id, workflow_task_id),
+        )
+        for kind, (date_str, note) in normalized.items():
+            self._conn.execute(
+                "INSERT INTO task_constraints(job_id, workflow_task_id, kind, date, note) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (job_id, workflow_task_id, kind, date_str, note),
+            )
         self._commit()
 
     # -- マイルストーンの整合性（先行/後続タスク間） -----------------------------------

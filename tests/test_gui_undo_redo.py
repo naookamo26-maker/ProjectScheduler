@@ -1638,3 +1638,89 @@ def test_dependency_edge_is_clickable_along_the_curve(window, qapp):
 
     anchor_point = scene.nodes[task_a].output_anchor_scene_pos()
     assert isinstance(scene.itemAt(anchor_point, view.transform()), AnchorItem)
+
+
+def test_task_constraint_dialog_edits_are_one_undo_step_and_show_in_the_table(window, qapp):
+    """ジョブタブの「日付制約」列がダイアログの結果を要約表示し、Undo1回で
+    元に戻ること。"""
+    from gui.tab_jobs import constraint_summary
+
+    jobs_tab = window.tab_jobs
+    team_id = window.db.add_team("チームA", 1)
+    ms_id = window.db.add_milestone("MS1", "2026-06-30")
+    wf_id = window.db.add_workflow("WF1")
+    task_id = window.db.add_workflow_task(wf_id, "タスク1", team_id, 3)
+    job_id = window.db.add_job("ジョブ1", wf_id, ms_id, 1)
+
+    window.tabs.setCurrentWidget(jobs_tab)
+    jobs_tab.refresh_jobs(select_id=job_id)
+    qapp.processEvents()
+
+    table = jobs_tab.override_table
+
+    def constraint_cell_text():
+        return table.cellWidget(0, 5).text()
+
+    assert constraint_cell_text() == "—"
+
+    window.db.replace_task_constraints(
+        job_id, task_id, {"SNET": "2026-02-02", "FNLT": "2026-03-02"})
+    jobs_tab._refresh_overrides()
+    qapp.processEvents()
+    # 要約は種別の正準順（SNET→SNLT→FNLT→START_ON）で並ぶ
+    assert constraint_cell_text() == "SNET 02-02／FNLT 03-02"
+
+    window.undo_manager.undo()
+    qapp.processEvents()
+    assert window.db.list_task_constraints(job_id) == []
+    assert jobs_tab.override_table.cellWidget(0, 5).text() == "—"
+
+    assert constraint_summary([]) == "—"
+
+
+def test_task_constraint_dialog_offers_fewer_kinds_for_a_whole_job(window, qapp):
+    """ジョブ全体の制約は「配下の全タスクに同じ条件を課す」意味なので、
+    その読み方が成り立つ SNET / FNLT だけをダイアログに出すこと。"""
+    from gui.db import JOB_LEVEL_CONSTRAINT_KINDS, TASK_CONSTRAINT_KINDS
+    from gui.tab_jobs import TaskConstraintDialog
+
+    task_dialog = TaskConstraintDialog("タスク", {}, TASK_CONSTRAINT_KINDS, parent=window)
+    assert set(task_dialog._rows) == set(TASK_CONSTRAINT_KINDS)
+
+    job_dialog = TaskConstraintDialog("ジョブ", {}, JOB_LEVEL_CONSTRAINT_KINDS, parent=window)
+    assert set(job_dialog._rows) == {"SNET", "FNLT"}
+
+    # チェックを外した種別は values() に含まれない（＝解除される）
+    job_dialog._rows["SNET"][0].setChecked(True)
+    job_dialog._rows["SNET"][1].setDate(QDate(2026, 2, 2))
+    job_dialog._rows["FNLT"][0].setChecked(False)
+    assert job_dialog.values() == {"SNET": "2026-02-02"}
+
+    task_dialog.deleteLater()
+    job_dialog.deleteLater()
+
+
+def test_gantt_tab_reports_unsatisfiable_constraints_in_the_status_line(window, qapp):
+    """満たせない制約は例外ではなく結果として返るため、状況表示で件数を
+    出さないと気付けない。"""
+    import time
+
+    team_id = window.db.add_team("チームA", 1)
+    ms_id = window.db.add_milestone("MS1", "2026-06-30")
+    wf_id = window.db.add_workflow("WF1")
+    task_id = window.db.add_workflow_task(wf_id, "タスク1", team_id, 3)
+    job_id = window.db.add_job("ジョブ1", wf_id, ms_id, 1)
+    window.db.set_project("制約テスト", "2026-01-05")
+    window.db.set_task_constraint(job_id, task_id, "FNLT", "2026-01-06")
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    for _ in range(100):
+        qapp.processEvents()
+        if window.tab_gantt._result_df is not None:
+            break
+        time.sleep(0.05)
+
+    message, is_error = window.tab_gantt._result_summary()
+    assert is_error
+    assert "日付制約を満たせません" in message
+    assert "FNLT(2026-01-06)" in message

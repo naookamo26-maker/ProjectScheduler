@@ -745,3 +745,143 @@ def test_opening_pre_dependency_lag_schema_migrates_to_finish_to_start(tmp_path)
     assert len(deps) == 1
     assert (deps[0]["dep_type"], deps[0]["lag_days"]) == ("FS", 0)
     db.close()
+
+
+# -- 日付制約（task_constraints） -----------------------------------------------------
+
+def _build_job_with_task(db):
+    team = db.add_team("チームA", 1)
+    ms = db.add_milestone("MS1", "2026-06-30")
+    wf = db.add_workflow("WF1")
+    task = db.add_workflow_task(wf, "タスク1", team, 3)
+    job = db.add_job("ジョブ1", wf, ms, 100)
+    return job, task
+
+
+def test_task_constraint_is_stored_per_job_task_and_kind(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    job, task = _build_job_with_task(db)
+
+    db.set_task_constraint(job, task, "SNET", "2026-02-02")
+    db.set_task_constraint(job, task, "FNLT", "2026-03-02", note="外注納期")
+    db.set_task_constraint(job, None, "SNET", "2026-01-20")   # ジョブ全体
+
+    by_kind = {
+        (c["workflow_task_id"], c["kind"]): (c["date"], c["note"])
+        for c in db.list_task_constraints(job)
+    }
+    assert by_kind[(task, "SNET")] == ("2026-02-02", "")
+    assert by_kind[(task, "FNLT")] == ("2026-03-02", "外注納期")
+    assert by_kind[(None, "SNET")] == ("2026-01-20", "")
+
+    # 同じ (ジョブ, タスク, 種別) は上書きされ、増えない
+    db.set_task_constraint(job, task, "SNET", "2026-02-10")
+    task_level = db.list_task_constraints(job, workflow_task_id=task)
+    assert len(task_level) == 2
+    assert next(c["date"] for c in task_level if c["kind"] == "SNET") == "2026-02-10"
+
+    # workflow_task_id=None を明示すると、ジョブ全体の制約だけが返る
+    job_level = db.list_task_constraints(job, workflow_task_id=None)
+    assert [(c["kind"], c["date"]) for c in job_level] == [("SNET", "2026-01-20")]
+    db.close()
+
+
+def test_task_constraint_rejects_unknown_kind_and_malformed_date(tmp_path):
+    """壊れた日付を保存できてしまうと、スケジューラ側で黙って NaT になり
+    「制約が無かったこと」になる。書き込み経路で弾くこと。"""
+    from gui.db import ProjectDatabaseError
+
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    job, task = _build_job_with_task(db)
+
+    with pytest.raises(ProjectDatabaseError):
+        db.set_task_constraint(job, task, "ASAP", "2026-02-02")
+    with pytest.raises(ProjectDatabaseError):
+        db.set_task_constraint(job, task, "SNET", "2026-13-45")
+    with pytest.raises(ProjectDatabaseError):
+        db.set_task_constraint(job, task, "SNET", "2026/02/02")
+    assert db.list_task_constraints(job) == []
+    db.close()
+
+
+def test_job_level_constraint_is_limited_to_bounds(tmp_path):
+    """ジョブ全体の制約は「配下の全タスクに同じ条件を課す」意味なので、
+    その読み方が正しい SNET / FNLT だけを許す。START_ON / SNLT を配ると
+    「すべてのタスクが同じ日に始まる」になってしまう。"""
+    from gui.db import ProjectDatabaseError
+
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    job, task = _build_job_with_task(db)
+
+    db.set_task_constraint(job, None, "SNET", "2026-02-02")
+    db.set_task_constraint(job, None, "FNLT", "2026-03-02")
+    for kind in ("START_ON", "SNLT"):
+        with pytest.raises(ProjectDatabaseError):
+            db.set_task_constraint(job, None, kind, "2026-02-02")
+        # タスク単位なら同じ種別が設定できる
+        db.set_task_constraint(job, task, kind, "2026-02-02")
+    db.close()
+
+
+def test_replace_task_constraints_is_a_single_undo_step(tmp_path):
+    """編集ダイアログのOKは1回のUndoで元に戻ること（種別ごとに set/clear を
+    呼ぶと最大4段のUndoに割れてしまう）。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    manager, _ = _attach_dummy_undo_manager(db)
+    job, task = _build_job_with_task(db)
+    db.set_task_constraint(job, task, "SNET", "2026-02-02")
+
+    stack_before = len(manager._undo_stack)
+    db.replace_task_constraints(job, task, {"FNLT": "2026-03-02", "START_ON": "2026-02-16"})
+    assert len(manager._undo_stack) == stack_before + 1
+
+    kinds = {c["kind"]: c["date"] for c in db.list_task_constraints(job, workflow_task_id=task)}
+    assert kinds == {"FNLT": "2026-03-02", "START_ON": "2026-02-16"}  # SNETは解除された
+
+    manager.undo()
+    kinds = {c["kind"]: c["date"] for c in db.list_task_constraints(job, workflow_task_id=task)}
+    assert kinds == {"SNET": "2026-02-02"}
+    db.close()
+
+
+def test_deleting_a_job_removes_its_constraints(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    job, task = _build_job_with_task(db)
+    db.set_task_constraint(job, task, "SNET", "2026-02-02")
+    db.set_task_constraint(job, None, "FNLT", "2026-03-02")
+
+    db.delete_job(job)
+    assert db.list_task_constraints() == []
+    db.close()
+
+
+def test_opening_pre_constraint_schema_adds_the_table(tmp_path):
+    """task_constraints が無い旧バージョン(v7)の.pscheduleを開いた際、
+    テーブルが追加され、制約0件のプロジェクトとして扱えること。"""
+    import sqlite3
+
+    path = tmp_path / "legacy.pschedule"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE project (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            project_name TEXT NOT NULL DEFAULT '',
+            start_date TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+        CREATE TABLE workflow_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
+        """
+    )
+    conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '7')")
+    conn.execute("INSERT INTO project(id, project_name, start_date) VALUES (1, '', '')")
+    conn.execute("INSERT INTO jobs(name) VALUES ('ジョブ1')")
+    conn.commit()
+    conn.close()
+
+    db = ProjectDatabase.open_existing(str(path))
+    assert db.list_task_constraints() == []
+    db.set_task_constraint(1, None, "SNET", "2026-02-02")
+    assert [c["kind"] for c in db.list_task_constraints()] == ["SNET"]
+    db.close()

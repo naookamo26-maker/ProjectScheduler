@@ -47,7 +47,7 @@ setCellWidget 1.5秒）。そこで次の2点で行数への依存を切って�
 ため、単位を開いたままウィジェットを破棄すると閉じられなくなるため。
 """
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QDate, Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -70,11 +70,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.db import DuplicateNameError, ProjectDatabaseError
+from gui.db import (
+    JOB_LEVEL_CONSTRAINT_KINDS,
+    TASK_CONSTRAINT_KINDS,
+    TASK_CONSTRAINT_LABELS,
+    DuplicateNameError,
+    ProjectDatabaseError,
+)
 from gui.widgets_common import (
     CrudSection,
     DefaultAwareSpinBox,
     NoWheelComboBox,
+    NoWheelDateEdit,
     NoWheelListWidget,
     NoWheelSpinBox,
     auto_size_columns,
@@ -103,11 +110,98 @@ _BLANK_MILESTONE_LABEL = "（未設定）"
 # （列幅は読み取り専用テキストの幅を基準に自動調整されるため）。
 _CELL_WIDGET_EXTRA_WIDTH = 34
 
+# 日付制約が1件も無いことを示すボタンの表示。
+_NO_CONSTRAINT_LABEL = "—"
+
 
 def _readonly_item(text):
     item = QTableWidgetItem(text)
     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
     return item
+
+
+def constraint_summary(constraints):
+    """設定済みの日付制約を、表のボタンに載る短さでまとめる。"""
+    if not constraints:
+        return _NO_CONSTRAINT_LABEL
+    ordered = sorted(constraints, key=lambda c: TASK_CONSTRAINT_KINDS.index(c["kind"]))
+    return "／".join(f'{c["kind"]} {c["date"][5:]}' for c in ordered)
+
+
+class TaskConstraintDialog(QDialog):
+    """1つのタスク（またはジョブ全体）の日付制約をまとめて編集するダイアログ。
+
+    種別ごとに「使う」チェックと日付を並べる。1タスクに複数の制約
+    （例: SNET と FNLT で期間を挟む）を同時に置けるため、種別を1つ選ばせる
+    のではなく全種別を並べて個別にオン/オフさせる形にしている。
+
+    **矛盾する制約（SNETがFNLTより後、依存タスクより前のSTART_ON 等）も
+    そのまま保存できる。** 制約は「解が満たすべき条件」であって解ではないので、
+    入力同士を事前に矛盾させないための検査はここでは行わない。満たせない制約は
+    スケジューリング実行時に診断結果として報告される（gui/tab_gantt.py の
+    状況表示、およびガントチャートのツールチップ）。
+    """
+
+    def __init__(self, title, current, allowed_kinds=TASK_CONSTRAINT_KINDS,
+                 default_date=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self._rows = {}
+
+        form = QFormLayout(self)
+        base_date = default_date or QDate.currentDate()
+
+        for kind in allowed_kinds:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+
+            check = QCheckBox()
+            date_edit = NoWheelDateEdit()
+            date_edit.setCalendarPopup(True)
+            date_edit.setDisplayFormat("yyyy-MM-dd")
+
+            existing = current.get(kind)
+            check.setChecked(existing is not None)
+            date_edit.setDate(_to_qdate(existing) if existing else base_date)
+            date_edit.setEnabled(existing is not None)
+            check.toggled.connect(date_edit.setEnabled)
+
+            row_layout.addWidget(check)
+            row_layout.addWidget(date_edit, 1)
+            form.addRow(f"{kind}（{TASK_CONSTRAINT_LABELS[kind]}）", row)
+            self._rows[kind] = (check, date_edit)
+
+        # ここで指定するのは日程そのものではなく「解が満たすべき条件」である、
+        # という区別が伝わらないと、日程を直接入力するつもりで使われてしまう。
+        # 折り返しラベルはQFormLayoutが高さを取り違えて文章が切れるため、
+        # 改行位置は決め打ちにしてラベル列を使わない1列の行に置く。
+        hint = QLabel(
+            "日付は「入力」、日程は「出力」です。\n"
+            "ここで指定するのは『解が満たすべき条件』であって、日程そのものでは\n"
+            "ありません。満たせない制約（依存関係やライン数と両立しない等）も\n"
+            "そのまま保存でき、ガントチャートタブに診断結果として表示されます。"
+        )
+        hint.setStyleSheet("color: #6b6a66;")
+        form.addRow(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def values(self):
+        """{種別: 'YYYY-MM-DD'}。チェックが外れている種別は含まれない（＝解除）。"""
+        return {
+            kind: date_edit.date().toString("yyyy-MM-dd")
+            for kind, (check, date_edit) in self._rows.items()
+            if check.isChecked()
+        }
+
+
+def _to_qdate(iso_str):
+    d = QDate.fromString(str(iso_str), "yyyy-MM-dd")
+    return d if d.isValid() else QDate.currentDate()
 
 
 class JobDependencyLinkDialog(QDialog):
@@ -265,9 +359,21 @@ class JobsTab(QWidget):
 
         override_group = QGroupBox("タスク上書き（選択中のジョブ）")
         override_layout = QVBoxLayout(override_group)
-        self.override_table = QTableWidget(0, 5)
+
+        override_toolbar = QHBoxLayout()
+        override_toolbar.addStretch(1)
+        self.job_constraint_btn = QPushButton("ジョブ全体の日付制約...")
+        self.job_constraint_btn.setToolTip(
+            "このジョブの全タスクに同じ条件を課します"
+            f"（{' / '.join(JOB_LEVEL_CONSTRAINT_KINDS)} のみ）。"
+        )
+        self.job_constraint_btn.clicked.connect(self._edit_job_constraints)
+        override_toolbar.addWidget(self.job_constraint_btn)
+        override_layout.addLayout(override_toolbar)
+
+        self.override_table = QTableWidget(0, 6)
         self.override_table.setHorizontalHeaderLabels(
-            ["タスク名", "有効", "日数", "マイルストーン", "チーム"]
+            ["タスク名", "有効", "日数", "マイルストーン", "チーム", "日付制約"]
         )
         self.override_table.verticalHeader().setVisible(False)
         self.override_table.setSelectionMode(QTableWidget.NoSelection)
@@ -637,11 +743,25 @@ class JobsTab(QWidget):
         all_milestones = self.db.list_milestones()
         team_options = [(t["id"], t["name"]) for t in self.db.list_teams()]
 
+        self.job_constraint_btn.setEnabled(self.current_job_id is not None)
         if self.current_job_id is None:
+            self.job_constraint_btn.setText("ジョブ全体の日付制約...")
             table.blockSignals(False)
             return
         job = next(j for j in self.db.list_jobs() if j["id"] == self.current_job_id)
         default_ms_label = job["milestone_name"] or "未設定"
+
+        constraints_by_task = {}
+        job_constraints = []
+        for c in self.db.list_task_constraints(self.current_job_id):
+            if c["workflow_task_id"] is None:
+                job_constraints.append(c)
+            else:
+                constraints_by_task.setdefault(c["workflow_task_id"], []).append(c)
+        self.job_constraint_btn.setText(
+            "ジョブ全体の日付制約..." if not job_constraints
+            else f"ジョブ全体の日付制約: {constraint_summary(job_constraints)}"
+        )
 
         for r in self.db.list_job_tasks_with_overrides(self.current_job_id):
             row = table.rowCount()
@@ -710,10 +830,66 @@ class JobsTab(QWidget):
                 lambda _idx, tid=r["workflow_task_id"]: self._on_override_changed(tid)
             )
             table.setCellWidget(row, 4, team_combo)
+
+            # 日付制約は1タスクに複数（SNETとFNLTで期間を挟む等）置けるため、
+            # セル内で直接編集させずダイアログに寄せる。ボタンの文字がそのまま
+            # 現在の設定の要約になる。
+            constraint_btn = QPushButton(
+                constraint_summary(constraints_by_task.get(r["workflow_task_id"], []))
+            )
+            constraint_btn.setFlat(True)
+            constraint_btn.clicked.connect(
+                lambda _checked=False, tid=r["workflow_task_id"], name=r["task_name"]:
+                self._edit_task_constraints(tid, name)
+            )
+            table.setCellWidget(row, 5, constraint_btn)
         table.blockSignals(False)
         auto_size_columns(table, min_width=50)
         table.setColumnWidth(1, 44)  # 「有効」列はチェックボックスのみなので詰める
+        table.setColumnWidth(5, max(table.columnWidth(5), 150))  # 制約の要約が収まる幅
         self._ensure_job_selection()
+
+    def _edit_task_constraints(self, workflow_task_id, task_name):
+        self._edit_constraints(
+            workflow_task_id, f"日付制約: {task_name}", TASK_CONSTRAINT_KINDS)
+
+    def _edit_job_constraints(self):
+        job = next((j for j in self.db.list_jobs() if j["id"] == self.current_job_id), None)
+        if job is None:
+            return
+        self._edit_constraints(
+            None, f"ジョブ全体の日付制約: {job['name']}", JOB_LEVEL_CONSTRAINT_KINDS)
+
+    def _edit_constraints(self, workflow_task_id, title, allowed_kinds):
+        """日付制約の編集ダイアログを開き、OKなら差し替える。
+
+        種別ごとに set/clear を呼ぶと最大4段のUndoに割れてしまうため、
+        replace_task_constraints で1つのUndo単位にまとめる。
+        """
+        if self.current_job_id is None:
+            return
+        current = {
+            c["kind"]: c["date"] for c in
+            self.db.list_task_constraints(self.current_job_id, workflow_task_id=workflow_task_id)
+        }
+        project_start = self.db.get_project()["start_date"]
+        dialog = TaskConstraintDialog(
+            title, current, allowed_kinds,
+            default_date=_to_qdate(project_start) if project_start else None,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        new_values = dialog.values()
+        if new_values == current:
+            return  # 変更なし。Undo履歴に空のエントリを積まない
+        try:
+            self.db.replace_task_constraints(
+                self.current_job_id, workflow_task_id, new_values)
+        except ProjectDatabaseError as e:
+            QMessageBox.warning(self, "設定できません", str(e))
+            return
+        self._refresh_overrides()
 
     def _ensure_job_selection(self):
         """タスク上書き欄のセルウィジェット（スピンボックス/コンボ）をクリックして

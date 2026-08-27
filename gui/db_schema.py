@@ -16,7 +16,7 @@ CRUD本体（gui/db.py）から分離しているのは、この2つが「増え
 4. `docs/db_design.md` のテーブル一覧を追随させる。
 """
 
-SCHEMA_VERSION = "7"
+SCHEMA_VERSION = "8"
 
 _SCHEMA_SQL = """
 CREATE TABLE schema_meta (
@@ -124,6 +124,21 @@ CREATE TABLE job_external_dependencies (
     is_active INTEGER NOT NULL DEFAULT 1,
     UNIQUE(job_id, workflow_task_id, depends_on_job_id, depends_on_workflow_task_id)
 );
+
+CREATE TABLE task_constraints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id           INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    workflow_task_id INTEGER REFERENCES workflow_tasks(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('SNET', 'SNLT', 'FNLT', 'START_ON')),
+    date TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    UNIQUE(job_id, workflow_task_id, kind)
+);
+-- SQLiteのUNIQUEはNULL同士を「異なる値」として扱うため、上のUNIQUEだけでは
+-- ジョブ全体の制約（workflow_task_id IS NULL）の重複を防げない。holidays の
+-- ux_holidays_team と同じく、部分インデックスで補う。
+CREATE UNIQUE INDEX ux_task_constraints_job ON task_constraints(job_id, kind)
+    WHERE workflow_task_id IS NULL;
 
 CREATE TABLE workflow_dependency_templates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -247,6 +262,32 @@ def migrate(conn):
                 "ALTER TABLE task_dependencies ADD COLUMN lag_days INTEGER NOT NULL DEFAULT 0"
             )
         version = "7"
+
+    if version == "7":
+        # v8: task_constraints を追加（日付を「入力」として持つための唯一の場所。
+        # タスクに start_date を持たせると計算結果と入力が同じ列に混ざるため、
+        # 制約として別テーブルに分離する。docs/architecture.md 参照）。
+        # 旧ファイルには制約が1件も無い状態として扱えばよいので、テーブルを
+        # 作るだけで移行は完了する。
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_constraints'"
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                "CREATE TABLE task_constraints ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, "
+                "workflow_task_id INTEGER REFERENCES workflow_tasks(id) ON DELETE CASCADE, "
+                "kind TEXT NOT NULL CHECK (kind IN ('SNET', 'SNLT', 'FNLT', 'START_ON')), "
+                "date TEXT NOT NULL, "
+                "note TEXT NOT NULL DEFAULT '', "
+                "UNIQUE(job_id, workflow_task_id, kind))"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX ux_task_constraints_job ON task_constraints(job_id, kind) "
+                "WHERE workflow_task_id IS NULL"
+            )
+        version = "8"
 
     conn.execute(
         "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)
