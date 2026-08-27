@@ -15,7 +15,7 @@ project_scheduler.py の _build_scheduling_order() が採用しているトポ�
 """
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QPainterPath, QPen, QPolygonF
+from PySide6.QtGui import QBrush, QColor, QPainterPath, QPainterPathStroker, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -29,19 +29,26 @@ from PySide6.QtWidgets import (
     QGraphicsSimpleTextItem,
     QGraphicsView,
     QInputDialog,
+    QLabel,
     QLineEdit,
     QListWidgetItem,
     QMenu,
     QMessageBox,
 )
 
-from gui.db import DuplicateNameError, ProjectDatabaseError
+from gui.db import MAX_LAG_DAYS, DuplicateNameError, ProjectDatabaseError
 from gui.widgets_common import (
     NoWheelComboBox,
     NoWheelListWidget,
     NoWheelSpinBox,
     confirm_and_repair_milestone_consistency,
 )
+
+# エッジのクリック判定の太さ（見た目の線は2px）と、種別・ラグのラベルの見た目。
+EDGE_HIT_WIDTH = 14
+EDGE_LABEL_BG_COLOR = "#faf9f5"
+EDGE_LABEL_PADDING = 3
+EDGE_LABEL_GAP = 4
 
 NODE_WIDTH = 170
 NODE_HEIGHT = 64
@@ -336,19 +343,62 @@ def _arrow_polygon(tip, direction, size=9):
     return QPolygonF([tip, left, right])
 
 
+def format_dependency_kind(dep_type, lag_days):
+    """依存関係の種別・ラグを画面表示用の短い文字列にする。
+    既定（FS・ラグ0）は「指定なし」を意味するので空文字を返す
+    ——ほぼすべてのエッジが既定である以上、既定にラベルを出すと
+    キャンバスがラベルで埋まって、例外である方が目立たなくなる。"""
+    dep_type = (dep_type or "FS").upper()
+    lag_days = int(lag_days or 0)
+    if dep_type == "FS" and lag_days == 0:
+        return ""
+    return dep_type if lag_days == 0 else f"{dep_type}{lag_days:+d}"
+
+
 class EdgeItem(QGraphicsPathItem):
-    def __init__(self, dependency_id, pred_node, succ_node, color="#52514e", line_style=Qt.SolidLine):
+    def __init__(self, dependency_id, pred_node, succ_node, color="#52514e", line_style=Qt.SolidLine,
+                 dep_type="FS", lag_days=0):
         super().__init__()
         self.dependency_id = dependency_id
         self.pred_node = pred_node
         self.succ_node = succ_node
+        self.dep_type = dep_type
+        self.lag_days = lag_days
         self.setPen(QPen(QColor(color), 2, line_style))
         self.setBrush(Qt.NoBrush)
         self.setZValue(-1)
         self.arrow_item = QGraphicsPolygonItem(self)
         self.arrow_item.setBrush(QBrush(QColor(color)))
         self.arrow_item.setPen(QPen(Qt.NoPen))
+        # 種別・ラグのラベル。既定（FS・0）のときは非表示にするため、
+        # 背景の下敷きごとまとめて隠せるよう別アイテムに分けている。
+        self.label_bg = QGraphicsRectItem(self)
+        self.label_bg.setBrush(QBrush(QColor(EDGE_LABEL_BG_COLOR)))
+        self.label_bg.setPen(QPen(QColor(color), 1))
+        self.label_item = QGraphicsSimpleTextItem(self.label_bg)
+        self.label_item.setBrush(QBrush(QColor(color)))
+        self.set_dependency_kind(dep_type, lag_days)
+
+    def set_dependency_kind(self, dep_type, lag_days):
+        self.dep_type = (dep_type or "FS").upper()
+        self.lag_days = int(lag_days or 0)
+        text = format_dependency_kind(self.dep_type, self.lag_days)
+        self.label_item.setText(text)
+        self.label_bg.setVisible(bool(text))
         self.update_path()
+
+    def shape(self):
+        """クリック判定を線の太さ（2px）から広げる。ベジェ曲線をペンの
+        太さのままで当てるのは実用にならないため。"""
+        stroker = QPainterPathStroker()
+        stroker.setWidth(EDGE_HIT_WIDTH)
+        return stroker.createStroke(self.path())
+
+    def boundingRect(self):
+        # Qtはヒット判定の前に boundingRect で絞り込むため、shape() だけを
+        # 広げても矩形の外側は当たらない。同じ幅ぶん広げて揃える。
+        margin = EDGE_HIT_WIDTH / 2
+        return super().boundingRect().adjusted(-margin, -margin, margin, margin)
 
     def update_path(self):
         start = self.pred_node.output_anchor_scene_pos()
@@ -365,6 +415,20 @@ class EdgeItem(QGraphicsPathItem):
         ahead = path.pointAtPercent(0.51)
         direction = ahead - mid
         self.arrow_item.setPolygon(_arrow_polygon(mid, direction))
+        self._update_label_pos(mid)
+
+    def _update_label_pos(self, mid):
+        """ラベルは矢印と重ならないよう線の少し上に置く。"""
+        if not self.label_bg.isVisible():
+            return
+        rect = self.label_item.boundingRect()
+        pad = EDGE_LABEL_PADDING
+        self.label_bg.setRect(0, 0, rect.width() + pad * 2, rect.height() + pad * 2)
+        self.label_item.setPos(pad, pad)
+        self.label_bg.setPos(
+            mid.x() - (rect.width() + pad * 2) / 2,
+            mid.y() - (rect.height() + pad * 2) - EDGE_LABEL_GAP,
+        )
 
 
 class WorkflowGraphScene(QGraphicsScene):
@@ -410,7 +474,8 @@ class WorkflowGraphScene(QGraphicsScene):
             succ = self.nodes.get(d["successor_task_id"])
             if pred is None or succ is None:
                 continue
-            edge = EdgeItem(d["id"], pred, succ)
+            edge = EdgeItem(d["id"], pred, succ,
+                            dep_type=d["dep_type"], lag_days=d["lag_days"])
             self.addItem(edge)
             self.edges[d["id"]] = edge
             pred.edges.append(edge)
@@ -545,6 +610,25 @@ class WorkflowGraphScene(QGraphicsScene):
             succ_node.edges.append(edge)
             self.adjacency.setdefault(pred_id, []).append(succ_id)
             self.auto_arrange()
+
+    def update_edge_kind(self, dependency_id, dep_type, lag_days):
+        """依存関係の種別（FS/SS）とラグ（営業日）を変更する。
+
+        依存の向きは変えないため循環依存の再検査は不要。マイルストーンの
+        整合性（先行タスクの実効マイルストーン <= 後続）も、依存の有無が
+        変わらない以上ここでは崩れない。
+        """
+        edge = self.edges.get(dependency_id)
+        if edge is None:
+            return
+        try:
+            self.db.update_task_dependency(dependency_id, dep_type, lag_days)
+        except ProjectDatabaseError as e:
+            QMessageBox.warning(self.parent_widget, "エラー", str(e))
+            return
+        edge.set_dependency_kind(dep_type, lag_days)
+        if self.on_changed:
+            self.on_changed()
 
     def delete_edge(self, edge):
         with self.db.undo_group("依存関係を削除"):
@@ -783,6 +867,67 @@ class TaskNodeEditDialog(QDialog):
         return {item.data(Qt.UserRole) for item in self.predecessor_list.selectedItems()}
 
 
+class DependencyKindDialog(QDialog):
+    """依存関係（ワークフロー内の1本のエッジ）の種別とラグを編集するダイアログ。
+
+    先行/後続の組み合わせ自体は変更させない。向きを変えるのは「別の依存関係」
+    であり循環依存の再検査が要るため、既存の依存を消して引き直す操作
+    （＝キャンバス上のドラッグ）に任せる。
+    """
+
+    def __init__(self, pred_name, succ_name, dep_type="FS", lag_days=0, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("依存関係を編集")
+
+        form = QFormLayout(self)
+        form.addRow("依存関係", QLabel(f"{pred_name} → {succ_name}"))
+
+        self.kind_combo = NoWheelComboBox()
+        self.kind_combo.addItem("完了 → 開始（FS）", "FS")
+        self.kind_combo.addItem("開始 → 開始（SS）", "SS")
+        idx = self.kind_combo.findData((dep_type or "FS").upper())
+        self.kind_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        form.addRow("種別", self.kind_combo)
+
+        self.lag_spin = NoWheelSpinBox()
+        self.lag_spin.setRange(-MAX_LAG_DAYS, MAX_LAG_DAYS)
+        self.lag_spin.setValue(int(lag_days or 0))
+        self.lag_spin.setSuffix(" 営業日")
+        form.addRow("ラグ", self.lag_spin)
+
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet("color: #6b6a66;")
+        form.addRow("", self.hint)
+        self.kind_combo.currentIndexChanged.connect(self._update_hint)
+        self.lag_spin.valueChanged.connect(self._update_hint)
+        self._update_hint()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def _update_hint(self):
+        """設定した内容を日本語の一文で言い直す。FS/SS・正負のラグの
+        組み合わせは意味を取り違えやすいので、記号のまま確定させない。"""
+        kind = self.kind_combo.currentData()
+        lag = self.lag_spin.value()
+        anchor = "先行タスクの完了後" if kind == "FS" else "先行タスクの開始と同時"
+        if lag == 0:
+            text = f"{anchor}に後続タスクを開始する。"
+        elif lag > 0:
+            base = "完了後" if kind == "FS" else "開始から"
+            text = f"先行タスクの{base} {lag} 営業日空けてから後続タスクを開始する。"
+        else:
+            base = "完了" if kind == "FS" else "開始"
+            text = f"先行タスクの{base}より {abs(lag)} 営業日早く後続タスクを開始できる。"
+        self.hint.setText(text)
+
+    def values(self):
+        return self.kind_combo.currentData(), self.lag_spin.value()
+
+
 class DependencyTemplateDialog(QDialog):
     """依存テンプレート（ワークフローペア単位の既定タスク対応）の追加・編集ダイアログ。
     「このワークフローのタスク」は現在選択中のワークフロー内のタスクに固定し、
@@ -926,6 +1071,25 @@ def apply_predecessors(scene, node, predecessor_task_ids):
             scene.delete_edge(edge)
 
 
+def edit_edge_via_dialog(scene, parent, edge):
+    db = scene.db
+    current = db.get_task_dependency(edge.dependency_id)
+    if current is None:
+        return
+    names = {t["id"]: t["name"] for t in db.list_workflow_tasks(scene.workflow_id)}
+    dialog = DependencyKindDialog(
+        names.get(current["predecessor_task_id"], "?"),
+        names.get(current["successor_task_id"], "?"),
+        current["dep_type"], current["lag_days"], parent,
+    )
+    if dialog.exec() != QDialog.Accepted:
+        return
+    dep_type, lag_days = dialog.values()
+    if (dep_type, lag_days) == (current["dep_type"], current["lag_days"]):
+        return  # 変更なし。Undo履歴に空のエントリを積まない
+    scene.update_edge_kind(edge.dependency_id, dep_type, lag_days)
+
+
 def add_template_via_dialog(scene, parent):
     db = scene.db
     if not db.list_workflow_tasks(scene.workflow_id):
@@ -1027,6 +1191,11 @@ class WorkflowGraphView(QGraphicsView):
             return
         if template_node is not None:
             edit_template_via_dialog(self.scene(), self, template_node.template_id)
+            event.accept()
+            return
+        edge = self._resolve_edge_hit(item)
+        if edge is not None:
+            edit_edge_via_dialog(self.scene(), self, edge)
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
@@ -1171,10 +1340,24 @@ class WorkflowGraphView(QGraphicsView):
             return None, item.parentItem()
         return None, None
 
+    def _resolve_edge_hit(self, item):
+        """ワークフロー内の依存関係のエッジを判定する。矢印・種別ラベルなど
+        子要素をクリックした場合に備えて親を辿る（依存テンプレートのエッジは
+        疑似ノード側で編集するため、ここでは対象外にする）。"""
+        while item is not None:
+            if isinstance(item, EdgeItem):
+                scene = self.scene()
+                if scene is not None and scene.edges.get(item.dependency_id) is item:
+                    return item
+                return None
+            item = item.parentItem()
+        return None
+
     def contextMenuEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
         item = self.scene().itemAt(scene_pos, self.transform()) if self.scene() else None
         node, template_node = self._resolve_hit(item)
+        edge = self._resolve_edge_hit(item)
 
         menu = QMenu(self)
         if node is not None:
@@ -1193,6 +1376,14 @@ class WorkflowGraphView(QGraphicsView):
                 edit_template_via_dialog(self.scene(), self, template_node.template_id)
             elif chosen == delete_action:
                 self.scene().delete_dependency_template_node(template_node.template_id)
+        elif edge is not None:
+            edit_action = menu.addAction("種別・ラグを編集...")
+            delete_action = menu.addAction("削除")
+            chosen = menu.exec(event.globalPos())
+            if chosen == edit_action:
+                edit_edge_via_dialog(self.scene(), self, edge)
+            elif chosen == delete_action:
+                self.scene().delete_edge(edge)
         else:
             add_task_action = menu.addAction("タスクを追加...")
             add_template_action = menu.addAction("依存テンプレートを追加...")

@@ -32,7 +32,12 @@ from gui.db import (  # noqa: E402
     ProjectDatabaseError,
     ReferencedEntityError,
 )
-from gui.gantt_generator import build_frames, generate_gantt, validate_for_generation  # noqa: E402
+from gui.gantt_generator import (  # noqa: E402
+    build_frames,
+    compute_schedule_from_frames,
+    generate_gantt,
+    validate_for_generation,
+)
 from project_scheduler import ResourceOverflowError, SchedulingError  # noqa: E402
 
 SAMPLE_DB = Path(__file__).resolve().parent.parent / "data" / "Project_Schedule_Sample_GameDev_v22.pschedule"
@@ -1034,3 +1039,118 @@ def test_sample_pschedule_generates_full_schedule(tmp_path):
     assert len(result_df) == 340
     assert html_path.stat().st_size > 0
     db.close()
+
+
+# -- 依存関係の種別（FS/SS）とラグ ---------------------------------------------------
+
+def _build_two_task_project(db_path):
+    """2タスク（A: 3日 → B: 2日）だけの、リソース競合が起きない最小構成。
+    開発開始日 2026-01-05 は月曜、締切は十分先に取ってある。"""
+    db = ProjectDatabase.create_new(str(db_path))
+    db.set_project("ラグ検証", "2026-01-05")
+    team_id = db.add_team("チームA", 5)
+    ms_id = db.add_milestone("マイルストーン1", "2026-06-30")
+    wf_id = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf_id, "A", team_id, 3)
+    t2 = db.add_workflow_task(wf_id, "B", team_id, 2)
+    dep_id = db.add_task_dependency(wf_id, t1, t2)
+    db.add_job("ジョブ1", wf_id, ms_id, 1)
+    return db, dep_id, ms_id
+
+
+def _dates(db, **kwargs):
+    """{タスク名: (開始日, 終了日)} を 'YYYY-MM-DD' 文字列で返す。"""
+    kwargs.setdefault("distribution_ratio", 0.0)   # ASAP側に寄せて依存の効果だけを見る
+    kwargs.setdefault("auto_exclude_jp_holidays", False)
+    result = compute_schedule_from_frames(build_frames(db), verbose=False, **kwargs)
+    return {
+        row["Task_Name"]: (str(row["Start_Date"])[:10], str(row["End_Date"])[:10])
+        for _, row in result.iterrows()
+    }
+
+
+def test_dependency_lag_inserts_working_days_between_tasks(tmp_path):
+    """FS + ラグ2日で、先行タスクの完了後に「稼働日で2日」空くこと。
+    暦日ではなく稼働日で数えるため、土日を挟むと着手日は週明けになる。"""
+    db, dep_id, ms_id = _build_two_task_project(tmp_path / "p.pschedule")
+
+    assert _dates(db)["B"][0] == "2026-01-08"  # ラグ0: Aの完了(1/8)と同時に着手
+
+    db.update_task_dependency(dep_id, "FS", 2)
+    # 1/8(木)・1/9(金) を空け、次の稼働日は 1/12(月)
+    assert _dates(db)["B"][0] == "2026-01-12"
+    db.close()
+
+
+def test_start_to_start_dependency_starts_with_the_predecessor(tmp_path):
+    db, dep_id, ms_id = _build_two_task_project(tmp_path / "p.pschedule")
+
+    db.update_task_dependency(dep_id, "SS", 0)
+    dates = _dates(db)
+    assert dates["B"][0] == dates["A"][0] == "2026-01-05"
+
+    db.update_task_dependency(dep_id, "SS", 1)
+    assert _dates(db)["B"][0] == "2026-01-06"  # Aの開始から1稼働日後
+    db.close()
+
+
+def test_negative_lag_lets_the_successor_overlap_the_predecessor(tmp_path):
+    """負のラグ（リード）で、後続タスクが先行タスクの完了前に着手できること。"""
+    db, dep_id, ms_id = _build_two_task_project(tmp_path / "p.pschedule")
+
+    db.update_task_dependency(dep_id, "FS", -1)
+    dates = _dates(db)
+    assert dates["A"][1] == "2026-01-08"
+    assert dates["B"][0] == "2026-01-07"  # Aの完了より1稼働日早い
+    db.close()
+
+
+def test_lag_is_honoured_when_scheduling_backward_from_the_deadline(tmp_path):
+    """distribution_ratio=1.0（締切ギリギリに寄せる＝ALAP方向）でも、
+    ラグが最遅日程の逆算に織り込まれること。ここが抜けると後続タスクの
+    スラック計算がずれる。"""
+    db, dep_id, ms_id = _build_two_task_project(tmp_path / "p.pschedule")
+    db.update_milestone(ms_id, "マイルストーン1", "2026-02-13")  # 金曜
+
+    dates = _dates(db, distribution_ratio=1.0)
+    assert dates["B"] == ("2026-02-11", "2026-02-13")
+    assert dates["A"][1] == "2026-02-11"  # ラグ0: Bの開始日に完了
+
+    db.update_task_dependency(dep_id, "FS", 3)
+    dates = _dates(db, distribution_ratio=1.0)
+    assert dates["B"] == ("2026-02-11", "2026-02-13")   # 後続の最遅日程は変わらない
+    assert dates["A"][1] == "2026-02-06"  # 2/10・2/9・2/6 の3稼働日ぶん手前へ
+    db.close()
+
+
+def test_build_frames_encodes_dependency_kind_and_lag(tmp_path):
+    """種別・ラグが既定（FS・0）の依存は従来どおり素のTask_IDのまま
+    書き出され、それ以外だけ括弧付きになること（旧データとの互換）。"""
+    db, dep_id, ms_id = _build_two_task_project(tmp_path / "p.pschedule")
+
+    def internal_depends():
+        df = build_frames(db)["workflows"]
+        return df.loc[df["Task_Name"] == "B", "Internal_Depends"].iloc[0]
+
+    assert internal_depends() == "T_001"
+    db.update_task_dependency(dep_id, "SS", 2)
+    assert internal_depends() == "T_001(SS+2)"
+    db.update_task_dependency(dep_id, "SS", 0)
+    assert internal_depends() == "T_001(SS)"
+    db.update_task_dependency(dep_id, "FS", -1)
+    assert internal_depends() == "T_001(FS-1)"
+    db.close()
+
+
+def test_dependency_ref_round_trips_and_rejects_malformed_text():
+    from project_scheduler import format_dependency_ref, parse_dependency_ref
+
+    assert parse_dependency_ref("T_003") == ("T_003", "FS", 0)
+    for dep_type, lag in [("FS", 0), ("FS", 2), ("FS", -1), ("SS", 0), ("SS", 7)]:
+        text = format_dependency_ref("T_003", dep_type, lag)
+        assert parse_dependency_ref(text) == ("T_003", dep_type, lag)
+
+    with pytest.raises(SchedulingError):
+        parse_dependency_ref("T_003(FF+1)")   # 未対応の種別
+    with pytest.raises(SchedulingError):
+        parse_dependency_ref("T_003(+2)")     # 種別が無い

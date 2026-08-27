@@ -16,7 +16,7 @@ CRUD本体（gui/db.py）から分離しているのは、この2つが「増え
 4. `docs/db_design.md` のテーブル一覧を追随させる。
 """
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
 
 _SCHEMA_SQL = """
 CREATE TABLE schema_meta (
@@ -81,6 +81,8 @@ CREATE TABLE task_dependencies (
     workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
     predecessor_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
     successor_task_id   INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
+    dep_type TEXT NOT NULL DEFAULT 'FS' CHECK (dep_type IN ('FS', 'SS')),
+    lag_days INTEGER NOT NULL DEFAULT 0,
     UNIQUE(predecessor_task_id, successor_task_id),
     CHECK (predecessor_task_id != successor_task_id)
 );
@@ -225,6 +227,26 @@ def migrate(conn):
             if cols and "note" not in cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN note TEXT NOT NULL DEFAULT ''")
         version = "6"
+
+    if version == "6":
+        # v7: task_dependencies に dep_type（FS/SS）と lag_days（営業日）を追加。
+        # 旧ファイルの依存関係はすべて「FS・ラグ0」＝ 既定値のままで従来と同じ
+        # 意味になるため、列を足すだけで移行は完了する。
+        cols = [
+            r["name"] for r in
+            conn.execute("PRAGMA table_info(task_dependencies)").fetchall()
+        ]
+        if cols and "dep_type" not in cols:
+            # ALTER TABLE ADD COLUMN では CHECK 制約を後付けできないため、
+            # 値の妥当性は gui/db.py 側（_normalize_dependency_kind）で守る。
+            conn.execute(
+                "ALTER TABLE task_dependencies ADD COLUMN dep_type TEXT NOT NULL DEFAULT 'FS'"
+            )
+        if cols and "lag_days" not in cols:
+            conn.execute(
+                "ALTER TABLE task_dependencies ADD COLUMN lag_days INTEGER NOT NULL DEFAULT 0"
+            )
+        version = "7"
 
     conn.execute(
         "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)

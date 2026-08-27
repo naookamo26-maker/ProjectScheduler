@@ -1535,3 +1535,106 @@ def test_duplicate_workflow_copies_content_and_selects_the_copy_as_one_undo_step
     assert [w["name"] for w in window.db.list_workflows()] == ["WF1"]
     restored_item = wf_tab.workflow_list.currentItem()
     assert restored_item is not None and restored_item.data(Qt.UserRole) == wf_id
+
+
+def test_edit_dependency_kind_updates_edge_label_and_table(window, qapp):
+    """依存関係の種別・ラグを変更すると、ノードビューのエッジラベルと
+    テーブルビューの「先行タスク」欄の双方に反映され、Undoで戻ること。
+    既定（FS・ラグ0）のエッジにはラベルを出さない。"""
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    task_a = window.db.add_workflow_task(wf_id, "A", team_id, 1)
+    task_b = window.db.add_workflow_task(wf_id, "B", team_id, 1)
+    dep_id = window.db.add_task_dependency(wf_id, task_a, task_b)
+
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    edge = scene.edges[dep_id]
+    assert not edge.label_bg.isVisible()  # 既定はラベル無し
+
+    def pred_cell_text():
+        table = wf_tab.task_section.table
+        for row in range(table.rowCount()):
+            if table.item(row, 0).text() == "B":
+                return table.item(row, 3).text()
+        return None
+
+    assert pred_cell_text() == "A"
+
+    scene.update_edge_kind(dep_id, "SS", 2)
+    qapp.processEvents()
+    assert edge.label_bg.isVisible()
+    assert edge.label_item.text() == "SS+2"
+    assert pred_cell_text() == "A（SS+2）"
+
+    window.undo_manager.undo()
+    qapp.processEvents()
+    dep = window.db.get_task_dependency(dep_id)
+    assert (dep["dep_type"], dep["lag_days"]) == ("FS", 0)
+    assert not wf_tab.current_scene.edges[dep_id].label_bg.isVisible()
+    assert pred_cell_text() == "A"
+
+
+def test_dependency_kind_dialog_reports_the_setting_in_words(window, qapp):
+    """FS/SS・正負のラグの意味を、ダイアログが日本語の一文で言い直すこと
+    （記号だけだと取り違えやすいため）。"""
+    from gui.node_canvas import DependencyKindDialog
+
+    dialog = DependencyKindDialog("A", "B", "FS", 0, window)
+    assert dialog.values() == ("FS", 0)
+    assert "完了後に後続タスクを開始" in dialog.hint.text()
+
+    dialog.lag_spin.setValue(2)
+    assert "2 営業日空けて" in dialog.hint.text()
+
+    dialog.kind_combo.setCurrentIndex(dialog.kind_combo.findData("SS"))
+    dialog.lag_spin.setValue(-3)
+    assert dialog.values() == ("SS", -3)
+    assert "3 営業日早く" in dialog.hint.text()
+    dialog.deleteLater()
+
+
+def test_dependency_edge_is_clickable_along_the_curve(window, qapp):
+    """依存関係の線をダブルクリック/右クリックで編集できるようにするには、
+    2pxのベジェ曲線に当たり判定が付いている必要がある。曲線上および
+    その近傍でエッジとして解決でき、ノードの上では誤認しないこと。"""
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    task_a = window.db.add_workflow_task(wf_id, "A", team_id, 1)
+    task_b = window.db.add_workflow_task(wf_id, "B", team_id, 1)
+    dep_id = window.db.add_task_dependency(wf_id, task_a, task_b)
+
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    view, scene = wf_tab.view, wf_tab.current_scene
+    # タスクをDBへ直接追加したためノードの座標は既定(0,0)のまま重なっている。
+    # 実際の操作（キャンバスからの追加・編集）と同じ配置にしてから判定する。
+    scene.auto_arrange()
+    qapp.processEvents()
+    edge = scene.edges[dep_id]
+
+    for pct in (0.4, 0.5, 0.6):
+        point = edge.path().pointAtPercent(pct)
+        assert view._resolve_edge_hit(scene.itemAt(point, view.transform())) is edge
+
+    near = edge.path().pointAtPercent(0.5)
+    near.setY(near.y() - 5)   # 線から少し外れた位置でも掴める
+    assert view._resolve_edge_hit(scene.itemAt(near, view.transform())) is edge
+
+    node_center = scene.nodes[task_a].sceneBoundingRect().center()
+    assert view._resolve_edge_hit(scene.itemAt(node_center, view.transform())) is None
+
+    # 線の端は出力アンカーの丸と重なる。そこは依存関係を引くドラッグの
+    # 起点なので、エッジではなくアンカーが勝つ（当たり判定を広げても
+    # ドラッグでの依存追加を潰さないこと）。
+    from gui.node_canvas import AnchorItem
+
+    anchor_point = scene.nodes[task_a].output_anchor_scene_pos()
+    assert isinstance(scene.itemAt(anchor_point, view.transform()), AnchorItem)

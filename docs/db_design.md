@@ -30,7 +30,7 @@ PySide6（Qt）に一切依存しないため、GUIを起動せずに単体で�
 | `holidays` | 休業日（日付、任意でチームを指定。未指定は全チーム共通。備考あり） |
 | `workflows` | ワークフロー（テンプレートの名前と、一覧での表示順`sort_order`） |
 | `workflow_tasks` | ワークフロー内のタスク（名前・担当チーム・所要日数・ノードグラフ上の座標） |
-| `task_dependencies` | ワークフロー内のタスク依存（Internal_Depends相当、predecessor→successor） |
+| `task_dependencies` | ワークフロー内のタスク依存（Internal_Depends相当、predecessor→successor）。`dep_type`が種別（`FS`=完了→開始 / `SS`=開始→開始）、`lag_days`が間に空ける営業日数（負ならリード＝先行の完了前に着手可）。既定は`FS`・`0` |
 | `jobs` | ジョブ（ワークフローの実体化。名前・使用ワークフロー・既定マイルストーン・優先度） |
 | `job_task_overrides` | ジョブ単位でのタスク上書き（有効/無効・日数・マイルストーン・チームの差分のみ保持） |
 | `job_dependency_links` | ジョブ単位の依存リンク（「このジョブは、あのジョブに依存する」）。追加時に`workflow_dependency_templates`を参照し、タスク単位の依存を自動展開する |

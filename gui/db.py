@@ -46,6 +46,40 @@ class ReferencedEntityError(ProjectDatabaseError):
     """参照が残っている行を削除しようとした場合"""
 
 
+#: ワークフロー内の依存関係の種別。値はDBに保存する文字列そのもの。
+#: FS = Finish-to-Start（先行タスクの完了後に開始）
+#: SS = Start-to-Start（先行タスクの開始に合わせて開始）
+DEPENDENCY_KINDS = ("FS", "SS")
+
+#: ラグ（営業日）の許容範囲。上限は「1タスクの所要日数として現実的な桁」に
+#: 合わせた安全弁で、業務上の意味があるわけではない（入力ミスで
+#: 稼働日カレンダーが極端に伸びるのを防ぐためだけの値）。
+MAX_LAG_DAYS = 3650
+
+
+def normalize_dependency_kind(dep_type, lag_days):
+    """依存関係の種別・ラグを検証し、(dep_type, lag_days) に正規化して返す。
+
+    ALTER TABLE で後から足した列にはCHECK制約を付けられない（＝旧ファイルを
+    移行した場合、DB側では不正な値を弾けない）ため、書き込み経路をここに
+    集約して守る。
+    """
+    dep_type = str(dep_type or "FS").strip().upper()
+    if dep_type not in DEPENDENCY_KINDS:
+        raise ProjectDatabaseError(
+            f"依存関係の種別 '{dep_type}' は不正です（{' / '.join(DEPENDENCY_KINDS)} のいずれか）"
+        )
+    try:
+        lag_days = int(lag_days)
+    except (TypeError, ValueError):
+        raise ProjectDatabaseError("ラグは整数（営業日）で指定してください") from None
+    if abs(lag_days) > MAX_LAG_DAYS:
+        raise ProjectDatabaseError(
+            f"ラグ {lag_days} 日は範囲外です（±{MAX_LAG_DAYS}日まで）"
+        )
+    return dep_type, lag_days
+
+
 def undoable(label):
     """ProjectDatabaseの変更系メソッドに付け、Undo/Redoの記録対象にするデコレータ。
 
@@ -674,15 +708,15 @@ class ProjectDatabase:
             task_id_map[t["id"]] = cur.lastrowid
 
         for d in self._conn.execute(
-            "SELECT predecessor_task_id, successor_task_id FROM task_dependencies "
-            "WHERE workflow_id = ?",
+            "SELECT predecessor_task_id, successor_task_id, dep_type, lag_days "
+            "FROM task_dependencies WHERE workflow_id = ?",
             (workflow_id,),
         ).fetchall():
             self._conn.execute(
                 "INSERT INTO task_dependencies(workflow_id, predecessor_task_id, "
-                "successor_task_id) VALUES (?, ?, ?)",
+                "successor_task_id, dep_type, lag_days) VALUES (?, ?, ?, ?, ?)",
                 (new_workflow_id, task_id_map[d["predecessor_task_id"]],
-                 task_id_map[d["successor_task_id"]]),
+                 task_id_map[d["successor_task_id"]], d["dep_type"], d["lag_days"]),
             )
 
         # 依存先（depends_on_workflow_id/depends_on_workflow_task_id）は他
@@ -790,26 +824,57 @@ class ProjectDatabase:
 
     def list_task_dependencies(self, workflow_id):
         rows = self._conn.execute(
-            "SELECT id, workflow_id, predecessor_task_id, successor_task_id "
+            "SELECT id, workflow_id, predecessor_task_id, successor_task_id, "
+            "dep_type, lag_days "
             "FROM task_dependencies WHERE workflow_id = ?",
             (workflow_id,),
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_task_dependency(self, dependency_id):
+        """1件を取得する（見つからなければ None）。GUIの編集ダイアログ用。"""
+        row = self._conn.execute(
+            "SELECT id, workflow_id, predecessor_task_id, successor_task_id, "
+            "dep_type, lag_days "
+            "FROM task_dependencies WHERE id = ?",
+            (dependency_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
     @undoable("依存関係を追加")
-    def add_task_dependency(self, workflow_id, predecessor_task_id, successor_task_id):
+    def add_task_dependency(self, workflow_id, predecessor_task_id, successor_task_id,
+                            dep_type="FS", lag_days=0):
         """循環依存のチェックは呼び出し側（gui/node_canvas.py）が事前に行う想定。
-        ここでは構造的制約（自己参照禁止・重複禁止）のみDB制約で守る。"""
+        ここでは構造的制約（自己参照禁止・重複禁止）のみDB制約で守る。
+
+        dep_type / lag_days の既定値（FS・0）は従来の唯一の挙動そのものなので、
+        引数を渡さない既存の呼び出しは意味が変わらない。
+        """
+        dep_type, lag_days = normalize_dependency_kind(dep_type, lag_days)
         try:
             cur = self._conn.execute(
                 "INSERT INTO task_dependencies(workflow_id, predecessor_task_id, "
-                "successor_task_id) VALUES (?, ?, ?)",
-                (workflow_id, predecessor_task_id, successor_task_id),
+                "successor_task_id, dep_type, lag_days) VALUES (?, ?, ?, ?, ?)",
+                (workflow_id, predecessor_task_id, successor_task_id, dep_type, lag_days),
             )
         except sqlite3.IntegrityError as e:
             raise ProjectDatabaseError("この依存関係は既に存在するか、不正です") from e
         self._commit()
         return cur.lastrowid
+
+    @undoable("依存関係の種別・ラグを変更")
+    def update_task_dependency(self, dependency_id, dep_type, lag_days):
+        """種別（FS/SS）とラグ（営業日）だけを差し替える。依存の向き
+        （predecessor/successor）は変更しない——向きを変えることは
+        「別の依存関係」であり、循環依存の再検査が要るため。"""
+        dep_type, lag_days = normalize_dependency_kind(dep_type, lag_days)
+        cur = self._conn.execute(
+            "UPDATE task_dependencies SET dep_type = ?, lag_days = ? WHERE id = ?",
+            (dep_type, lag_days, dependency_id),
+        )
+        if cur.rowcount == 0:
+            raise ProjectDatabaseError("対象の依存関係が見つかりません")
+        self._commit()
 
     @undoable("依存関係を削除")
     def delete_task_dependency(self, dependency_id):

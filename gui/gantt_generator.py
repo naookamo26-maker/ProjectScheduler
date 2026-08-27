@@ -11,6 +11,7 @@ import pandas as pd
 from project_scheduler import (
     _TEAM_COLOR_OVERFLOW,
     _build_team_color_map,
+    format_dependency_ref,
     run_resource_constrained_scheduler_from_frames,
 )
 
@@ -90,13 +91,20 @@ def build_frames(db):
         deps = db.list_task_dependencies(w["id"])
         deps_by_succ = {}
         for d in deps:
-            deps_by_succ.setdefault(d["successor_task_id"], []).append(d["predecessor_task_id"])
+            deps_by_succ.setdefault(d["successor_task_id"], []).append(d)
         tasks = db.list_workflow_tasks(w["id"])
         for t in tasks:
             task_str[t["id"]] = _fmt("T", t["id"])
         for t in tasks:
             preds = deps_by_succ.get(t["id"], [])
-            internal_depends = ",".join(task_str[p] for p in preds) if preds else None
+            # 種別・ラグが既定（FS・0）の依存は "T_003" のまま。それ以外だけ
+            # "T_003(SS+2)" の形になる（format_dependency_ref を参照）。
+            internal_depends = ",".join(
+                format_dependency_ref(
+                    task_str[d["predecessor_task_id"]], d["dep_type"], d["lag_days"]
+                )
+                for d in preds
+            ) if preds else None
             wf_rows.append({
                 "Workflow_ID": wf_str[w["id"]],
                 "Task_ID": task_str[t["id"]],

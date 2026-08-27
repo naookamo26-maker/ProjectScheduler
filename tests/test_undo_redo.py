@@ -619,3 +619,129 @@ def test_undo_stack_is_capped(tmp_path):
     for i in range(_MAX_STACK_SIZE + 20):
         db.add_team(f"チーム{i}", 1)
     assert len(manager._undo_stack) == _MAX_STACK_SIZE
+
+
+# -- 依存関係の種別（FS/SS）とラグ ---------------------------------------------------
+
+def test_task_dependency_defaults_to_finish_to_start_without_lag(tmp_path):
+    """種別・ラグを指定せずに追加した依存は FS・0（＝この機能が入る前と
+    まったく同じ意味）になること。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    team = db.add_team("チームA", 1)
+    wf = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf, "タスク1", team, 3)
+    t2 = db.add_workflow_task(wf, "タスク2", team, 3)
+    dep_id = db.add_task_dependency(wf, t1, t2)
+
+    dep = db.get_task_dependency(dep_id)
+    assert (dep["dep_type"], dep["lag_days"]) == ("FS", 0)
+    assert db.list_task_dependencies(wf)[0]["dep_type"] == "FS"
+    db.close()
+
+
+def test_update_task_dependency_kind_is_undoable(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    manager, _ = _attach_dummy_undo_manager(db)
+    team = db.add_team("チームA", 1)
+    wf = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf, "タスク1", team, 3)
+    t2 = db.add_workflow_task(wf, "タスク2", team, 3)
+    dep_id = db.add_task_dependency(wf, t1, t2)
+
+    db.update_task_dependency(dep_id, "SS", 2)
+    assert db.get_task_dependency(dep_id)["dep_type"] == "SS"
+    assert db.get_task_dependency(dep_id)["lag_days"] == 2
+
+    manager.undo()
+    dep = db.get_task_dependency(dep_id)
+    assert (dep["dep_type"], dep["lag_days"]) == ("FS", 0)
+
+    manager.redo()
+    dep = db.get_task_dependency(dep_id)
+    assert (dep["dep_type"], dep["lag_days"]) == ("SS", 2)
+    db.close()
+
+
+def test_task_dependency_rejects_unknown_kind_and_out_of_range_lag(tmp_path):
+    """ALTER TABLEで後から足した列にはCHECK制約を付けられないため、
+    不正な値は書き込み経路（gui/db.py）で弾かれること。"""
+    from gui.db import MAX_LAG_DAYS, ProjectDatabaseError
+
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    team = db.add_team("チームA", 1)
+    wf = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf, "タスク1", team, 3)
+    t2 = db.add_workflow_task(wf, "タスク2", team, 3)
+
+    with pytest.raises(ProjectDatabaseError):
+        db.add_task_dependency(wf, t1, t2, dep_type="FF")
+
+    dep_id = db.add_task_dependency(wf, t1, t2)
+    with pytest.raises(ProjectDatabaseError):
+        db.update_task_dependency(dep_id, "SS", MAX_LAG_DAYS + 1)
+    with pytest.raises(ProjectDatabaseError):
+        db.update_task_dependency(dep_id, "SS", "2日")
+    # 弾かれた場合は元の値のまま
+    assert db.get_task_dependency(dep_id)["dep_type"] == "FS"
+    db.close()
+
+
+def test_duplicating_workflow_copies_dependency_kind_and_lag(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    team = db.add_team("チームA", 1)
+    wf = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf, "タスク1", team, 3)
+    t2 = db.add_workflow_task(wf, "タスク2", team, 3)
+    dep_id = db.add_task_dependency(wf, t1, t2, dep_type="SS", lag_days=3)
+    assert db.get_task_dependency(dep_id)["lag_days"] == 3
+
+    copy_id = db.duplicate_workflow(wf)
+    copied = db.list_task_dependencies(copy_id)
+    assert len(copied) == 1
+    assert (copied[0]["dep_type"], copied[0]["lag_days"]) == ("SS", 3)
+    db.close()
+
+
+def test_opening_pre_dependency_lag_schema_migrates_to_finish_to_start(tmp_path):
+    """dep_type/lag_days列が無い旧バージョン(v6)の.pscheduleを開いた際、
+    列が追加され、既存の依存はすべて FS・0（＝従来の唯一の挙動）として
+    扱われること。"""
+    import sqlite3
+
+    path = tmp_path / "legacy.pschedule"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE project (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            project_name TEXT NOT NULL DEFAULT '',
+            start_date TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE workflows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE task_dependencies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_id INTEGER NOT NULL,
+            predecessor_task_id INTEGER NOT NULL,
+            successor_task_id INTEGER NOT NULL
+        );
+        """
+    )
+    conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '6')")
+    conn.execute("INSERT INTO project(id, project_name, start_date) VALUES (1, '', '')")
+    conn.execute("INSERT INTO workflows(name) VALUES ('WF1')")
+    conn.execute(
+        "INSERT INTO task_dependencies(workflow_id, predecessor_task_id, successor_task_id) "
+        "VALUES (1, 10, 20)"
+    )
+    conn.commit()
+    conn.close()
+
+    db = ProjectDatabase.open_existing(str(path))
+    deps = db.list_task_dependencies(1)
+    assert len(deps) == 1
+    assert (deps[0]["dep_type"], deps[0]["lag_days"]) == ("FS", 0)
+    db.close()
