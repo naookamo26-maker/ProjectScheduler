@@ -22,10 +22,11 @@ gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、ホイー
 表示する。
 """
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -41,12 +42,20 @@ from gui.gantt_generator import (
     validate_for_generation,
 )
 from gui.gantt_view import FrozenGanttPane, build_gantt_scenes
-from gui.widgets_common import ChoiceFilterGroup, CollapsibleSection
+from gui.widgets_common import ChoiceFilterGroup, CollapsibleSection, NoWheelSlider, NoWheelSpinBox
 from project_scheduler import SchedulingError
 
 # ジョブが1つもタグを持たない場合にまとめる擬似キー（gui/tab_jobs.py と同じ考え方）。
 _NO_TAG_FILTER_KEY = None
 _NO_TAG_FILTER_LABEL = "（タグなし）"
+
+# project_scheduler.py の distribution_ratio 既定値と同じ（配置コントロールの初期値）。
+_DEFAULT_DISTRIBUTION_RATIO = 0.7
+
+# ジョブ名検索は1文字入力するたびに絞り込みを走らせず、入力が止まってから
+# まとめて反映する（デバウンス）。値はキー入力の間隔として自然に感じられる
+# 程度（他の即時反映系UIとの一貫性より「打ち終わってから絞り込まれる」体感を優先）。
+_SEARCH_DEBOUNCE_MS = 300
 
 
 class _ScheduleWorker(QObject):
@@ -65,14 +74,17 @@ class _ScheduleWorker(QObject):
     finished = Signal(int, object)   # (seq, result_df)
     failed = Signal(int, str)        # (seq, エラーメッセージ)
 
-    def __init__(self, seq, frames):
+    def __init__(self, seq, frames, distribution_ratio):
         super().__init__()
         self._seq = seq
         self._frames = frames
+        self._distribution_ratio = distribution_ratio
 
     def run(self):
         try:
-            result_df = compute_schedule_from_frames(self._frames, verbose=False)
+            result_df = compute_schedule_from_frames(
+                self._frames, verbose=False, distribution_ratio=self._distribution_ratio,
+            )
         except SchedulingError as e:
             self.failed.emit(self._seq, str(e))
         except Exception as e:  # noqa: BLE001 - ワーカースレッドで例外を握り潰さない
@@ -87,19 +99,55 @@ class GanttTab(QWidget):
         self.db = db
         self._result_df = None
         self._display = None
-        # 直近の計算結果がどの時点のDB内容に対応するか（db.revision の値）。
-        # 一致している間は再計算しない（タブを行き来するたびに数秒かかる
-        # スケジューリングを走らせないため）。
-        self._computed_revision = None
+        # 「配置コントロール」スライダーで調整する distribution_ratio
+        # （project_scheduler.py 参照。各タスクを [ASAP, ALAP] のどのあたりに
+        # 配置するかの基準点）。DBには保存しない、このタブだけの表示用パラメータ
+        # （ワークフロー／チーム等の絞り込みと同じ扱い。Undo/Redoの対象にもしない）。
+        self._distribution_ratio = _DEFAULT_DISTRIBUTION_RATIO
+        # 直近の計算結果がどの時点のDB内容・distribution_ratioに対応するか
+        # （db.revision, distribution_ratio）の組。一致している間は再計算しない
+        # （タブを行き来するたびに数秒かかるスケジューリングを走らせないため）。
+        self._computed_signature = None
         # 実行中のスケジューリング要求の通し番号。結果が返ってきたときに
         # 「最後に出した要求のものか」を判定し、古い結果は捨てる。
         self._request_seq = 0
         self._thread = None
         self._worker = None
-        # 計算中の要求に対応する表示用補助情報（結果が返ってきたら _display へ移す）
+        # 計算中の要求に対応する表示用補助情報・distribution_ratio
+        # （結果が返ってきたら _display へ移す／_computed_signature に使う）。
         self._pending_display = None
+        self._pending_distribution_ratio = None
 
         layout = QVBoxLayout(self)
+
+        # 配置コントロール（distribution_ratio の調整）。ドラッグ中に毎回
+        # 再計算すると重い上にUndoできない中間状態が大量にできてしまうため、
+        # スライダーを離した時にだけ再計算する（_on_placement_slider_released）。
+        self.placement_group = QGroupBox("配置コントロール")
+        placement_layout = QHBoxLayout(self.placement_group)
+        placement_layout.addWidget(QLabel("最速"))
+        self.placement_slider = NoWheelSlider(Qt.Horizontal)
+        self.placement_slider.setRange(0, 100)
+        self.placement_slider.setValue(round(self._distribution_ratio * 100))
+        self.placement_slider.setToolTip(
+            "各タスクを、依存関係が満たされ次第の最速開始～締切から逆算した"
+            "最遅開始の範囲内のどこに配置するかの基準点（distribution_ratio）。"
+        )
+        placement_layout.addWidget(self.placement_slider, 1)
+        placement_layout.addWidget(QLabel("ギリギリ"))
+        self.placement_spinbox = NoWheelSpinBox()
+        self.placement_spinbox.setRange(0, 100)
+        self.placement_spinbox.setSuffix("%")
+        self.placement_spinbox.setValue(round(self._distribution_ratio * 100))
+        # 数字入力中に1文字ごと反映されるのを防ぐ（Enter/フォーカスアウト、
+        # または矢印ボタン操作でのみ valueChanged が飛ぶようにする）。
+        self.placement_spinbox.setKeyboardTracking(False)
+        placement_layout.addWidget(self.placement_spinbox)
+        layout.addWidget(self.placement_group)
+
+        self.placement_slider.valueChanged.connect(self._on_placement_slider_value_changed)
+        self.placement_slider.sliderReleased.connect(self._on_placement_slider_released)
+        self.placement_spinbox.valueChanged.connect(self._on_placement_spinbox_value_changed)
 
         # ワークフロー／チーム／タグの3つの絞り込み（いずれもOR条件の
         # チェックボックス一覧で、3つの間はAND条件で組み合わせる。
@@ -126,7 +174,17 @@ class GanttTab(QWidget):
         self.search_edit = QLineEdit()
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setPlaceholderText("ジョブ名の一部を入力")
-        self.search_edit.textChanged.connect(self._refresh_chart)
+        # 1文字入力するたびに絞り込みを走らせると、入力途中の文字列で毎回
+        # 再描画されてしまう。入力が止まってからまとめて反映する（デバウンス）。
+        self._search_debounce_timer = QTimer(self)
+        self._search_debounce_timer.setSingleShot(True)
+        self._search_debounce_timer.setInterval(_SEARCH_DEBOUNCE_MS)
+        self._search_debounce_timer.timeout.connect(self._refresh_chart)
+        self.search_edit.textChanged.connect(self._search_debounce_timer.start)
+        # クリアボタンなど即座に反映したい操作もあるため、編集完了時
+        # （Enter/フォーカスアウト）は待たずに即反映する。
+        self.search_edit.editingFinished.connect(self._search_debounce_timer.stop)
+        self.search_edit.editingFinished.connect(self._refresh_chart)
         # 20文字程度が入る幅に固定する（addWidget(..., 1)で親の幅いっぱいに
         # 伸びてしまうと、他の絞り込みチェックボックスと並べたときに長すぎるため）。
         search_edit_width = QFontMetrics(self.search_edit.font()).horizontalAdvance("あ" * 20) + 24
@@ -152,8 +210,9 @@ class GanttTab(QWidget):
         タスク数が増えるとスケジューリングは数秒かかるため、次の2つでUIが
         固まらないようにしている。
 
-        1. 前回計算した時点からDBの内容が変わっていなければ再計算しない
-           （db.revision で判定）。タブを行き来しただけで毎回計算し直すのを防ぐ。
+        1. 前回計算した時点からDBの内容・distribution_ratioが変わっていなければ
+           再計算しない（_computed_signature で判定）。タブを行き来しただけで
+           毎回計算し直すのを防ぐ。
         2. 計算本体はワーカースレッドで実行する（_ScheduleWorker）。DBを読むのは
            GUIスレッド（build_frames）、計算だけ別スレッド、という分割にしている。
            計算中も画面は操作でき、途中で内容を変えれば新しい要求が古い要求を
@@ -176,7 +235,8 @@ class GanttTab(QWidget):
             )
             return
 
-        if self._result_df is not None and self._computed_revision == self.db.revision:
+        signature = (self.db.revision, self._distribution_ratio)
+        if self._result_df is not None and self._computed_signature == signature:
             # 前回計算した時点から内容が変わっていないので、表示だけ作り直す。
             self._apply_result()
             return
@@ -191,10 +251,29 @@ class GanttTab(QWidget):
             return
 
         self._pending_display = display
+        self._pending_distribution_ratio = self._distribution_ratio
         self._request_seq += 1
         seq = self._request_seq
         self._start_worker(seq, frames)
         self._set_status("スケジューリングを計算中です...")
+
+    def _on_placement_slider_value_changed(self, value):
+        """ドラッグ中は毎回ここが呼ばれる。スピンボックスの表示だけ追従させ、
+        重い再計算はスライダーを離すまで行わない（_on_placement_slider_released）。"""
+        self.placement_spinbox.blockSignals(True)
+        self.placement_spinbox.setValue(value)
+        self.placement_spinbox.blockSignals(False)
+
+    def _on_placement_slider_released(self):
+        self._distribution_ratio = self.placement_slider.value() / 100.0
+        self.refresh_choices()
+
+    def _on_placement_spinbox_value_changed(self, value):
+        self.placement_slider.blockSignals(True)
+        self.placement_slider.setValue(value)
+        self.placement_slider.blockSignals(False)
+        self._distribution_ratio = value / 100.0
+        self.refresh_choices()
 
     def _start_worker(self, seq, frames):
         """ワーカースレッドを起こしてスケジューリングを走らせる。
@@ -204,7 +283,7 @@ class GanttTab(QWidget):
         害はなく、途中で強制終了させるより安全なため（終了は quit()/wait() を
         shutdown() でまとめて待つ）。"""
         thread = QThread(self)
-        worker = _ScheduleWorker(seq, frames)
+        worker = _ScheduleWorker(seq, frames, self._distribution_ratio)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_schedule_finished)
@@ -244,7 +323,7 @@ class GanttTab(QWidget):
             return  # 追い越された古い要求の結果なので捨てる
         self._result_df = result_df
         self._display = self._pending_display
-        self._computed_revision = self.db.revision
+        self._computed_signature = (self.db.revision, self._pending_distribution_ratio)
         self._apply_result()
 
     def _on_schedule_failed(self, seq, message):
@@ -301,7 +380,7 @@ class GanttTab(QWidget):
         ように誤解させてしまうため。"""
         self._result_df = None
         self._display = None
-        self._computed_revision = None
+        self._computed_signature = None
         self.view.setScene(None)
         self._rebuild_filters()
         self._set_status(status_message, is_error=is_error)

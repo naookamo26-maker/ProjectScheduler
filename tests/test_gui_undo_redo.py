@@ -1023,6 +1023,17 @@ def _wait_for_schedule(window, qapp, timeout_sec=15.0):
     qapp.processEvents()
 
 
+def _wait_for_search_debounce(window, qapp, timeout_sec=2.0):
+    """ジョブ名検索欄のデバウンスタイマー（gui/tab_gantt.py の
+    _search_debounce_timer）が発火するまでイベントを回して待つ。"""
+    timer = window.tab_gantt._search_debounce_timer
+    deadline = time.monotonic() + timeout_sec
+    while timer.isActive() and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    qapp.processEvents()
+
+
 def test_gantt_tab_computes_schedule_in_background(window, qapp):
     """スケジューリングはワーカースレッドで実行され、完了後に結果が反映されること。
 
@@ -1193,7 +1204,7 @@ def test_gantt_search_box_filters_by_job_name(window, qapp):
     _wait_for_schedule(window, qapp)
 
     window.tab_gantt.search_edit.setText("アルファ")
-    qapp.processEvents()
+    _wait_for_search_debounce(window, qapp)
 
     body_scene = window.tab_gantt.view.scene()
     tooltips = [item.toolTip() for item in body_scene.items() if item.toolTip()]
