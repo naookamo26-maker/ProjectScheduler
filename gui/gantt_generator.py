@@ -6,6 +6,8 @@ DB（ProjectDatabase）の内容から project_scheduler.py を直接呼び出�
 変換はここで一度だけ行う（GUIの画面上にはこの文字列IDは一切表示されない）。
 """
 
+from datetime import date
+
 import pandas as pd
 
 from project_scheduler import (
@@ -173,6 +175,8 @@ def build_display(db):
         - workflow_colors: {Workflow_ID(文字列): 16進色}（チーム別表示でバーを
           ワークフロー別に色分けする際に使う。チーム色と同じ固定パレット）
         - milestone_markers: [(id, 名前, pd.Timestamp), ...]（プロジェクト開始日を含む、締切順）
+        - common_holiday_dates: {datetime.date, ...}（全チーム共通の休業日）
+        - holidays_by_team: {Team_ID(文字列): {datetime.date, ...}}（チーム別の休業日）
     """
     teams = db.list_teams()
     team_str = {t["id"]: _fmt("TEAM", t["id"]) for t in teams}
@@ -202,10 +206,24 @@ def build_display(db):
         milestone_markers.append((_fmt("MS", m["id"]), m["name"], pd.to_datetime(m["end_date"])))
     milestone_markers.sort(key=lambda marker: marker[2])
 
+    # ガントチャートの日付軸で、休業日の日付ラベルを赤字にするための情報
+    # （gui/gantt_view.py参照）。全チーム共通（team_idがNULL）と、チーム別の
+    # 休業日を分けて持つ——表示中のチームが分かって初めて「どの休業日が
+    # 関係するか」が決まるため、判定自体はgantt_view.py側で行う。
+    common_holiday_dates = set()
+    holidays_by_team = {}
+    for h in db.list_holidays():
+        d = date.fromisoformat(h["date"])
+        if h["team_id"] is None:
+            common_holiday_dates.add(d)
+        else:
+            holidays_by_team.setdefault(team_str[h["team_id"]], set()).add(d)
+
     return {
         "team_names": team_names, "team_colors": team_colors,
         "workflow_names": workflow_names, "workflow_colors": workflow_colors,
         "milestone_markers": milestone_markers,
+        "common_holiday_dates": common_holiday_dates, "holidays_by_team": holidays_by_team,
     }
 
 
