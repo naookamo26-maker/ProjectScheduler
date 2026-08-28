@@ -16,7 +16,7 @@ CRUD本体（gui/db.py）から分離しているのは、この2つが「増え
 4. `docs/db_design.md` のテーブル一覧を追随させる。
 """
 
-SCHEMA_VERSION = "11"
+SCHEMA_VERSION = "12"
 
 _SCHEMA_SQL = """
 CREATE TABLE schema_meta (
@@ -90,7 +90,7 @@ CREATE TABLE jobs (
     name TEXT NOT NULL UNIQUE,
     workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE RESTRICT,
     default_milestone_id INTEGER REFERENCES milestones(id) ON DELETE SET NULL,
-    priority INTEGER NOT NULL DEFAULT 100 CHECK (priority >= 1),
+    priority INTEGER CHECK (priority IS NULL OR priority >= 1),
     tags TEXT NOT NULL DEFAULT ''
 );
 
@@ -400,6 +400,41 @@ def migrate(conn):
         conn.commit()
         conn.execute("PRAGMA foreign_keys = ON")
         version = "11"
+
+    if version == "11":
+        # v12: jobs.priority を「未指定」を許容するよう緩和する。従来は
+        # NOT NULL DEFAULT 100 のため新規ジョブは常に「優先度100」で作られて
+        # いたが、以後はNULL（未指定）を許し、スケジューリング時に自動的に
+        # 最低優先度として扱う（project_scheduler.DEFAULT_LOW_PRIORITY。
+        # 元々「未指定なら最低優先」というロジック自体はスケジューラ側に
+        # 用意されていたが、DB側が常に非NULLの100を書き込んでいたため
+        # 実質使われていなかった）。既存ジョブの値（100を含む）はユーザーが
+        # 明示的に設定した値と区別できないため、勝手にNULLへ書き換えない。
+        # SQLiteはALTER TABLEでNOT NULL/CHECKを直接変更できないため、
+        # テーブルを作り直して既存データを移し替える。
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = OFF")
+
+        job_cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+        if job_cols and "priority" in job_cols:
+            conn.execute(
+                "CREATE TABLE jobs_new ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "name TEXT NOT NULL UNIQUE, "
+                "workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE RESTRICT, "
+                "default_milestone_id INTEGER REFERENCES milestones(id) ON DELETE SET NULL, "
+                "priority INTEGER CHECK (priority IS NULL OR priority >= 1), "
+                "tags TEXT NOT NULL DEFAULT '')"
+            )
+            conn.execute(
+                "INSERT INTO jobs_new(id, name, workflow_id, default_milestone_id, priority, tags) "
+                "SELECT id, name, workflow_id, default_milestone_id, priority, tags FROM jobs"
+            )
+            conn.execute("DROP TABLE jobs")
+            conn.execute("ALTER TABLE jobs_new RENAME TO jobs")
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = ON")
+        version = "12"
 
     conn.execute(
         "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)

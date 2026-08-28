@@ -171,6 +171,30 @@ def test_job_tags_are_normalized_on_add_and_update(tmp_path):
     db.close()
 
 
+def test_job_priority_can_be_left_unspecified(tmp_path):
+    """優先度は「未指定」（NULL）を許容する。新規ジョブは既定でこの状態になり、
+    スケジューリング側で自動的に最低優先として扱われる
+    （project_scheduler.DEFAULT_LOW_PRIORITY）。明示的に数値を設定した後、
+    再び未指定へ戻すこともできる。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    team = db.add_team("チームA", 1)
+    wf = db.add_workflow("WF1")
+    db.add_workflow_task(wf, "A", team, 1)
+
+    job_id = db.add_job("J1", wf, None)  # priority省略＝未指定
+    job = next(j for j in db.list_jobs() if j["id"] == job_id)
+    assert job["priority"] is None
+
+    db.update_job(job_id, "J1", wf, None, 5, "")
+    job = next(j for j in db.list_jobs() if j["id"] == job_id)
+    assert job["priority"] == 5
+
+    db.update_job(job_id, "J1", wf, None, None, "")
+    job = next(j for j in db.list_jobs() if j["id"] == job_id)
+    assert job["priority"] is None
+    db.close()
+
+
 def test_duplicate_job_copies_task_overrides_and_outgoing_dependencies(tmp_path):
     """ジョブの複製は、タスク上書き・依存先ジョブ（ジョブ間依存、テンプレート
     由来のタスク対応・手動追加のタスク対応の両方）を引き継ぐ。一方、他ジョブが
@@ -1138,4 +1162,56 @@ def test_opening_pre_tags_schema_adds_tags_column_and_allows_zero_lines(tmp_path
     assert db.list_teams()[0]["max_lines"] == 0
     db.update_team_capacity_change(1, "2026-02-01", 0)
     assert db.list_team_capacity_changes(1)[0]["lines"] == 0
+    db.close()
+
+
+def test_opening_pre_optional_priority_schema_preserves_values_and_allows_null(tmp_path):
+    """jobs.priorityがNOT NULL DEFAULT 100だった旧バージョン(v11)の.pscheduleを
+    開いた際、既存ジョブの値（100を含む）はそのまま保持され、かつ以後は
+    NULL（未指定）を保存できるようになること（テーブルを作り直すため）。"""
+    import sqlite3
+
+    path = tmp_path / "legacy.pschedule"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE project (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            project_name TEXT NOT NULL DEFAULT '',
+            start_date TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE workflows (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+        CREATE TABLE milestones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+            end_date TEXT NOT NULL, note TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            workflow_id INTEGER NOT NULL,
+            default_milestone_id INTEGER,
+            priority INTEGER NOT NULL DEFAULT 100 CHECK (priority >= 1),
+            tags TEXT NOT NULL DEFAULT ''
+        );
+        """
+    )
+    conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '11')")
+    conn.execute("INSERT INTO project(id, project_name, start_date) VALUES (1, '', '')")
+    conn.execute("INSERT INTO workflows(name) VALUES ('WF1')")
+    conn.execute("INSERT INTO jobs(name, workflow_id, priority, tags) VALUES ('J1', 1, 100, '')")
+    conn.execute("INSERT INTO jobs(name, workflow_id, priority, tags) VALUES ('J2', 1, 3, '緊急')")
+    conn.commit()
+    conn.close()
+
+    db = ProjectDatabase.open_existing(str(path))
+
+    jobs = {j["name"]: j for j in db.list_jobs()}
+    assert jobs["J1"]["priority"] == 100  # 既存の値は勝手にNULLへ書き換えない
+    assert jobs["J2"]["priority"] == 3
+    assert jobs["J2"]["tags"] == "緊急"
+
+    # 以後は未指定（NULL）を保存できる。
+    new_id = db.add_job("J3", 1, None, None)
+    assert db.list_jobs()[[j["id"] for j in db.list_jobs()].index(new_id)]["priority"] is None
     db.close()

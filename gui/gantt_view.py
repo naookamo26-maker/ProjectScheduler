@@ -442,14 +442,18 @@ class FrozenGanttPane(QWidget):
                 visible = not hide_week_aux
                 header_line.setVisible(visible)
                 body_line.setVisible(visible)
-                header_line.setPen(QPen(_AUX_GRID_COLOR, 1))
-                body_line.setPen(QPen(_AUX_GRID_COLOR, 1))
+                aux_pen = QPen(_AUX_GRID_COLOR, 1)
+                aux_pen.setCosmetic(True)  # ズーム（水平方向の拡縮）で線が太くならないようにする
+                header_line.setPen(aux_pen)
+                body_line.setPen(aux_pen)
                 label.setVisible(False)
                 continue
             header_line.setVisible(True)
             body_line.setVisible(True)
-            header_line.setPen(QPen(_GRID_COLOR, 1))
-            body_line.setPen(QPen(_GRID_COLOR, 1))
+            main_pen = QPen(_GRID_COLOR, 1)
+            main_pen.setCosmetic(True)  # ズーム（水平方向の拡縮）で線が太くならないようにする
+            header_line.setPen(main_pen)
+            body_line.setPen(main_pen)
             label.setVisible(True)
             if compact:
                 text = full_text.split("/", 1)[0].lstrip("0") or "0"
@@ -694,10 +698,11 @@ def build_gantt_scenes(df, display, color_by="team"):
         x = x_of(tick_date)
         is_month_boundary = (tick_date.year, tick_date.month) != prev_month
         prev_month = (tick_date.year, tick_date.month)
-        header_line = header_scene.addLine(x, TOP_MARGIN - _GRID_TOP_OFFSET, x, header_stub_bottom,
-                                            QPen(_GRID_COLOR, 1))
+        week_pen = QPen(_GRID_COLOR, 1)
+        week_pen.setCosmetic(True)  # ズーム（水平方向の拡縮）で線が太くならないようにする
+        header_line = header_scene.addLine(x, TOP_MARGIN - _GRID_TOP_OFFSET, x, header_stub_bottom, week_pen)
         header_line.setZValue(-2)
-        body_line = body_scene.addLine(x, TOP_MARGIN, x, chart_bottom, QPen(_GRID_COLOR, 1))
+        body_line = body_scene.addLine(x, TOP_MARGIN, x, chart_bottom, week_pen)
         body_line.setZValue(-2)
         full_text = tick_date.strftime("%m/%d")
         label = _add_fixed_size_label(
@@ -724,11 +729,12 @@ def build_gantt_scenes(df, display, color_by="team"):
     while day_cursor <= axis_end:
         if day_cursor not in week_dates:
             x = x_of(day_cursor)
-            header_line = header_scene.addLine(x, TOP_MARGIN - _GRID_TOP_OFFSET, x, header_stub_bottom,
-                                                QPen(_AUX_GRID_COLOR, 1))
+            day_pen = QPen(_AUX_GRID_COLOR, 1)
+            day_pen.setCosmetic(True)  # ズーム（水平方向の拡縮）で線が太くならないようにする
+            header_line = header_scene.addLine(x, TOP_MARGIN - _GRID_TOP_OFFSET, x, header_stub_bottom, day_pen)
             header_line.setZValue(-3)
             header_line.setVisible(False)
-            body_line = body_scene.addLine(x, TOP_MARGIN, x, chart_bottom, QPen(_AUX_GRID_COLOR, 1))
+            body_line = body_scene.addLine(x, TOP_MARGIN, x, chart_bottom, day_pen)
             body_line.setZValue(-3)
             body_line.setVisible(False)
             is_holiday = day_cursor.date() in holiday_dates
@@ -769,7 +775,9 @@ def build_gantt_scenes(df, display, color_by="team"):
             x = x_of(year_cursor)
             row_top = TOP_MARGIN - _YEAR_LABEL_OFFSET - _YEAR_DIVIDER_PADDING
             row_bottom = TOP_MARGIN - _YEAR_LABEL_OFFSET + year_metrics.height() + _YEAR_DIVIDER_PADDING
-            header_line = header_scene.addLine(x, row_top, x, row_bottom, QPen(_YEAR_GRID_COLOR, 1))
+            year_pen = QPen(_YEAR_GRID_COLOR, 1)
+            year_pen.setCosmetic(True)  # ズーム（水平方向の拡縮）で線が太くならないようにする
+            header_line = header_scene.addLine(x, row_top, x, row_bottom, year_pen)
             header_line.setZValue(-1)
         year_cursor = year_cursor.replace(year=year_cursor.year + 1)
 

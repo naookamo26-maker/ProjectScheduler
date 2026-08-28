@@ -120,6 +120,11 @@ class ResourceOverflowError(SchedulingError):
 
 DEFAULT_LOW_PRIORITY = 999  # Priority未指定タスクのフォールバック（最後に処理＝押し出されやすい）
 
+# マイルストーン未指定のジョブのフォールバック（一番遅いマイルストーンの締切と
+# みなす。マイルストーンが1件も無いプロジェクトでは、開発開始日からこの年数後を
+# 仮の締切とみなす）。
+MISSING_MILESTONE_FALLBACK_YEARS = 5
+
 #: 依存関係の種別。FS = Finish-to-Start（先行の完了後に開始）、
 #: SS = Start-to-Start（先行の開始に合わせて開始）。
 DEPENDENCY_KINDS = ("FS", "SS")
@@ -438,7 +443,7 @@ def _build_external_dep_map(df_extdeps):
     return dep_map
 
 
-def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps):
+def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project_start):
     teams_dict = df_teams.set_index("Team_ID")["Max_Lines"].to_dict()
     ext_dep_map = _build_external_dep_map(df_extdeps)
 
@@ -447,6 +452,15 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps):
     ms_end_map = {}
     for ms_id, ms_row in df_ms.iterrows():
         ms_end_map[ms_id] = pd.to_datetime(ms_row.get("End_Date"))
+
+    # マイルストーン未指定のジョブのフォールバック先（一番締切が遅い
+    # マイルストーン）。マイルストーンが1件も定義されていない、または
+    # 全件End_Dateが空の場合はNone（呼び出し側で開発開始日+5年を使う）。
+    _valid_ms_ends = {mid: end for mid, end in ms_end_map.items() if pd.notna(end)}
+    latest_ms_id = max(_valid_ms_ends, key=lambda mid: _valid_ms_ends[mid]) if _valid_ms_ends else None
+    fallback_ms_end = (
+        project_start + pd.DateOffset(years=MISSING_MILESTONE_FALLBACK_YEARS)
+    )
 
     wf_tasks_by_id = {}
     for row in df_wf.to_dict("records"):
@@ -503,15 +517,36 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps):
                     f"ライン制限なし（無制限）として扱います。"
                 )
 
-            if task_ms not in ms_end_map:
+            if not pd.notna(task_ms) or str(task_ms).strip() == "":
+                # マイルストーン未指定: 一番締切が遅いマイルストーンに合わせて
+                # 扱う（間に合わないジョブとして誤って埋もれるより、後ろ倒し
+                # 気味に見積もる方が安全）。マイルストーンが1件も無い
+                # プロジェクトでは、開発開始日から
+                # MISSING_MILESTONE_FALLBACK_YEARS 年後を仮の締切とみなす。
+                if latest_ms_id is not None:
+                    task_ms = latest_ms_id
+                    ms_end = ms_end_map[task_ms]
+                    logger.info(
+                        f"タスク '{g_id}' にマイルストーンが設定されていないため、"
+                        f"最も締切が遅いマイルストーン '{task_ms}'（{ms_end.date()}）を仮の締切として扱います"
+                    )
+                else:
+                    ms_end = fallback_ms_end
+                    logger.info(
+                        f"タスク '{g_id}' にマイルストーンが設定されておらず、プロジェクトにも"
+                        f"マイルストーンが1件も無いため、開発開始日から"
+                        f"{MISSING_MILESTONE_FALLBACK_YEARS}年後（{ms_end.date()}）を仮の締切として扱います"
+                    )
+            elif task_ms not in ms_end_map:
                 raise MissingMilestoneError(
                     f"タスク '{g_id}' が参照するマイルストーン '{task_ms}' が Milestones シートに見つかりません"
                 )
-            ms_end = ms_end_map[task_ms]
-            if pd.isna(ms_end):
-                raise MissingMilestoneError(
-                    f"マイルストーン '{task_ms}'（タスク '{g_id}' が参照）の End_Date が空です"
-                )
+            else:
+                ms_end = ms_end_map[task_ms]
+                if pd.isna(ms_end):
+                    raise MissingMilestoneError(
+                        f"マイルストーン '{task_ms}'（タスク '{g_id}' が参照）の End_Date が空です"
+                    )
 
             internal_depends = t.get("Internal_Depends")
             int_deps = []
@@ -2032,7 +2067,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
     milestone_markers.sort(key=lambda m: m[2])
 
     teams_dict, active_tasks, active_ids = _parse_tasks(
-        df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps)
+        df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project_start)
     team_capacity_schedule = _build_team_capacity_schedule(df_teams, df_team_capacity)
 
     if not active_ids:

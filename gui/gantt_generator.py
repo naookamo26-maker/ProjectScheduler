@@ -77,9 +77,13 @@ def build_frames(db):
 
     milestones = db.list_milestones()
     ms_str = {m["id"]: _fmt("MS", m["id"]) for m in milestones}
+    # マイルストーンが1件も無い場合でも、project_scheduler.py側の必須列
+    # チェック（Milestone_ID/End_Date）を通せるよう、列だけは常に持たせておく
+    # （project_scheduler._parse_tasksが「マイルストーン未指定かつ1件も無い」を
+    # 開発開始日+5年のフォールバックとして扱えるようにするため）。
     df_ms = pd.DataFrame([{
         "Milestone_ID": ms_str[m["id"]], "End_Date": m["end_date"], "Milestone_Name": m["name"],
-    } for m in milestones])
+    } for m in milestones], columns=["Milestone_ID", "End_Date", "Milestone_Name"])
 
     workflows = db.list_workflows()
     wf_str = {w["id"]: _fmt("WF", w["id"]) for w in workflows}
