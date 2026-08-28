@@ -56,9 +56,9 @@ _NO_TAG_FILTER_KEY = None
 _NO_TAG_FILTER_LABEL = "（タグなし）"
 
 # 配置コントロール（チャート本体右下にオーバーレイ表示する小さな操作パネル）の
-# 幅・チャート右端／下端からの余白(px)。ラベル・スライダー・スピンボックスを
-# 縦に積まず1行に収めて縦方向を圧迫しないぶん、幅は広めに取る。
-_PLACEMENT_CONTROL_WIDTH = 300
+# 幅・チャート右端／下端からの余白(px)。タイトル・ラベル・スライダー・
+# スピンボックスを縦に積まず1行に収めて縦方向を圧迫しないぶん、幅は広めに取る。
+_PLACEMENT_CONTROL_WIDTH = 420
 _PLACEMENT_CONTROL_MARGIN = 12
 
 # ジョブ名検索は1文字入力するたびに絞り込みを走らせず、入力が止まってから
@@ -194,13 +194,10 @@ class GanttTab(QWidget):
         # ようにする（QGroupBoxはタイトル無しの単なる枠として使う）。
         self.placement_group = QGroupBox("", self.view)
         self.placement_group.setFixedWidth(_PLACEMENT_CONTROL_WIDTH)
-        outer_layout = QVBoxLayout(self.placement_group)
-        placement_title = QLabel("配置コントロール")
-        outer_layout.addWidget(placement_title)
-        # ガントチャートの縦方向を圧迫しないよう、ラベル・スライダー・
+        # ガントチャートの縦方向を圧迫しないよう、タイトル・ラベル・スライダー・
         # スピンボックスを縦に積まず1行に収める（そのぶん幅を確保する）。
-        placement_layout = QHBoxLayout()
-        outer_layout.addLayout(placement_layout)
+        placement_layout = QHBoxLayout(self.placement_group)
+        placement_layout.addWidget(QLabel("配置コントロール"))
         placement_layout.addWidget(QLabel("最速"))
         self.placement_slider = NoWheelSlider(Qt.Horizontal)
         self.placement_slider.setRange(0, 100)
