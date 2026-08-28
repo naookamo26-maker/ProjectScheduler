@@ -772,6 +772,11 @@ def build_gantt_scenes(df, display, color_by="team"):
         x = x_of(date)
         color = _PROJECT_START_COLOR if marker_id == "PROJECT_START" else _MILESTONE_COLOR
         pen = QPen(color, 2, Qt.DashLine)
+        # コズメティックペンにし、太さ(2px)がズーム（本体の拡縮率）の影響を
+        # 受けず常に画面上で一定になるようにする（既定では線の太さもシーン
+        # 座標として拡縮されるため、ズームアウトすると細く、ズームインすると
+        # 太くなってしまう）。
+        pen.setCosmetic(True)
         header_line = header_scene.addLine(x, TOP_MARGIN - _GRID_TOP_OFFSET, x, header_stub_bottom, pen)
         header_line.setZValue(-1)
         body_line = body_scene.addLine(x, TOP_MARGIN, x, chart_bottom, pen)
