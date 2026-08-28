@@ -1085,8 +1085,8 @@ def test_sample_pschedule_generates_full_schedule(tmp_path):
     html_path = tmp_path / "schedule_gantt.html"
     result_df = generate_gantt(db, plotly_output_path=str(html_path), verbose=False)
 
-    # data/Project_Schedule_Sample_GameDev_v22.xlsx をCLIで直接実行した場合と
-    # 同じ340行になることを確認する（DB移行・GUI側の変換で欠落/重複が無いこと）。
+    # 移行元のExcelサンプル（削除済み）を旧CLIで実行した場合と同じ340行になる
+    # ことを確認する（DB移行・GUI側の変換で欠落/重複が無いこと）。
     assert len(result_df) == 340
     assert html_path.stat().st_size > 0
     db.close()

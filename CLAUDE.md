@@ -90,7 +90,6 @@
 
 次のファイルは読み込まない（生成物・バイナリで、読んでも設計判断の役に立たない）。
 
-- `samples/schedule_gantt.html`（4.3MB の生成済みガントチャート）
-- `data/*.pschedule`（SQLiteのバイナリ）、`data/*.xlsx`。中身が必要なら
-  `gui/db.py`のAPI経由か`sqlite3`で必要な行だけを取り出す
+- `data/*.pschedule`（SQLiteのバイナリ）。中身が必要なら`gui/db.py`のAPI経由か
+  `sqlite3`で必要な行だけを取り出す
 - `output/`配下の生成物

@@ -6,14 +6,10 @@
 直接開けるインタラクティブなガントチャート（単一HTMLファイル、Plotly製・
 チーム別色分け）として出力する。
 
-入力データの作成には2通りの方法がある:
-
-- **GUI（推奨）**: PySide6製のデスクトップアプリ（`gui/`）。IDを一切意識せず、
-  名前のドロップダウン選択とノードグラフでの依存関係編集だけでデータを組み立て
-  られる。保存形式はSQLite（`.pschedule`）で、GUIから直接ガントチャートを生成
-  できる（Excelを経由しない）。詳しくは [GUIの使い方](#guiプロジェクトスケジューラーgui) を参照。
-- **Excel + CLI**: 多シート構成のExcelを直接編集し、`project_scheduler.py`を
-  コマンドラインから実行する（下記「使い方」）。
+入力データの作成には、PySide6製のデスクトップGUI（`gui/`）を使う。IDを
+一切意識せず、名前のドロップダウン選択とノードグラフでの依存関係編集だけで
+データを組み立てられる。保存形式はSQLite（`.pschedule`）で、GUIから直接
+ガントチャートを生成できる。
 
 ## セットアップ
 
@@ -33,7 +29,7 @@ python run_gui.py
 
 | ファイル | 規模 | 用途 |
 | --- | --- | --- |
-| [`data/Project_Schedule_Sample_GameDev_v22.pschedule`](data/Project_Schedule_Sample_GameDev_v22.pschedule) | 45ジョブ / 340タスク | 機能をひととおり触るための最小構成（既存のExcelサンプルを`scripts/migrate_excel_to_db.py`で変換したもの） |
+| [`data/Project_Schedule_Sample_GameDev_v22.pschedule`](data/Project_Schedule_Sample_GameDev_v22.pschedule) | 45ジョブ / 340タスク | 機能をひととおり触るための最小構成 |
 | [`data/Project_Schedule_Sample_AAA_Large.pschedule`](data/Project_Schedule_Sample_AAA_Large.pschedule) | 1,916ジョブ / 16,230タスク | AAA級タイトルの制作進行を想定した大規模サンプル。実運用規模での動作確認用 |
 
 大規模サンプルは `scripts/generate_large_sample.py` で生成している（内容は決定的なので、
@@ -44,8 +40,8 @@ python run_gui.py
 
 3タブ（基本情報設定／ワークフロー設計／ジョブ）でデータを入力し、
 `.pschedule`ファイルをウィンドウにドラッグ&ドロップして開くこともできる。
-「ファイル → ガントチャートを生成...」から出力先フォルダを選べば、CLI版と
-同じインタラクティブHTMLが書き出される。
+「ファイル → ガントチャートを生成...」から出力先フォルダを選べば、
+インタラクティブHTMLが書き出される（詳細は下記）。
 保存は明示的に行う（Ctrl+S＝上書き保存、Ctrl+Shift+S＝名前を付けて保存。
 「ファイル」メニューからも実行できる）。未保存の変更があるとタイトルバーの
 ファイル名の前に`*`が表示される。
@@ -59,44 +55,11 @@ python run_gui.py
 - [`docs/packaging.md`](docs/packaging.md) — Windows `.exe` パッケージング手順
 - [`docs/roadmap.md`](docs/roadmap.md) — 今後の検討事項（未着手の課題と設計方針の記録）
 
-### Windows向け `.exe`
-
-GitHub Actions（`.github/workflows/build-exe.yml`）が `windows-latest` 上で
-自動ビルドする。Actionsの実行結果から `ProjectSchedulerGUI-windows`
-Artifactをダウンロードすれば、Pythonのインストール無しで実行できる。
-手元のWindows環境でビルドする手順も含め、詳細は
-[`docs/packaging.md`](docs/packaging.md) を参照。
-
-## 使い方（Excel + CLI）
-
-```bash
-python project_scheduler.py [Excelファイル] -o output/schedule_gantt.html
-```
-
-引数を省略すると `data/Project_Schedule_Sample_GameDev_v22.xlsx`
-（ゲーム開発案件のサンプルデータ）を使ってスケジューリングを実行する。
-
-サンプルデータを実行した出力例は `samples/` 配下にコミット済み:
-
-- [`samples/schedule_gantt.html`](samples/schedule_gantt.html) — インタラクティブHTML
-  ガントチャート（ダウンロードしてブラウザで開く。GitHubのファイルビューでは
-  ソースのまま表示される点に注意）
-
-主なオプション:
-
-- `-o` / `--output`（`--html-output` も同義）: インタラクティブHTMLガント
-  チャートの出力先（既定 `output/schedule_gantt.html`。空文字を指定すると
-  出力しない）
-- `--distribution-ratio`: 各タスクをASAP(0.0)〜ALAP(1.0)のどのあたりに
-  配置するかの基準点（既定 `0.7`）
-
-コードから直接呼び出す場合は `run_resource_constrained_scheduler()` を使う
-（詳細は `project_scheduler.py` のdocstringを参照）。
-
 ### インタラクティブHTMLガントチャート
 
-`output/schedule_gantt.html` はブラウザにドラッグ&ドロップするだけで開ける
-単一ファイル（Plotly.jsを埋め込み済みでオフラインでも動作、サーバー不要）。
+メニューの「ファイル → ガントチャートを生成...」で書き出す
+`schedule_gantt.html` は、ブラウザにドラッグ&ドロップするだけで開ける単一
+ファイル（Plotly.jsを埋め込み済みでオフラインでも動作、サーバー不要）。
 
 - **ワークフローごとに別々のガントチャートに分割**する
 - 各チャート内は**ジョブ単位で1行**にまとめる。ジョブ名は1回だけ表示し、
@@ -118,28 +81,20 @@ python project_scheduler.py [Excelファイル] -o output/schedule_gantt.html
 チーム色は固定12色のカテゴリカルパレット（彩度を抑え明度を高めた淡い配色。
 前半8色は色相を均等配置し色覚多様性シミュレーション下でもなるべく隣接色を
 判別できるようにしてあり、後半4色は前半1〜4番目と同系色の別トーン）を
-`Teams` シートの行順に割り当てる。13チーム目以降は無彩色にフォールドする
+チーム一覧の登録順に割り当てる。13チーム目以降は無彩色にフォールドする
 （色は識別の補助であり、チーム名は常に凡例・ツールチップのテキストでも
 確認できるため実用上問題ない）。
 
-## 入力フォーマット
+プログラムから直接呼び出す場合は `run_resource_constrained_scheduler_from_frames()`
+を使う（詳細は `project_scheduler.py` のdocstringを参照）。
 
-Excelブック内の各シート:
+### Windows向け `.exe`
 
-| シート | 必須 | 内容 |
-| --- | --- | --- |
-| `Project` | ○ | プロジェクト情報（1行）。`Start_Date` は全タスク共通の絶対下限日 |
-| `Milestones` | ○ | マイルストーンID・締切日（`End_Date`） |
-| `Teams` | ○ | チームID・同時並行可能ライン数（`Max_Lines`） |
-| `Workflows` | ○ | ワークフロー単位のタスク定義（所要日数・依存関係・担当チーム） |
-| `Jobs` | ○ | ジョブ（実際の制作物）とその優先度（`Priority`） |
-| `Job_Tasks` | 任意 | ジョブ単位でのタスク上書き（無効化・日数上書き等） |
-| `Holidays` | 任意 | 全社共通 or チーム別の休業日 |
-| `External_Dependencies` | 任意 | ジョブ・ワークフローをまたぐタスク間依存 |
-| `Workflow_Names` | 任意 | ガントチャート見出し用のワークフロー表示名 |
-
-詳細な列定義はサンプルファイル `data/Project_Schedule_Sample_GameDev_v22.xlsx`
-内の `README` シートを参照。
+GitHub Actions（`.github/workflows/build-exe.yml`）が `windows-latest` 上で
+自動ビルドする。Actionsの実行結果から `ProjectSchedulerGUI-windows`
+Artifactをダウンロードすれば、Pythonのインストール無しで実行できる。
+手元のWindows環境でビルドする手順も含め、詳細は
+[`docs/packaging.md`](docs/packaging.md) を参照。
 
 ## スケジューリングの考え方
 
@@ -150,7 +105,7 @@ Excelブック内の各シート:
    締切側・着手可能日側の順に探索範囲を広げる。
 3. リソースが競合した場合は、**優先度（`Priority`）の高い（値の小さい）ジョブが
    先に日程を確保**し、低いジョブが後ろへ押し出される。
-4. 土日・日本の祝日（自動計算）・`Holidays` シートで指定した休業日は
+4. 土日・日本の祝日（自動計算）・基本情報設定タブで指定した休業日は
    稼働日としてカウントしない。
 5. 締切までに収まらないタスクがあっても**エラーにはせず**、可能な限り早い日程へ
    配置したうえで、超過日数を結果の `Deadline_Overrun_Days` 列で返す
