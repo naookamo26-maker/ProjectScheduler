@@ -841,7 +841,9 @@ class JobsTab(QWidget):
             # __init__で_on_override_tag_text_changedに一括で繋いである）。
             table.setItem(row, 6, QTableWidgetItem(r["tags"]))
         table.blockSignals(False)
-        auto_size_columns(table, min_width=50)
+        # 「タグ」列（最後の列）はジョブ一覧と同様、内容幅に関わらず表の
+        # 右側に残る余白をすべて使う。
+        auto_size_columns(table, min_width=50, stretch_last=True)
         table.setColumnWidth(1, 44)  # 「有効」列はチェックボックスのみなので詰める
         self._ensure_job_selection()
 
