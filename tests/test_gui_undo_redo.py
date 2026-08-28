@@ -23,6 +23,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 pytest.importorskip("PySide6")
+pd = pytest.importorskip("pandas")
 
 # 分類: gui（PySide6 + offscreen QApplication が必要。最も重い）
 pytestmark = pytest.mark.gui
@@ -1070,8 +1071,6 @@ def test_gantt_chart_draws_overrun_tasks_with_a_red_border(window, qapp):
     window.db.set_project("枠線テスト", "2026-01-05")
     team_id = window.db.add_team("チームA", 1)  # 同時1本のみ
     ms_id = window.db.add_milestone("マイルストーン1", "2026-01-09")  # 同じ週の金曜
-    # チャートは「対象」で選んだワークフロー1件分だけを描くため、
-    # 間に合うタスクと間に合わないタスクが同じ図に載るよう1つにまとめる
     wf_id = window.db.add_workflow("WF")
     window.db.add_workflow_task(wf_id, "タスク", team_id, 2)
     for i in range(3):
@@ -1137,6 +1136,198 @@ def test_hidden_gantt_tab_is_not_refreshed_during_undo(window, qapp):
         mocked.assert_not_called()
 
 
+# -- ガントチャートタブ: 絞り込み（ワークフロー／チーム／タグ・文字列検索・間に合わないジョブ） --
+
+def _build_multi_workflow_project(db):
+    """複数ワークフロー・複数チームが混在するプロジェクト（絞り込みのテスト用）。
+    ジョブ2（WF2）だけが1本のチームで詰まり、締切に間に合わなくなる。"""
+    db.set_project("絞り込みテスト", "2026-01-05")
+    team_a = db.add_team("チームA", 2)
+    team_b = db.add_team("チームB", 1)
+    ms_id = db.add_milestone("MS1", "2026-01-09")  # 同じ週の金曜（間に合わせづらい締切）
+    wf1 = db.add_workflow("WF1")
+    db.add_workflow_task(wf1, "タスク", team_a, 1)
+    wf2 = db.add_workflow("WF2")
+    db.add_workflow_task(wf2, "タスク", team_b, 5)  # 締切に間に合わない所要日数
+    job1 = db.add_job("案件アルファ", wf1, ms_id, 100, "緊急")
+    job2 = db.add_job("案件ベータ", wf2, ms_id, 100, "通常")
+    return job1, job2, team_a, team_b, wf1, wf2
+
+
+def test_gantt_filters_narrow_the_displayed_jobs(window, qapp):
+    """ワークフロー／チーム／タグのチェックを外すと、該当するジョブのタスクが
+    チャート（本体シーン）から消えること（スケジューリング結果自体は変わらない）。"""
+    job1, job2, _team_a, _team_b, wf1, wf2 = _build_multi_workflow_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    def job_names_in_body_scene():
+        body_scene = window.tab_gantt.view.scene()
+        names = set()
+        for item in body_scene.items():
+            tooltip = item.toolTip()
+            if tooltip and hasattr(item, "pen"):
+                names.add(tooltip.split(" / ")[0])
+        return names
+
+    assert job_names_in_body_scene() == {"案件アルファ", "案件ベータ"}
+
+    wf1_str = window.tab_gantt._display["workflow_names"]
+    wf1_id = next(k for k, v in wf1_str.items() if v == "WF1")
+    window.tab_gantt.workflow_filter._checks[wf1_id].setChecked(False)
+    qapp.processEvents()
+    assert job_names_in_body_scene() == {"案件ベータ"}
+    window.tab_gantt.workflow_filter._checks[wf1_id].setChecked(True)
+    qapp.processEvents()
+
+    tag_filter = window.tab_gantt.tag_filter
+    tag_filter._checks["緊急"].setChecked(False)
+    qapp.processEvents()
+    assert job_names_in_body_scene() == {"案件ベータ"}
+
+
+def test_gantt_search_box_filters_by_job_name(window, qapp):
+    """ジョブ名の文字列検索で、一致しないジョブが表示から除外されること。"""
+    _build_multi_workflow_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    window.tab_gantt.search_edit.setText("アルファ")
+    qapp.processEvents()
+
+    body_scene = window.tab_gantt.view.scene()
+    tooltips = [item.toolTip() for item in body_scene.items() if item.toolTip()]
+    assert any("案件アルファ" in t for t in tooltips)
+    assert not any("案件ベータ" in t for t in tooltips)
+
+
+def test_gantt_overrun_only_checkbox_filters_to_late_jobs(window, qapp):
+    """「間に合わないジョブのみ表示」をオンにすると、締切に間に合うジョブが
+    チャートから消え、間に合わないジョブだけが残ること。"""
+    _build_multi_workflow_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    df = window.tab_gantt._result_df
+    assert (df["Deadline_Overrun_Days"] > 0).any()  # 前提: 実際に超過するジョブがある
+
+    window.tab_gantt.overrun_only_checkbox.setChecked(True)
+    qapp.processEvents()
+
+    body_scene = window.tab_gantt.view.scene()
+    tooltips = [item.toolTip() for item in body_scene.items() if item.toolTip()]
+    assert any("案件ベータ" in t for t in tooltips)
+    assert not any("案件アルファ" in t for t in tooltips)
+
+
+def test_gantt_column_shows_workflow_color_swatch_next_to_job_name(window, qapp):
+    """左列のジョブ名の左に、ワークフロー別の色スペースが表示されること
+    （複数ワークフローが混在する表示で、どのワークフローのジョブか見分ける
+    ため）。"""
+    from PySide6.QtWidgets import QGraphicsRectItem
+
+    from gui.gantt_view import _JOB_SWATCH_WIDTH
+
+    _build_multi_workflow_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    column_scene = window.tab_gantt.view.column.scene()
+    swatches = {
+        item.toolTip(): item.brush().color().name()
+        for item in column_scene.items()
+        if isinstance(item, QGraphicsRectItem) and item.rect().width() == _JOB_SWATCH_WIDTH
+    }
+    assert "ワークフロー: WF1" in swatches
+    assert "ワークフロー: WF2" in swatches
+    assert swatches["ワークフロー: WF1"] != swatches["ワークフロー: WF2"]
+
+
+# -- ガントチャート描画（gui/gantt_view.py）: 「今日」の縦線・1行飛ばしの行背景 ------------
+#
+# build_gantt_scenes() はDB/スケジューラーを介さずDataFrameだけで呼べるため、
+# ワーカースレッドでの計算を待つ window フィクスチャより軽量な qapp フィクスチャ
+# だけで直接検証する。
+
+_MINIMAL_GANTT_DISPLAY = {
+    "team_names": {"TEAM_001": "チームA"},
+    "team_colors": {"TEAM_001": "#cccccc"},
+    "workflow_names": {"WF_001": "WF1"},
+    "workflow_colors": {"WF_001": "#dddddd"},
+    "milestone_markers": [],
+    "common_holiday_dates": set(),
+    "holidays_by_team": {},
+    "job_tags": {},
+}
+
+
+def _gantt_task_row(job_id, job_name, start, end):
+    return {
+        "Job_ID": job_id, "Job_Name": job_name, "Task_Name": "タスク1",
+        "Workflow_ID": "WF_001", "Team_ID": "TEAM_001",
+        "Start_Date": start, "End_Date": end,
+        "Deadline_Overrun_Days": 0, "Constraint_Violation": "", "Resource_Adjusted": False,
+    }
+
+
+def test_gantt_chart_shows_today_line_when_within_display_range(qapp):
+    """表示範囲内に今日が含まれる場合、マイルストーンと同じコズメティック
+    ペインの「今日」の縦線が描かれること。"""
+    from gui.gantt_view import _TODAY_LINE_COLOR, build_gantt_scenes
+
+    today = pd.Timestamp.today().normalize()
+    df = pd.DataFrame([_gantt_task_row(
+        "JOB_001", "ジョブA", today - pd.Timedelta(days=10), today + pd.Timedelta(days=10),
+    )])
+    scenes = build_gantt_scenes(df, _MINIMAL_GANTT_DISPLAY, color_by="team")
+    assert scenes is not None
+
+    today_lines = [
+        item for item in scenes.body.items()
+        if hasattr(item, "pen") and item.pen().color() == _TODAY_LINE_COLOR
+    ]
+    assert today_lines, "今日の縦線が描かれていない"
+    assert today_lines[0].pen().isCosmetic()
+
+
+def test_gantt_chart_hides_today_line_when_outside_display_range(qapp):
+    """今日が表示範囲の外（プロジェクトが過去のみ）にある場合、今日の縦線を
+    描かない（軸を無理に広げて表示範囲を歪めないため）。"""
+    from gui.gantt_view import _TODAY_LINE_COLOR, build_gantt_scenes
+
+    df = pd.DataFrame([_gantt_task_row(
+        "JOB_001", "ジョブA", pd.Timestamp("2000-01-01"), pd.Timestamp("2000-01-10"),
+    )])
+    scenes = build_gantt_scenes(df, _MINIMAL_GANTT_DISPLAY, color_by="team")
+    today_lines = [
+        item for item in scenes.body.items()
+        if hasattr(item, "pen") and item.pen().color() == _TODAY_LINE_COLOR
+    ]
+    assert not today_lines
+
+
+def test_gantt_chart_stripes_every_other_job_row(qapp):
+    """ジョブの行は1行飛ばしで背面が薄い灰色になること（左列・本体の両方）。"""
+    from gui.gantt_view import _ROW_STRIPE_COLOR, build_gantt_scenes
+
+    base = pd.Timestamp("2026-01-05")
+    df = pd.DataFrame([
+        _gantt_task_row(f"JOB_{i:03d}", f"ジョブ{i}", base + pd.Timedelta(days=i * 3),
+                         base + pd.Timedelta(days=i * 3 + 2))
+        for i in range(4)
+    ])
+    scenes = build_gantt_scenes(df, _MINIMAL_GANTT_DISPLAY, color_by="team")
+
+    def stripe_count(scene):
+        return sum(
+            1 for item in scene.items()
+            if hasattr(item, "brush") and item.brush().color() == _ROW_STRIPE_COLOR
+        )
+
+    assert stripe_count(scenes.body) == 2  # 4行中、奇数インデックス(1,3)の2行分
+    assert stripe_count(scenes.column) == 2
+
+
 # -- ワークフロー設計タブ: ノードビュー／テーブルビューの切り替え ---------------------------
 
 
@@ -1187,6 +1378,78 @@ def test_task_table_orders_tasks_upstream_to_downstream(window, qapp):
     assert table.item(b_row, 3).text() == "A"
     c_row = names.index("C")
     assert table.item(c_row, 3).text() == "B"
+
+
+def test_compute_workflow_min_duration_follows_critical_path():
+    """FS/SSの依存種別とラグを踏まえた最短完了日数（クリティカルパス）を
+    正しく計算すること。チームの同時ライン数・休業日は一切考慮しない
+    （純粋にタスクの所要日数と内部依存だけで決まる下限）。"""
+    from gui.node_canvas import compute_workflow_min_duration
+
+    tasks = [
+        {"id": 1, "default_days": 5},  # A
+        {"id": 2, "default_days": 3},  # B: Aの完了(FS)+2日後に開始
+        {"id": 3, "default_days": 4},  # C: Aの開始(SS)+1日後に開始
+    ]
+    deps = [
+        {"predecessor_task_id": 1, "successor_task_id": 2, "dep_type": "FS", "lag_days": 2},
+        {"predecessor_task_id": 1, "successor_task_id": 3, "dep_type": "SS", "lag_days": 1},
+    ]
+    # A: 0〜5。B: FSなのでAの終了(5)+2=7に開始、3日で10に終了。
+    # C: SSなのでAの開始(0)+1=1に開始、4日で5に終了。全体は最も遅いBの10。
+    assert compute_workflow_min_duration(tasks, deps) == 10
+
+
+def test_compute_workflow_min_duration_clamps_negative_lead_to_zero():
+    """リード（負のラグ）で計算上マイナスの開始日になっても、0未満には
+    しない（プロジェクト開始日より前には遡れないため）。"""
+    from gui.node_canvas import compute_workflow_min_duration
+
+    tasks = [{"id": 1, "default_days": 2}, {"id": 2, "default_days": 3}]
+    deps = [{"predecessor_task_id": 1, "successor_task_id": 2, "dep_type": "FS", "lag_days": -100}]
+    assert compute_workflow_min_duration(tasks, deps) == 3  # 開始日は0に丸められ、3日タスクで終了
+
+
+def test_compute_workflow_min_duration_returns_zero_for_no_tasks():
+    from gui.node_canvas import compute_workflow_min_duration
+
+    assert compute_workflow_min_duration([], []) == 0
+
+
+def test_node_canvas_shows_duration_marker_above_all_nodes(window, qapp):
+    """ノードビュー上部に、ワークフロー全体の最短完了日数を示す目盛り
+    （｜←-- 最短N日 --→｜）が表示され、常に全ノードより上（yが小さい）に
+    位置すること。"""
+    from PySide6.QtWidgets import QGraphicsSimpleTextItem
+
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    a = scene.add_task("A", team_id, 5, 0, 0)
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    b = scene.add_task("B", team_id, 3, 0, 0)
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    scene.try_add_edge(scene.nodes[a.workflow_task_id], scene.nodes[b.workflow_task_id])
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+
+    labels = [
+        item for item in scene.items()
+        if isinstance(item, QGraphicsSimpleTextItem) and item.text().startswith("最短")
+    ]
+    assert len(labels) == 1
+    assert labels[0].text() == "最短8日"  # A(5日)→B(3日、FS+0)の直列で8日
+
+    marker_y = labels[0].y()
+    node_tops = [node.y() for node in scene.nodes.values()]
+    assert marker_y < min(node_tops)
 
 
 def test_task_table_edit_and_delete_reuse_the_node_view_dialog_flow(window, qapp):

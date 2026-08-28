@@ -74,6 +74,21 @@ TEMPLATE_NODE_HEIGHT = TEMPLATE_NODE_HEADER_HEIGHT + TEMPLATE_NODE_CONTENT_HEIGH
 # 上端よりさらに上に余白を空けて配置する（compute_combined_layout参照）。
 TEMPLATE_LAYOUT_MARGIN = NODE_HEIGHT + 60
 
+# ワークフロー全体の最短完了日数を示す目盛り（｜←-- 最短N日 --→｜）の見た目。
+# gui/gantt_view.py の開発開始日の縦線と同じ色（構造的な基準線という
+# 位置づけを揃えるため。チーム色・依存テンプレートの配色とは別系統にする）。
+DURATION_MARKER_COLOR = "#52514e"
+# ノード・依存テンプレートの疑似ノードの邪魔にならないよう、現在配置されて
+# いる最上段のさらに上に空ける余白(px)。
+DURATION_MARKER_MARGIN = 40
+DURATION_MARKER_TICK_HEIGHT = 12
+DURATION_MARKER_ARROW_SIZE = 8
+# 矢印の先端を目盛り線の端（｜）そのものではなく、少しだけ内側に置く
+# ギャップ(px)。先端が｜と完全に重なると矢印の形が潰れて見えるため。
+DURATION_MARKER_ARROW_INSET = 3
+# ラベル（"最短N日"）と、その両側の線分との間隔(px)。
+DURATION_MARKER_LABEL_GAP = 6
+
 _ADD_TEAM_SENTINEL = "__add_new_team__"
 
 
@@ -110,6 +125,53 @@ def compute_task_depths(tasks, dependencies):
     for tid in task_ids:
         calc_depth(tid, set())
     return depth
+
+
+def compute_workflow_min_duration(tasks, dependencies):
+    """タスク・依存関係一覧から、ワークフロー全体を完了するまでの最短日数
+    （純粋関数、Qt/DB非依存）を計算する。
+
+    内部依存（Internal_Depends）の種別（FS/SS）とラグだけで決まる下限で、
+    project_scheduler.py の実際のスケジューリング結果とは異なる——チームの
+    同時ライン数（リソース制約）・休業日・他ジョブとの競合は一切考慮しない、
+    「このワークフローだけを、資源制約なしで最速で流したら何日か」という
+    設計時の目安。開発開始日を0日目とする起算のため、暦日換算になる
+    （休業日を考慮しないため、project_scheduler.py の営業日ベースの計算
+    とはこの点でも異なる）。
+
+    tasks: [{"id": ..., "default_days": ...}, ...]
+    dependencies: [{"predecessor_task_id": ..., "successor_task_id": ...,
+                     "dep_type": "FS"/"SS", "lag_days": int}, ...]
+    Returns: 全タスクが完了するまでの最短日数（タスクが1件も無ければ0）。
+    """
+    task_days = {t["id"]: t["default_days"] for t in tasks}
+    preds = {tid: [] for tid in task_days}
+    for d in dependencies:
+        p, s = d["predecessor_task_id"], d["successor_task_id"]
+        if p in task_days and s in task_days:
+            preds[s].append((p, d.get("dep_type", "FS"), d.get("lag_days", 0)))
+
+    start = {}
+    finish = {}
+
+    def calc(tid, path):
+        if tid in finish:
+            return finish[tid]
+        if tid in path or not preds[tid]:
+            start[tid] = 0  # pathに含まれる=循環がある場合の保険（compute_task_depthsと同じ考え方）
+        else:
+            bounds = []
+            for pred_id, dep_type, lag_days in preds[tid]:
+                calc(pred_id, path | {tid})
+                anchor = start[pred_id] if (dep_type or "FS").upper() == "SS" else finish[pred_id]
+                bounds.append(anchor + int(lag_days or 0))
+            start[tid] = max(0, max(bounds))
+        finish[tid] = start[tid] + task_days[tid]
+        return finish[tid]
+
+    for tid in task_days:
+        calc(tid, set())
+    return max(finish.values()) if finish else 0
 
 
 def compute_auto_layout(tasks, dependencies, gap_x=NODE_WIDTH + 60, gap_y=NODE_HEIGHT + 30):
@@ -441,6 +503,7 @@ class WorkflowGraphScene(QGraphicsScene):
         self.adjacency = {}  # predecessor_task_id -> [successor_task_id, ...]
         self.template_nodes = {}  # template_id -> TemplateDependencyNodeItem
         self.template_edges = {}  # template_id -> EdgeItem
+        self._duration_marker_items = []  # 最短完了日数の目盛り（線・矢印・ラベル）
         self.setSceneRect(-2000, -2000, 4000, 4000)
         self.reload()
 
@@ -451,6 +514,9 @@ class WorkflowGraphScene(QGraphicsScene):
         self.adjacency.clear()
         self.template_nodes.clear()
         self.template_edges.clear()
+        # self.clear() で以前の目盛りアイテムも破棄済みのため、参照を捨てておく
+        # （_refresh_duration_marker が誤って破棄済みアイテムに触れないように）。
+        self._duration_marker_items = []
 
         colors = team_color_map(self.db.list_teams())
         tasks = self.db.list_workflow_tasks(self.workflow_id)
@@ -492,6 +558,8 @@ class WorkflowGraphScene(QGraphicsScene):
                 continue
             node.setPos(*pos)
             self.template_edges[tpl["id"]].update_path()
+
+        self._refresh_duration_marker(tasks, deps, positions)
 
         if self.on_changed:
             self.on_changed()
@@ -755,8 +823,73 @@ class WorkflowGraphScene(QGraphicsScene):
                 if node is None:
                     continue
                 node.setPos(x, y)
+        self._refresh_duration_marker(tasks, deps, positions)
         if self.on_changed:
             self.on_changed()
+
+    # -- ワークフロー全体の最短完了日数の目盛り ----------------------------------------
+    #
+    # ｜←-- 最短N日 --→｜ のイメージで、キャンバス上部（現在配置されている
+    # 全ノード・疑似ノードの最上段よりさらに上）に表示する。ドラッグ中の
+    # 一時的な位置には追従しない——座標そのものが「自動整列し直すたびに
+    # compute_combined_layoutへ揃う一時的な値」という既存の割り切り
+    # （auto_arrange参照）と同じ扱いにして良い、付随的な注記情報のため。
+
+    def _remove_duration_marker(self):
+        for item in self._duration_marker_items:
+            self.removeItem(item)
+        self._duration_marker_items = []
+
+    def _refresh_duration_marker(self, tasks, deps, positions):
+        self._remove_duration_marker()
+        task_positions = [positions[t["id"]] for t in tasks if t["id"] in positions]
+        if not task_positions:
+            return
+
+        x_left = min(x for x, _y in task_positions)
+        x_right = max(x for x, _y in task_positions) + NODE_WIDTH
+        marker_y = min(y for _x, y in positions.values()) - DURATION_MARKER_MARGIN
+
+        color = QColor(DURATION_MARKER_COLOR)
+        pen = QPen(color, 1.5)
+        items = []
+
+        label_item = QGraphicsSimpleTextItem(f"最短{compute_workflow_min_duration(tasks, deps)}日")
+        font = label_item.font()
+        font.setBold(True)
+        label_item.setFont(font)
+        label_item.setBrush(QBrush(color))
+        label_rect = label_item.boundingRect()
+        center_x = (x_left + x_right) / 2
+        label_half = label_rect.width() / 2 + DURATION_MARKER_LABEL_GAP
+        label_item.setPos(center_x - label_rect.width() / 2, marker_y - label_rect.height() / 2)
+        self.addItem(label_item)
+        items.append(label_item)
+
+        # ラベルの両側に線分を引く（ラベルの方が目盛りの全幅より広い場合は
+        # 線分を省き、目盛り線・矢印だけにする）。
+        if x_right - x_left > label_half * 2:
+            left_line = self.addLine(x_left, marker_y, center_x - label_half, marker_y, pen)
+            right_line = self.addLine(center_x + label_half, marker_y, x_right, marker_y, pen)
+            items += [left_line, right_line]
+
+        tick_half = DURATION_MARKER_TICK_HEIGHT / 2
+        items.append(self.addLine(x_left, marker_y - tick_half, x_left, marker_y + tick_half, pen))
+        items.append(self.addLine(x_right, marker_y - tick_half, x_right, marker_y + tick_half, pen))
+
+        for tip_x, direction in ((x_left + DURATION_MARKER_ARROW_INSET, QPointF(-1, 0)),
+                                  (x_right - DURATION_MARKER_ARROW_INSET, QPointF(1, 0))):
+            arrow = QGraphicsPolygonItem(
+                _arrow_polygon(QPointF(tip_x, marker_y), direction, DURATION_MARKER_ARROW_SIZE)
+            )
+            arrow.setBrush(QBrush(color))
+            arrow.setPen(QPen(Qt.NoPen))
+            self.addItem(arrow)
+            items.append(arrow)
+
+        for item in items:
+            item.setZValue(-1)
+        self._duration_marker_items = items
 
     def refresh_colors(self):
         """チームマスタが変わった際、既存ノードの色を再計算する。"""

@@ -4,40 +4,36 @@
 メニューの「ガントチャートを生成」（HTMLファイル出力）とは別に、
 DBの現在の設定のまま素早くスケジューリング結果を確認するためのタブ。
 このタブに切り替えるたびに自動的にスケジューリングを実行し直し（refresh_choices、
-gui/main.py の _on_tab_changed から呼ばれる）、選択中の対象（ワークフロー
-または後述のチーム）のタスクをバーチャートとして描画する（gui/gantt_view.py
-参照。gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、
-ホイールズーム・中ボタンパン対応）。
+gui/main.py の _on_tab_changed から呼ばれる）、全ワークフロー・全チームの
+ジョブをまとめてジョブ単位の行で表示する（gui/gantt_view.py 参照。
+gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、ホイール
+ズーム・中ボタンパン対応）。
 
-「表示単位」で ワークフロー別／チーム別 を切り替えられる。対象コンボで既に
-1件に絞り込まれている軸（ワークフロー別ならワークフロー、チーム別なら
-チーム）ではなく、もう一方の軸で凡例チェックボックスによる絞り込みを行う
-（既に1件に固定された軸をチェックボックスで絞り込んでも意味がないため）。
-- ワークフロー別: 選んだワークフロー1件分のタスクを、ジョブ単位の行で表示
-  （既定）。チーム凡例のチェックボックスで、Plotly版HTML出力と同様に
-  チーム単位の絞り込みができる（非表示にしたチームのタスクは除外し、
-  ジョブ内のレーンを詰め直す＝スケジューリングのやり直しではなく表示上の
-  フィルタのみ）。バーの色はチーム別に塗り分ける。
-- チーム別: 選んだチーム1件分のタスクを、ワークフローをまたいでジョブ単位の
-  行で表示する（そのチームの稼働状況を横断的に見せる）。既にチーム1件に
-  絞り込まれているため、凡例はワークフロー絞り込みに切り替わる（非表示に
-  したワークフローのタスクは除外）。バーの色はワークフロー別に塗り分ける
-  （同一チーム内でどのワークフローの仕事かを見分けるため）。
+表示は常に全ジョブが対象で、バーの色はチーム別に塗り分ける。どのワークフロー
+のジョブかは、左列のジョブ名の左に置く色スペースで見分ける（gui/gantt_view.py
+の_JOB_SWATCH_WIDTH参照）。上部の「絞り込み」（折りたたみ式、gui/tab_jobs.py
+と同じ構造）の中に、ワークフロー／チーム／タグのチェックボックス（ワーク
+フロー・チームはチャート本体と対応する色スペース付き）、ジョブ名の文字列
+検索、「間に合わないジョブのみ表示」をまとめてあり、一時的に表示件数を
+絞り込める（絞り込みはあくまで表示上のもので、スケジューリング自体は
+やり直さない）。
 
-いずれのモードでも、ジョブはそのジョブの最初のタスクの開始日が早い順。
-マイルストーンは縦線として表示する。
+ジョブはそのジョブの最初のタスクの開始日が早い順。マイルストーンは縦線として
+表示する。
 """
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
     QLabel,
-    QPushButton,
+    QLineEdit,
     QVBoxLayout,
     QWidget,
 )
 
+from gui.db import parse_job_tags
 from gui.gantt_generator import (
     build_display,
     build_frames,
@@ -45,8 +41,12 @@ from gui.gantt_generator import (
     validate_for_generation,
 )
 from gui.gantt_view import FrozenGanttPane, build_gantt_scenes
-from gui.widgets_common import NoWheelComboBox
+from gui.widgets_common import ChoiceFilterGroup, CollapsibleSection
 from project_scheduler import SchedulingError
+
+# ジョブが1つもタグを持たない場合にまとめる擬似キー（gui/tab_jobs.py と同じ考え方）。
+_NO_TAG_FILTER_KEY = None
+_NO_TAG_FILTER_LABEL = "（タグなし）"
 
 
 class _ScheduleWorker(QObject):
@@ -98,49 +98,49 @@ class GanttTab(QWidget):
         self._worker = None
         # 計算中の要求に対応する表示用補助情報（結果が返ってきたら _display へ移す）
         self._pending_display = None
-        self._filter_checks = {}  # 絞り込み対象ID(文字列) -> QCheckBox
-        self._filter_dim = "team"  # 凡例チェックボックスが対象にしている軸（"team" or "workflow"）
 
         layout = QVBoxLayout(self)
 
-        toolbar = QHBoxLayout()
-        toolbar.addWidget(QLabel("表示単位:"))
-        self.mode_combo = NoWheelComboBox()
-        # 既定のAdjustToContentsOnFirstShowだと、表示後に選択肢の内容が変わって
-        # （対象コンボはワークフロー/チーム名を動的に入れ替える）も幅が追従せず、
-        # 長い名前が見切れる。常に現在の内容に合わせて幅を取り直す。
-        self.mode_combo.setSizeAdjustPolicy(NoWheelComboBox.AdjustToContents)
-        self.mode_combo.addItem("ワークフロー別", "workflow")
-        self.mode_combo.addItem("チーム別", "team")
-        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
-        toolbar.addWidget(self.mode_combo)
-        toolbar.addSpacing(8)
-        toolbar.addWidget(QLabel("対象:"))
-        self.group_combo = NoWheelComboBox()
-        self.group_combo.setSizeAdjustPolicy(NoWheelComboBox.AdjustToContents)
-        self.group_combo.currentIndexChanged.connect(self._refresh_chart)
-        toolbar.addWidget(self.group_combo)
-        toolbar.addStretch(1)
-        layout.addLayout(toolbar)
+        # ワークフロー／チーム／タグの3つの絞り込み（いずれもOR条件の
+        # チェックボックス一覧で、3つの間はAND条件で組み合わせる。
+        # gui/tab_jobs.py の絞り込みと同じ構造・見た目）。
+        self.filters_section = CollapsibleSection("絞り込み")
+        layout.addWidget(self.filters_section)
+
+        self.workflow_filter = ChoiceFilterGroup("ワークフロー")
+        self.workflow_filter.changed.connect(self._refresh_chart)
+        self.filters_section.content_layout.addWidget(self.workflow_filter)
+
+        self.team_filter = ChoiceFilterGroup("チーム")
+        self.team_filter.changed.connect(self._refresh_chart)
+        self.filters_section.content_layout.addWidget(self.team_filter)
+
+        self.tag_filter = ChoiceFilterGroup("タグ")
+        self.tag_filter.changed.connect(self._refresh_chart)
+        self.filters_section.content_layout.addWidget(self.tag_filter)
+
+        # ジョブ名の文字列検索・「間に合わないジョブのみ表示」も、ワークフロー
+        # ／チーム／タグと同じ「絞り込み」セクションにまとめる。
+        search_toolbar = QHBoxLayout()
+        search_toolbar.addWidget(QLabel("ジョブ名で絞り込み:"))
+        self.search_edit = QLineEdit()
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setPlaceholderText("ジョブ名の一部を入力")
+        self.search_edit.textChanged.connect(self._refresh_chart)
+        # 20文字程度が入る幅に固定する（addWidget(..., 1)で親の幅いっぱいに
+        # 伸びてしまうと、他の絞り込みチェックボックスと並べたときに長すぎるため）。
+        search_edit_width = QFontMetrics(self.search_edit.font()).horizontalAdvance("あ" * 20) + 24
+        self.search_edit.setFixedWidth(search_edit_width)
+        search_toolbar.addWidget(self.search_edit)
+        self.overrun_only_checkbox = QCheckBox("間に合わないジョブのみ表示")
+        self.overrun_only_checkbox.stateChanged.connect(self._refresh_chart)
+        search_toolbar.addWidget(self.overrun_only_checkbox)
+        search_toolbar.addStretch(1)
+        self.filters_section.content_layout.addLayout(search_toolbar)
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
-
-        legend_toolbar = QHBoxLayout()
-        self.legend_title_label = QLabel("チームで絞り込み:")
-        legend_toolbar.addWidget(self.legend_title_label)
-        select_all_btn = QPushButton("すべて表示")
-        select_all_btn.clicked.connect(lambda: self._set_all_filters(True))
-        select_none_btn = QPushButton("すべて解除")
-        select_none_btn.clicked.connect(lambda: self._set_all_filters(False))
-        legend_toolbar.addWidget(select_all_btn)
-        legend_toolbar.addWidget(select_none_btn)
-        legend_toolbar.addSpacing(12)
-        self.legend_layout = QHBoxLayout()
-        legend_toolbar.addLayout(self.legend_layout)
-        legend_toolbar.addStretch(1)
-        layout.addLayout(legend_toolbar)
 
         self.view = FrozenGanttPane()
         layout.addWidget(self.view, 1)
@@ -253,9 +253,8 @@ class GanttTab(QWidget):
         self._clear_chart_state(f"スケジューリングに失敗しました: {message}", is_error=True)
 
     def _apply_result(self):
-        """計算済みの結果でタブ内の表示（対象コンボ・凡例・チャート）を作り直す。"""
-        self._refresh_group_choices()
-        self._refresh_legend()
+        """計算済みの結果でタブ内の表示（絞り込み選択肢・チャート）を作り直す。"""
+        self._rebuild_filters()
         self._refresh_chart()
         self._set_status(*self._result_summary())
 
@@ -296,127 +295,95 @@ class GanttTab(QWidget):
         self.status_label.setText(message)
 
     def _clear_chart_state(self, status_message, is_error=False):
-        """スケジューリングに失敗した場合に、前回の生成結果（チャート・凡例・
-        対象コンボ）を全てクリアする。クリアしないと、直前まで表示していた
-        古い結果が失敗後もそのまま残ってしまい、あたかも最新の内容であるかの
+        """スケジューリングに失敗した場合に、前回の生成結果（チャート・絞り込み
+        選択肢）を全てクリアする。クリアしないと、直前まで表示していた古い
+        結果が失敗後もそのまま残ってしまい、あたかも最新の内容であるかの
         ように誤解させてしまうため。"""
         self._result_df = None
         self._display = None
         self._computed_revision = None
         self.view.setScene(None)
-        self.group_combo.blockSignals(True)
-        self.group_combo.clear()
-        self.group_combo.blockSignals(False)
-        while self.legend_layout.count():
-            item = self.legend_layout.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.hide()
-                widget.deleteLater()
-        self._filter_checks = {}
+        self._rebuild_filters()
         self._set_status(status_message, is_error=is_error)
 
-    def _on_mode_changed(self):
-        self._refresh_group_choices()
-        self._refresh_legend()
-        self._refresh_chart()
+    # -- ワークフロー／チーム／タグの絞り込み ------------------------------------------
 
-    def _refresh_group_choices(self):
-        """表示単位（ワークフロー別／チーム別）に応じて、「対象」コンボの
-        選択肢をワークフロー一覧またはチーム一覧に入れ替える。"""
-        self.group_combo.blockSignals(True)
-        current = self.group_combo.currentData()
-        self.group_combo.clear()
-        if self._result_df is not None:
-            if self.mode_combo.currentData() == "team":
-                ids = list(dict.fromkeys(self._result_df["Team_ID"].tolist()))
-                names = self._display["team_names"]
-            else:
-                ids = list(dict.fromkeys(self._result_df["Workflow_ID"].tolist()))
-                names = self._display["workflow_names"]
-            for entity_id in ids:
-                self.group_combo.addItem(names.get(entity_id, entity_id), entity_id)
-        self.group_combo.blockSignals(False)
-        if current is not None:
-            idx = self.group_combo.findData(current)
-            if idx >= 0:
-                self.group_combo.setCurrentIndex(idx)
+    def _job_tag_keys(self, job_id):
+        """絞り込み判定に使う、ジョブが持つタグのキー集合。タグが1つも無い
+        ジョブは擬似キー _NO_TAG_FILTER_KEY（＝「（タグなし）」）を持つ扱いにする。"""
+        job_tags = (self._display or {}).get("job_tags") or {}
+        tags = parse_job_tags(job_tags.get(job_id, ""))
+        return set(tags) if tags else {_NO_TAG_FILTER_KEY}
 
-    def _refresh_legend(self):
-        # 表示単位（ワークフロー別／チーム別）に応じて、凡例チェックボックスの
-        # 対象軸を切り替える。対象コンボで既に1件に絞り込まれている軸ではなく、
-        # もう一方の軸で絞り込む（ワークフロー別ならチーム、チーム別なら
-        # ワークフロー）。
-        new_dim = "workflow" if self.mode_combo.currentData() == "team" else "team"
-        # 既存のチェック状態は同じ軸である限り可能な限り維持し（tab_jobs.pyの
-        # _rebuild_workflow_filterと同じ考え方）、新規項目は既定で表示する。
-        previous_unchecked = (
-            {entity_id for entity_id, cb in self._filter_checks.items() if not cb.isChecked()}
-            if self._filter_dim == new_dim else set()
-        )
-        self._filter_dim = new_dim
-        while self.legend_layout.count():
-            item = self.legend_layout.takeAt(0)
-            widget = item.widget()
-            if widget:
-                # deleteLater()だけだとレイアウトから外れた後も実際に破棄される
-                # （次のイベントループ）までウィジェットが古い位置に表示され続け、
-                # 新しく追加したチェックボックスと重なって古い表記が残って見える
-                # ことがあるため、hide()で即座に非表示にしてから破棄する。
-                widget.hide()
-                widget.deleteLater()
-        self._filter_checks = {}
-        if not self._display:
+    def _rebuild_filters(self):
+        """ワークフロー／チーム／タグの絞り込み用チェックボックスを、直近の
+        計算結果（全ジョブ）に合わせて再構築する。既存のチェック状態はキーで
+        可能な限り維持し、新規キーは既定で表示にする（gui/tab_jobs.py と同じ
+        考え方）。"""
+        if self._result_df is None or not self._display:
+            self.workflow_filter.rebuild([])
+            self.team_filter.rebuild([])
+            self.tag_filter.rebuild([])
             return
 
-        self.legend_title_label.setText(
-            "ワークフローで絞り込み:" if new_dim == "workflow" else "チームで絞り込み:"
+        workflow_names = self._display["workflow_names"]
+        team_names = self._display["team_names"]
+        workflow_ids = list(dict.fromkeys(self._result_df["Workflow_ID"].tolist()))
+        team_ids = list(dict.fromkeys(self._result_df["Team_ID"].tolist()))
+        # チェックボックスの左に色スペースを添える（左列のジョブ名の色スペース・
+        # バーの色と対応付けられるようにするため）。
+        self.workflow_filter.rebuild(
+            [(wid, workflow_names.get(wid, wid)) for wid in workflow_ids],
+            colors=self._display["workflow_colors"],
         )
-        names = self._display["workflow_names"] if new_dim == "workflow" else self._display["team_names"]
-        colors = self._display["workflow_colors"] if new_dim == "workflow" else self._display["team_colors"]
-        for entity_id, name in names.items():
-            color = colors.get(entity_id, "#cbc9c2")
-            swatch = QLabel("　")
-            swatch.setFixedWidth(14)
-            swatch.setStyleSheet(f"background-color: {color}; border: 1px solid #0b0b0b;")
-            self.legend_layout.addWidget(swatch)
+        self.team_filter.rebuild(
+            [(tid, team_names.get(tid, tid)) for tid in team_ids],
+            colors=self._display["team_colors"],
+        )
 
-            checkbox = QCheckBox(name)
-            checkbox.setChecked(entity_id not in previous_unchecked)
-            checkbox.stateChanged.connect(lambda _state: self._refresh_chart())
-            self.legend_layout.addWidget(checkbox)
-            self._filter_checks[entity_id] = checkbox
-        self.legend_layout.addStretch(1)
-
-    def _set_all_filters(self, checked):
-        for checkbox in self._filter_checks.values():
-            checkbox.blockSignals(True)
-            checkbox.setChecked(checked)
-            checkbox.blockSignals(False)
-        self._refresh_chart()
-
-    def _visible_filter_ids(self):
-        return {entity_id for entity_id, cb in self._filter_checks.items() if cb.isChecked()}
+        tag_keys = set()
+        has_no_tag = False
+        for job_id in dict.fromkeys(self._result_df["Job_ID"].tolist()):
+            keys = self._job_tag_keys(job_id)
+            if keys == {_NO_TAG_FILTER_KEY}:
+                has_no_tag = True
+            else:
+                tag_keys.update(keys)
+        tag_items = [(tag, tag) for tag in sorted(tag_keys)]
+        if has_no_tag:
+            tag_items.append((_NO_TAG_FILTER_KEY, _NO_TAG_FILTER_LABEL))
+        self.tag_filter.rebuild(tag_items)
 
     def _refresh_chart(self):
         if self._result_df is None:
             self.view.setScene(None)
             return
-        group_id = self.group_combo.currentData()
-        if group_id is None:
-            self.view.setScene(None)
-            return
-        if self.mode_combo.currentData() == "team":
-            # 既に対象コンボで1チームに絞り込まれているため、凡例では
-            # ワークフローで絞り込み、バーの色もワークフロー別に塗り分ける。
-            df = self._result_df[self._result_df["Team_ID"] == group_id]
-            df = df[df["Workflow_ID"].isin(self._visible_filter_ids())]
-            color_by = "workflow"
-        else:
-            df = self._result_df[self._result_df["Workflow_ID"] == group_id]
-            df = df[df["Team_ID"].isin(self._visible_filter_ids())]
-            color_by = "team"
-        scenes = build_gantt_scenes(df, self._display, color_by=color_by)
+
+        df = self._result_df
+        df = df[df["Workflow_ID"].isin(self.workflow_filter.visible_keys())]
+        df = df[df["Team_ID"].isin(self.team_filter.visible_keys())]
+
+        search_text = self.search_edit.text().strip()
+        if search_text:
+            df = df[df["Job_Name"].str.contains(search_text, case=False, na=False, regex=False)]
+
+        visible_tags = self.tag_filter.visible_keys()
+        keep_job_ids = {
+            job_id for job_id in df["Job_ID"].unique()
+            if self._job_tag_keys(job_id) & visible_tags
+        }
+        df = df[df["Job_ID"].isin(keep_job_ids)]
+
+        if self.overrun_only_checkbox.isChecked():
+            # 「間に合わない」かどうかはジョブ全体としての事実であり、他の
+            # 絞り込み（ワークフロー／チーム等）で一部のタスクが隠れていても
+            # 変わらないため、絞り込み前の全結果（self._result_df）から判定する。
+            overrun_job_ids = set(
+                self._result_df.loc[self._result_df["Deadline_Overrun_Days"] > 0, "Job_ID"]
+            )
+            df = df[df["Job_ID"].isin(overrun_job_ids)]
+
+        scenes = build_gantt_scenes(df, self._display, color_by="team")
         self.view.setScene(scenes)
         if scenes is not None:
             # setScene直後はビューポートのジオメトリがまだ確定していないことが

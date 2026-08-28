@@ -5,13 +5,16 @@
   基本情報設定・ワークフロー設計・ジョブタブで繰り返し使う型。
 - make_fk_combo: 外部キー選択用のQComboBox（表示は名前、内部値はDBの整数ID）。
 - confirm_or_block_delete: 削除前の参照整合性チェック用ダイアログ。
+- ChoiceFilterGroup / CollapsibleSection: チェックボックス一覧による絞り込みと、
+  それらをまとめて畳める折りたたみセクション（ジョブ・ガントチャートタブ共通）。
 """
 
-from PySide6.QtCore import QDate, Qt
+from PySide6.QtCore import QDate, Qt, Signal
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDateEdit,
     QDialog,
@@ -25,7 +28,9 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
+    QWidget,
 )
 
 ROW_ID_ROLE = Qt.UserRole
@@ -478,12 +483,13 @@ class CrudSection(QGroupBox):
 
     def __init__(
         self, title, column_labels, on_add, on_delete, on_edit=None,
-        edit_dblclick_columns=None, parent=None,
+        edit_dblclick_columns=None, on_duplicate=None, parent=None,
     ):
         super().__init__(title, parent)
         self.on_add = on_add
         self.on_delete = on_delete
         self.on_edit = on_edit
+        self.on_duplicate = on_duplicate
         # on_edit をダブルクリックで開く対象列を限定したい場合に指定する
         # （例: 列0がインライン編集可能なテキストで、別の列だけダイアログを
         # 開かせたいケース）。Noneなら全列で発火（従来互換の挙動）。
@@ -499,6 +505,10 @@ class CrudSection(QGroupBox):
             edit_btn = QPushButton("編集...")
             edit_btn.clicked.connect(self._handle_edit)
             toolbar.addWidget(edit_btn)
+        if on_duplicate is not None:
+            duplicate_btn = QPushButton("複製")
+            duplicate_btn.clicked.connect(self._handle_duplicate)
+            toolbar.addWidget(duplicate_btn)
         del_btn = QPushButton("－ 削除")
         del_btn.clicked.connect(self._handle_delete)
         toolbar.addWidget(del_btn)
@@ -537,8 +547,115 @@ class CrudSection(QGroupBox):
             return
         self.on_delete(row)
 
+    def _handle_duplicate(self):
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "複製", "複製する行を選択してください。")
+            return
+        self.on_duplicate(row)
+
     def current_row_id(self):
         row = self.table.currentRow()
         if row < 0:
             return None
         return row_id(self.table, row)
+
+
+# -- 絞り込み用チェックボックス一覧・折りたたみセクション ------------------------------
+#
+# ジョブタブ・ガントチャートタブの両方で、「ワークフロー／チーム／タグ等の
+# チェックボックスをOR条件で絞り込み、複数の絞り込みをAND条件で組み合わせる」
+# という同じ構造を使うため、ここに共通化してある。
+
+
+class ChoiceFilterGroup(QGroupBox):
+    """チェックボックス一覧による絞り込み（OR条件）。「すべて表示」「すべて解除」
+    ボタンと、rebuild()で渡した項目ぶんのチェックボックスを横並びで持つ。"""
+
+    changed = Signal()
+
+    def __init__(self, title, parent=None):
+        super().__init__(title, parent)
+        self._checks = {}  # key -> QCheckBox
+        layout = QHBoxLayout(self)
+        select_all_btn = QPushButton("すべて表示")
+        select_all_btn.clicked.connect(lambda: self.set_all(True))
+        select_none_btn = QPushButton("すべて解除")
+        select_none_btn.clicked.connect(lambda: self.set_all(False))
+        layout.addWidget(select_all_btn)
+        layout.addWidget(select_none_btn)
+        layout.addSpacing(16)
+        self._checks_layout = QHBoxLayout()
+        layout.addLayout(self._checks_layout)
+        layout.addStretch(1)
+
+    def rebuild(self, items, colors=None):
+        """items: [(key, label), ...]。既存のチェック状態はキーで可能な限り
+        維持し、新規キーは既定でチェック済み（＝表示）にする。
+
+        colors: {key: 16進色, ...}（省略可）。渡すと、そのキーのチェックボックスの
+        左に色スペースを添える（ワークフロー／チームのように色分けがある軸で、
+        チャート本体の色と対応付けられるようにするため）。"""
+        colors = colors or {}
+        previous_checked = {k for k, cb in self._checks.items() if cb.isChecked()}
+        previous_unchecked = {k for k, cb in self._checks.items() if not cb.isChecked()}
+        while self._checks_layout.count():
+            item = self._checks_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._checks = {}
+        for key, label in items:
+            checked = key not in previous_unchecked or key in previous_checked
+            if key in colors:
+                swatch = QLabel("　")
+                swatch.setFixedWidth(14)
+                swatch.setStyleSheet(f"background-color: {colors[key]}; border: 1px solid #0b0b0b;")
+                self._checks_layout.addWidget(swatch)
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(checked)  # connect前に設定し、構築時のstateChangedを発火させない
+            checkbox.stateChanged.connect(lambda _state: self.changed.emit())
+            self._checks_layout.addWidget(checkbox)
+            self._checks[key] = checkbox
+
+    def set_all(self, checked):
+        # 一括変更中に途中でchanged経由のrebuildが走るとループ中のウィジェットが
+        # 差し替わってしまうため、シグナルを止めてから最後にまとめて一度だけ発火する。
+        for checkbox in self._checks.values():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(checked)
+            checkbox.blockSignals(False)
+        self.changed.emit()
+
+    def visible_keys(self):
+        return {k for k, cb in self._checks.items() if cb.isChecked()}
+
+
+class CollapsibleSection(QWidget):
+    """折りたたみ可能なセクション。見出しをクリックすると中身の表示/非表示が
+    切り替わる。複数の絞り込み（ChoiceFilterGroup等）が常時展開だと縦幅を
+    取りすぎる画面で、まとめて1つに畳めるようにする。"""
+
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self._toggle_btn = QToolButton()
+        self._toggle_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._toggle_btn.setArrowType(Qt.RightArrow)
+        self._toggle_btn.setText(title)
+        self._toggle_btn.setCheckable(True)
+        self._toggle_btn.setChecked(False)
+        self._toggle_btn.setStyleSheet("QToolButton { border: none; font-weight: bold; }")
+        self._toggle_btn.clicked.connect(self._on_toggled)
+        outer.addWidget(self._toggle_btn)
+
+        self.content = QWidget()
+        self.content_layout = QVBoxLayout(self.content)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self.content.setVisible(False)  # 既定は折りたたんだ状態
+        outer.addWidget(self.content)
+
+    def _on_toggled(self, checked):
+        self._toggle_btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+        self.content.setVisible(checked)

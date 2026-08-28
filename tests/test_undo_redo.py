@@ -148,6 +148,120 @@ def test_duplicate_workflow_copies_tasks_dependencies_and_own_templates(tmp_path
     db.close()
 
 
+def test_job_tags_are_normalized_on_add_and_update(tmp_path):
+    """タグはカンマ区切りの1文字列として保持し、前後の空白除去・空要素除去・
+    重複排除・「, 」区切りへの整形を保存時に行う。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    team = db.add_team("チームA", 1)
+    wf = db.add_workflow("WF1")
+    db.add_workflow_task(wf, "A", team, 1)
+
+    job_id = db.add_job("J1", wf, None, 100, " 緊急 ,顧客A,, 緊急")
+    job = next(j for j in db.list_jobs() if j["id"] == job_id)
+    assert job["tags"] == "緊急, 顧客A"
+
+    db.update_job(job_id, "J1", wf, None, 100, "顧客B")
+    job = next(j for j in db.list_jobs() if j["id"] == job_id)
+    assert job["tags"] == "顧客B"
+
+    # タグ未指定（既定の""）の場合はタグ無しとして扱う。
+    job_id2 = db.add_job("J2", wf, None, 100)
+    job2 = next(j for j in db.list_jobs() if j["id"] == job_id2)
+    assert job2["tags"] == ""
+    db.close()
+
+
+def test_duplicate_job_copies_task_overrides_and_outgoing_dependencies(tmp_path):
+    """ジョブの複製は、タスク上書き・依存先ジョブ（ジョブ間依存、テンプレート
+    由来のタスク対応・手動追加のタスク対応の両方）を引き継ぐ。一方、他ジョブが
+    このジョブに依存している側（依存されている側）は引き継がない（複製先へ
+    他ジョブが勝手に依存する状態になる副作用を避けるため）。名前の衝突は
+    自動的に連番回避されること、Undo1回で全て元に戻ることも確認する。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    manager, _ = _attach_dummy_undo_manager(db)
+
+    team = db.add_team("チームA", 1)
+    ms = db.add_milestone("MS1", "2026-06-30")
+    wf1 = db.add_workflow("WF1")
+    wf2 = db.add_workflow("WF2")
+    task_a = db.add_workflow_task(wf1, "A", team, 1)
+    task_b = db.add_workflow_task(wf1, "B", team, 1)
+    task_x = db.add_workflow_task(wf2, "X", team, 1)
+    task_y = db.add_workflow_task(wf2, "Y", team, 1)
+    db.add_dependency_template(wf1, task_a, wf2, task_x)  # WF1のA -> WF2のX
+
+    job_id = db.add_job("J1", wf1, ms, 50, "緊急, 顧客A")
+    other_job = db.add_job("J2", wf2, None, 100)
+    third_job = db.add_job("J3", wf1, None, 100)
+    db.upsert_job_task_override(job_id, task_a, is_active=False, override_days=3)
+
+    db.add_job_dependency_link(job_id, other_job)  # テンプレート由来のタスク対応が自動生成される
+    db.add_external_dependency(job_id, task_b, other_job, task_y)  # 手動追加分
+    db.add_job_dependency_link(third_job, job_id)  # J3がJ1に依存する側（複製で引き継がれてはいけない）
+
+    stack_size_before = len(manager._undo_stack)
+    new_job_id = db.duplicate_job(job_id)
+    assert len(manager._undo_stack) == stack_size_before + 1  # 1つのUndo単位
+
+    jobs = {j["name"]: j for j in db.list_jobs()}
+    assert "J1のコピー" in jobs
+    new_job = jobs["J1のコピー"]
+    assert new_job["id"] == new_job_id
+    assert new_job["workflow_id"] == wf1
+    assert new_job["default_milestone_id"] == ms
+    assert new_job["priority"] == 50
+    assert new_job["tags"] == "緊急, 顧客A"
+
+    new_overrides = db.list_job_tasks_with_overrides(new_job_id)
+    override = next(o for o in new_overrides if o["task_name"] == "A")
+    assert (override["is_active"], override["override_days"]) == (0, 3)
+
+    # 依存先ジョブ（このジョブ→他ジョブ）は複製される。
+    new_links = db.list_job_dependency_links(new_job_id)
+    assert [l["depends_on_job_id"] for l in new_links] == [other_job]
+    new_link_id = new_links[0]["id"]
+
+    new_ext_deps = {
+        (d["workflow_task_id"], d["depends_on_workflow_task_id"]): d
+        for d in db.list_external_dependencies(job_id=new_job_id)
+    }
+    assert set(new_ext_deps) == {(task_a, task_x), (task_b, task_y)}
+    assert new_ext_deps[(task_a, task_x)]["source_link_id"] == new_link_id  # 付け替え済み
+    assert new_ext_deps[(task_b, task_y)]["source_link_id"] is None  # 手動追加分はNoneのまま
+
+    # このジョブに依存している側（J3→J1）は複製先には引き継がれない。
+    assert [l["depends_on_job_id"] for l in db.list_job_dependency_links(third_job)] == [job_id]
+
+    # 名前が衝突する場合は連番を付与する。
+    new_job_id2 = db.duplicate_job(job_id)
+    jobs = {j["name"]: j["id"] for j in db.list_jobs()}
+    assert jobs["J1のコピー (2)"] == new_job_id2
+
+    manager.undo()
+    assert "J1のコピー (2)" not in {j["name"] for j in db.list_jobs()}
+    manager.undo()
+    assert {j["name"] for j in db.list_jobs()} == {"J1", "J2", "J3"}
+    db.close()
+
+
+def test_team_lines_can_be_zero(tmp_path):
+    """途中で合流する・早めに引き上げるチームを表現するため、チームの同時
+    ライン数（既定値・変更点のいずれも）に0を設定できること。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    team_id = db.add_team("チームA", 0)
+    assert db.list_teams()[0]["max_lines"] == 0
+
+    db.update_team(team_id, "チームA", 0)
+    assert db.list_teams()[0]["max_lines"] == 0
+
+    change_id = db.add_team_capacity_change(team_id, "2026-02-01", 0)
+    assert db.list_team_capacity_changes(team_id)[0]["lines"] == 0
+
+    db.update_team_capacity_change(change_id, "2026-02-01", 2)
+    assert db.list_team_capacity_changes(team_id)[0]["lines"] == 2
+    db.close()
+
+
 def test_nested_calls_collapse_into_one_undo_entry(tmp_path):
     """add_job_dependency_link は内部で sync_dependency_templates を呼ぶが、
     Undoスタックには1エントリだけ積まれ、Undo1回で両方まとめて元に戻ること。"""
@@ -948,4 +1062,80 @@ def test_opening_pre_canvas_removal_schema_drops_canvas_columns(tmp_path):
     tasks = db.list_workflow_tasks(1)
     assert len(tasks) == 1
     assert (tasks[0]["name"], tasks[0]["default_days"]) == ("タスク1", 3)
+    db.close()
+
+
+# -- jobs.tags の追加 / teams・team_capacity_changesのCHECK緩和（v11） -----------------
+
+def test_opening_pre_tags_schema_adds_tags_column_and_allows_zero_lines(tmp_path):
+    """tags列が無く、max_lines/linesのCHECKが「1以上」だった旧バージョン(v10)の
+    .pscheduleを開いた際、jobs.tagsが追加され既存ジョブは空文字になること、
+    かつteams.max_lines/team_capacity_changes.linesに0を保存できるようになる
+    こと（テーブルを作り直すため、既存データは保持されること）。"""
+    import sqlite3
+
+    path = tmp_path / "legacy.pschedule"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE project (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            project_name TEXT NOT NULL DEFAULT '',
+            start_date TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE teams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            max_lines INTEGER NOT NULL CHECK (max_lines >= 1)
+        );
+        CREATE TABLE team_capacity_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+            start_date TEXT NOT NULL,
+            lines INTEGER NOT NULL CHECK (lines >= 1),
+            UNIQUE(team_id, start_date)
+        );
+        CREATE TABLE workflows (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+        CREATE TABLE milestones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+            end_date TEXT NOT NULL, note TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            workflow_id INTEGER NOT NULL,
+            default_milestone_id INTEGER,
+            priority INTEGER NOT NULL DEFAULT 100
+        );
+        """
+    )
+    conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '10')")
+    conn.execute("INSERT INTO project(id, project_name, start_date) VALUES (1, '', '')")
+    conn.execute("INSERT INTO teams(name, max_lines) VALUES ('チームA', 2)")
+    conn.execute(
+        "INSERT INTO team_capacity_changes(team_id, start_date, lines) VALUES (1, '2026-02-01', 3)"
+    )
+    conn.execute("INSERT INTO workflows(name) VALUES ('WF1')")
+    conn.execute("INSERT INTO jobs(name, workflow_id, priority) VALUES ('J1', 1, 100)")
+    conn.commit()
+    conn.close()
+
+    db = ProjectDatabase.open_existing(str(path))
+
+    job_cols = {r["name"] for r in db._conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    assert "tags" in job_cols
+    assert db.list_jobs()[0]["tags"] == ""
+
+    # 既存データ（チーム・変更点）は保持される。
+    assert db.list_teams() == [{"id": 1, "name": "チームA", "max_lines": 2}]
+    assert db.list_team_capacity_changes(1) == [
+        {"id": 1, "team_id": 1, "start_date": "2026-02-01", "lines": 3}
+    ]
+
+    # CHECKが緩和され、0を保存できる。
+    db.update_team(1, "チームA", 0)
+    assert db.list_teams()[0]["max_lines"] == 0
+    db.update_team_capacity_change(1, "2026-02-01", 0)
+    assert db.list_team_capacity_changes(1)[0]["lines"] == 0
     db.close()

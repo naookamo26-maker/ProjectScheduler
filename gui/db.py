@@ -98,6 +98,36 @@ def _validate_start_pin_date(value):
         ) from None
 
 
+def normalize_tags(tags):
+    """ジョブのタグ入力（カンマ区切りの1文字列、またはリスト）を、正規化した
+    カンマ区切り文字列に変換する。前後の空白を落とし、空要素は除外し、
+    重複は最初の1つだけ残す（表示順は入力順を保つ）。
+
+    ALTER TABLE で後から足した列にはCHECK制約を付けられないため、他の
+    後付け列（normalize_dependency_kind 等）と同様に書き込み経路で正規化する。
+    """
+    if tags is None:
+        return ""
+    parts = tags.split(",") if isinstance(tags, str) else list(tags)
+    seen = set()
+    result = []
+    for part in parts:
+        tag = str(part).strip()
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        result.append(tag)
+    return ", ".join(result)
+
+
+def parse_job_tags(tags):
+    """ジョブのタグ文字列（カンマ区切り）を、タグ名のリストに分解する。
+    normalize_tagsで正規化済みの文字列を主に想定するが、前後の空白除去・
+    空要素の除外は独立して行うため、正規化前の生の文字列にも使える。
+    ジョブタブ・ガントチャートタブのタグ絞り込みで共通して使う。"""
+    return [t.strip() for t in (tags or "").split(",") if t.strip()]
+
+
 def undoable(label):
     """ProjectDatabaseの変更系メソッドに付け、Undo/Redoの記録対象にするデコレータ。
 
@@ -895,7 +925,7 @@ class ProjectDatabase:
     def list_jobs(self):
         rows = self._conn.execute(
             "SELECT j.id, j.name, j.workflow_id, w.name AS workflow_name, "
-            "j.default_milestone_id, m.name AS milestone_name, j.priority "
+            "j.default_milestone_id, m.name AS milestone_name, j.priority, j.tags "
             "FROM jobs j "
             "JOIN workflows w ON w.id = j.workflow_id "
             "LEFT JOIN milestones m ON m.id = j.default_milestone_id "
@@ -903,21 +933,21 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    @undoable(lambda self, name, workflow_id, default_milestone_id, priority: f"ジョブ「{name}」を追加")
-    def add_job(self, name, workflow_id, default_milestone_id, priority):
+    @undoable(lambda self, name, workflow_id, default_milestone_id, priority, tags="": f"ジョブ「{name}」を追加")
+    def add_job(self, name, workflow_id, default_milestone_id, priority, tags=""):
         try:
             cur = self._conn.execute(
-                "INSERT INTO jobs(name, workflow_id, default_milestone_id, priority) "
-                "VALUES (?, ?, ?, ?)",
-                (name, workflow_id, default_milestone_id, priority),
+                "INSERT INTO jobs(name, workflow_id, default_milestone_id, priority, tags) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (name, workflow_id, default_milestone_id, priority, normalize_tags(tags)),
             )
         except sqlite3.IntegrityError as e:
             raise DuplicateNameError(f"ジョブ名 '{name}' は既に使用されています") from e
         self._commit()
         return cur.lastrowid
 
-    @undoable(lambda self, job_id, name, workflow_id, default_milestone_id, priority: f"ジョブ「{name}」を変更")
-    def update_job(self, job_id, name, workflow_id, default_milestone_id, priority):
+    @undoable(lambda self, job_id, name, workflow_id, default_milestone_id, priority, tags: f"ジョブ「{name}」を変更")
+    def update_job(self, job_id, name, workflow_id, default_milestone_id, priority, tags):
         old = self._conn.execute(
             "SELECT workflow_id FROM jobs WHERE id = ?", (job_id,)
         ).fetchone()
@@ -925,8 +955,8 @@ class ProjectDatabase:
         try:
             self._conn.execute(
                 "UPDATE jobs SET name = ?, workflow_id = ?, default_milestone_id = ?, "
-                "priority = ? WHERE id = ?",
-                (name, workflow_id, default_milestone_id, priority, job_id),
+                "priority = ?, tags = ? WHERE id = ?",
+                (name, workflow_id, default_milestone_id, priority, normalize_tags(tags), job_id),
             )
         except sqlite3.IntegrityError as e:
             raise DuplicateNameError(f"ジョブ名 '{name}' は既に使用されています") from e
@@ -935,6 +965,94 @@ class ProjectDatabase:
             # ワークフローの組み合わせが変わると、依存先ジョブのタスク対応が
             # 参照すべきテンプレートも変わるため、最新の状態へ同期し直す。
             self.sync_dependency_templates()
+
+    @undoable(lambda self, job_id: f"ジョブ「{_entity_name(self._conn, 'jobs', job_id)}」を複製")
+    def duplicate_job(self, job_id):
+        """ジョブ1件を、タスク上書き（job_task_overrides）・依存先ジョブ
+        （job_dependency_links）・そのタスク単位の対応（job_external_dependencies）
+        ごと複製する。
+
+        複製しないもの:
+        - このジョブに依存している側（他ジョブの job_dependency_links /
+          job_external_dependencies で depends_on_job_id がこのジョブを指す
+          もの）。複製先を他ジョブの依存先へ勝手に加えると、意図しない
+          副作用になるため（duplicate_workflow が「他ワークフローが複製元に
+          依存する側のテンプレート」を複製しないのと同じ考え方）。
+
+        新しいジョブは元と同じワークフロー・既定マイルストーン・優先度・
+        タグを引き継ぐ。名前は「元の名前のコピー」を既定とし、衝突する
+        場合は連番を付与する（duplicate_workflow と同じ考え方）。"""
+        row = self._conn.execute(
+            "SELECT name, workflow_id, default_milestone_id, priority, tags "
+            "FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if row is None:
+            raise ProjectDatabaseError("複製元のジョブが見つかりません")
+
+        existing_names = {
+            r["name"] for r in self._conn.execute("SELECT name FROM jobs").fetchall()
+        }
+        base_name = f"{row['name']}のコピー"
+        new_name = base_name
+        n = 2
+        while new_name in existing_names:
+            new_name = f"{base_name} ({n})"
+            n += 1
+
+        cur = self._conn.execute(
+            "INSERT INTO jobs(name, workflow_id, default_milestone_id, priority, tags) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (new_name, row["workflow_id"], row["default_milestone_id"], row["priority"], row["tags"]),
+        )
+        new_job_id = cur.lastrowid
+
+        for o in self._conn.execute(
+            "SELECT workflow_task_id, is_active, override_days, milestone_id, team_id, "
+            "start_pin_date FROM job_task_overrides WHERE job_id = ?",
+            (job_id,),
+        ).fetchall():
+            self._conn.execute(
+                "INSERT INTO job_task_overrides(job_id, workflow_task_id, is_active, "
+                "override_days, milestone_id, team_id, start_pin_date) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (new_job_id, o["workflow_task_id"], o["is_active"], o["override_days"],
+                 o["milestone_id"], o["team_id"], o["start_pin_date"]),
+            )
+
+        # 依存先ジョブ（このジョブ→他ジョブ）は、リンクIDを付け替えつつ複製する。
+        # workflow_task_id / depends_on_workflow_task_id は同じワークフロー・
+        # 同じ依存先ジョブを指したまま変わらないため、付け替えが要るのは
+        # source_link_id（複製前のリンクIDのまま残すと複製先ではなく元の
+        # ジョブのリンクを指してしまう）だけ。
+        link_id_map = {}
+        for link in self._conn.execute(
+            "SELECT id, depends_on_job_id FROM job_dependency_links WHERE job_id = ?",
+            (job_id,),
+        ).fetchall():
+            cur = self._conn.execute(
+                "INSERT INTO job_dependency_links(job_id, depends_on_job_id) VALUES (?, ?)",
+                (new_job_id, link["depends_on_job_id"]),
+            )
+            link_id_map[link["id"]] = cur.lastrowid
+
+        for d in self._conn.execute(
+            "SELECT workflow_task_id, depends_on_job_id, depends_on_workflow_task_id, "
+            "source_link_id, is_active FROM job_external_dependencies WHERE job_id = ?",
+            (job_id,),
+        ).fetchall():
+            new_source_link_id = (
+                link_id_map.get(d["source_link_id"]) if d["source_link_id"] is not None else None
+            )
+            self._conn.execute(
+                "INSERT INTO job_external_dependencies(job_id, workflow_task_id, "
+                "depends_on_job_id, depends_on_workflow_task_id, source_link_id, is_active) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (new_job_id, d["workflow_task_id"], d["depends_on_job_id"],
+                 d["depends_on_workflow_task_id"], new_source_link_id, d["is_active"]),
+            )
+
+        self._commit()
+        return new_job_id
 
     def job_usage_count(self, job_id):
         """他のジョブがこのジョブに外部依存している数（削除時の警告用）"""

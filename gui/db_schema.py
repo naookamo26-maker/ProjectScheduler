@@ -16,7 +16,7 @@ CRUD本体（gui/db.py）から分離しているのは、この2つが「増え
 4. `docs/db_design.md` のテーブル一覧を追随させる。
 """
 
-SCHEMA_VERSION = "10"
+SCHEMA_VERSION = "11"
 
 _SCHEMA_SQL = """
 CREATE TABLE schema_meta (
@@ -40,14 +40,14 @@ CREATE TABLE milestones (
 CREATE TABLE teams (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
-    max_lines INTEGER NOT NULL CHECK (max_lines >= 1)
+    max_lines INTEGER NOT NULL CHECK (max_lines >= 0)
 );
 
 CREATE TABLE team_capacity_changes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
     start_date TEXT NOT NULL,
-    lines INTEGER NOT NULL CHECK (lines >= 1),
+    lines INTEGER NOT NULL CHECK (lines >= 0),
     UNIQUE(team_id, start_date)
 );
 
@@ -90,7 +90,8 @@ CREATE TABLE jobs (
     name TEXT NOT NULL UNIQUE,
     workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE RESTRICT,
     default_milestone_id INTEGER REFERENCES milestones(id) ON DELETE SET NULL,
-    priority INTEGER NOT NULL DEFAULT 100 CHECK (priority >= 1)
+    priority INTEGER NOT NULL DEFAULT 100 CHECK (priority >= 1),
+    tags TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE job_task_overrides (
@@ -343,6 +344,62 @@ def migrate(conn):
         if "canvas_y" in cols:
             conn.execute("ALTER TABLE workflow_tasks DROP COLUMN canvas_y")
         version = "10"
+
+    if version == "10":
+        # v11: jobs.tags を追加（複数タグ、カンマ区切りの1文字列として保持）。
+        # 既存ジョブは「タグ無し」（空文字）として扱う。
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+        if cols and "tags" not in cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN tags TEXT NOT NULL DEFAULT ''")
+
+        # teams.max_lines / team_capacity_changes.lines の CHECK を
+        # 「1以上」から「0以上」に緩和する（早めに引き上げる・遅く合流する
+        # チームを、途中区間のライン数0で表現できるようにするため）。
+        # SQLiteはALTER TABLEでCHECK制約を直接変更できないため、テーブルを
+        # 作り直して既存データを移し替える。テスト用の簡略化した旧スキーマ
+        # （該当テーブル/列自体が無い）場合は何もしない。
+        #
+        # PRAGMA foreign_keys の変更はトランザクションの外でしか効かないため、
+        # ここまでの変更（jobs.tags の追加等）を一旦コミットしてから切り替える。
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = OFF")
+
+        team_cols = [r["name"] for r in conn.execute("PRAGMA table_info(teams)").fetchall()]
+        if team_cols and "max_lines" in team_cols:
+            conn.execute(
+                "CREATE TABLE teams_new ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "name TEXT NOT NULL UNIQUE, "
+                "max_lines INTEGER NOT NULL CHECK (max_lines >= 0))"
+            )
+            conn.execute(
+                "INSERT INTO teams_new(id, name, max_lines) SELECT id, name, max_lines FROM teams"
+            )
+            conn.execute("DROP TABLE teams")
+            conn.execute("ALTER TABLE teams_new RENAME TO teams")
+
+        capacity_cols = [
+            r["name"] for r in
+            conn.execute("PRAGMA table_info(team_capacity_changes)").fetchall()
+        ]
+        if capacity_cols and "lines" in capacity_cols:
+            conn.execute(
+                "CREATE TABLE team_capacity_changes_new ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE, "
+                "start_date TEXT NOT NULL, "
+                "lines INTEGER NOT NULL CHECK (lines >= 0), "
+                "UNIQUE(team_id, start_date))"
+            )
+            conn.execute(
+                "INSERT INTO team_capacity_changes_new(id, team_id, start_date, lines) "
+                "SELECT id, team_id, start_date, lines FROM team_capacity_changes"
+            )
+            conn.execute("DROP TABLE team_capacity_changes")
+            conn.execute("ALTER TABLE team_capacity_changes_new RENAME TO team_capacity_changes")
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = ON")
+        version = "11"
 
     conn.execute(
         "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)
