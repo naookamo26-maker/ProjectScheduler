@@ -749,6 +749,58 @@ GUI側でダイアログ表示する（プロジェクト全体の依存グラ�
 しか原子的に置き換えられないため（テンポラリ領域が別ドライブにあると保証が
 崩れる）。
 
+### 「名前を付けて保存」の拡張子自動付与と上書き確認
+
+`gui/main.py`の`on_save_as()`は、`QFileDialog.getSaveFileName()`が返した
+パスに`.pschedule`拡張子が付いていなければ補う（`foo.txt` → `foo.txt.pschedule`）。
+このときQFileDialog自身の上書き確認は、ユーザーが実際にダイアログで選んだ
+パス（拡張子を補う**前**）に対してのものであり、拡張子を補った**後**の実際の
+書き込み先が別の既存ファイルと衝突していても、ユーザーはその衝突を確認して
+いない。そのため`on_save_as()`は、拡張子を補った結果`Path(path).exists()`と
+なる場合に改めて`QMessageBox.question`で上書き確認を取る。既に`.pschedule`
+付きで選ばれた場合はこの分岐を通らない（QFileDialog自身の確認に任せる）。
+
+回帰テストは`tests/test_gui_undo_redo.py`の`test_save_as_without_extension_*`。
+
+### ファイルを開く際の検証（`gui/db_schema.py`の`check_openable`）
+
+`ProjectDatabase.open_existing()`は、`migrate()`を呼ぶ前に
+`check_openable(conn)`でファイルを検証し、ProjectSchedulerの
+プロジェクトファイルとして扱えないと判断した場合は`SchemaError`を送出する
+（`open_existing()`側で`ProjectDatabaseError`に読み替える）。検証しないと
+GUIの「プロジェクトを開けませんでした」ダイアログに素のsqlite3例外の文言
+（`file is not a database`等）がそのまま出て、原因がファイルの中身の問題だと
+伝わらない。次の3パターンを検証する。
+
+1. **`schema_meta`テーブルが無い**——別アプリのSQLiteファイル、0バイトの
+   ファイル等。`_SCHEMA_SQL`はスキーマv1の時点から常にこのテーブルを含む
+   ため、テーブル自体が無いことは強い手がかりになる。
+2. **`schema_meta`テーブルはあるが`schema_version`の行が無い**——
+   `create_new()`は常にこの行を挿入する（同梱の実サンプルも例外なく持つ）
+   ため、実在する正規のファイルには起こらない状態。かつては「schema_meta
+   導入前の最初期のファイル」を想定してバージョン"1"扱いで読み進める
+   フォールバックがあったが、これは未検証のまま壊れていた——現行スキーマの
+   ファイルからこの行だけが失われると、v1からの全migrationが適用され、
+   `workflows.sort_order`のような既に存在する列に対して重複して
+   `ALTER TABLE`しようとし`duplicate column name`で例外になっていた。
+3. **`schema_version`が、このアプリが対応する`SCHEMA_VERSION`より新しい**
+   ——より新しいバージョンのProjectSchedulerで作成されたファイル。以前は
+   ここで拒否せず読み進めていたため、未知のカラム・テーブルはそのまま
+   保持されるが、GUI側は古いスキーマの理解のまま動き続け、保存すると
+   新しいバージョンの意味を持つデータが（旧バージョンの認識のまま）
+   書き換わる恐れがあった。
+
+`sqlite3.connect()`自体は中身を問わず開けてしまう（ファイルが実際に
+SQLiteかどうかは最初の読み書きまで判定されない）ため、非SQLiteファイルの
+検出は`check_openable()`より前、`disk_conn.backup(db._conn)`が送出する
+`sqlite3.DatabaseError`（`file is not a database`）を`open_existing()`が
+直接捕まえて行う。
+
+回帰テストは`tests/test_undo_redo.py`の`test_opening_a_future_schema_version_*` /
+`test_opening_a_file_without_schema_meta_table_*` /
+`test_opening_a_non_sqlite_file_*` /
+`test_opening_a_file_with_schema_meta_table_but_no_version_row_*`。
+
 ### DBを閉じる順序
 
 `gui/main.py`がプロジェクトを開き直す／ウィンドウを閉じる際は、**タブを片付けて

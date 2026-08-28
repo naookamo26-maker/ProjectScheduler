@@ -2144,3 +2144,70 @@ def test_gantt_tab_reports_unsatisfiable_pin_in_the_status_line(window, qapp):
     assert is_error
     assert "開始固定日どおりに配置できません" in message
     assert "依存タスクの着手可能日" in message
+
+
+# -- 名前を付けて保存：拡張子自動付与時の上書き確認（gui/main.py の on_save_as） ----------
+#
+# QFileDialogの上書き確認は、ユーザーがダイアログで実際に選んだパス（拡張子を
+# 補う前）に対してのもの。on_save_as() が拡張子を補った結果の実際の書き込み先が
+# 別の既存ファイルと衝突する場合、ユーザーが目にしていないファイルを無確認で
+# 上書きしてしまわないよう、on_save_as() 側で改めて確認することを検証する。
+
+def test_save_as_without_extension_confirms_before_overwriting_existing_file(window, qapp, tmp_path):
+    """回帰テスト: ダイアログで 'foo.txt' を選ぶと、その名前の上書き確認だけを
+    経て、実際の書き込み先は 'foo.txt.pschedule' になる。この時
+    'foo.txt.pschedule' が既に存在すれば、以前は無確認で上書きしていた。"""
+    window.db.set_project("上書き確認テスト", "2026-01-05")
+
+    from PySide6.QtWidgets import QMessageBox
+
+    existing = tmp_path / "foo.txt.pschedule"
+    existing.write_bytes(b"as-is: should not be overwritten without confirmation")
+    picked = str(tmp_path / "foo.txt")  # ユーザーはこの名前（拡張子なし）を選ぶ
+
+    with patch("gui.main.QFileDialog.getSaveFileName", return_value=(picked, "")), \
+         patch("gui.main.QMessageBox.question", return_value=QMessageBox.No) as mock_confirm:
+        result = window.on_save_as()
+
+    assert mock_confirm.called  # 補った後のパスに対して確認したこと
+    assert result is False
+    assert existing.read_bytes() == b"as-is: should not be overwritten without confirmation"
+    assert window.db.path != str(existing)  # 保存先として確定していないこと
+
+
+def test_save_as_without_extension_overwrites_after_confirmation(window, qapp, tmp_path):
+    """確認で「はい」を選べば、従来どおり拡張子を補って保存されること。"""
+    window.db.set_project("上書き確認テスト", "2026-01-05")
+
+    from PySide6.QtWidgets import QMessageBox
+
+    existing = tmp_path / "foo.txt.pschedule"
+    existing.write_bytes(b"old content")
+    picked = str(tmp_path / "foo.txt")
+
+    with patch("gui.main.QFileDialog.getSaveFileName", return_value=(picked, "")), \
+         patch("gui.main.QMessageBox.question", return_value=QMessageBox.Yes) as mock_confirm:
+        result = window.on_save_as()
+
+    assert mock_confirm.called
+    assert result is True
+    assert window.db.path == str(existing)
+    assert existing.read_bytes() != b"old content"  # 実際に上書きされている
+
+
+def test_save_as_with_extension_already_typed_does_not_prompt_again(window, qapp, tmp_path):
+    """既に'.pschedule'付きで選んだ場合は、拡張子を補う分岐そのものを通らない
+    ため、ここでの二重確認は発生しない（QFileDialog自身の確認に任せる）。"""
+    window.db.set_project("上書き確認テスト", "2026-01-05")
+
+    existing = tmp_path / "bar.pschedule"
+    existing.write_bytes(b"old content")
+    picked = str(existing)
+
+    with patch("gui.main.QFileDialog.getSaveFileName", return_value=(picked, "")), \
+         patch("gui.main.QMessageBox.question") as mock_confirm:
+        result = window.on_save_as()
+
+    assert not mock_confirm.called
+    assert result is True
+    assert window.db.path == str(existing)

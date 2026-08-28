@@ -281,7 +281,19 @@ class MainWindow(QMainWindow):
         if not path:
             return False
         if not path.endswith(f".{DEFAULT_SUFFIX}"):
+            # QFileDialogが確認済みの上書きは、拡張子を補う前のパス（例: "foo.txt"）
+            # に対してのもの。拡張子を補った実際の書き込み先（"foo.txt.pschedule"）
+            # が既存ファイルと衝突する場合、ユーザーが目にしていない別のファイルを
+            # 無確認で上書きすることになるため、ここで改めて確認する。
             path = f"{path}.{DEFAULT_SUFFIX}"
+            if Path(path).exists():
+                reply = QMessageBox.question(
+                    self, "上書きの確認",
+                    f"'{Path(path).name}' は既に存在します。上書きしますか？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return False
         try:
             self.db.save_as(path)
         except Exception as e:
