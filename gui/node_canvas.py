@@ -285,6 +285,11 @@ class TaskNodeItem(QGraphicsPathItem):
         super().__init__(path)
         self.workflow_task_id = workflow_task_id
         self.edges = []  # 接続中のEdgeItem一覧（移動時の再描画用）
+        # このタスクを対象とする依存テンプレート（他ワークフローへの依存）の
+        # 疑似ノードから伸びるEdgeItem一覧。scene.edges/delete_edgeが前提とする
+        # 「両端とも実タスクノード」という扱いに混ぜられないため、self.edgesとは
+        # 別リストに分けて持つ（_add_template_scene_item/_remove_template_scene_item参照）。
+        self.incoming_template_edges = []
 
         self.setFlags(
             QGraphicsItem.ItemIsMovable
@@ -329,6 +334,8 @@ class TaskNodeItem(QGraphicsPathItem):
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemPositionHasChanged:
             for edge in self.edges:
+                edge.update_path()
+            for edge in self.incoming_template_edges:
                 edge.update_path()
         return super().itemChange(change, value)
 
@@ -504,7 +511,6 @@ class WorkflowGraphScene(QGraphicsScene):
         self.template_nodes = {}  # template_id -> TemplateDependencyNodeItem
         self.template_edges = {}  # template_id -> EdgeItem
         self._duration_marker_items = []  # 最短完了日数の目盛り（線・矢印・ラベル）
-        self.setSceneRect(-2000, -2000, 4000, 4000)
         self.reload()
 
     def reload(self):
@@ -560,9 +566,26 @@ class WorkflowGraphScene(QGraphicsScene):
             self.template_edges[tpl["id"]].update_path()
 
         self._refresh_duration_marker(tasks, deps, positions)
+        self._update_scene_rect()
 
         if self.on_changed:
             self.on_changed()
+
+    def _update_scene_rect(self):
+        """全ノード・疑似ノードが収まるよう、シーンの矩形を配置後の内容に
+        合わせて広げ直す。
+
+        固定サイズ（旧: setSceneRect(-2000, -2000, 4000, 4000)）のままだと、
+        ワークフローが横に長くなって実際のノード配置がその範囲をはみ出した
+        場合、ビューのスクロール可能範囲（＝パンやfit_allで到達できる範囲）が
+        QGraphicsViewの仕様上シーン矩形に固定されてしまい、右端のノードまで
+        表示・パンできなくなる。ドラッグで自由に動かせる余白は残しつつ、
+        レイアウトが変わるたび（reload/auto_arrange）に実際の内容を包む
+        矩形へ広げ直す。"""
+        margin = 400
+        bounds = self.itemsBoundingRect().adjusted(-margin, -margin, margin, margin)
+        base = QRectF(-2000, -2000, 4000, 4000)
+        self.setSceneRect(bounds.united(base))
 
     # -- 依存テンプレート（他ワークフローへの依存）の疑似ノード ------------------------
 
@@ -582,10 +605,15 @@ class WorkflowGraphScene(QGraphicsScene):
         edge = EdgeItem(tpl["id"], node, target_node, color=TEMPLATE_EDGE_COLOR, line_style=Qt.DashLine)
         self.addItem(edge)
         self.template_edges[tpl["id"]] = edge
+        # 対象タスクノードが動いた際にこの線も追従できるよう、対象ノード側にも
+        # 登録しておく（TaskNodeItem.itemChange参照）。
+        target_node.incoming_template_edges.append(edge)
 
     def _remove_template_scene_item(self, template_id):
         edge = self.template_edges.pop(template_id, None)
         if edge is not None:
+            if edge in edge.succ_node.incoming_template_edges:
+                edge.succ_node.incoming_template_edges.remove(edge)
             self.removeItem(edge)
         node = self.template_nodes.pop(template_id, None)
         if node is not None:
@@ -824,6 +852,7 @@ class WorkflowGraphScene(QGraphicsScene):
                     continue
                 node.setPos(x, y)
         self._refresh_duration_marker(tasks, deps, positions)
+        self._update_scene_rect()
         if self.on_changed:
             self.on_changed()
 
@@ -1266,6 +1295,12 @@ class WorkflowGraphView(QGraphicsView):
         # 読めなくなる。この独自キャンバスはOSのテーマに関わらず常に明るい
         # 背景で描くようにし、文字色との組み合わせを固定して視認性を保つ。
         self.setBackgroundBrush(QBrush(QColor("#fdfcf9")))
+        # QGraphicsViewは既定でacceptDrops()がTrueになっており、プロジェクト
+        # ファイル（.pschedule）をこのビュー上にドラッグ&ドロップしても
+        # シーンが受け取らないまま素通りせず、MainWindow.dropEvent（ウィンドウ
+        # 全体でのファイルオープン）まで伝播しない。このビュー自体はファイルの
+        # ドロップを扱わないため、明示的に無効化してMainWindow側へ委ねる。
+        self.setAcceptDrops(False)
         self._connecting_from = None
         self._temp_edge = None
         self._panning = False

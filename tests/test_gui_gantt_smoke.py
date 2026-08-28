@@ -54,7 +54,9 @@ def test_create_and_reopen_preserves_data(tmp_path):
     db.close()
 
     db2 = ProjectDatabase.open_existing(str(path))
-    assert db2.get_project() == {"project_name": "テストプロジェクト", "start_date": "2026-01-01"}
+    assert db2.get_project() == {
+        "project_name": "テストプロジェクト", "start_date": "2026-01-01", "distribution_ratio": 0.7,
+    }
     assert db2.list_teams() == [{"id": team_id, "name": "チームA", "max_lines": 2}]
     db2.close()
 

@@ -12,20 +12,22 @@ gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、ホイー
 表示は常に全ジョブが対象で、バーの色はチーム別に塗り分ける。どのワークフロー
 のジョブかは、左列のジョブ名の左に置く色スペースで見分ける（gui/gantt_view.py
 の_JOB_SWATCH_WIDTH参照）。上部の「絞り込み」（折りたたみ式、gui/tab_jobs.py
-と同じ構造）の中に、ワークフロー／チーム／タグのチェックボックス（ワーク
-フロー・チームはチャート本体と対応する色スペース付き）、ジョブ名の文字列
-検索、「間に合わないジョブのみ表示」をまとめてあり、一時的に表示件数を
-絞り込める（絞り込みはあくまで表示上のもので、スケジューリング自体は
-やり直さない）。
+と同じ構造）の中に、ワークフロー／チーム／ジョブ タグ／タスク タグの
+チェックボックス（ワークフロー・チームはチャート本体と対応する色スペース
+付き。タスク タグは、そのタグを持つタスクを1つでも含むジョブを表示する）、
+ジョブ名の文字列検索、「間に合わないジョブのみ表示」をまとめてあり、一時的に
+表示件数を絞り込める（絞り込みはあくまで表示上のもので、スケジューリング
+自体はやり直さない）。
 
 ジョブはそのジョブの最初のタスクの開始日が早い順。マイルストーンは縦線として
 表示する。
 """
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -33,7 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.db import parse_job_tags
+from gui.db import parse_tags
 from gui.gantt_generator import (
     build_display,
     build_frames,
@@ -41,12 +43,32 @@ from gui.gantt_generator import (
     validate_for_generation,
 )
 from gui.gantt_view import FrozenGanttPane, build_gantt_scenes
-from gui.widgets_common import ChoiceFilterGroup, CollapsibleSection
+from gui.widgets_common import (
+    ChoiceFilterGroup,
+    CollapsibleSection,
+    NoWheelSlider,
+    NoWheelSpinBox,
+    bind_undo_session,
+)
 from project_scheduler import SchedulingError
 
-# ジョブが1つもタグを持たない場合にまとめる擬似キー（gui/tab_jobs.py と同じ考え方）。
+# ジョブ タグ／タスク タグを1つも持たない場合にまとめる擬似キー
+# （gui/tab_jobs.py と同じ考え方。2つの絞り込みは別々のChoiceFilterGroupの
+# ため、同じ値を使ってもキー空間は混ざらない）。
 _NO_TAG_FILTER_KEY = None
-_NO_TAG_FILTER_LABEL = "（タグなし）"
+_NO_JOB_TAG_FILTER_LABEL = "（ジョブ タグなし）"
+_NO_TASK_TAG_FILTER_LABEL = "（タスク タグなし）"
+
+# 配置コントロール（チャート本体右下にオーバーレイ表示する小さな操作パネル）の
+# 幅・チャート右端／下端からの余白(px)。タイトル・ラベル・スライダー・
+# スピンボックスを縦に積まず1行に収めて縦方向を圧迫しないぶん、幅は広めに取る。
+_PLACEMENT_CONTROL_WIDTH = 420
+_PLACEMENT_CONTROL_MARGIN = 12
+
+# ジョブ名検索は1文字入力するたびに絞り込みを走らせず、入力が止まってから
+# まとめて反映する（デバウンス）。値はキー入力の間隔として自然に感じられる
+# 程度（他の即時反映系UIとの一貫性より「打ち終わってから絞り込まれる」体感を優先）。
+_SEARCH_DEBOUNCE_MS = 300
 
 
 class _ScheduleWorker(QObject):
@@ -65,14 +87,17 @@ class _ScheduleWorker(QObject):
     finished = Signal(int, object)   # (seq, result_df)
     failed = Signal(int, str)        # (seq, エラーメッセージ)
 
-    def __init__(self, seq, frames):
+    def __init__(self, seq, frames, distribution_ratio):
         super().__init__()
         self._seq = seq
         self._frames = frames
+        self._distribution_ratio = distribution_ratio
 
     def run(self):
         try:
-            result_df = compute_schedule_from_frames(self._frames, verbose=False)
+            result_df = compute_schedule_from_frames(
+                self._frames, verbose=False, distribution_ratio=self._distribution_ratio,
+            )
         except SchedulingError as e:
             self.failed.emit(self._seq, str(e))
         except Exception as e:  # noqa: BLE001 - ワーカースレッドで例外を握り潰さない
@@ -87,9 +112,16 @@ class GanttTab(QWidget):
         self.db = db
         self._result_df = None
         self._display = None
+        # 「配置コントロール」で調整する distribution_ratio（project_scheduler.py
+        # 参照。各タスクを[ASAP, ALAP]のどのあたりに配置するかの基準点）。
+        # プロジェクト設定としてDB（project.distribution_ratio）に保存する。
+        # ここに持つのは表示用のキャッシュで、DB側が正——Undo/Redo等でDBの値が
+        # 変わった場合は refresh_choices() の先頭で読み直して同期する。
+        self._distribution_ratio = self.db.get_project()["distribution_ratio"]
         # 直近の計算結果がどの時点のDB内容に対応するか（db.revision の値）。
         # 一致している間は再計算しない（タブを行き来するたびに数秒かかる
-        # スケジューリングを走らせないため）。
+        # スケジューリングを走らせないため）。distribution_ratioの変更もDBへの
+        # 書き込みを伴う＝db.revisionが進むため、これだけで両方カバーできる。
         self._computed_revision = None
         # 実行中のスケジューリング要求の通し番号。結果が返ってきたときに
         # 「最後に出した要求のものか」を判定し、古い結果は捨てる。
@@ -101,9 +133,9 @@ class GanttTab(QWidget):
 
         layout = QVBoxLayout(self)
 
-        # ワークフロー／チーム／タグの3つの絞り込み（いずれもOR条件の
-        # チェックボックス一覧で、3つの間はAND条件で組み合わせる。
-        # gui/tab_jobs.py の絞り込みと同じ構造・見た目）。
+        # ワークフロー／チーム／ジョブ タグ／タスク タグの4つの絞り込み
+        # （いずれもOR条件のチェックボックス一覧で、4つの間はAND条件で
+        # 組み合わせる。gui/tab_jobs.py の絞り込みと同じ構造・見た目）。
         self.filters_section = CollapsibleSection("絞り込み")
         layout.addWidget(self.filters_section)
 
@@ -115,18 +147,36 @@ class GanttTab(QWidget):
         self.team_filter.changed.connect(self._refresh_chart)
         self.filters_section.content_layout.addWidget(self.team_filter)
 
-        self.tag_filter = ChoiceFilterGroup("タグ")
+        self.tag_filter = ChoiceFilterGroup("ジョブ タグ")
         self.tag_filter.changed.connect(self._refresh_chart)
         self.filters_section.content_layout.addWidget(self.tag_filter)
 
+        # タスク タグ（job_task_overrides.tags）での絞り込み。そのタグを持つ
+        # タスクを1つでも含むジョブを表示する（gui/tab_jobs.py の
+        # task_tag_filter と同じ考え方。display["job_task_tags"] は
+        # gantt_generator.build_display() が組み立てる）。
+        self.task_tag_filter = ChoiceFilterGroup("タスク タグ")
+        self.task_tag_filter.changed.connect(self._refresh_chart)
+        self.filters_section.content_layout.addWidget(self.task_tag_filter)
+
         # ジョブ名の文字列検索・「間に合わないジョブのみ表示」も、ワークフロー
-        # ／チーム／タグと同じ「絞り込み」セクションにまとめる。
+        # ／チーム／ジョブ タグ／タスク タグと同じ「絞り込み」セクションにまとめる。
         search_toolbar = QHBoxLayout()
         search_toolbar.addWidget(QLabel("ジョブ名で絞り込み:"))
         self.search_edit = QLineEdit()
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setPlaceholderText("ジョブ名の一部を入力")
-        self.search_edit.textChanged.connect(self._refresh_chart)
+        # 1文字入力するたびに絞り込みを走らせると、入力途中の文字列で毎回
+        # 再描画されてしまう。入力が止まってからまとめて反映する（デバウンス）。
+        self._search_debounce_timer = QTimer(self)
+        self._search_debounce_timer.setSingleShot(True)
+        self._search_debounce_timer.setInterval(_SEARCH_DEBOUNCE_MS)
+        self._search_debounce_timer.timeout.connect(self._refresh_chart)
+        self.search_edit.textChanged.connect(self._search_debounce_timer.start)
+        # クリアボタンなど即座に反映したい操作もあるため、編集完了時
+        # （Enter/フォーカスアウト）は待たずに即反映する。
+        self.search_edit.editingFinished.connect(self._search_debounce_timer.stop)
+        self.search_edit.editingFinished.connect(self._refresh_chart)
         # 20文字程度が入る幅に固定する（addWidget(..., 1)で親の幅いっぱいに
         # 伸びてしまうと、他の絞り込みチェックボックスと並べたときに長すぎるため）。
         search_edit_width = QFontMetrics(self.search_edit.font()).horizontalAdvance("あ" * 20) + 24
@@ -145,6 +195,76 @@ class GanttTab(QWidget):
         self.view = FrozenGanttPane()
         layout.addWidget(self.view, 1)
 
+        # 配置コントロール（distribution_ratio の調整）。チャート本体（self.view）
+        # の右下に、レイアウトへは組み込まないフローティングパネルとして重ねる
+        # （self.viewのリサイズに追従させて位置合わせし直す。_reposition_placement_control
+        # /eventFilter参照）。ドラッグ中に毎回再計算すると重い上にUndoできない
+        # 中間状態が大量にできてしまうため、スライダーを離した時にだけ
+        # DBへ書き込み・再計算する（_on_placement_slider_released）。
+        # QGroupBoxのネイティブタイトルは枠線をまたぐ固定位置にしか描画できない
+        # ため、タイトルは通常のQLabelとして枠内に置き、位置を自由に調整できる
+        # ようにする（QGroupBoxはタイトル無しの単なる枠として使う）。
+        self.placement_group = QGroupBox("", self.view)
+        self.placement_group.setFixedWidth(_PLACEMENT_CONTROL_WIDTH)
+        # ガントチャートの縦方向を圧迫しないよう、タイトル・ラベル・スライダー・
+        # スピンボックスを縦に積まず1行に収める（そのぶん幅を確保する）。
+        placement_layout = QHBoxLayout(self.placement_group)
+        placement_layout.addWidget(QLabel("配置コントロール"))
+        placement_layout.addWidget(QLabel("最速"))
+        self.placement_slider = NoWheelSlider(Qt.Horizontal)
+        self.placement_slider.setRange(0, 100)
+        self.placement_slider.setToolTip(
+            "各タスクを、依存関係が満たされ次第の最速開始～締切から逆算した"
+            "最遅開始の範囲内のどこに配置するかの基準点（distribution_ratio）。"
+        )
+        placement_layout.addWidget(self.placement_slider, 1)
+        placement_layout.addWidget(QLabel("ギリギリ"))
+        self.placement_spinbox = NoWheelSpinBox()
+        self.placement_spinbox.setRange(0, 100)
+        self.placement_spinbox.setSuffix("%")
+        self.placement_spinbox.setAlignment(Qt.AlignRight)
+        # 数字入力中に1文字ごと反映されるのを防ぐ（Enter/フォーカスアウト、
+        # または矢印ボタン操作でのみ valueChanged が飛ぶようにする）。
+        self.placement_spinbox.setKeyboardTracking(False)
+        # スピンボックスでの連続した増減（矢印連打・入力し直し）を、
+        # フォーカスの出入り単位で1つのUndoにまとめる（docs/architecture.md
+        # 「Undo/Redo」参照）。スライダーはドラッグ中DBに書き込まず離した時に
+        # 1回だけ書き込むため、これ自体で既に1操作1Undoになっており不要。
+        bind_undo_session(self.placement_spinbox, self.db, "配置コントロールを変更")
+        placement_layout.addWidget(self.placement_spinbox)
+        self._sync_placement_widgets(self._distribution_ratio)
+
+        self.placement_slider.valueChanged.connect(self._on_placement_slider_value_changed)
+        self.placement_slider.sliderReleased.connect(self._on_placement_slider_released)
+        self.placement_spinbox.valueChanged.connect(self._on_placement_spinbox_value_changed)
+        self.view.installEventFilter(self)
+        self.placement_group.adjustSize()
+        self.placement_group.raise_()
+        QTimer.singleShot(0, self._reposition_placement_control)
+
+    def eventFilter(self, obj, event):
+        if obj is self.view and event.type() == QEvent.Resize:
+            self._reposition_placement_control()
+        return super().eventFilter(obj, event)
+
+    def _reposition_placement_control(self):
+        """配置コントロールをチャート本体（self.view）の右下に留め直す。"""
+        self.placement_group.adjustSize()
+        x = self.view.width() - self.placement_group.width() - _PLACEMENT_CONTROL_MARGIN
+        y = self.view.height() - self.placement_group.height() - _PLACEMENT_CONTROL_MARGIN
+        self.placement_group.move(max(0, x), max(0, y))
+
+    def _sync_placement_widgets(self, ratio):
+        """配置コントロールのスライダー・スピンボックスの表示をratioに合わせる
+        （シグナルを止めて行う——ここからの再計算・DB書き込みは発生させない）。"""
+        value = round(ratio * 100)
+        self.placement_slider.blockSignals(True)
+        self.placement_slider.setValue(value)
+        self.placement_slider.blockSignals(False)
+        self.placement_spinbox.blockSignals(True)
+        self.placement_spinbox.setValue(value)
+        self.placement_spinbox.blockSignals(False)
+
     def refresh_choices(self):
         """このタブに切り替わるたびに gui/main.py の _on_tab_changed から呼ばれ、
         現在のDB内容でスケジューリングを実行し直す。
@@ -154,6 +274,8 @@ class GanttTab(QWidget):
 
         1. 前回計算した時点からDBの内容が変わっていなければ再計算しない
            （db.revision で判定）。タブを行き来しただけで毎回計算し直すのを防ぐ。
+           distribution_ratioの変更もDBへの書き込みを伴う（db.set_distribution_ratio）
+           ためdb.revisionが進み、これだけで両方カバーできる。
         2. 計算本体はワーカースレッドで実行する（_ScheduleWorker）。DBを読むのは
            GUIスレッド（build_frames）、計算だけ別スレッド、という分割にしている。
            計算中も画面は操作でき、途中で内容を変えれば新しい要求が古い要求を
@@ -167,6 +289,14 @@ class GanttTab(QWidget):
         避けるための特別扱いが、gui/main.py 側で必要になっていた）。
         明示的な操作であるFileメニューの「ガントチャートを生成」は、従来どおり
         ダイアログでエラーを知らせる。"""
+        # 配置コントロールはDBのproject.distribution_ratioが正。Undo/Redo等で
+        # DB側の値がこのタブの知らないうちに変わっている場合があるため、
+        # 毎回ここで読み直して表示（スライダー・スピンボックス）を合わせ直す。
+        db_ratio = self.db.get_project()["distribution_ratio"]
+        if db_ratio != self._distribution_ratio:
+            self._distribution_ratio = db_ratio
+            self._sync_placement_widgets(db_ratio)
+
         errors = validate_for_generation(self.db)
         if errors:
             self._cancel_pending_request()
@@ -196,6 +326,30 @@ class GanttTab(QWidget):
         self._start_worker(seq, frames)
         self._set_status("スケジューリングを計算中です...")
 
+    def _on_placement_slider_value_changed(self, value):
+        """ドラッグ中は毎回ここが呼ばれる。スピンボックスの表示だけ追従させ、
+        重いDB書き込み・再計算はスライダーを離すまで行わない
+        （_on_placement_slider_released）。"""
+        self.placement_spinbox.blockSignals(True)
+        self.placement_spinbox.setValue(value)
+        self.placement_spinbox.blockSignals(False)
+
+    def _on_placement_slider_released(self):
+        self._commit_distribution_ratio(self.placement_slider.value() / 100.0)
+
+    def _on_placement_spinbox_value_changed(self, value):
+        self.placement_slider.blockSignals(True)
+        self.placement_slider.setValue(value)
+        self.placement_slider.blockSignals(False)
+        self._commit_distribution_ratio(value / 100.0)
+
+    def _commit_distribution_ratio(self, ratio):
+        if ratio == self._distribution_ratio:
+            return  # 実際には変わっていない（ドラッグして元の値に戻した等）
+        self._distribution_ratio = ratio
+        self.db.set_distribution_ratio(ratio)
+        self.refresh_choices()
+
     def _start_worker(self, seq, frames):
         """ワーカースレッドを起こしてスケジューリングを走らせる。
 
@@ -204,7 +358,7 @@ class GanttTab(QWidget):
         害はなく、途中で強制終了させるより安全なため（終了は quit()/wait() を
         shutdown() でまとめて待つ）。"""
         thread = QThread(self)
-        worker = _ScheduleWorker(seq, frames)
+        worker = _ScheduleWorker(seq, frames, self._distribution_ratio)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_schedule_finished)
@@ -306,24 +460,34 @@ class GanttTab(QWidget):
         self._rebuild_filters()
         self._set_status(status_message, is_error=is_error)
 
-    # -- ワークフロー／チーム／タグの絞り込み ------------------------------------------
+    # -- ワークフロー／チーム／ジョブ タグ／タスク タグの絞り込み ----------------------------
 
     def _job_tag_keys(self, job_id):
-        """絞り込み判定に使う、ジョブが持つタグのキー集合。タグが1つも無い
-        ジョブは擬似キー _NO_TAG_FILTER_KEY（＝「（タグなし）」）を持つ扱いにする。"""
+        """絞り込み判定に使う、ジョブが持つジョブ タグのキー集合。ジョブ タグが
+        1つも無いジョブは擬似キー _NO_TAG_FILTER_KEY（＝「（ジョブ タグなし）」）
+        を持つ扱いにする。"""
         job_tags = (self._display or {}).get("job_tags") or {}
-        tags = parse_job_tags(job_tags.get(job_id, ""))
+        tags = parse_tags(job_tags.get(job_id, ""))
+        return set(tags) if tags else {_NO_TAG_FILTER_KEY}
+
+    def _job_task_tag_keys(self, job_id):
+        """絞り込み判定に使う、ジョブが持つタスク タグのキー集合。タスク タグを
+        持つタスクが1つも無いジョブは擬似キー _NO_TAG_FILTER_KEY
+        （＝「（タスク タグなし）」）を持つ扱いにする。"""
+        job_task_tags = (self._display or {}).get("job_task_tags") or {}
+        tags = parse_tags(job_task_tags.get(job_id, ""))
         return set(tags) if tags else {_NO_TAG_FILTER_KEY}
 
     def _rebuild_filters(self):
-        """ワークフロー／チーム／タグの絞り込み用チェックボックスを、直近の
-        計算結果（全ジョブ）に合わせて再構築する。既存のチェック状態はキーで
-        可能な限り維持し、新規キーは既定で表示にする（gui/tab_jobs.py と同じ
-        考え方）。"""
+        """ワークフロー／チーム／ジョブ タグ／タスク タグの絞り込み用
+        チェックボックスを、直近の計算結果（全ジョブ）に合わせて再構築する。
+        既存のチェック状態はキーで可能な限り維持し、新規キーは既定で表示に
+        する（gui/tab_jobs.py と同じ考え方）。"""
         if self._result_df is None or not self._display:
             self.workflow_filter.rebuild([])
             self.team_filter.rebuild([])
             self.tag_filter.rebuild([])
+            self.task_tag_filter.rebuild([])
             return
 
         workflow_names = self._display["workflow_names"]
@@ -341,9 +505,11 @@ class GanttTab(QWidget):
             colors=self._display["team_colors"],
         )
 
+        job_ids = list(dict.fromkeys(self._result_df["Job_ID"].tolist()))
+
         tag_keys = set()
         has_no_tag = False
-        for job_id in dict.fromkeys(self._result_df["Job_ID"].tolist()):
+        for job_id in job_ids:
             keys = self._job_tag_keys(job_id)
             if keys == {_NO_TAG_FILTER_KEY}:
                 has_no_tag = True
@@ -351,8 +517,21 @@ class GanttTab(QWidget):
                 tag_keys.update(keys)
         tag_items = [(tag, tag) for tag in sorted(tag_keys)]
         if has_no_tag:
-            tag_items.append((_NO_TAG_FILTER_KEY, _NO_TAG_FILTER_LABEL))
+            tag_items.append((_NO_TAG_FILTER_KEY, _NO_JOB_TAG_FILTER_LABEL))
         self.tag_filter.rebuild(tag_items)
+
+        task_tag_keys = set()
+        has_no_task_tag = False
+        for job_id in job_ids:
+            keys = self._job_task_tag_keys(job_id)
+            if keys == {_NO_TAG_FILTER_KEY}:
+                has_no_task_tag = True
+            else:
+                task_tag_keys.update(keys)
+        task_tag_items = [(tag, tag) for tag in sorted(task_tag_keys)]
+        if has_no_task_tag:
+            task_tag_items.append((_NO_TAG_FILTER_KEY, _NO_TASK_TAG_FILTER_LABEL))
+        self.task_tag_filter.rebuild(task_tag_items)
 
     def _refresh_chart(self):
         if self._result_df is None:
@@ -368,9 +547,11 @@ class GanttTab(QWidget):
             df = df[df["Job_Name"].str.contains(search_text, case=False, na=False, regex=False)]
 
         visible_tags = self.tag_filter.visible_keys()
+        visible_task_tags = self.task_tag_filter.visible_keys()
         keep_job_ids = {
             job_id for job_id in df["Job_ID"].unique()
             if self._job_tag_keys(job_id) & visible_tags
+            and self._job_task_tag_keys(job_id) & visible_task_tags
         }
         df = df[df["Job_ID"].isin(keep_job_ids)]
 

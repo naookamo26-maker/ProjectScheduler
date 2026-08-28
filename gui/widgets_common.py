@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QMessageBox,
     QPushButton,
+    QSlider,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -111,6 +112,14 @@ def bind_undo_session(widget, db, label, on_session_end=None, on_before_commit=N
     別のUndoエントリになってしまう）。"""
     widget._undo_session = (db, label, on_session_end, on_before_commit)
     return widget
+
+
+class NoWheelSlider(QSlider):
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
 
 
 class NoWheelSpinBox(_UndoSessionMixin, QSpinBox):

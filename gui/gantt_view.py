@@ -89,6 +89,10 @@ _TASK_LABEL_H_MARGIN_PX = 6
 _TASK_LABEL_V_MARGIN_PX = 2
 # 2行表示に切り替える際、1行目と2行目の間に最低限見込む余白(px)。
 _TASK_LABEL_LINE_GAP_PX = 2
+# _center_task_labelsのビューポート判定に見込む余白(px)。ちょうど画面端で
+# 出入りするラベルがパンのたびに省略表示とフル表示を行き来してちらつかない
+# ようにする（実際に見えている範囲より少しだけ広く処理対象にする）。
+_TASK_LABEL_VIEWPORT_MARGIN_PX = 64
 
 _GRID_COLOR = QColor("#e1e0d9")
 # 日単位の補助線・間引かれた週の目盛り線用。主線（_GRID_COLOR）よりさらに
@@ -159,6 +163,12 @@ class GanttGraphicsView(QGraphicsView):
         # 背景で描くようにし、文字色との組み合わせを固定して視認性を保つ。
         self.setBackgroundBrush(QBrush(_PANE_BG))
         self.setDragMode(QGraphicsView.RubberBandDrag)
+        # QGraphicsViewは既定でacceptDrops()がTrueになっており、プロジェクト
+        # ファイル（.pschedule）をこのビュー上にドラッグ&ドロップしても
+        # シーンが受け取らないまま素通りせず、MainWindow.dropEvent（ウィンドウ
+        # 全体でのファイルオープン）まで伝播しない。このビュー自体はファイルの
+        # ドロップを扱わないため、明示的に無効化してMainWindow側へ委ねる。
+        self.setAcceptDrops(False)
         self._panning = False
         self._pan_last_pos = None
         h_bar = self.horizontalScrollBar()
@@ -263,6 +273,9 @@ class _FrozenPaneView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setInteractive(False)
         self.setFrameShape(QGraphicsView.NoFrame)
+        # GanttGraphicsView と同じ理由（ファイルドロップをMainWindowへ
+        # 伝播させるため）で無効化する。
+        self.setAcceptDrops(False)
 
 
 class GanttHeaderView(_FrozenPaneView):
@@ -478,12 +491,33 @@ class FrozenGanttPane(QWidget):
         scene = self.body.scene()
         if scene is None or sx <= 0 or sy <= 0:
             return
+        # 現在ビューポートに映っている範囲（シーン座標、余白付き）。この外に
+        # あるラベルは省略・2行化などの本文処理をせず、非表示化だけして
+        # 早期に打ち切る。ここをスキップしないと、大規模プロジェクト
+        # （数千〜数万タスク）でラベルが読めるほど拡大した際、画面外の
+        # タスクぶんまで含めた全件のテキスト整形をパン・ズームのたびに
+        # 行うことになり、操作が重くなる（バウンディングボックスの比較
+        # 自体は全件行っても軽いため、判定はこの後も全ラベル分ループする）。
+        visible_rect = self.body.mapToScene(self.body.viewport().rect()).boundingRect()
+        margin_x = _TASK_LABEL_VIEWPORT_MARGIN_PX / sx
+        margin_y = _TASK_LABEL_VIEWPORT_MARGIN_PX / sy
+        visible_left = visible_rect.left() - margin_x
+        visible_right = visible_rect.right() + margin_x
+        visible_top = visible_rect.top() - margin_y
+        visible_bottom = visible_rect.bottom() + margin_y
         # 全タスクラベルが同じフォント（task_font）を共有しているのが通常なので、
-        # QFontMetricsをラベルごとに作り直さず使い回す（数百〜数千件のラベルを
-        # 毎フレーム処理するため、地味だが効く最適化）。
+        # QFontMetricsをラベルごとに作り直さず使い回す（画面内に映っている分
+        # だけとはいえ、数百件規模になりうるため、地味だが効く最適化）。
         metrics_cache = {}
         for label, center_x, center_y, bar_width, bar_height, full_text, font in \
                 getattr(scene, "gantt_task_labels", []):
+            half_w, half_h = bar_width / 2, bar_height / 2
+            if (center_x + half_w < visible_left or center_x - half_w > visible_right
+                    or center_y + half_h < visible_top or center_y - half_h > visible_bottom):
+                if label.isVisible():
+                    label.setVisible(False)
+                continue
+
             metrics = metrics_cache.get(id(font))
             if metrics is None:
                 metrics = QFontMetrics(font)

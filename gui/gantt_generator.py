@@ -10,6 +10,7 @@ from datetime import date
 
 import pandas as pd
 
+from gui.db import parse_tags
 from project_scheduler import (
     _TEAM_COLOR_OVERFLOW,
     _build_team_color_map,
@@ -181,8 +182,14 @@ def build_display(db):
         - milestone_markers: [(id, 名前, pd.Timestamp), ...]（プロジェクト開始日を含む、締切順）
         - common_holiday_dates: {datetime.date, ...}（全チーム共通の休業日）
         - holidays_by_team: {Team_ID(文字列): {datetime.date, ...}}（チーム別の休業日）
-        - job_tags: {Job_ID(文字列): タグ（カンマ区切りの1文字列）}（ガントチャート
-          タブのタグ絞り込み用。result_dfにはタグを持たせていないため）
+        - job_tags: {Job_ID(文字列): ジョブ タグ（カンマ区切りの1文字列）}（ガント
+          チャートタブのジョブ タグ絞り込み用。result_dfにはタグを持たせて
+          いないため）
+        - job_task_tags: {Job_ID(文字列): タスク タグ（カンマ区切りの1文字列）}
+          （ガントチャートタブのタスク タグ絞り込み用。ジョブが持つ全タスクの
+          タスク タグを1つの集合にまとめたもの——job_tagsと違い、個々の
+          タスクどのタグを持つかまでは表現しない。ジョブ単位で「いずれかの
+          タスクがそのタグを持つか」だけを見る絞り込みのため十分）
     """
     teams = db.list_teams()
     team_str = {t["id"]: _fmt("TEAM", t["id"]) for t in teams}
@@ -227,12 +234,24 @@ def build_display(db):
 
     job_tags = {_fmt("JOB", j["id"]): j["tags"] for j in db.list_jobs()}
 
+    # タスク タグは job_task_overrides 側にしか持たない（タスク自体は既定では
+    # タグ無し）ため、全ジョブ分の上書き行から job_id 単位のタグ集合へ潰す。
+    job_task_tag_sets = {}
+    for o in db.list_all_job_task_overrides():
+        tags = parse_tags(o["tags"])
+        if tags:
+            job_task_tag_sets.setdefault(o["job_id"], set()).update(tags)
+    job_task_tags = {
+        _fmt("JOB", j["id"]): ", ".join(sorted(job_task_tag_sets.get(j["id"], ())))
+        for j in db.list_jobs()
+    }
+
     return {
         "team_names": team_names, "team_colors": team_colors,
         "workflow_names": workflow_names, "workflow_colors": workflow_colors,
         "milestone_markers": milestone_markers,
         "common_holiday_dates": common_holiday_dates, "holidays_by_team": holidays_by_team,
-        "job_tags": job_tags,
+        "job_tags": job_tags, "job_task_tags": job_task_tags,
     }
 
 
@@ -265,12 +284,17 @@ def compute_schedule(db, **scheduler_kwargs):
     まとめて同期実行する薄いラッパー。GUIから使う場合は、計算部分だけを
     ワーカースレッドへ逃がすため、この3つを個別に呼ぶ（gui/tab_gantt.py）。
 
+    distribution_ratio を明示指定しなければ、プロジェクト設定
+    （db.get_project()["distribution_ratio"]、ガントチャートタブの
+    「配置コントロール」で調整・保存する値）を既定値として使う。
+
     Returns: (result_df, display) のタプル。
       result_df: run_resource_constrained_scheduler_from_frames() の戻り値そのもの。
       display: build_display() の戻り値。
 
     SchedulingError系の例外はそのまま呼び出し元に伝播させる。
     """
+    scheduler_kwargs.setdefault("distribution_ratio", db.get_project()["distribution_ratio"])
     result_df = compute_schedule_from_frames(build_frames(db), **scheduler_kwargs)
     return result_df, build_display(db)
 
@@ -278,8 +302,14 @@ def compute_schedule(db, **scheduler_kwargs):
 def generate_gantt(db, plotly_output_path=None, **scheduler_kwargs):
     """build_frames() の結果を project_scheduler.run_resource_constrained_scheduler_from_frames()
     にそのまま渡す。SchedulingError系（循環依存・リソース不足・マイルストーン不整合等）は
-    そのまま呼び出し元に伝播させる（GUI側でダイアログに変換する）。"""
+    そのまま呼び出し元に伝播させる（GUI側でダイアログに変換する）。
+
+    distribution_ratio を明示指定しなければ、プロジェクト設定
+    （db.get_project()["distribution_ratio"]）を既定値として使う——
+    ガントチャートタブで調整した基準点が、メニューの「ガントチャートを
+    生成」（HTMLファイル出力）でもそのまま使われるようにするため。"""
     frames = build_frames(db)
+    scheduler_kwargs.setdefault("distribution_ratio", db.get_project()["distribution_ratio"])
     return run_resource_constrained_scheduler_from_frames(
         frames["project"], frames["teams"], frames["milestones"], frames["workflows"],
         frames["jobs"], frames["job_tasks"], frames["holidays"], frames["external_dependencies"],
