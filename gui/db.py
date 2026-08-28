@@ -113,9 +113,10 @@ def _validate_distribution_ratio(value):
 
 
 def normalize_tags(tags):
-    """ジョブのタグ入力（カンマ区切りの1文字列、またはリスト）を、正規化した
+    """タグ入力（カンマ区切りの1文字列、またはリスト）を、正規化した
     カンマ区切り文字列に変換する。前後の空白を落とし、空要素は除外し、
-    重複は最初の1つだけ残す（表示順は入力順を保つ）。
+    重複は最初の1つだけ残す（表示順は入力順を保つ）。ジョブ タグ・
+    タスク タグのどちらにも使う共通の関数。
 
     ALTER TABLE で後から足した列にはCHECK制約を付けられないため、他の
     後付け列（normalize_dependency_kind 等）と同様に書き込み経路で正規化する。
@@ -134,11 +135,12 @@ def normalize_tags(tags):
     return ", ".join(result)
 
 
-def parse_job_tags(tags):
-    """ジョブのタグ文字列（カンマ区切り）を、タグ名のリストに分解する。
+def parse_tags(tags):
+    """タグ文字列（カンマ区切り）を、タグ名のリストに分解する。
     normalize_tagsで正規化済みの文字列を主に想定するが、前後の空白除去・
     空要素の除外は独立して行うため、正規化前の生の文字列にも使える。
-    ジョブタブ・ガントチャートタブのタグ絞り込みで共通して使う。"""
+    ジョブ タグ・タスク タグのどちらにも使う共通の関数（ジョブタブ・
+    ガントチャートタブのタグ絞り込みで共通して使う）。"""
     return [t.strip() for t in (tags or "").split(",") if t.strip()]
 
 
@@ -1037,15 +1039,15 @@ class ProjectDatabase:
 
         for o in self._conn.execute(
             "SELECT workflow_task_id, is_active, override_days, milestone_id, team_id, "
-            "start_pin_date FROM job_task_overrides WHERE job_id = ?",
+            "start_pin_date, tags FROM job_task_overrides WHERE job_id = ?",
             (job_id,),
         ).fetchall():
             self._conn.execute(
                 "INSERT INTO job_task_overrides(job_id, workflow_task_id, is_active, "
-                "override_days, milestone_id, team_id, start_pin_date) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "override_days, milestone_id, team_id, start_pin_date, tags) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (new_job_id, o["workflow_task_id"], o["is_active"], o["override_days"],
-                 o["milestone_id"], o["team_id"], o["start_pin_date"]),
+                 o["milestone_id"], o["team_id"], o["start_pin_date"], o["tags"]),
             )
 
         # 依存先ジョブ（このジョブ→他ジョブ）は、リンクIDを付け替えつつ複製する。
@@ -1149,7 +1151,7 @@ class ProjectDatabase:
             "o.milestone_id AS override_milestone_id, "
             "om.name AS override_milestone_name, "
             "o.team_id AS override_team_id, ot.name AS override_team_name, "
-            "o.start_pin_date "
+            "o.start_pin_date, COALESCE(o.tags, '') AS tags "
             "FROM jobs j "
             "JOIN workflow_tasks wt ON wt.workflow_id = j.workflow_id "
             "JOIN teams t ON t.id = wt.team_id "
@@ -1174,7 +1176,7 @@ class ProjectDatabase:
         rows = self._conn.execute(
             "SELECT o.job_id, o.workflow_task_id, o.is_active, o.override_days, "
             "o.milestone_id AS override_milestone_id, o.team_id AS override_team_id, "
-            "o.start_pin_date "
+            "o.start_pin_date, o.tags "
             "FROM job_task_overrides o "
             "JOIN jobs j ON j.id = o.job_id "
             "JOIN workflow_tasks wt ON wt.id = o.workflow_task_id "
@@ -1185,8 +1187,9 @@ class ProjectDatabase:
     @undoable("タスク上書きを変更")
     def upsert_job_task_override(self, job_id, workflow_task_id, is_active=True,
                                   override_days=None, milestone_id=None, team_id=None,
-                                  start_pin_date=None):
+                                  start_pin_date=None, tags=""):
         start_pin_date = _validate_start_pin_date(start_pin_date)
+        tags = normalize_tags(tags)
         existing = self._conn.execute(
             "SELECT id FROM job_task_overrides WHERE job_id = ? AND workflow_task_id = ?",
             (job_id, workflow_task_id),
@@ -1194,17 +1197,17 @@ class ProjectDatabase:
         if existing:
             self._conn.execute(
                 "UPDATE job_task_overrides SET is_active = ?, override_days = ?, "
-                "milestone_id = ?, team_id = ?, start_pin_date = ? WHERE id = ?",
+                "milestone_id = ?, team_id = ?, start_pin_date = ?, tags = ? WHERE id = ?",
                 (int(is_active), override_days, milestone_id, team_id, start_pin_date,
-                 existing["id"]),
+                 tags, existing["id"]),
             )
         else:
             self._conn.execute(
                 "INSERT INTO job_task_overrides(job_id, workflow_task_id, is_active, "
-                "override_days, milestone_id, team_id, start_pin_date) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "override_days, milestone_id, team_id, start_pin_date, tags) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (job_id, workflow_task_id, int(is_active), override_days, milestone_id,
-                 team_id, start_pin_date),
+                 team_id, start_pin_date, tags),
             )
         self._commit()
 

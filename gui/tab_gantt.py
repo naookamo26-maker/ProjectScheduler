@@ -12,11 +12,12 @@ gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、ホイー
 表示は常に全ジョブが対象で、バーの色はチーム別に塗り分ける。どのワークフロー
 のジョブかは、左列のジョブ名の左に置く色スペースで見分ける（gui/gantt_view.py
 の_JOB_SWATCH_WIDTH参照）。上部の「絞り込み」（折りたたみ式、gui/tab_jobs.py
-と同じ構造）の中に、ワークフロー／チーム／タグのチェックボックス（ワーク
-フロー・チームはチャート本体と対応する色スペース付き）、ジョブ名の文字列
-検索、「間に合わないジョブのみ表示」をまとめてあり、一時的に表示件数を
-絞り込める（絞り込みはあくまで表示上のもので、スケジューリング自体は
-やり直さない）。
+と同じ構造）の中に、ワークフロー／チーム／ジョブ タグ／タスク タグの
+チェックボックス（ワークフロー・チームはチャート本体と対応する色スペース
+付き。タスク タグは、そのタグを持つタスクを1つでも含むジョブを表示する）、
+ジョブ名の文字列検索、「間に合わないジョブのみ表示」をまとめてあり、一時的に
+表示件数を絞り込める（絞り込みはあくまで表示上のもので、スケジューリング
+自体はやり直さない）。
 
 ジョブはそのジョブの最初のタスクの開始日が早い順。マイルストーンは縦線として
 表示する。
@@ -34,7 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.db import parse_job_tags
+from gui.db import parse_tags
 from gui.gantt_generator import (
     build_display,
     build_frames,
@@ -51,9 +52,12 @@ from gui.widgets_common import (
 )
 from project_scheduler import SchedulingError
 
-# ジョブが1つもタグを持たない場合にまとめる擬似キー（gui/tab_jobs.py と同じ考え方）。
+# ジョブ タグ／タスク タグを1つも持たない場合にまとめる擬似キー
+# （gui/tab_jobs.py と同じ考え方。2つの絞り込みは別々のChoiceFilterGroupの
+# ため、同じ値を使ってもキー空間は混ざらない）。
 _NO_TAG_FILTER_KEY = None
-_NO_TAG_FILTER_LABEL = "（タグなし）"
+_NO_JOB_TAG_FILTER_LABEL = "（ジョブ タグなし）"
+_NO_TASK_TAG_FILTER_LABEL = "（タスク タグなし）"
 
 # 配置コントロール（チャート本体右下にオーバーレイ表示する小さな操作パネル）の
 # 幅・チャート右端／下端からの余白(px)。タイトル・ラベル・スライダー・
@@ -129,9 +133,9 @@ class GanttTab(QWidget):
 
         layout = QVBoxLayout(self)
 
-        # ワークフロー／チーム／タグの3つの絞り込み（いずれもOR条件の
-        # チェックボックス一覧で、3つの間はAND条件で組み合わせる。
-        # gui/tab_jobs.py の絞り込みと同じ構造・見た目）。
+        # ワークフロー／チーム／ジョブ タグ／タスク タグの4つの絞り込み
+        # （いずれもOR条件のチェックボックス一覧で、4つの間はAND条件で
+        # 組み合わせる。gui/tab_jobs.py の絞り込みと同じ構造・見た目）。
         self.filters_section = CollapsibleSection("絞り込み")
         layout.addWidget(self.filters_section)
 
@@ -143,12 +147,20 @@ class GanttTab(QWidget):
         self.team_filter.changed.connect(self._refresh_chart)
         self.filters_section.content_layout.addWidget(self.team_filter)
 
-        self.tag_filter = ChoiceFilterGroup("タグ")
+        self.tag_filter = ChoiceFilterGroup("ジョブ タグ")
         self.tag_filter.changed.connect(self._refresh_chart)
         self.filters_section.content_layout.addWidget(self.tag_filter)
 
+        # タスク タグ（job_task_overrides.tags）での絞り込み。そのタグを持つ
+        # タスクを1つでも含むジョブを表示する（gui/tab_jobs.py の
+        # task_tag_filter と同じ考え方。display["job_task_tags"] は
+        # gantt_generator.build_display() が組み立てる）。
+        self.task_tag_filter = ChoiceFilterGroup("タスク タグ")
+        self.task_tag_filter.changed.connect(self._refresh_chart)
+        self.filters_section.content_layout.addWidget(self.task_tag_filter)
+
         # ジョブ名の文字列検索・「間に合わないジョブのみ表示」も、ワークフロー
-        # ／チーム／タグと同じ「絞り込み」セクションにまとめる。
+        # ／チーム／ジョブ タグ／タスク タグと同じ「絞り込み」セクションにまとめる。
         search_toolbar = QHBoxLayout()
         search_toolbar.addWidget(QLabel("ジョブ名で絞り込み:"))
         self.search_edit = QLineEdit()
@@ -448,24 +460,34 @@ class GanttTab(QWidget):
         self._rebuild_filters()
         self._set_status(status_message, is_error=is_error)
 
-    # -- ワークフロー／チーム／タグの絞り込み ------------------------------------------
+    # -- ワークフロー／チーム／ジョブ タグ／タスク タグの絞り込み ----------------------------
 
     def _job_tag_keys(self, job_id):
-        """絞り込み判定に使う、ジョブが持つタグのキー集合。タグが1つも無い
-        ジョブは擬似キー _NO_TAG_FILTER_KEY（＝「（タグなし）」）を持つ扱いにする。"""
+        """絞り込み判定に使う、ジョブが持つジョブ タグのキー集合。ジョブ タグが
+        1つも無いジョブは擬似キー _NO_TAG_FILTER_KEY（＝「（ジョブ タグなし）」）
+        を持つ扱いにする。"""
         job_tags = (self._display or {}).get("job_tags") or {}
-        tags = parse_job_tags(job_tags.get(job_id, ""))
+        tags = parse_tags(job_tags.get(job_id, ""))
+        return set(tags) if tags else {_NO_TAG_FILTER_KEY}
+
+    def _job_task_tag_keys(self, job_id):
+        """絞り込み判定に使う、ジョブが持つタスク タグのキー集合。タスク タグを
+        持つタスクが1つも無いジョブは擬似キー _NO_TAG_FILTER_KEY
+        （＝「（タスク タグなし）」）を持つ扱いにする。"""
+        job_task_tags = (self._display or {}).get("job_task_tags") or {}
+        tags = parse_tags(job_task_tags.get(job_id, ""))
         return set(tags) if tags else {_NO_TAG_FILTER_KEY}
 
     def _rebuild_filters(self):
-        """ワークフロー／チーム／タグの絞り込み用チェックボックスを、直近の
-        計算結果（全ジョブ）に合わせて再構築する。既存のチェック状態はキーで
-        可能な限り維持し、新規キーは既定で表示にする（gui/tab_jobs.py と同じ
-        考え方）。"""
+        """ワークフロー／チーム／ジョブ タグ／タスク タグの絞り込み用
+        チェックボックスを、直近の計算結果（全ジョブ）に合わせて再構築する。
+        既存のチェック状態はキーで可能な限り維持し、新規キーは既定で表示に
+        する（gui/tab_jobs.py と同じ考え方）。"""
         if self._result_df is None or not self._display:
             self.workflow_filter.rebuild([])
             self.team_filter.rebuild([])
             self.tag_filter.rebuild([])
+            self.task_tag_filter.rebuild([])
             return
 
         workflow_names = self._display["workflow_names"]
@@ -483,9 +505,11 @@ class GanttTab(QWidget):
             colors=self._display["team_colors"],
         )
 
+        job_ids = list(dict.fromkeys(self._result_df["Job_ID"].tolist()))
+
         tag_keys = set()
         has_no_tag = False
-        for job_id in dict.fromkeys(self._result_df["Job_ID"].tolist()):
+        for job_id in job_ids:
             keys = self._job_tag_keys(job_id)
             if keys == {_NO_TAG_FILTER_KEY}:
                 has_no_tag = True
@@ -493,8 +517,21 @@ class GanttTab(QWidget):
                 tag_keys.update(keys)
         tag_items = [(tag, tag) for tag in sorted(tag_keys)]
         if has_no_tag:
-            tag_items.append((_NO_TAG_FILTER_KEY, _NO_TAG_FILTER_LABEL))
+            tag_items.append((_NO_TAG_FILTER_KEY, _NO_JOB_TAG_FILTER_LABEL))
         self.tag_filter.rebuild(tag_items)
+
+        task_tag_keys = set()
+        has_no_task_tag = False
+        for job_id in job_ids:
+            keys = self._job_task_tag_keys(job_id)
+            if keys == {_NO_TAG_FILTER_KEY}:
+                has_no_task_tag = True
+            else:
+                task_tag_keys.update(keys)
+        task_tag_items = [(tag, tag) for tag in sorted(task_tag_keys)]
+        if has_no_task_tag:
+            task_tag_items.append((_NO_TAG_FILTER_KEY, _NO_TASK_TAG_FILTER_LABEL))
+        self.task_tag_filter.rebuild(task_tag_items)
 
     def _refresh_chart(self):
         if self._result_df is None:
@@ -510,9 +547,11 @@ class GanttTab(QWidget):
             df = df[df["Job_Name"].str.contains(search_text, case=False, na=False, regex=False)]
 
         visible_tags = self.tag_filter.visible_keys()
+        visible_task_tags = self.task_tag_filter.visible_keys()
         keep_job_ids = {
             job_id for job_id in df["Job_ID"].unique()
             if self._job_tag_keys(job_id) & visible_tags
+            and self._job_task_tag_keys(job_id) & visible_task_tags
         }
         df = df[df["Job_ID"].isin(keep_job_ids)]
 

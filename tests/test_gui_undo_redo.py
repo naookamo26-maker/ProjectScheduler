@@ -850,6 +850,48 @@ def test_override_days_edit_keeps_its_spinbox_alive(window, qapp):
     assert rows[0]["override_days"] is None  # 1回のUndoで上書きが消える
 
 
+def test_task_tag_edit_persists_and_filters_jobs(window, qapp):
+    """タスク上書き表の「タスク タグ」列（7列目）を編集すると
+    job_task_overrides.tags に保存され、ジョブ タグと同じ正規化（前後の
+    空白除去・重複排除・「, 」区切り）を経て表示に書き戻ること。また、
+    「絞り込み」のタスク タグフィルタで、そのタグを持つタスクを含む
+    ジョブだけに絞り込めること（他の項目を上書きしていないジョブでも
+    タスク タグだけで上書き行が作られ、絞り込み対象になる）。"""
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    window.db.add_workflow_task(wf_id, "タスク1", team_id, 3)
+    job1 = window.db.add_job("J1", wf_id, None, 100)
+    job2 = window.db.add_job("J2", wf_id, None, 100)  # タスク タグを付けない対照
+    window.tabs.setCurrentWidget(window.tab_jobs)
+    window.tab_jobs.refresh_jobs(select_id=job1)
+    qapp.processEvents()
+
+    table = window.tab_jobs.override_table
+    assert table.horizontalHeaderItem(6).text() == "タスク タグ"
+    table.item(0, 6).setText(" 確認 ,レビュー,, 確認")
+    qapp.processEvents()
+
+    rows = window.db.list_job_tasks_with_overrides(job1)
+    assert rows[0]["tags"] == "確認, レビュー"
+    assert table.item(0, 6).text() == "確認, レビュー"  # 正規化した表記へ書き戻る
+
+    # 絞り込みの選択肢は（ジョブ タグと同様）refresh_jobs() 時にDBから
+    # 作り直される。タグ編集直後は即座には反映されないため、タブの
+    # 切り替え等で自然に起きる再読み込みを明示的に呼ぶ。
+    window.tab_jobs.refresh_jobs(select_id=job1)
+    qapp.processEvents()
+
+    task_tag_filter = window.tab_jobs.task_tag_filter
+    assert set(task_tag_filter._checks.keys()) == {"確認", "レビュー", None}
+    task_tag_filter._checks[None].setChecked(False)  # 「（タスク タグなし）」を外す
+    qapp.processEvents()
+
+    jobs_table = window.tab_jobs.jobs_section.table
+    visible_job_ids = {row_id(jobs_table, row) for row in range(jobs_table.rowCount())}
+    assert visible_job_ids == {job1}
+    assert job2 not in visible_job_ids
+
+
 def test_gantt_tab_reports_validation_errors_without_a_modal(window, qapp):
     """未完成なプロジェクトでガントチャートタブに切り替えても、モーダル
     ダイアログではなくタブ内の表示でエラーを知らせること。
@@ -1195,6 +1237,34 @@ def test_gantt_filters_narrow_the_displayed_jobs(window, qapp):
     tag_filter._checks["緊急"].setChecked(False)
     qapp.processEvents()
     assert job_names_in_body_scene() == {"案件ベータ"}
+
+
+def test_gantt_task_tag_filter_narrows_the_displayed_jobs(window, qapp):
+    """タスク タグのチェックを外すと、そのタグを持つタスクを含まないジョブが
+    チャート（本体シーン）から消えること。"""
+    job1, _job2, _team_a, _team_b, wf1, _wf2 = _build_multi_workflow_project(window.db)
+    task1 = window.db.list_workflow_tasks(wf1)[0]["id"]
+    window.db.upsert_job_task_override(job1, task1, tags="要確認")
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    def job_names_in_body_scene():
+        body_scene = window.tab_gantt.view.scene()
+        names = set()
+        for item in body_scene.items():
+            tooltip = item.toolTip()
+            if tooltip and hasattr(item, "pen"):
+                names.add(tooltip.split(" / ")[0])
+        return names
+
+    assert job_names_in_body_scene() == {"案件アルファ", "案件ベータ"}
+
+    task_tag_filter = window.tab_gantt.task_tag_filter
+    assert set(task_tag_filter._checks.keys()) == {"要確認", None}
+    task_tag_filter._checks[None].setChecked(False)  # 「（タスク タグなし）」を外す
+    qapp.processEvents()
+    assert job_names_in_body_scene() == {"案件アルファ"}
 
 
 def test_gantt_search_box_filters_by_job_name(window, qapp):

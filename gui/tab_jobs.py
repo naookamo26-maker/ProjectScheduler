@@ -2,24 +2,28 @@
 タブ3「ジョブ作成」。
 
 左右2分割（QSplitter、既定50/50でユーザーがドラッグ調整可）。
-- 左: ジョブ一覧（名前・ワークフロー・既定マイルストーン・優先度・タグ）を
+- 左: ジョブ一覧（名前・ワークフロー・既定マイルストーン・優先度・ジョブ タグ）を
   縦全体に表示。上部の「絞り込み」は折りたたみ可能なセクション（既定は
   折りたたみ状態。常時展開だと縦幅を取りすぎるため）で、開くとワークフロー
-  ／マイルストーン／タグの3段が現れる（いずれもチェックボックスのOR条件で、
-  3つの間はAND条件。一時的に表示件数を絞るだけでデータは削除されない）。
-  「タグ」列はStretchで残り幅を吸収し、パネル幅にかかわらず横スクロール
-  なしで5列すべてが収まるようにしている。「複製」ボタンで選択中のジョブを
-  タスク上書き・依存先ジョブごと複製できる（このジョブに依存している側は
-  複製先へ引き継がない。db.duplicate_job参照）。タグは単純なカンマ区切りの
-  テキスト入力（例:「緊急, 顧客A」）で、保存時に前後の空白除去・重複排除・
-  「, 」区切りへの正規化を行う（gui/db.py の normalize_tags 参照）。
+  ／マイルストーン／ジョブ タグ／タスク タグの4段が現れる（いずれも
+  チェックボックスのOR条件で、4つの間はAND条件。一時的に表示件数を絞る
+  だけでデータは削除されない。タスク タグは、そのタグを持つタスクを
+  1つでも含むジョブを表示する）。「ジョブ タグ」列はStretchで残り幅を
+  吸収し、パネル幅にかかわらず横スクロールなしで5列すべてが収まるように
+  している。「複製」ボタンで選択中のジョブをタスク上書き・依存先ジョブ
+  ごと複製できる（このジョブに依存している側は複製先へ引き継がない。
+  db.duplicate_job参照）。ジョブ タグは単純なカンマ区切りのテキスト入力
+  （例:「緊急, 顧客A」）で、保存時に前後の空白除去・重複排除・「, 」区切り
+  への正規化を行う（gui/db.py の normalize_tags 参照。タスク タグも同じ
+  仕様・同じ正規化関数を使う）。
 - 右: 上下2分割（QSplitter）で、選択中ジョブのタスク上書き表と依存先ジョブを
   縦に並べる。
   - タスク上書き表: 選択ジョブが使うワークフローのタスク一覧をそのまま
     自動的に表示し（手入力不要）、既定から外れる項目（無効化・日数上書き・
-    マイルストーン上書き・チーム上書き）だけを編集する。既定日数・既定
-    チームは、上書き用のスピンボックス/コンボボックスの特殊表示
-    （「既定（n日）」「（既定: 値）」）に統合し、専用の列は持たない。
+    マイルストーン上書き・チーム上書き・タスク タグ）だけを編集する。
+    既定日数・既定チームは、上書き用のスピンボックス/コンボボックスの
+    特殊表示（「既定（n日）」「（既定: 値）」）に統合し、専用の列は持たない。
+    タスク タグはジョブ タグ列と同じ、常に編集可能なテキスト入力の列。
     既定値のままの行はDBに保存しない（差分のみ保持、gui/db.py参照）。
     ジョブ一覧のセルウィジェット（ワークフロー・マイルストーンのコンボ、
     優先度のスピンボックス）は、**画面に見えている行の分だけ**実体化する
@@ -78,7 +82,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.db import DuplicateNameError, ProjectDatabaseError, normalize_tags, parse_job_tags
+from gui.db import DuplicateNameError, ProjectDatabaseError, normalize_tags, parse_tags
 from gui.widgets_common import (
     ChoiceFilterGroup,
     CollapsibleSection,
@@ -111,11 +115,14 @@ _VISIBLE_ROW_MARGIN = 12
 _BLANK_MILESTONE_LABEL = "（未設定）"
 _UNSPECIFIED_PRIORITY_LABEL = "（未指定）"
 
-# ジョブ一覧の絞り込み（マイルストーン／タグ）で「該当が無いジョブ」を
-# まとめるための擬似キー。実在のID・タグ文字列と衝突しないよう None を使う。
+# ジョブ一覧の絞り込み（マイルストーン／ジョブ タグ／タスク タグ）で
+# 「該当が無いジョブ」をまとめるための擬似キー。実在のID・タグ文字列と
+# 衝突しないよう None を使う（ジョブ タグ・タスク タグの絞り込みは別々の
+# ChoiceFilterGroupなので、同じ値を使っても両者のキー空間は混ざらない）。
 _NO_MILESTONE_FILTER_KEY = None
 _NO_TAG_FILTER_KEY = None
-_NO_TAG_FILTER_LABEL = "（タグなし）"
+_NO_JOB_TAG_FILTER_LABEL = "（ジョブ タグなし）"
+_NO_TASK_TAG_FILTER_LABEL = "（タスク タグなし）"
 
 # コンボボックスの▼やスピンボックスの▲▼のぶん、テキスト幅より少し広くする
 # （列幅は読み取り専用テキストの幅を基準に自動調整されるため）。
@@ -245,9 +252,10 @@ class JobsTab(QWidget):
 
         layout = QVBoxLayout(self)
 
-        # ワークフロー／マイルストーン／タグの3つの絞り込み（いずれもOR条件の
-        # チェックボックス一覧で、3つの間はAND条件で組み合わせる）。常時展開だと
-        # 縦幅を取りすぎるため、まとめて1つの折りたたみセクションに収める。
+        # ワークフロー／マイルストーン／ジョブ タグ／タスク タグの4つの絞り込み
+        # （いずれもOR条件のチェックボックス一覧で、4つの間はAND条件で
+        # 組み合わせる）。常時展開だと縦幅を取りすぎるため、まとめて1つの
+        # 折りたたみセクションに収める。
         self.filters_section = CollapsibleSection("絞り込み")
         layout.addWidget(self.filters_section)
 
@@ -259,12 +267,20 @@ class JobsTab(QWidget):
         self.milestone_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
         self.filters_section.content_layout.addWidget(self.milestone_filter)
 
-        self.tag_filter = ChoiceFilterGroup("タグ")
+        self.tag_filter = ChoiceFilterGroup("ジョブ タグ")
         self.tag_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
         self.filters_section.content_layout.addWidget(self.tag_filter)
 
+        # タスク タグ（job_task_overrides.tags）での絞り込み。そのタグを持つ
+        # タスクを1つでも含むジョブを表示する（gui/db.pyのlist_all_job_task_overrides
+        # から全ジョブ分をまとめて引き、job_id単位のタグ集合に潰して使う。
+        # _task_tag_map参照）。
+        self.task_tag_filter = ChoiceFilterGroup("タスク タグ")
+        self.task_tag_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
+        self.filters_section.content_layout.addWidget(self.task_tag_filter)
+
         self.jobs_section = CrudSection(
-            "ジョブ", ["ジョブ名", "ワークフロー", "既定マイルストーン", "優先度", "タグ"],
+            "ジョブ", ["ジョブ名", "ワークフロー", "既定マイルストーン", "優先度", "ジョブ タグ"],
             on_add=self._add_job, on_delete=self._delete_job, on_duplicate=self._duplicate_job,
         )
         self.jobs_section.table.itemChanged.connect(self._on_job_cell_text_changed)
@@ -275,8 +291,8 @@ class JobsTab(QWidget):
         jobs_header.setSortIndicatorShown(True)
         jobs_header.setSortIndicator(self._sort_column, Qt.AscendingOrder)
         jobs_header.sectionClicked.connect(self._on_job_header_clicked)
-        # 「タグ」列（内容の長さが最も変動する）に残り幅を吸収させ、パネル幅に
-        # かかわらず横スクロールなしで5列すべてが収まるようにする。
+        # 「ジョブ タグ」列（内容の長さが最も変動する）に残り幅を吸収させ、
+        # パネル幅にかかわらず横スクロールなしで5列すべてが収まるようにする。
         jobs_header.setSectionResizeMode(4, QHeaderView.Stretch)
         # スクロールや表示領域の変化に追従して、見えている行にだけ
         # セルウィジェットを用意する。
@@ -287,12 +303,15 @@ class JobsTab(QWidget):
         override_group = QGroupBox("タスク上書き（選択中のジョブ）")
         override_layout = QVBoxLayout(override_group)
 
-        self.override_table = QTableWidget(0, 6)
+        self.override_table = QTableWidget(0, 7)
         self.override_table.setHorizontalHeaderLabels(
-            ["タスク名", "有効", "日数", "マイルストーン", "チーム", "開始固定日"]
+            ["タスク名", "有効", "日数", "マイルストーン", "チーム", "開始固定日", "タスク タグ"]
         )
         self.override_table.verticalHeader().setVisible(False)
         self.override_table.setSelectionMode(QTableWidget.NoSelection)
+        # タスク タグ列は、ジョブ タグ列（ジョブ一覧）と同じくカンマ区切りの
+        # テキスト入力（専用ウィジェットを持たない、常に編集可能なitem）にする。
+        self.override_table.itemChanged.connect(self._on_override_tag_text_changed)
         override_layout.addWidget(self.override_table)
 
         dep_group = QGroupBox("依存先ジョブ（展開してタスク単位の対応を確認・編集）")
@@ -350,18 +369,40 @@ class JobsTab(QWidget):
         if total > 0:
             self.main_splitter.setSizes([total // 2, total - total // 2])
 
-    # -- ワークフロー／マイルストーン／タグの絞り込み ------------------------------------
+    # -- ワークフロー／マイルストーン／ジョブ タグ／タスク タグの絞り込み ---------------------
 
     def _job_tag_keys(self, job):
-        """絞り込み判定に使う、ジョブが持つタグのキー集合。タグが1つも無い
-        ジョブは擬似キー _NO_TAG_FILTER_KEY（＝「（タグなし）」）を持つ扱いにする。"""
-        tags = parse_job_tags(job["tags"])
+        """絞り込み判定に使う、ジョブが持つジョブ タグのキー集合。ジョブ タグが
+        1つも無いジョブは擬似キー _NO_TAG_FILTER_KEY（＝「（ジョブ タグなし）」）
+        を持つ扱いにする。"""
+        tags = parse_tags(job["tags"])
         return set(tags) if tags else {_NO_TAG_FILTER_KEY}
 
-    def _rebuild_filters(self, jobs):
-        """ワークフロー／マイルストーン／タグの絞り込み用チェックボックスを、
-        現在のDBの内容（渡された絞り込み前のジョブ一覧）に合わせて再構築する。
-        既存のチェック状態はキーで可能な限り維持し、新規キーは既定で表示にする。"""
+    def _task_tag_map(self):
+        """job_id -> そのジョブの全タスクが持つタスク タグの集合。
+        db.list_all_job_task_overrides() で全ジョブ分を1回のクエリでまとめて
+        引き、job_id単位のタグ集合に潰す（タスク タグの絞り込みはジョブ単位で
+        「いずれかのタスクがそのタグを持つか」を見るため、タスク側の内訳は
+        絞り込みでは使わない）。"""
+        mapping = {}
+        for o in self.db.list_all_job_task_overrides():
+            tags = parse_tags(o["tags"])
+            if tags:
+                mapping.setdefault(o["job_id"], set()).update(tags)
+        return mapping
+
+    def _job_task_tag_keys(self, job_id, task_tag_map):
+        """絞り込み判定に使う、ジョブが持つタスク タグのキー集合。タスク タグを
+        持つタスクが1つも無いジョブは擬似キー _NO_TAG_FILTER_KEY
+        （＝「（タスク タグなし）」）を持つ扱いにする。"""
+        tags = task_tag_map.get(job_id)
+        return set(tags) if tags else {_NO_TAG_FILTER_KEY}
+
+    def _rebuild_filters(self, jobs, task_tag_map):
+        """ワークフロー／マイルストーン／ジョブ タグ／タスク タグの絞り込み用
+        チェックボックスを、現在のDBの内容（渡された絞り込み前のジョブ一覧）に
+        合わせて再構築する。既存のチェック状態はキーで可能な限り維持し、
+        新規キーは既定で表示にする。"""
         self.workflow_filter.rebuild([(w["id"], w["name"]) for w in self.db.list_workflows()])
         self.milestone_filter.rebuild(
             [(m["id"], m["name"]) for m in self.db.list_milestones()]
@@ -374,8 +415,18 @@ class JobsTab(QWidget):
         tag_keys.discard(_NO_TAG_FILTER_KEY)
         tag_items = [(tag, tag) for tag in sorted(tag_keys)]
         if has_no_tag:
-            tag_items.append((_NO_TAG_FILTER_KEY, _NO_TAG_FILTER_LABEL))
+            tag_items.append((_NO_TAG_FILTER_KEY, _NO_JOB_TAG_FILTER_LABEL))
         self.tag_filter.rebuild(tag_items)
+
+        task_tag_keys = set()
+        for job in jobs:
+            task_tag_keys.update(self._job_task_tag_keys(job["id"], task_tag_map))
+        has_no_task_tag = _NO_TAG_FILTER_KEY in task_tag_keys
+        task_tag_keys.discard(_NO_TAG_FILTER_KEY)
+        task_tag_items = [(tag, tag) for tag in sorted(task_tag_keys)]
+        if has_no_task_tag:
+            task_tag_items.append((_NO_TAG_FILTER_KEY, _NO_TASK_TAG_FILTER_LABEL))
+        self.task_tag_filter.rebuild(task_tag_items)
 
     # -- ジョブ一覧 --------------------------------------------------------------
 
@@ -394,10 +445,12 @@ class JobsTab(QWidget):
 
     def refresh_jobs(self, select_id=None):
         all_jobs = self.db.list_jobs()
-        self._rebuild_filters(all_jobs)
+        task_tag_map = self._task_tag_map()
+        self._rebuild_filters(all_jobs, task_tag_map)
         visible_workflow_ids = self.workflow_filter.visible_keys()
         visible_milestone_keys = self.milestone_filter.visible_keys()
         visible_tag_keys = self.tag_filter.visible_keys()
+        visible_task_tag_keys = self.task_tag_filter.visible_keys()
 
         table = self.jobs_section.table
         table.blockSignals(True)
@@ -415,6 +468,7 @@ class JobsTab(QWidget):
             if job["workflow_id"] in visible_workflow_ids
             and job["default_milestone_id"] in visible_milestone_keys
             and self._job_tag_keys(job) & visible_tag_keys
+            and self._job_task_tag_keys(job["id"], task_tag_map) & visible_task_tag_keys
         ]
         self._job_by_id = {job["id"]: job for job in jobs}
         self._row_by_job_id = {job["id"]: row for row, job in enumerate(jobs)}
@@ -433,9 +487,9 @@ class JobsTab(QWidget):
                 milestone_names.get(job["default_milestone_id"], _BLANK_MILESTONE_LABEL)))
             table.setItem(row, 3, _readonly_item(
                 str(job["priority"]) if job["priority"] is not None else _UNSPECIFIED_PRIORITY_LABEL))
-            # タグはシンプルなテキスト入力（カンマ区切り）のため、ワークフロー
-            # ／マイルストーン／優先度と違って専用ウィジェットを持たず、常に
-            # 編集可能なitemとして表示する（ジョブ名列と同じ扱い）。
+            # ジョブ タグはシンプルなテキスト入力（カンマ区切り）のため、ワーク
+            # フロー／マイルストーン／優先度と違って専用ウィジェットを持たず、
+            # 常に編集可能なitemとして表示する（ジョブ名列と同じ扱い）。
             table.setItem(row, 4, QTableWidgetItem(job["tags"]))
             if job["id"] == select_id:
                 select_row = row
@@ -633,8 +687,8 @@ class JobsTab(QWidget):
             priority = None if raw_priority == 0 else raw_priority
         else:
             priority = job["priority"]
-        # タグ列はウィジェットを持たない（常にitemとしてのみ存在する）ため、
-        # 名前列と同様にテキストをそのまま読む。
+        # ジョブ タグ列はウィジェットを持たない（常にitemとしてのみ存在する）
+        # ため、名前列と同様にテキストをそのまま読む。
         raw_tags = tags_override if tags_override is not None else table.item(row, 4).text()
         tags = normalize_tags(raw_tags)
 
@@ -778,6 +832,11 @@ class JobsTab(QWidget):
             )
             bind_undo_session(pin_edit, self.db, "タスクの開始固定日を変更")
             table.setCellWidget(row, 5, pin_edit)
+
+            # タスク タグ。ジョブ タグ列（ジョブ一覧）と同様、専用ウィジェットを
+            # 持たない常に編集可能なitemとして表示する（itemChangedは
+            # __init__で_on_override_tag_text_changedに一括で繋いである）。
+            table.setItem(row, 6, QTableWidgetItem(r["tags"]))
         table.blockSignals(False)
         auto_size_columns(table, min_width=50)
         table.setColumnWidth(1, 44)  # 「有効」列はチェックボックスのみなので詰める
@@ -800,6 +859,19 @@ class JobsTab(QWidget):
                 table.setCurrentCell(row, max(table.currentColumn(), 0))
                 return
 
+    def _on_override_tag_text_changed(self, item):
+        """タスク上書き表の「タスク タグ」列（6列目）の編集完了時に呼ばれる。
+        他の列（チェックボックス・コンボ・スピンボックス等）はセルウィジェットの
+        シグナルで直接 _on_override_changed に繋いでいるが、タスク タグ列は
+        ジョブ タグ列と同じくウィジェットを持たない常時編集可能なitemのため、
+        テーブル全体のitemChangedを購読してここで列を判定する。"""
+        if item.column() != 6:
+            return
+        workflow_task_id = row_id(self.override_table, item.row())
+        if workflow_task_id is None:
+            return
+        self._on_override_changed(workflow_task_id)
+
     def _on_override_changed(self, workflow_task_id, milestone_changed=False):
         table = self.override_table
         for row in range(table.rowCount()):
@@ -810,14 +882,18 @@ class JobsTab(QWidget):
                 milestone_id = table.cellWidget(row, 3).currentData()
                 team_id = table.cellWidget(row, 4).currentData()
                 start_pin_date = table.cellWidget(row, 5).value()
+                # タスク タグ列はジョブ タグ列と同様にウィジェットを持たない
+                # ため、名前列と同じくitemのテキストをそのまま読む。
+                tags_item = table.item(row, 6)
+                tags = normalize_tags(tags_item.text() if tags_item is not None else "")
 
                 with self.db.undo_group("タスク上書きを変更"):
                     if (not is_active or override_days is not None or milestone_id is not None
-                            or team_id is not None or start_pin_date is not None):
+                            or team_id is not None or start_pin_date is not None or tags):
                         self.db.upsert_job_task_override(
                             self.current_job_id, workflow_task_id, is_active=is_active,
                             override_days=override_days, milestone_id=milestone_id, team_id=team_id,
-                            start_pin_date=start_pin_date,
+                            start_pin_date=start_pin_date, tags=tags,
                         )
                     else:
                         self.db.clear_job_task_override(self.current_job_id, workflow_task_id)
@@ -832,6 +908,15 @@ class JobsTab(QWidget):
                     changed = self.db.cascade_milestone_to_successors(
                         self.current_job_id, workflow_task_id
                     )
+                # ユーザーが入力したカンマ区切りの表記ゆれ（空白の有無等）を
+                # 正規化した表示へ書き戻す（ジョブ タグ列のtags_overrideと同じ
+                # 考え方）。milestone_changed分岐でテーブルを作り直す場合も
+                # 二度手間にはならず、作り直さない分岐（日数・チーム・有効・
+                # タグのみの変更）では必須になる。
+                if tags_item is not None and tags_item.text() != tags:
+                    table.blockSignals(True)
+                    tags_item.setText(tags)
+                    table.blockSignals(False)
                 if raised or changed:
                     messages = []
                     if raised:

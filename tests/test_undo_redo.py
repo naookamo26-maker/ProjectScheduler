@@ -171,6 +171,37 @@ def test_job_tags_are_normalized_on_add_and_update(tmp_path):
     db.close()
 
 
+def test_task_tags_are_normalized_and_default_free_rows_are_cleared(tmp_path):
+    """タスク タグ（job_task_overrides.tags）はジョブ タグ（jobs.tags）と同じ
+    仕様で、カンマ区切りの正規化（前後の空白除去・空要素除去・重複排除・
+    「, 」区切り）を行う。タグ以外の項目が既定のままでも、タグを持てば
+    行が作られ（差分のみ保持）、タグも既定（空）に戻せば
+    clear_job_task_override で行ごと削除できる。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    team = db.add_team("チームA", 1)
+    wf = db.add_workflow("WF1")
+    task = db.add_workflow_task(wf, "A", team, 1)
+    job_id = db.add_job("J1", wf, None, 100)
+
+    # 他の項目は既定のまま、タスク タグだけを設定しても上書き行が作られる。
+    db.upsert_job_task_override(job_id, task, tags=" 確認 ,レビュー,, 確認")
+    row = db.list_job_tasks_with_overrides(job_id)[0]
+    assert row["tags"] == "確認, レビュー"
+    assert (row["is_active"], row["override_days"]) == (1, None)
+
+    all_overrides = db.list_all_job_task_overrides()
+    assert len(all_overrides) == 1
+    assert all_overrides[0]["tags"] == "確認, レビュー"
+
+    # タグを空に戻す（他の項目も既定のまま）と、差分が無くなるため呼び出し側は
+    # clear_job_task_override を呼ぶ想定——ここでは実際に削除されることを確認する。
+    db.clear_job_task_override(job_id, task)
+    row = db.list_job_tasks_with_overrides(job_id)[0]
+    assert row["tags"] == ""
+    assert row["override_id"] is None
+    db.close()
+
+
 def test_job_priority_can_be_left_unspecified(tmp_path):
     """優先度は「未指定」（NULL）を許容する。新規ジョブは既定でこの状態になり、
     スケジューリング側で自動的に最低優先として扱われる
@@ -196,8 +227,9 @@ def test_job_priority_can_be_left_unspecified(tmp_path):
 
 
 def test_duplicate_job_copies_task_overrides_and_outgoing_dependencies(tmp_path):
-    """ジョブの複製は、タスク上書き・依存先ジョブ（ジョブ間依存、テンプレート
-    由来のタスク対応・手動追加のタスク対応の両方）を引き継ぐ。一方、他ジョブが
+    """ジョブの複製は、タスク上書き（タスク タグを含む）・依存先ジョブ
+    （ジョブ間依存、テンプレート由来のタスク対応・手動追加のタスク対応の
+    両方）を引き継ぐ。一方、他ジョブが
     このジョブに依存している側（依存されている側）は引き継がない（複製先へ
     他ジョブが勝手に依存する状態になる副作用を避けるため）。名前の衝突は
     自動的に連番回避されること、Undo1回で全て元に戻ることも確認する。"""
@@ -217,7 +249,8 @@ def test_duplicate_job_copies_task_overrides_and_outgoing_dependencies(tmp_path)
     job_id = db.add_job("J1", wf1, ms, 50, "緊急, 顧客A")
     other_job = db.add_job("J2", wf2, None, 100)
     third_job = db.add_job("J3", wf1, None, 100)
-    db.upsert_job_task_override(job_id, task_a, is_active=False, override_days=3)
+    db.upsert_job_task_override(job_id, task_a, is_active=False, override_days=3,
+                                 tags=" 緊急タスク ,確認")
 
     db.add_job_dependency_link(job_id, other_job)  # テンプレート由来のタスク対応が自動生成される
     db.add_external_dependency(job_id, task_b, other_job, task_y)  # 手動追加分
@@ -239,6 +272,7 @@ def test_duplicate_job_copies_task_overrides_and_outgoing_dependencies(tmp_path)
     new_overrides = db.list_job_tasks_with_overrides(new_job_id)
     override = next(o for o in new_overrides if o["task_name"] == "A")
     assert (override["is_active"], override["override_days"]) == (0, 3)
+    assert override["tags"] == "緊急タスク, 確認"  # タスク タグも複製される
 
     # 依存先ジョブ（このジョブ→他ジョブ）は複製される。
     new_links = db.list_job_dependency_links(new_job_id)
