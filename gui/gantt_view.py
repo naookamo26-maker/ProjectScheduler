@@ -71,6 +71,8 @@ _MILESTONE_LABEL_OFFSET = 56
 _YEAR_LABEL_OFFSET = 38
 _TICK_LABEL_OFFSET = 22
 _GRID_TOP_OFFSET = 10
+# 年の区切り線を、年ラベルの文字の高さから上下にどれだけ広げるか(px)。
+_YEAR_DIVIDER_PADDING = 3
 # ヘッダー／左列ペインの表示専用の余白。ペイン境界の罫線が、隣接する本体側の
 # 続きと見た目上つながって見えるよう、担当範囲の少し先まで描いておく分。
 _PANE_PADDING = 10
@@ -747,14 +749,15 @@ def build_gantt_scenes(df, display, color_by="team"):
         )
         if year_cursor > axis_start:
             # 年の変わり目に区切り線を引く（軸の左端そのものは境目ではないため
-            # 引かない）。ズーム量に関わらず常に表示する（月・週の目盛りと違い
-            # 間引く対象ではない）。
+            # 引かない）。チャート全体（本体・他の行）には伸ばさず、年のラベルを
+            # 書いている行の高さだけに収める（「2026 | 2027」のように、年ラベル
+            # 同士の区切りとして見せるため）。ズーム量に関わらず常に表示する
+            # （月・週の目盛りと違い間引く対象ではない）。
             x = x_of(year_cursor)
-            year_pen = QPen(_YEAR_GRID_COLOR, 1)
-            header_line = header_scene.addLine(x, TOP_MARGIN - _GRID_TOP_OFFSET, x, header_stub_bottom, year_pen)
+            row_top = TOP_MARGIN - _YEAR_LABEL_OFFSET - _YEAR_DIVIDER_PADDING
+            row_bottom = TOP_MARGIN - _YEAR_LABEL_OFFSET + year_metrics.height() + _YEAR_DIVIDER_PADDING
+            header_line = header_scene.addLine(x, row_top, x, row_bottom, QPen(_YEAR_GRID_COLOR, 1))
             header_line.setZValue(-1)
-            body_line = body_scene.addLine(x, TOP_MARGIN, x, chart_bottom, year_pen)
-            body_line.setZValue(-1)
         year_cursor = year_cursor.replace(year=year_cursor.year + 1)
 
     # -- マイルストーン（プロジェクト開始日含む）を縦線で表示 ------------------------
