@@ -31,7 +31,7 @@ PySide6（Qt）に一切依存しないため、GUIを起動せずに単体で�
 | `workflows` | ワークフロー（テンプレートの名前と、一覧での表示順`sort_order`） |
 | `workflow_tasks` | ワークフロー内のタスク（名前・担当チーム・所要日数）。ノードグラフ上の座標は保持しない——依存の深さから毎回計算し直す（下記「座標は保存しない」参照） |
 | `task_dependencies` | ワークフロー内のタスク依存（Internal_Depends相当、predecessor→successor）。`dep_type`が種別（`FS`=完了→開始 / `SS`=開始→開始）、`lag_days`が間に空ける営業日数（負ならリード＝先行の完了前に着手可）。既定は`FS`・`0` |
-| `jobs` | ジョブ（ワークフローの実体化。名前・使用ワークフロー・既定マイルストーン・優先度・タグ）。`tags`はカンマ区切りの1文字列（例:「緊急, 顧客A」）で、書き込み経路（`gui/db.py`の`normalize_tags`）で正規化する |
+| `jobs` | ジョブ（ワークフローの実体化。名前・使用ワークフロー・既定マイルストーン・優先度・タグ）。`priority`はNULL可（未指定）——未指定は`project_scheduler.py`側で自動的に最低優先として扱う。`tags`はカンマ区切りの1文字列（例:「緊急, 顧客A」）で、書き込み経路（`gui/db.py`の`normalize_tags`）で正規化する |
 | `job_task_overrides` | ジョブ単位でのタスク上書き（有効/無効・日数・マイルストーン・チームの差分のみ保持）。`start_pin_date`が開始固定日（実績確定・外部都合のピン留め）。**日付を「入力」として持つ唯一の場所** |
 | `job_dependency_links` | ジョブ単位の依存リンク（「このジョブは、あのジョブに依存する」）。追加時に`workflow_dependency_templates`を参照し、タスク単位の依存を自動展開する |
 | `job_external_dependencies` | ジョブをまたぐタスク依存（External_Dependencies相当）。`source_link_id`で`job_dependency_links`からの自動生成分か手動追加分かを区別する。`is_active`で（自動生成分も含め）削除せず一時的に無効化できる |

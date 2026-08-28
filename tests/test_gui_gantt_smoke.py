@@ -905,6 +905,55 @@ def test_generate_gantt_rejects_circular_dependency(tmp_path):
     db.close()
 
 
+# -- マイルストーン未指定ジョブのフォールバック ---------------------------------------
+
+def test_job_without_milestone_uses_latest_milestone_as_deadline(tmp_path):
+    """ジョブにマイルストーンを設定しなくても、以前のように
+    MissingMilestoneErrorで失敗せず、一番締切が遅いマイルストーンに合わせて
+    日程を組むこと。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    db.set_project("マイルストーン未指定テスト", "2026-01-05")
+    team_id = db.add_team("チームA", 1)
+    db.add_milestone("マイルストーン1", "2026-02-01")
+    latest_ms_id = db.add_milestone("マイルストーン2", "2026-06-30")  # 一番遅い
+    wf_id = db.add_workflow("WF1")
+    db.add_workflow_task(wf_id, "タスク1", team_id, 3)
+    db.add_job("ジョブ1", wf_id, None, 1)  # マイルストーン未指定
+
+    result_df = generate_gantt(db, verbose=False)
+    assert len(result_df) == 1
+    row = result_df.iloc[0]
+    assert row["Milestone_ID"] == f"MS_{latest_ms_id:03d}"
+    assert row["Deadline_Overrun_Days"] == 0
+    db.close()
+
+
+def test_job_without_milestone_and_no_milestones_at_all_uses_five_year_fallback(tmp_path):
+    """マイルストーンがプロジェクトに1件も無く、ジョブのマイルストーンも
+    未指定という「万が一」のケースでも、スケジューリングが失敗しないこと。
+    さらに、仮の締切が「ほぼ即日」等の極端に短いものではなく、実際に
+    開発開始日からおよそ5年後（MISSING_MILESTONE_FALLBACK_YEARS）である
+    ことを、締切に収まる/収まらない所要日数の境界で確認する
+    （distribution_ratio=0.0でASAP配置に固定し、End_Dateを決定的にする）。"""
+    def _overrun_for(task_days):
+        db = ProjectDatabase.create_new(str(tmp_path / f"project_{task_days}.pschedule"))
+        db.set_project("マイルストーン0件テスト", "2026-01-05")
+        team_id = db.add_team("チームA", 1)  # 同時1本のみ＝所要日数がそのまま日程になる
+        wf_id = db.add_workflow("WF1")
+        db.add_workflow_task(wf_id, "タスク1", team_id, task_days)
+        db.add_job("ジョブ1", wf_id, None, 1)
+        result_df = generate_gantt(db, verbose=False, distribution_ratio=0.0)
+        assert len(result_df) == 1
+        db.close()
+        return result_df.iloc[0]["Deadline_Overrun_Days"]
+
+    # 5年（営業日ベースでおよそ1300日）より明確に短い所要日数（約3.6年相当）
+    # では締切に収まり、明確に長い所要日数（約6.8年相当）では超過すること。
+    # 「未指定＝即日締切」等の誤ったフォールバックであれば、短い方も超過する。
+    assert _overrun_for(900) == 0
+    assert _overrun_for(1700) > 0
+
+
 def _build_tight_single_team_project(db_path, team_max_lines):
     """1チーム・独立した3ジョブ（各2日タスク1つ）・共通の厳しい締切（開始日を
     含む1週間）という構成を組み立てる。チームの同時ライン数が1のままでは

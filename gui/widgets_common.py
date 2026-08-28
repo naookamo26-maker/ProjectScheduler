@@ -217,11 +217,25 @@ class OptionalDateEdit(NoWheelDateEdit):
     def set_value(self, iso_str):
         self.setDate(_to_qdate_or_unset(iso_str))
 
+    def _sync_calendar_page_to_today(self):
+        """未設定（_UNSET_DATE=2000-01-01）のままカレンダーを開くと表示月が
+        2000年になってしまい、現在の年まで大きくスクロールする必要がある。
+        実際の値（＝未設定という状態）は変えず、カレンダーの表示ページだけ
+        今日の月に合わせておく（ポップアップが開く直前のイベントで呼ぶ）。"""
+        if self.date() == _UNSET_DATE:
+            today = QDate.currentDate()
+            self.calendarWidget().setCurrentPage(today.year(), today.month())
+
+    def mousePressEvent(self, event):
+        self._sync_calendar_page_to_today()
+        super().mousePressEvent(event)
+
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
             self.setDate(_UNSET_DATE)
             event.accept()
             return
+        self._sync_calendar_page_to_today()
         super().keyPressEvent(event)
 
 

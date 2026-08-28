@@ -933,8 +933,8 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    @undoable(lambda self, name, workflow_id, default_milestone_id, priority, tags="": f"ジョブ「{name}」を追加")
-    def add_job(self, name, workflow_id, default_milestone_id, priority, tags=""):
+    @undoable(lambda self, name, workflow_id, default_milestone_id, priority=None, tags="": f"ジョブ「{name}」を追加")
+    def add_job(self, name, workflow_id, default_milestone_id, priority=None, tags=""):
         try:
             cur = self._conn.execute(
                 "INSERT INTO jobs(name, workflow_id, default_milestone_id, priority, tags) "

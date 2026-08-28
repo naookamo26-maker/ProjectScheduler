@@ -109,6 +109,7 @@ _VISIBLE_ROW_MARGIN = 12
 # 既定マイルストーン未設定の表示（コンボの空欄と、ウィジェットが無い行の
 # テキスト表示とで文言を揃える必要があるため定数にしてある）。
 _BLANK_MILESTONE_LABEL = "（未設定）"
+_UNSPECIFIED_PRIORITY_LABEL = "（未指定）"
 
 # ジョブ一覧の絞り込み（マイルストーン／タグ）で「該当が無いジョブ」を
 # まとめるための擬似キー。実在のID・タグ文字列と衝突しないよう None を使う。
@@ -223,7 +224,7 @@ _JOB_SORT_KEYS = {
     0: lambda j: j["name"],
     1: lambda j: j["workflow_name"],
     2: lambda j: (j["milestone_name"] is None, j["milestone_name"] or ""),
-    3: lambda j: j["priority"],
+    3: lambda j: (j["priority"] is None, j["priority"] or 0),
     4: lambda j: j["tags"],
 }
 
@@ -430,7 +431,8 @@ class JobsTab(QWidget):
             table.setItem(row, 1, _readonly_item(workflow_names.get(job["workflow_id"], "")))
             table.setItem(row, 2, _readonly_item(
                 milestone_names.get(job["default_milestone_id"], _BLANK_MILESTONE_LABEL)))
-            table.setItem(row, 3, _readonly_item(str(job["priority"])))
+            table.setItem(row, 3, _readonly_item(
+                str(job["priority"]) if job["priority"] is not None else _UNSPECIFIED_PRIORITY_LABEL))
             # タグはシンプルなテキスト入力（カンマ区切り）のため、ワークフロー
             # ／マイルストーン／優先度と違って専用ウィジェットを持たず、常に
             # 編集可能なitemとして表示する（ジョブ名列と同じ扱い）。
@@ -497,8 +499,9 @@ class JobsTab(QWidget):
         table.setCellWidget(row, 2, ms_combo)
 
         priority_spin = NoWheelSpinBox()
-        priority_spin.setRange(1, 999)
-        priority_spin.setValue(job["priority"])
+        priority_spin.setRange(0, 999)
+        priority_spin.setSpecialValueText(_UNSPECIFIED_PRIORITY_LABEL)
+        priority_spin.setValue(job["priority"] if job["priority"] is not None else 0)
         priority_spin.valueChanged.connect(
             lambda _val, jid=job_id: self._on_job_field_changed(jid)
         )
@@ -573,7 +576,7 @@ class JobsTab(QWidget):
         name = unique_default_name(existing, "新しいジョブ")
         workflow_id = self.db.list_workflows()[0]["id"]
         try:
-            new_id = self.db.add_job(name, workflow_id, None, 100)
+            new_id = self.db.add_job(name, workflow_id, None, None)
         except DuplicateNameError as e:
             QMessageBox.warning(self, "追加できません", str(e))
             return
@@ -625,7 +628,11 @@ class JobsTab(QWidget):
                        else job["workflow_id"])
         milestone_id = (milestone_widget.currentData() if milestone_widget is not None
                         else job["default_milestone_id"])
-        priority = priority_widget.value() if priority_widget is not None else job["priority"]
+        if priority_widget is not None:
+            raw_priority = priority_widget.value()
+            priority = None if raw_priority == 0 else raw_priority
+        else:
+            priority = job["priority"]
         # タグ列はウィジェットを持たない（常にitemとしてのみ存在する）ため、
         # 名前列と同様にテキストをそのまま読む。
         raw_tags = tags_override if tags_override is not None else table.item(row, 4).text()
