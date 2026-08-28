@@ -1295,6 +1295,12 @@ class WorkflowGraphView(QGraphicsView):
         # 読めなくなる。この独自キャンバスはOSのテーマに関わらず常に明るい
         # 背景で描くようにし、文字色との組み合わせを固定して視認性を保つ。
         self.setBackgroundBrush(QBrush(QColor("#fdfcf9")))
+        # QGraphicsViewは既定でacceptDrops()がTrueになっており、プロジェクト
+        # ファイル（.pschedule）をこのビュー上にドラッグ&ドロップしても
+        # シーンが受け取らないまま素通りせず、MainWindow.dropEvent（ウィンドウ
+        # 全体でのファイルオープン）まで伝播しない。このビュー自体はファイルの
+        # ドロップを扱わないため、明示的に無効化してMainWindow側へ委ねる。
+        self.setAcceptDrops(False)
         self._connecting_from = None
         self._temp_edge = None
         self._panning = False

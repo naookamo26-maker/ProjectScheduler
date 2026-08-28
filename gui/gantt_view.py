@@ -159,6 +159,12 @@ class GanttGraphicsView(QGraphicsView):
         # 背景で描くようにし、文字色との組み合わせを固定して視認性を保つ。
         self.setBackgroundBrush(QBrush(_PANE_BG))
         self.setDragMode(QGraphicsView.RubberBandDrag)
+        # QGraphicsViewは既定でacceptDrops()がTrueになっており、プロジェクト
+        # ファイル（.pschedule）をこのビュー上にドラッグ&ドロップしても
+        # シーンが受け取らないまま素通りせず、MainWindow.dropEvent（ウィンドウ
+        # 全体でのファイルオープン）まで伝播しない。このビュー自体はファイルの
+        # ドロップを扱わないため、明示的に無効化してMainWindow側へ委ねる。
+        self.setAcceptDrops(False)
         self._panning = False
         self._pan_last_pos = None
         h_bar = self.horizontalScrollBar()
@@ -263,6 +269,9 @@ class _FrozenPaneView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setInteractive(False)
         self.setFrameShape(QGraphicsView.NoFrame)
+        # GanttGraphicsView と同じ理由（ファイルドロップをMainWindowへ
+        # 伝播させるため）で無効化する。
+        self.setAcceptDrops(False)
 
 
 class GanttHeaderView(_FrozenPaneView):
