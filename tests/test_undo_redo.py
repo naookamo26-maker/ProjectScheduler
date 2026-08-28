@@ -1249,3 +1249,99 @@ def test_opening_pre_optional_priority_schema_preserves_values_and_allows_null(t
     new_id = db.add_job("J3", 1, None, None)
     assert db.list_jobs()[[j["id"] for j in db.list_jobs()].index(new_id)]["priority"] is None
     db.close()
+
+
+# -- ファイルを開く際の検証（gui/db_schema.py の check_openable） -----------------------
+#
+# open_existing() が、素のsqlite3例外をそのまま伝播させず、原因が分かる
+# ProjectDatabaseError にして送出することを確認する（GUI側の「プロジェクトを
+# 開けませんでした」ダイアログにそのまま表示されるため）。
+
+def test_opening_a_future_schema_version_is_rejected_with_a_clear_message(tmp_path):
+    """回帰テスト: より新しいバージョンのProjectSchedulerで作成されたファイルを
+    開こうとすると、警告もエラーも無く開けてしまっていた（未知のカラム・
+    テーブルは保持されるが、GUI側は古いスキーマの理解のまま動き続け、保存すると
+    新しいバージョンの意味を持つデータが壊れる恐れがあった）。"""
+    path = tmp_path / "future.pschedule"
+    db = ProjectDatabase.create_new(str(path))
+    db.set_project("P", "2025-01-01")
+    db.save()
+    db.close()
+
+    import sqlite3
+    conn = sqlite3.connect(str(path))
+    conn.execute("UPDATE schema_meta SET value = '99' WHERE key = 'schema_version'")
+    conn.execute("ALTER TABLE project ADD COLUMN future_col TEXT")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(ProjectDatabaseError, match="新しいバージョン"):
+        ProjectDatabase.open_existing(str(path))
+
+
+def test_opening_the_current_schema_version_still_works(tmp_path):
+    """境界値: このアプリがまさに書き出すバージョンそのものは、引き続き
+    問題なく開けること（>ではなく>=でない一方向の比較を確認する）。"""
+    path = tmp_path / "current.pschedule"
+    db = ProjectDatabase.create_new(str(path))
+    db.save()
+    db.close()
+
+    reopened = ProjectDatabase.open_existing(str(path))
+    reopened.close()
+
+
+def test_opening_a_file_without_schema_meta_table_is_rejected_with_a_clear_message(tmp_path):
+    """回帰テスト: ProjectSchedulerのファイルではない（別アプリのSQLiteファイル・
+    0バイトのファイル等）場合、以前は 'no such table: schema_meta' という
+    素のsqlite3例外がそのまま「プロジェクトを開けませんでした」ダイアログに
+    出ていた。原因がファイルの中身の問題だと伝わる文言にする。"""
+    import sqlite3
+
+    # 別アプリのSQLiteファイル
+    other = tmp_path / "other.pschedule"
+    conn = sqlite3.connect(str(other))
+    conn.execute("CREATE TABLE foo(x)")
+    conn.commit()
+    conn.close()
+    with pytest.raises(ProjectDatabaseError, match="ProjectScheduler"):
+        ProjectDatabase.open_existing(str(other))
+
+    # 0バイトのファイル（sqlite3的には有効な空DBとして開けてしまう）
+    empty = tmp_path / "empty.pschedule"
+    empty.write_bytes(b"")
+    with pytest.raises(ProjectDatabaseError, match="ProjectScheduler"):
+        ProjectDatabase.open_existing(str(empty))
+
+
+def test_opening_a_non_sqlite_file_is_rejected_with_a_clear_message(tmp_path):
+    """回帰テスト: 中身がSQLiteですらないファイル（例: テキストファイルに
+    .pscheduleの拡張子だけ付けたもの）は、以前は sqlite3.DatabaseError
+    ('file is not a database') がそのまま伝播していた。"""
+    path = tmp_path / "note.pschedule"
+    path.write_text("これはプロジェクトファイルではありません")
+
+    with pytest.raises(ProjectDatabaseError, match="読み込めませんでした"):
+        ProjectDatabase.open_existing(str(path))
+
+
+def test_opening_a_file_with_schema_meta_table_but_no_version_row_is_rejected(tmp_path):
+    """回帰テスト: schema_metaテーブルはあるがschema_versionの行が無いファイルは、
+    以前は「バージョン1」として扱われ、全migrationがv1から適用されていた。
+    現行スキーマの列に対して重複してALTER TABLEしようとして
+    'duplicate column name' で例外になっていた（本来のバージョンが1でない
+    限り、この巻き戻しは常に壊れる）。"""
+    import sqlite3
+
+    path = tmp_path / "norow.pschedule"
+    db = ProjectDatabase.create_new(str(path))
+    db.save()
+    db.close()
+
+    conn = sqlite3.connect(str(path))
+    conn.execute("DELETE FROM schema_meta")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(ProjectDatabaseError, match="壊れています"):
+        ProjectDatabase.open_existing(str(path))

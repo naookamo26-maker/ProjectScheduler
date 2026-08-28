@@ -18,6 +18,76 @@ CRUD本体（gui/db.py）から分離しているのは、この2つが「増え
 
 SCHEMA_VERSION = "14"
 
+
+class SchemaError(Exception):
+    """開いたファイルが、このバージョンのProjectSchedulerでは扱えないと
+    判断した場合に送出する（ProjectSchedulerのファイルではない、または
+    より新しいバージョンで作成されている）。gui/db.py の open_existing() が
+    ProjectDatabaseError に読み替えて送出する（db_schema.py はgui/db.pyの
+    例外階層に依存させたくないため、独立した例外として定義する）。"""
+
+
+def check_openable(conn):
+    """ファイルを開いてよいかどうかを、migrate() を呼ぶ前に検証する。
+
+    1. `schema_meta` テーブルが無ければ拒否する。`_SCHEMA_SQL` は
+       スキーマv1の時点から常にこのテーブルを含んでいるため、テーブル
+       自体が無いことは「ProjectSchedulerのプロジェクトファイルではない」
+       ことの強い手がかりになる（別アプリのSQLiteファイル、空ファイル等）。
+       検証しないと `no such table: schema_meta` という素のsqlite3例外が
+       そのままGUIの「プロジェクトを開けませんでした」ダイアログに出て、
+       原因がファイルの中身の問題だと伝わらない。
+    2. `schema_version` の行が無ければ拒否する。`_SCHEMA_SQL` は
+       スキーマv1の時点から常に`create_new()`でこの行を挿入しているため
+       （同梱の実サンプルも例外なく持つ）、テーブルはあるのに行が無い状態は
+       実在する正規のファイルには起こらない。かつては「schema_meta導入前の
+       最初期のファイル」を想定してバージョン"1"として扱い読み進める
+       フォールバックがあったが、これは未検証のまま壊れていた——例えば
+       v14で作られたファイルからこの行だけが失われると、v1からの全
+       migrationが素通りせず適用され、`workflows.sort_order`のような
+       既に存在する列を再度ALTER TABLEしようとして
+       `duplicate column name`で例外になる。
+    3. `schema_version` が、このアプリが対応する `SCHEMA_VERSION` より
+       新しい場合は拒否する。ここで弾かずに読み進めると、未知のカラム・
+       テーブルはそのまま素通りしつつGUI側だけが理解できないスキーマに
+       対して動き続けてしまい、保存すると新しいバージョンの意味を持つ
+       データが（旧バージョンの認識のまま）書き換わる恐れがある。
+
+    戻り値: 検証を通過した場合は何も返さない（None）。
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'"
+    ).fetchone()
+    if not exists:
+        raise SchemaError(
+            "ProjectSchedulerのプロジェクトファイル（.pschedule）ではないようです"
+            "（schema_metaテーブルが見つかりません）。"
+        )
+    row = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+    ).fetchone()
+    if row is None:
+        raise SchemaError(
+            "ProjectSchedulerのプロジェクトファイル（.pschedule）として"
+            "壊れています（schema_versionの記録が見つかりません）。"
+        )
+    version = row["value"]
+    try:
+        version_num = int(version)
+        current_num = int(SCHEMA_VERSION)
+    except (TypeError, ValueError):
+        raise SchemaError(
+            f"schema_versionの値 '{version}' を解釈できません。"
+            "ファイルが壊れている可能性があります。"
+        ) from None
+    if version_num > current_num:
+        raise SchemaError(
+            "このファイルはより新しいバージョンのProjectSchedulerで作成されています"
+            f"（ファイルのバージョン: {version}、このアプリが対応するバージョン: "
+            f"{SCHEMA_VERSION}）。アプリを最新版に更新してから開いてください。"
+        )
+
+
 _SCHEMA_SQL = """
 CREATE TABLE schema_meta (
     key   TEXT PRIMARY KEY,

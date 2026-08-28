@@ -32,7 +32,13 @@ from datetime import date
 from pathlib import Path
 
 # 再エクスポート: 呼び出し側・テストからは従来どおり gui.db から参照できるようにする。
-from gui.db_schema import SCHEMA_VERSION, _SCHEMA_SQL, migrate as _migrate_schema  # noqa: F401
+from gui.db_schema import (  # noqa: F401
+    SCHEMA_VERSION,
+    SchemaError,
+    _SCHEMA_SQL,
+    check_openable,
+    migrate as _migrate_schema,
+)
 
 
 class ProjectDatabaseError(Exception):
@@ -364,15 +370,47 @@ class ProjectDatabase:
 
     @classmethod
     def open_existing(cls, path):
+        """既存の`.pschedule`ファイルを開く。
+
+        次の場合は、素のsqlite3例外をそのまま伝播させず、原因が分かる
+        `ProjectDatabaseError`にして送出する（GUI側は例外の`str()`を
+        そのまま「プロジェクトを開けませんでした」ダイアログに出すため、
+        素のsqlite3例外だと「file is not a database」のような技術的な
+        文言しか伝わらない）。
+
+        - SQLiteファイルとして開けない（中身が破損している、または
+          そもそもSQLiteファイルではない）
+        - `schema_meta`テーブルが無い（ProjectSchedulerのファイルではない
+          可能性が高い）
+        - `schema_version`が、このアプリが対応するバージョンより新しい
+          （新しいバージョンのProjectSchedulerで作成されたファイルを、
+          古いアプリで開こうとしている）。ここで拒否しないと、知らない
+          カラム・テーブルはそのまま保持しつつGUIだけが理解できない
+          スキーマに対して動き続けてしまい、保存すると新しいバージョンの
+          意味を持つデータが（旧バージョンの認識のまま）書き換わる恐れが
+          あるため（詳細は gui/db_schema.py の check_openable() 参照）。
+        """
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"プロジェクトファイルが見つかりません: {path}")
         disk_conn = sqlite3.connect(str(p))
         try:
             db = cls(path)
-            disk_conn.backup(db._conn)
+            try:
+                disk_conn.backup(db._conn)
+            except sqlite3.DatabaseError as e:
+                raise ProjectDatabaseError(
+                    f"ProjectSchedulerのプロジェクトファイル（.pschedule）として"
+                    f"読み込めませんでした（{e}）。ファイルが破損しているか、"
+                    "SQLite形式ではない可能性があります。"
+                ) from e
         finally:
             disk_conn.close()
+        try:
+            check_openable(db._conn)
+        except SchemaError as e:
+            db.close()
+            raise ProjectDatabaseError(str(e)) from e
         _migrate_schema(db._conn)
         db._dirty = False
         return db
