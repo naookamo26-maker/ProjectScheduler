@@ -48,6 +48,11 @@ BAR_MARGIN = 3
 # ときでも、角が丸まっていることで境目を視認しやすくする。
 BAR_CORNER_RADIUS = 3
 LEFT_MARGIN = 190
+# 左列のジョブ名の左に置く、ワークフロー識別用の色スペース（幅・文字との間隔）。
+# 複数ワークフローのジョブが混在して並ぶ表示でも、どのワークフローのジョブか
+# 一目で分かるようにするため。
+_JOB_SWATCH_WIDTH = 10
+_JOB_SWATCH_GAP = 4
 # ヘッダーは上から (1)マイルストーン名 (2)年 (3)月日 の3段構成のため、
 # 目盛り1段のみだった頃より高さが必要。
 TOP_MARGIN = 58
@@ -637,15 +642,15 @@ def build_gantt_scenes(df, display, color_by="team"):
     # -- ジョブごとにレーン詰め、Y座標を決める --------------------------------------
     job_order = df.groupby("Job_ID")["Start_Date"].min().sort_values().index.tolist()
     y_cursor = TOP_MARGIN
-    job_blocks = []  # (job_id, job_name, y_top, y_bottom, [(task_row, lane), ...])
+    job_blocks = []  # (job_id, job_name, workflow_id, y_top, y_bottom, [(task_row, lane), ...])
     for job_id in job_order:
         job_rows = df[df["Job_ID"] == job_id].sort_values("Start_Date")
         tasks = [{"start": r["Start_Date"], "end": r["End_Date"]} for _, r in job_rows.iterrows()]
         lanes, lane_count = _pack_lanes(tasks)
         y_top = y_cursor
         y_bottom = y_top + lane_count * ROW_HEIGHT
-        job_blocks.append((job_id, str(job_rows.iloc[0]["Job_Name"]), y_top, y_bottom,
-                            list(zip(job_rows.to_dict("records"), lanes))))
+        job_blocks.append((job_id, str(job_rows.iloc[0]["Job_Name"]), job_rows.iloc[0]["Workflow_ID"],
+                            y_top, y_bottom, list(zip(job_rows.to_dict("records"), lanes))))
         y_cursor = y_bottom + JOB_GAP
 
     chart_bottom = y_cursor
@@ -791,6 +796,7 @@ def build_gantt_scenes(df, display, color_by="team"):
     # -- ジョブ／タスクのバーを描画 ---------------------------------------------------
     team_names = display.get("team_names") or {}
     workflow_names = display.get("workflow_names") or {}
+    workflow_colors = display.get("workflow_colors") or {}
     if color_by == "workflow":
         color_map, color_key = (display.get("workflow_colors") or {}), "Workflow_ID"
     else:
@@ -807,10 +813,26 @@ def build_gantt_scenes(df, display, color_by="team"):
     # 参照だけ残しておく。
     body_scene.gantt_task_labels = []
 
-    for job_id, job_name, y_top, y_bottom, task_lane_pairs in job_blocks:
+    job_metrics = QFontMetrics(job_font)
+    swatch_height = job_metrics.height()
+    for job_id, job_name, job_workflow_id, y_top, y_bottom, task_lane_pairs in job_blocks:
+        # ワークフロー識別用の色スペース。ItemIgnoresTransformationsを立てて
+        # ジョブ名ラベルと同様に常に一定の画面サイズで表示する（縦にズームしても
+        # 太さが変わらないようにするため）。
+        swatch_color = QColor(workflow_colors.get(job_workflow_id, _DEFAULT_BAR_COLOR))
+        swatch = column_scene.addRect(
+            0, 0, _JOB_SWATCH_WIDTH, swatch_height,
+            QPen(_NORMAL_BORDER_COLOR, _NORMAL_BORDER_WIDTH), QBrush(swatch_color),
+        )
+        swatch.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        swatch.setPos(4, (y_top + y_bottom) / 2 - swatch_height / 2)
+        swatch.setToolTip(f"ワークフロー: {workflow_names.get(job_workflow_id, job_workflow_id)}")
+
         _add_fixed_size_label(
-            column_scene, _elide_text(job_name, job_font, LEFT_MARGIN - 12), job_font,
-            (4, (y_top + y_bottom) / 2 - 8),
+            column_scene,
+            _elide_text(job_name, job_font, LEFT_MARGIN - 12 - _JOB_SWATCH_WIDTH - _JOB_SWATCH_GAP),
+            job_font,
+            (4 + _JOB_SWATCH_WIDTH + _JOB_SWATCH_GAP, (y_top + y_bottom) / 2 - 8),
         )
 
         for r, lane in task_lane_pairs:

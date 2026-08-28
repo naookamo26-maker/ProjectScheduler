@@ -55,7 +55,7 @@ setCellWidget 1.5秒）。そこで次の2点で行数への依存を切って�
 ため、単位を開いたままウィジェットを破棄すると閉じられなくなるため。
 """
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -72,15 +72,16 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
-    QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from gui.db import DuplicateNameError, ProjectDatabaseError, normalize_tags
+from gui.db import DuplicateNameError, ProjectDatabaseError, normalize_tags, parse_job_tags
 from gui.widgets_common import (
+    ChoiceFilterGroup,
+    CollapsibleSection,
     CrudSection,
     DefaultAwareSpinBox,
     NoWheelComboBox,
@@ -123,89 +124,6 @@ def _readonly_item(text):
     item = QTableWidgetItem(text)
     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
     return item
-
-
-class _CollapsibleSection(QWidget):
-    """折りたたみ可能なセクション。見出しをクリックすると中身の表示/非表示が
-    切り替わる。ジョブ一覧の絞り込み（ワークフロー／マイルストーン／タグの
-    3段）が常時展開だと縦幅を取りすぎるため、まとめて1つに畳めるようにする。"""
-
-    def __init__(self, title, parent=None):
-        super().__init__(parent)
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-
-        self._toggle_btn = QToolButton()
-        self._toggle_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._toggle_btn.setArrowType(Qt.RightArrow)
-        self._toggle_btn.setText(title)
-        self._toggle_btn.setCheckable(True)
-        self._toggle_btn.setChecked(False)
-        self._toggle_btn.setStyleSheet("QToolButton { border: none; font-weight: bold; }")
-        self._toggle_btn.clicked.connect(self._on_toggled)
-        outer.addWidget(self._toggle_btn)
-
-        self.content = QWidget()
-        self.content_layout = QVBoxLayout(self.content)
-        self.content_layout.setContentsMargins(0, 0, 0, 0)
-        self.content.setVisible(False)  # 既定は折りたたんだ状態
-        outer.addWidget(self.content)
-
-    def _on_toggled(self, checked):
-        self._toggle_btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
-        self.content.setVisible(checked)
-
-
-class _ChoiceFilterGroup(QGroupBox):
-    """チェックボックス一覧による絞り込み（OR条件）。ジョブ一覧の
-    ワークフロー／マイルストーン／タグの3つの絞り込みで構造を使い回す。"""
-
-    changed = Signal()
-
-    def __init__(self, title, parent=None):
-        super().__init__(title, parent)
-        self._checks = {}  # key -> QCheckBox
-        layout = QHBoxLayout(self)
-        select_all_btn = QPushButton("すべて表示")
-        select_all_btn.clicked.connect(lambda: self.set_all(True))
-        select_none_btn = QPushButton("すべて解除")
-        select_none_btn.clicked.connect(lambda: self.set_all(False))
-        layout.addWidget(select_all_btn)
-        layout.addWidget(select_none_btn)
-        layout.addSpacing(16)
-        self._checks_layout = QHBoxLayout()
-        layout.addLayout(self._checks_layout)
-        layout.addStretch(1)
-
-    def rebuild(self, items):
-        """items: [(key, label), ...]。既存のチェック状態はキーで可能な限り
-        維持し、新規キーは既定でチェック済み（＝表示）にする。"""
-        previous_checked = {k for k, cb in self._checks.items() if cb.isChecked()}
-        previous_unchecked = {k for k, cb in self._checks.items() if not cb.isChecked()}
-        while self._checks_layout.count():
-            item = self._checks_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self._checks = {}
-        for key, label in items:
-            checked = key not in previous_unchecked or key in previous_checked
-            checkbox = QCheckBox(label)
-            checkbox.setChecked(checked)  # connect前に設定し、構築時のstateChangedを発火させない
-            checkbox.stateChanged.connect(lambda _state: self.changed.emit())
-            self._checks_layout.addWidget(checkbox)
-            self._checks[key] = checkbox
-
-    def set_all(self, checked):
-        # 一括変更中に途中でchanged経由のrebuildが走るとループ中のウィジェットが
-        # 差し替わってしまうため、シグナルを止めてから最後にまとめて一度だけ発火する。
-        for checkbox in self._checks.values():
-            checkbox.blockSignals(True)
-            checkbox.setChecked(checked)
-            checkbox.blockSignals(False)
-        self.changed.emit()
-
-    def visible_keys(self):
-        return {k for k, cb in self._checks.items() if cb.isChecked()}
 
 
 class JobDependencyLinkDialog(QDialog):
@@ -329,18 +247,18 @@ class JobsTab(QWidget):
         # ワークフロー／マイルストーン／タグの3つの絞り込み（いずれもOR条件の
         # チェックボックス一覧で、3つの間はAND条件で組み合わせる）。常時展開だと
         # 縦幅を取りすぎるため、まとめて1つの折りたたみセクションに収める。
-        self.filters_section = _CollapsibleSection("絞り込み")
+        self.filters_section = CollapsibleSection("絞り込み")
         layout.addWidget(self.filters_section)
 
-        self.workflow_filter = _ChoiceFilterGroup("ワークフロー")
+        self.workflow_filter = ChoiceFilterGroup("ワークフロー")
         self.workflow_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
         self.filters_section.content_layout.addWidget(self.workflow_filter)
 
-        self.milestone_filter = _ChoiceFilterGroup("マイルストーン")
+        self.milestone_filter = ChoiceFilterGroup("マイルストーン")
         self.milestone_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
         self.filters_section.content_layout.addWidget(self.milestone_filter)
 
-        self.tag_filter = _ChoiceFilterGroup("タグ")
+        self.tag_filter = ChoiceFilterGroup("タグ")
         self.tag_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
         self.filters_section.content_layout.addWidget(self.tag_filter)
 
@@ -436,7 +354,7 @@ class JobsTab(QWidget):
     def _job_tag_keys(self, job):
         """絞り込み判定に使う、ジョブが持つタグのキー集合。タグが1つも無い
         ジョブは擬似キー _NO_TAG_FILTER_KEY（＝「（タグなし）」）を持つ扱いにする。"""
-        tags = [t.strip() for t in (job["tags"] or "").split(",") if t.strip()]
+        tags = parse_job_tags(job["tags"])
         return set(tags) if tags else {_NO_TAG_FILTER_KEY}
 
     def _rebuild_filters(self, jobs):

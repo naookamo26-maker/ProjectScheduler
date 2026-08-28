@@ -1070,8 +1070,6 @@ def test_gantt_chart_draws_overrun_tasks_with_a_red_border(window, qapp):
     window.db.set_project("枠線テスト", "2026-01-05")
     team_id = window.db.add_team("チームA", 1)  # 同時1本のみ
     ms_id = window.db.add_milestone("マイルストーン1", "2026-01-09")  # 同じ週の金曜
-    # チャートは「対象」で選んだワークフロー1件分だけを描くため、
-    # 間に合うタスクと間に合わないタスクが同じ図に載るよう1つにまとめる
     wf_id = window.db.add_workflow("WF")
     window.db.add_workflow_task(wf_id, "タスク", team_id, 2)
     for i in range(3):
@@ -1135,6 +1133,113 @@ def test_hidden_gantt_tab_is_not_refreshed_during_undo(window, qapp):
         window.on_undo()
         qapp.processEvents()
         mocked.assert_not_called()
+
+
+# -- ガントチャートタブ: 絞り込み（ワークフロー／チーム／タグ・文字列検索・間に合わないジョブ） --
+
+def _build_multi_workflow_project(db):
+    """複数ワークフロー・複数チームが混在するプロジェクト（絞り込みのテスト用）。
+    ジョブ2（WF2）だけが1本のチームで詰まり、締切に間に合わなくなる。"""
+    db.set_project("絞り込みテスト", "2026-01-05")
+    team_a = db.add_team("チームA", 2)
+    team_b = db.add_team("チームB", 1)
+    ms_id = db.add_milestone("MS1", "2026-01-09")  # 同じ週の金曜（間に合わせづらい締切）
+    wf1 = db.add_workflow("WF1")
+    db.add_workflow_task(wf1, "タスク", team_a, 1)
+    wf2 = db.add_workflow("WF2")
+    db.add_workflow_task(wf2, "タスク", team_b, 5)  # 締切に間に合わない所要日数
+    job1 = db.add_job("案件アルファ", wf1, ms_id, 100, "緊急")
+    job2 = db.add_job("案件ベータ", wf2, ms_id, 100, "通常")
+    return job1, job2, team_a, team_b, wf1, wf2
+
+
+def test_gantt_filters_narrow_the_displayed_jobs(window, qapp):
+    """ワークフロー／チーム／タグのチェックを外すと、該当するジョブのタスクが
+    チャート（本体シーン）から消えること（スケジューリング結果自体は変わらない）。"""
+    job1, job2, _team_a, _team_b, wf1, wf2 = _build_multi_workflow_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    def job_names_in_body_scene():
+        body_scene = window.tab_gantt.view.scene()
+        names = set()
+        for item in body_scene.items():
+            tooltip = item.toolTip()
+            if tooltip and hasattr(item, "pen"):
+                names.add(tooltip.split(" / ")[0])
+        return names
+
+    assert job_names_in_body_scene() == {"案件アルファ", "案件ベータ"}
+
+    wf1_str = window.tab_gantt._display["workflow_names"]
+    wf1_id = next(k for k, v in wf1_str.items() if v == "WF1")
+    window.tab_gantt.workflow_filter._checks[wf1_id].setChecked(False)
+    qapp.processEvents()
+    assert job_names_in_body_scene() == {"案件ベータ"}
+    window.tab_gantt.workflow_filter._checks[wf1_id].setChecked(True)
+    qapp.processEvents()
+
+    tag_filter = window.tab_gantt.tag_filter
+    tag_filter._checks["緊急"].setChecked(False)
+    qapp.processEvents()
+    assert job_names_in_body_scene() == {"案件ベータ"}
+
+
+def test_gantt_search_box_filters_by_job_name(window, qapp):
+    """ジョブ名の文字列検索で、一致しないジョブが表示から除外されること。"""
+    _build_multi_workflow_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    window.tab_gantt.search_edit.setText("アルファ")
+    qapp.processEvents()
+
+    body_scene = window.tab_gantt.view.scene()
+    tooltips = [item.toolTip() for item in body_scene.items() if item.toolTip()]
+    assert any("案件アルファ" in t for t in tooltips)
+    assert not any("案件ベータ" in t for t in tooltips)
+
+
+def test_gantt_overrun_only_checkbox_filters_to_late_jobs(window, qapp):
+    """「間に合わないジョブのみ表示」をオンにすると、締切に間に合うジョブが
+    チャートから消え、間に合わないジョブだけが残ること。"""
+    _build_multi_workflow_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    df = window.tab_gantt._result_df
+    assert (df["Deadline_Overrun_Days"] > 0).any()  # 前提: 実際に超過するジョブがある
+
+    window.tab_gantt.overrun_only_checkbox.setChecked(True)
+    qapp.processEvents()
+
+    body_scene = window.tab_gantt.view.scene()
+    tooltips = [item.toolTip() for item in body_scene.items() if item.toolTip()]
+    assert any("案件ベータ" in t for t in tooltips)
+    assert not any("案件アルファ" in t for t in tooltips)
+
+
+def test_gantt_column_shows_workflow_color_swatch_next_to_job_name(window, qapp):
+    """左列のジョブ名の左に、ワークフロー別の色スペースが表示されること
+    （複数ワークフローが混在する表示で、どのワークフローのジョブか見分ける
+    ため）。"""
+    from PySide6.QtWidgets import QGraphicsRectItem
+
+    from gui.gantt_view import _JOB_SWATCH_WIDTH
+
+    _build_multi_workflow_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    column_scene = window.tab_gantt.view.column.scene()
+    swatches = {
+        item.toolTip(): item.brush().color().name()
+        for item in column_scene.items()
+        if isinstance(item, QGraphicsRectItem) and item.rect().width() == _JOB_SWATCH_WIDTH
+    }
+    assert "ワークフロー: WF1" in swatches
+    assert "ワークフロー: WF2" in swatches
+    assert swatches["ワークフロー: WF1"] != swatches["ワークフロー: WF2"]
 
 
 # -- ワークフロー設計タブ: ノードビュー／テーブルビューの切り替え ---------------------------

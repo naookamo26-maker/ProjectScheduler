@@ -177,6 +177,8 @@ def build_display(db):
         - milestone_markers: [(id, 名前, pd.Timestamp), ...]（プロジェクト開始日を含む、締切順）
         - common_holiday_dates: {datetime.date, ...}（全チーム共通の休業日）
         - holidays_by_team: {Team_ID(文字列): {datetime.date, ...}}（チーム別の休業日）
+        - job_tags: {Job_ID(文字列): タグ（カンマ区切りの1文字列）}（ガントチャート
+          タブのタグ絞り込み用。result_dfにはタグを持たせていないため）
     """
     teams = db.list_teams()
     team_str = {t["id"]: _fmt("TEAM", t["id"]) for t in teams}
@@ -219,11 +221,14 @@ def build_display(db):
         else:
             holidays_by_team.setdefault(team_str[h["team_id"]], set()).add(d)
 
+    job_tags = {_fmt("JOB", j["id"]): j["tags"] for j in db.list_jobs()}
+
     return {
         "team_names": team_names, "team_colors": team_colors,
         "workflow_names": workflow_names, "workflow_colors": workflow_colors,
         "milestone_markers": milestone_markers,
         "common_holiday_dates": common_holiday_dates, "holidays_by_team": holidays_by_team,
+        "job_tags": job_tags,
     }
 
 

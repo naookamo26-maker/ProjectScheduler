@@ -120,6 +120,14 @@ def normalize_tags(tags):
     return ", ".join(result)
 
 
+def parse_job_tags(tags):
+    """ジョブのタグ文字列（カンマ区切り）を、タグ名のリストに分解する。
+    normalize_tagsで正規化済みの文字列を主に想定するが、前後の空白除去・
+    空要素の除外は独立して行うため、正規化前の生の文字列にも使える。
+    ジョブタブ・ガントチャートタブのタグ絞り込みで共通して使う。"""
+    return [t.strip() for t in (tags or "").split(",") if t.strip()]
+
+
 def undoable(label):
     """ProjectDatabaseの変更系メソッドに付け、Undo/Redoの記録対象にするデコレータ。
 
