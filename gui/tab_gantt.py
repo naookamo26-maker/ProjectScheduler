@@ -189,11 +189,18 @@ class GanttTab(QWidget):
         # /eventFilter参照）。ドラッグ中に毎回再計算すると重い上にUndoできない
         # 中間状態が大量にできてしまうため、スライダーを離した時にだけ
         # DBへ書き込み・再計算する（_on_placement_slider_released）。
-        self.placement_group = QGroupBox("配置コントロール", self.view)
+        # QGroupBoxのネイティブタイトルは枠線をまたぐ固定位置にしか描画できない
+        # ため、タイトルは通常のQLabelとして枠内に置き、位置を自由に調整できる
+        # ようにする（QGroupBoxはタイトル無しの単なる枠として使う）。
+        self.placement_group = QGroupBox("", self.view)
         self.placement_group.setFixedWidth(_PLACEMENT_CONTROL_WIDTH)
+        outer_layout = QVBoxLayout(self.placement_group)
+        placement_title = QLabel("配置コントロール")
+        outer_layout.addWidget(placement_title)
         # ガントチャートの縦方向を圧迫しないよう、ラベル・スライダー・
         # スピンボックスを縦に積まず1行に収める（そのぶん幅を確保する）。
-        placement_layout = QHBoxLayout(self.placement_group)
+        placement_layout = QHBoxLayout()
+        outer_layout.addLayout(placement_layout)
         placement_layout.addWidget(QLabel("最速"))
         self.placement_slider = NoWheelSlider(Qt.Horizontal)
         self.placement_slider.setRange(0, 100)
