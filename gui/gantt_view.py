@@ -53,6 +53,10 @@ LEFT_MARGIN = 190
 TOP_MARGIN = 58
 JOB_GAP = 6
 AXIS_MARGIN_DAYS = 3
+# 日単位の補助線を表示し始める、画面上の1週間ぶんの幅(px)のしきい値。
+# これを下回る（＝十分に拡大していない）間は補助線を出さない。1週間の
+# 目盛り間隔が十分に広がって初めて意味を持つ情報のため。
+_DAY_GRID_MIN_WEEK_PX = 140
 # ヘッダー内の各段のY位置（TOP_MARGINからの差分。値が大きいほど上）。
 _MILESTONE_LABEL_OFFSET = 56
 _YEAR_LABEL_OFFSET = 38
@@ -71,6 +75,9 @@ _TASK_LABEL_V_MARGIN_PX = 2
 _TASK_LABEL_LINE_GAP_PX = 2
 
 _GRID_COLOR = QColor("#e1e0d9")
+# 日単位の補助線・間引かれた週の目盛り線用。主線（_GRID_COLOR）よりさらに
+# 薄くし、常時表示しても本体のバーの視認性を落とさないようにする。
+_AUX_GRID_COLOR = QColor("#eeede6")
 _MILESTONE_COLOR = QColor("#c0392b")
 _PROJECT_START_COLOR = QColor("#52514e")
 _DEFAULT_BAR_COLOR = "#cbc9c2"
@@ -85,8 +92,8 @@ _CONSTRAINT_BORDER_COLOR = QColor("#b26a00")
 _CONSTRAINT_BORDER_WIDTH = 3
 _NORMAL_BORDER_COLOR = QColor("#0b0b0b")
 _NORMAL_BORDER_WIDTH = 1
-# 本体シーンの重ね順: 目盛り・区切り線(-2〜-1) < 通常のバー(0) <
-# 締切超過のバー(1) < タスク名ラベル(2)
+# 本体シーンの重ね順: 日単位の補助線(-3) < 週の目盛り・区切り線(-2〜-1) <
+# 通常のバー(0) < 締切超過のバー(1) < タスク名ラベル(2)
 _OVERRUN_BAR_Z = 1
 _TASK_LABEL_Z = 2
 _PANE_BG = QColor("#fdfcf9")
@@ -355,9 +362,53 @@ class FrozenGanttPane(QWidget):
         self.column.setTransform(column_transform)
         self.column.verticalScrollBar().setValue(self.body.verticalScrollBar().value())
 
+        self._update_axis_density(sx)
         self._center_milestone_labels(sx)
         self._center_tick_labels(sx)
         self._center_task_labels(sx, sy)
+
+    def _update_axis_density(self, sx):
+        """現在の横方向の拡縮率（sx）に応じて、日付軸の見せ方を切り替える。
+
+        - 拡大時（1週間の目盛り間隔が_DAY_GRID_MIN_WEEK_PX以上に広がった）:
+          日単位の補助線を表示する。
+        - 縮小時（1週間の目盛り間隔が"MM/DD"ラベルの幅より狭くなった）:
+          月が変わった直後の週の目盛り（月初めの線）以外は、線を補助線化して
+          ラベルを消す。月初めの線のラベルは年の行と重複しないよう月の数字
+          だけに簡略化する（例:「03/02」→「3」）。
+        - それ以外（通常時）: 全ての週の目盛りに主線と"MM/DD"ラベルを表示する
+          （build_gantt_scenesが作った直後の状態）。
+
+        シーンは作り直さず、あらかじめ用意済みの線・ラベルの表示/非表示・
+        ペイン・文言だけを切り替える。"""
+        scene = self.header.scene()
+        if scene is None or sx <= 0:
+            return
+        week_px = DAY_WIDTH * 7 * sx
+        show_day_grid = week_px >= _DAY_GRID_MIN_WEEK_PX
+        label_min_px = getattr(scene, "gantt_week_label_min_px", 0)
+        compact = week_px < label_min_px
+
+        for header_line, body_line in getattr(scene, "gantt_day_ticks", []):
+            header_line.setVisible(show_day_grid)
+            body_line.setVisible(show_day_grid)
+
+        for header_line, body_line, label, is_month_boundary, full_text in \
+                getattr(scene, "gantt_week_ticks", []):
+            if compact and not is_month_boundary:
+                header_line.setPen(QPen(_AUX_GRID_COLOR, 1))
+                body_line.setPen(QPen(_AUX_GRID_COLOR, 1))
+                label.setVisible(False)
+                continue
+            header_line.setPen(QPen(_GRID_COLOR, 1))
+            body_line.setPen(QPen(_GRID_COLOR, 1))
+            label.setVisible(True)
+            if compact:
+                text = full_text.split("/", 1)[0].lstrip("0") or "0"
+            else:
+                text = full_text
+            if label.text() != text:
+                label.setText(text)
 
     def _center_task_labels(self, sx, sy):
         """タスクバー内のラベルを、そのバーの中心に揃え続ける。
@@ -534,7 +585,6 @@ def build_gantt_scenes(df, display, color_by="team"):
         else df["End_Date"].max()
     axis_start = axis_start - timedelta(days=AXIS_MARGIN_DAYS)
     axis_end = axis_end + timedelta(days=AXIS_MARGIN_DAYS)
-    total_days = max((axis_end - axis_start).days, 1)
 
     def x_of(date):
         return LEFT_MARGIN + (date - axis_start).days * DAY_WIDTH
@@ -570,37 +620,64 @@ def build_gantt_scenes(df, display, color_by="team"):
     header_stub_bottom = TOP_MARGIN + _PANE_PADDING
     column_stub_right = LEFT_MARGIN + _PANE_PADDING
 
-    # -- 日付軸（週単位の目盛り、期間が長い場合は間引く） -----------------------------
+    # -- 日付軸（週単位の目盛り＋日単位の補助線。密度はズーム量に応じて動的に
+    #    切り替える） ------------------------------------------------------------
     # 目盛りラベルは年をまたいでも「YYYY-MM-DD」を毎回繰り返すと横に長く冗長なため、
     # 月日のみを目盛りごとに、年は表示範囲に含まれる年ごとに上段中央へ1回だけ表示する
     # 2段構成にする。いずれもヘッダー専用（本体には描かない）。
-    tick_step_days = 7
-    if total_days > 365:
-        tick_step_days = 28
-    elif total_days > 120:
-        tick_step_days = 14
+    #
+    # 週の目盛り線・日の補助線はここで表示範囲全体ぶん一度だけ作っておき、
+    # 実際にどれを見せるか（主線／補助線／ラベルの有無や文言）は現在の拡縮率
+    # （sx）に応じて FrozenGanttPane._update_axis_density が_sync_panesの
+    # たびに切り替える（シーンを作り直すコストを避けるため）。
+    #
+    # 週の目盛りのうち、月が変わった直後の1本（is_month_boundary）は「月初めの
+    # 線」として扱い、間隔が詰まったズーム時にもラベルと主線の見た目を残す
+    # （他の週の目盛りは補助線に格下げしてラベルを消す）。
+    header_scene.gantt_tick_labels = []  # 中央揃え用（_center_tick_labels）。週のラベルのみ対象。
+    header_scene.gantt_week_ticks = []   # (header_line, body_line, label, is_month_boundary, full_text)
+    header_scene.gantt_day_ticks = []    # (header_line, body_line)
 
-    # マイルストーンラベルと同じ理由（ItemIgnoresTransformationsを立てた項目の
-    # setPosはシーン座標のままズームの影響を受けるため、「中央揃え」を維持する
-    # オフセットは実際の表示倍率が分かるタイミング(FrozenGanttPane._sync_panes)
-    # でしか正しく計算できない）で、ここでは対象を後で拾えるよう参照だけ残す。
-    header_scene.gantt_tick_labels = []
-    tick_date = axis_start
-    # 最初の目盛りを月曜に揃える
-    tick_date = tick_date + timedelta(days=(7 - tick_date.weekday()) % 7)
+    week_dates = set()
+    tick_date = axis_start + timedelta(days=(7 - axis_start.weekday()) % 7)  # 最初の目盛りを月曜に揃える
+    prev_month = None
     while tick_date <= axis_end:
+        week_dates.add(tick_date)
         x = x_of(tick_date)
+        is_month_boundary = (tick_date.year, tick_date.month) != prev_month
+        prev_month = (tick_date.year, tick_date.month)
         header_line = header_scene.addLine(x, TOP_MARGIN - _GRID_TOP_OFFSET, x, header_stub_bottom,
                                             QPen(_GRID_COLOR, 1))
         header_line.setZValue(-2)
         body_line = body_scene.addLine(x, TOP_MARGIN, x, chart_bottom, QPen(_GRID_COLOR, 1))
         body_line.setZValue(-2)
+        full_text = tick_date.strftime("%m/%d")
         label = _add_fixed_size_label(
-            header_scene, tick_date.strftime("%m/%d"), task_font,
-            (x, TOP_MARGIN - _TICK_LABEL_OFFSET),
+            header_scene, full_text, task_font, (x, TOP_MARGIN - _TICK_LABEL_OFFSET),
         )
         header_scene.gantt_tick_labels.append((label, x))
-        tick_date += timedelta(days=tick_step_days)
+        header_scene.gantt_week_ticks.append((header_line, body_line, label, is_month_boundary, full_text))
+        tick_date += timedelta(days=7)
+
+    # 日単位の補助線（週の目盛りと重なる日は除く）。既定では非表示にしておき、
+    # 十分に拡大された時だけ _update_axis_density が表示する。
+    day_cursor = axis_start
+    while day_cursor <= axis_end:
+        if day_cursor not in week_dates:
+            x = x_of(day_cursor)
+            header_line = header_scene.addLine(x, TOP_MARGIN - _GRID_TOP_OFFSET, x, header_stub_bottom,
+                                                QPen(_AUX_GRID_COLOR, 1))
+            header_line.setZValue(-3)
+            header_line.setVisible(False)
+            body_line = body_scene.addLine(x, TOP_MARGIN, x, chart_bottom, QPen(_AUX_GRID_COLOR, 1))
+            body_line.setZValue(-3)
+            body_line.setVisible(False)
+            header_scene.gantt_day_ticks.append((header_line, body_line))
+        day_cursor += timedelta(days=1)
+
+    # 週の目盛りラベル（"MM/DD"、幅5文字ぶん）が重ならずに収まる最小の週間隔
+    # （画面px）。これを下回ったら _update_axis_density が間引きモードに切り替える。
+    header_scene.gantt_week_label_min_px = QFontMetrics(task_font).horizontalAdvance("00/00") * 1.4
 
     year_font = QFont(task_font)
     year_font.setBold(True)
