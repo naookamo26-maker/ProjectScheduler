@@ -589,9 +589,14 @@ class ChoiceFilterGroup(QGroupBox):
         layout.addLayout(self._checks_layout)
         layout.addStretch(1)
 
-    def rebuild(self, items):
+    def rebuild(self, items, colors=None):
         """items: [(key, label), ...]。既存のチェック状態はキーで可能な限り
-        維持し、新規キーは既定でチェック済み（＝表示）にする。"""
+        維持し、新規キーは既定でチェック済み（＝表示）にする。
+
+        colors: {key: 16進色, ...}（省略可）。渡すと、そのキーのチェックボックスの
+        左に色スペースを添える（ワークフロー／チームのように色分けがある軸で、
+        チャート本体の色と対応付けられるようにするため）。"""
+        colors = colors or {}
         previous_checked = {k for k, cb in self._checks.items() if cb.isChecked()}
         previous_unchecked = {k for k, cb in self._checks.items() if not cb.isChecked()}
         while self._checks_layout.count():
@@ -601,6 +606,11 @@ class ChoiceFilterGroup(QGroupBox):
         self._checks = {}
         for key, label in items:
             checked = key not in previous_unchecked or key in previous_checked
+            if key in colors:
+                swatch = QLabel("　")
+                swatch.setFixedWidth(14)
+                swatch.setStyleSheet(f"background-color: {colors[key]}; border: 1px solid #0b0b0b;")
+                self._checks_layout.addWidget(swatch)
             checkbox = QCheckBox(label)
             checkbox.setChecked(checked)  # connect前に設定し、構築時のstateChangedを発火させない
             checkbox.stateChanged.connect(lambda _state: self.changed.emit())

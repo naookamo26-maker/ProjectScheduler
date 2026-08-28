@@ -11,16 +11,19 @@ gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、ホイー
 
 表示は常に全ジョブが対象で、バーの色はチーム別に塗り分ける。どのワークフロー
 のジョブかは、左列のジョブ名の左に置く色スペースで見分ける（gui/gantt_view.py
-の_JOB_SWATCH_WIDTH参照）。上部の「絞り込み」（ワークフロー／チーム／タグ、
-gui/tab_jobs.py と同じ折りたたみ式チェックボックス）と、ジョブ名の文字列
-検索・「間に合わないジョブのみ表示」で、一時的に表示件数を絞り込める
-（絞り込みはあくまで表示上のもので、スケジューリング自体はやり直さない）。
+の_JOB_SWATCH_WIDTH参照）。上部の「絞り込み」（折りたたみ式、gui/tab_jobs.py
+と同じ構造）の中に、ワークフロー／チーム／タグのチェックボックス（ワーク
+フロー・チームはチャート本体と対応する色スペース付き）、ジョブ名の文字列
+検索、「間に合わないジョブのみ表示」をまとめてあり、一時的に表示件数を
+絞り込める（絞り込みはあくまで表示上のもので、スケジューリング自体は
+やり直さない）。
 
 ジョブはそのジョブの最初のタスクの開始日が早い順。マイルストーンは縦線として
 表示する。
 """
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
@@ -116,17 +119,24 @@ class GanttTab(QWidget):
         self.tag_filter.changed.connect(self._refresh_chart)
         self.filters_section.content_layout.addWidget(self.tag_filter)
 
+        # ジョブ名の文字列検索・「間に合わないジョブのみ表示」も、ワークフロー
+        # ／チーム／タグと同じ「絞り込み」セクションにまとめる。
         search_toolbar = QHBoxLayout()
         search_toolbar.addWidget(QLabel("ジョブ名で絞り込み:"))
         self.search_edit = QLineEdit()
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setPlaceholderText("ジョブ名の一部を入力")
         self.search_edit.textChanged.connect(self._refresh_chart)
-        search_toolbar.addWidget(self.search_edit, 1)
+        # 20文字程度が入る幅に固定する（addWidget(..., 1)で親の幅いっぱいに
+        # 伸びてしまうと、他の絞り込みチェックボックスと並べたときに長すぎるため）。
+        search_edit_width = QFontMetrics(self.search_edit.font()).horizontalAdvance("あ" * 20) + 24
+        self.search_edit.setFixedWidth(search_edit_width)
+        search_toolbar.addWidget(self.search_edit)
         self.overrun_only_checkbox = QCheckBox("間に合わないジョブのみ表示")
         self.overrun_only_checkbox.stateChanged.connect(self._refresh_chart)
         search_toolbar.addWidget(self.overrun_only_checkbox)
-        layout.addLayout(search_toolbar)
+        search_toolbar.addStretch(1)
+        self.filters_section.content_layout.addLayout(search_toolbar)
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
@@ -320,8 +330,16 @@ class GanttTab(QWidget):
         team_names = self._display["team_names"]
         workflow_ids = list(dict.fromkeys(self._result_df["Workflow_ID"].tolist()))
         team_ids = list(dict.fromkeys(self._result_df["Team_ID"].tolist()))
-        self.workflow_filter.rebuild([(wid, workflow_names.get(wid, wid)) for wid in workflow_ids])
-        self.team_filter.rebuild([(tid, team_names.get(tid, tid)) for tid in team_ids])
+        # チェックボックスの左に色スペースを添える（左列のジョブ名の色スペース・
+        # バーの色と対応付けられるようにするため）。
+        self.workflow_filter.rebuild(
+            [(wid, workflow_names.get(wid, wid)) for wid in workflow_ids],
+            colors=self._display["workflow_colors"],
+        )
+        self.team_filter.rebuild(
+            [(tid, team_names.get(tid, tid)) for tid in team_ids],
+            colors=self._display["team_colors"],
+        )
 
         tag_keys = set()
         has_no_tag = False
