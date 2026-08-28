@@ -23,6 +23,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 pytest.importorskip("PySide6")
+pd = pytest.importorskip("pandas")
 
 # 分類: gui（PySide6 + offscreen QApplication が必要。最も重い）
 pytestmark = pytest.mark.gui
@@ -1240,6 +1241,91 @@ def test_gantt_column_shows_workflow_color_swatch_next_to_job_name(window, qapp)
     assert "ワークフロー: WF1" in swatches
     assert "ワークフロー: WF2" in swatches
     assert swatches["ワークフロー: WF1"] != swatches["ワークフロー: WF2"]
+
+
+# -- ガントチャート描画（gui/gantt_view.py）: 「今日」の縦線・1行飛ばしの行背景 ------------
+#
+# build_gantt_scenes() はDB/スケジューラーを介さずDataFrameだけで呼べるため、
+# ワーカースレッドでの計算を待つ window フィクスチャより軽量な qapp フィクスチャ
+# だけで直接検証する。
+
+_MINIMAL_GANTT_DISPLAY = {
+    "team_names": {"TEAM_001": "チームA"},
+    "team_colors": {"TEAM_001": "#cccccc"},
+    "workflow_names": {"WF_001": "WF1"},
+    "workflow_colors": {"WF_001": "#dddddd"},
+    "milestone_markers": [],
+    "common_holiday_dates": set(),
+    "holidays_by_team": {},
+    "job_tags": {},
+}
+
+
+def _gantt_task_row(job_id, job_name, start, end):
+    return {
+        "Job_ID": job_id, "Job_Name": job_name, "Task_Name": "タスク1",
+        "Workflow_ID": "WF_001", "Team_ID": "TEAM_001",
+        "Start_Date": start, "End_Date": end,
+        "Deadline_Overrun_Days": 0, "Constraint_Violation": "", "Resource_Adjusted": False,
+    }
+
+
+def test_gantt_chart_shows_today_line_when_within_display_range(qapp):
+    """表示範囲内に今日が含まれる場合、マイルストーンと同じコズメティック
+    ペインの「今日」の縦線が描かれること。"""
+    from gui.gantt_view import _TODAY_LINE_COLOR, build_gantt_scenes
+
+    today = pd.Timestamp.today().normalize()
+    df = pd.DataFrame([_gantt_task_row(
+        "JOB_001", "ジョブA", today - pd.Timedelta(days=10), today + pd.Timedelta(days=10),
+    )])
+    scenes = build_gantt_scenes(df, _MINIMAL_GANTT_DISPLAY, color_by="team")
+    assert scenes is not None
+
+    today_lines = [
+        item for item in scenes.body.items()
+        if hasattr(item, "pen") and item.pen().color() == _TODAY_LINE_COLOR
+    ]
+    assert today_lines, "今日の縦線が描かれていない"
+    assert today_lines[0].pen().isCosmetic()
+
+
+def test_gantt_chart_hides_today_line_when_outside_display_range(qapp):
+    """今日が表示範囲の外（プロジェクトが過去のみ）にある場合、今日の縦線を
+    描かない（軸を無理に広げて表示範囲を歪めないため）。"""
+    from gui.gantt_view import _TODAY_LINE_COLOR, build_gantt_scenes
+
+    df = pd.DataFrame([_gantt_task_row(
+        "JOB_001", "ジョブA", pd.Timestamp("2000-01-01"), pd.Timestamp("2000-01-10"),
+    )])
+    scenes = build_gantt_scenes(df, _MINIMAL_GANTT_DISPLAY, color_by="team")
+    today_lines = [
+        item for item in scenes.body.items()
+        if hasattr(item, "pen") and item.pen().color() == _TODAY_LINE_COLOR
+    ]
+    assert not today_lines
+
+
+def test_gantt_chart_stripes_every_other_job_row(qapp):
+    """ジョブの行は1行飛ばしで背面が薄い灰色になること（左列・本体の両方）。"""
+    from gui.gantt_view import _ROW_STRIPE_COLOR, build_gantt_scenes
+
+    base = pd.Timestamp("2026-01-05")
+    df = pd.DataFrame([
+        _gantt_task_row(f"JOB_{i:03d}", f"ジョブ{i}", base + pd.Timedelta(days=i * 3),
+                         base + pd.Timedelta(days=i * 3 + 2))
+        for i in range(4)
+    ])
+    scenes = build_gantt_scenes(df, _MINIMAL_GANTT_DISPLAY, color_by="team")
+
+    def stripe_count(scene):
+        return sum(
+            1 for item in scene.items()
+            if hasattr(item, "brush") and item.brush().color() == _ROW_STRIPE_COLOR
+        )
+
+    assert stripe_count(scenes.body) == 2  # 4行中、奇数インデックス(1,3)の2行分
+    assert stripe_count(scenes.column) == 2
 
 
 # -- ワークフロー設計タブ: ノードビュー／テーブルビューの切り替え ---------------------------

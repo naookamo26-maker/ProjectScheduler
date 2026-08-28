@@ -27,7 +27,7 @@ QGraphicsView は setSceneRect() だけでは実際の描画をクリップし�
 """
 
 from collections import namedtuple
-from datetime import timedelta
+from datetime import date, timedelta
 
 from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainterPath, QPen, QTransform
@@ -99,10 +99,16 @@ _AUX_GRID_COLOR = QColor("#eeede6")
 _YEAR_GRID_COLOR = QColor("#c9c7bd")
 _MILESTONE_COLOR = QColor("#c0392b")
 _PROJECT_START_COLOR = QColor("#52514e")
+# 「今日」の縦線。マイルストーン（赤破線）・開発開始日（濃灰破線）と見分けが
+# つくよう、実線・別系統の色（青）にする。
+_TODAY_LINE_COLOR = QColor("#1a73e8")
 # 休業日の日付ラベル（日単位の個別表示時のみ）。マイルストーンと同じ赤系だが、
 # 別の要素であることが分かるよう独立した定数にしてある。
 _HOLIDAY_LABEL_COLOR = QColor("#c0392b")
 _DEFAULT_BAR_COLOR = "#cbc9c2"
+# 1行飛ばしのジョブ行の背景（半透明の黒を薄く重ねるだけなので、背景色
+# （_PANE_BG）を変えても常に「少し暗い」効果になり色を合わせ直す必要がない）。
+_ROW_STRIPE_COLOR = QColor(0, 0, 0, 12)
 # マイルストーンの締切に間に合わないタスクの強調。塗りつぶしはチーム／ワーク
 # フローの色分けをそのまま残したいので、枠線だけを赤く太くして重ねて表す。
 _OVERRUN_BORDER_COLOR = QColor("#c5221f")
@@ -114,8 +120,10 @@ _CONSTRAINT_BORDER_COLOR = QColor("#b26a00")
 _CONSTRAINT_BORDER_WIDTH = 3
 _NORMAL_BORDER_COLOR = QColor("#0b0b0b")
 _NORMAL_BORDER_WIDTH = 1
-# 本体シーンの重ね順: 日単位の補助線(-3) < 週の目盛り・区切り線(-2〜-1) <
-# 通常のバー(0) < 締切超過のバー(1) < タスク名ラベル(2)
+# 本体シーンの重ね順: 1行飛ばしの行背景(-5) < 日単位の補助線(-3) <
+# 週の目盛り・区切り線(-2〜-1) < 通常のバー(0) < 締切超過のバー(1) <
+# タスク名ラベル(2)
+_ROW_STRIPE_Z = -5
 _OVERRUN_BAR_Z = 1
 _TASK_LABEL_Z = 2
 _PANE_BG = QColor("#fdfcf9")
@@ -773,8 +781,8 @@ def build_gantt_scenes(df, display, color_by="team"):
     # 倍率が分かるタイミング（FrozenGanttPane._sync_panes）でしか正しく計算
     # できない。ここでは対象を後で拾えるよう参照だけ残しておく。
     header_scene.gantt_milestone_labels = []
-    for marker_id, label_text, date in milestone_markers:
-        x = x_of(date)
+    for marker_id, label_text, marker_date in milestone_markers:
+        x = x_of(marker_date)
         color = _PROJECT_START_COLOR if marker_id == "PROJECT_START" else _MILESTONE_COLOR
         pen = QPen(color, 2, Qt.DashLine)
         # コズメティックペンにし、太さ(2px)がズーム（本体の拡縮率）の影響を
@@ -790,6 +798,27 @@ def build_gantt_scenes(df, display, color_by="team"):
             header_scene, label_text, job_font,
             (x, TOP_MARGIN - _MILESTONE_LABEL_OFFSET),
             brush=QBrush(color), z_value=2,
+        )
+        header_scene.gantt_milestone_labels.append((label, x))
+
+    # -- 「今日」を縦線で表示（表示範囲に含まれる場合のみ） --------------------------
+    # マイルストーンとは違い対象データから独立した「現在時刻」由来の情報のため、
+    # 表示範囲（axis_start/axis_end）を決める対象には含めない——含めてしまうと、
+    # 過去または未来だけのプロジェクトで「今日」を無理に表示範囲へ押し込むために
+    # 軸全体が不自然に伸びてしまう。範囲外なら単に描かない。
+    today = axis_start + (date.today() - axis_start.date())
+    if axis_start <= today <= axis_end:
+        x = x_of(today)
+        pen = QPen(_TODAY_LINE_COLOR, 2)
+        pen.setCosmetic(True)  # マイルストーンと同じ理由で、太さをズームに依らず一定にする
+        header_line = header_scene.addLine(x, TOP_MARGIN - _GRID_TOP_OFFSET, x, header_stub_bottom, pen)
+        header_line.setZValue(-1)
+        body_line = body_scene.addLine(x, TOP_MARGIN, x, chart_bottom, pen)
+        body_line.setZValue(-1)
+        label = _add_fixed_size_label(
+            header_scene, "今日", job_font,
+            (x, TOP_MARGIN - _MILESTONE_LABEL_OFFSET),
+            brush=QBrush(_TODAY_LINE_COLOR), z_value=2,
         )
         header_scene.gantt_milestone_labels.append((label, x))
 
@@ -815,7 +844,23 @@ def build_gantt_scenes(df, display, color_by="team"):
 
     job_metrics = QFontMetrics(job_font)
     swatch_height = job_metrics.height()
-    for job_id, job_name, job_workflow_id, y_top, y_bottom, task_lane_pairs in job_blocks:
+    for row_index, (job_id, job_name, job_workflow_id, y_top, y_bottom, task_lane_pairs) \
+            in enumerate(job_blocks):
+        if row_index % 2 == 1:
+            # 1行飛ばしでジョブ行の背面を薄い灰色にし、行の視認性を上げる
+            # （どのバーがどのジョブの行に属するか目で追いやすくするため）。
+            # 半透明にしてあるのは、背景色（_PANE_BG）が変わっても常に
+            #「少し暗くする」効果になり、色を合わせ直す必要がないため。
+            column_stripe = column_scene.addRect(
+                0, y_top, column_stub_right, y_bottom - y_top, QPen(Qt.NoPen), QBrush(_ROW_STRIPE_COLOR),
+            )
+            column_stripe.setZValue(_ROW_STRIPE_Z)
+            body_stripe = body_scene.addRect(
+                LEFT_MARGIN, y_top, chart_right - LEFT_MARGIN, y_bottom - y_top,
+                QPen(Qt.NoPen), QBrush(_ROW_STRIPE_COLOR),
+            )
+            body_stripe.setZValue(_ROW_STRIPE_Z)
+
         # ワークフロー識別用の色スペース。ItemIgnoresTransformationsを立てて
         # ジョブ名ラベルと同様に常に一定の画面サイズで表示する（縦にズームしても
         # 太さが変わらないようにするため）。
