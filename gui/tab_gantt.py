@@ -56,8 +56,9 @@ _NO_TAG_FILTER_KEY = None
 _NO_TAG_FILTER_LABEL = "（タグなし）"
 
 # 配置コントロール（チャート本体右下にオーバーレイ表示する小さな操作パネル）の
-# 幅・チャート右端／下端からの余白(px)。
-_PLACEMENT_CONTROL_WIDTH = 200
+# 幅・チャート右端／下端からの余白(px)。ラベル・スライダー・スピンボックスを
+# 縦に積まず1行に収めて縦方向を圧迫しないぶん、幅は広めに取る。
+_PLACEMENT_CONTROL_WIDTH = 300
 _PLACEMENT_CONTROL_MARGIN = 12
 
 # ジョブ名検索は1文字入力するたびに絞り込みを走らせず、入力が止まってから
@@ -190,19 +191,18 @@ class GanttTab(QWidget):
         # DBへ書き込み・再計算する（_on_placement_slider_released）。
         self.placement_group = QGroupBox("配置コントロール", self.view)
         self.placement_group.setFixedWidth(_PLACEMENT_CONTROL_WIDTH)
-        placement_layout = QVBoxLayout(self.placement_group)
-        placement_labels_row = QHBoxLayout()
-        placement_labels_row.addWidget(QLabel("最速"))
-        placement_labels_row.addStretch(1)
-        placement_labels_row.addWidget(QLabel("ギリギリ"))
-        placement_layout.addLayout(placement_labels_row)
+        # ガントチャートの縦方向を圧迫しないよう、ラベル・スライダー・
+        # スピンボックスを縦に積まず1行に収める（そのぶん幅を確保する）。
+        placement_layout = QHBoxLayout(self.placement_group)
+        placement_layout.addWidget(QLabel("最速"))
         self.placement_slider = NoWheelSlider(Qt.Horizontal)
         self.placement_slider.setRange(0, 100)
         self.placement_slider.setToolTip(
             "各タスクを、依存関係が満たされ次第の最速開始～締切から逆算した"
             "最遅開始の範囲内のどこに配置するかの基準点（distribution_ratio）。"
         )
-        placement_layout.addWidget(self.placement_slider)
+        placement_layout.addWidget(self.placement_slider, 1)
+        placement_layout.addWidget(QLabel("ギリギリ"))
         self.placement_spinbox = NoWheelSpinBox()
         self.placement_spinbox.setRange(0, 100)
         self.placement_spinbox.setSuffix("%")
