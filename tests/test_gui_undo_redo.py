@@ -1114,6 +1114,87 @@ def test_gantt_tab_reuses_result_until_the_db_changes(window, qapp):
     assert window.tab_gantt._result_df is not None
 
 
+def test_switching_to_jobs_tab_and_back_does_not_force_a_recomputation(window, qapp):
+    """回帰テスト: ジョブタブに切り替えるたびに sync_dependency_templates() が
+    呼ばれる（gui/tab_jobs.py の refresh_choices）。この関数は以前、実際には
+    何も変わらなくても無条件に _commit() していたため、DB内容を一切変えて
+    いないのに db.revision だけが進んでいた。ガントチャートタブはその
+    revision が変わったことを「内容が変わった」と誤認し、ジョブタブへ
+    寄り道するだけで毎回スケジューリングをやり直していた
+    （gui/db.py の sync_dependency_templates 参照）。"""
+    _build_schedulable_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    seq_before = window.tab_gantt._request_seq
+    revision_before = window.db.revision
+
+    window.tabs.setCurrentWidget(window.tab_jobs)
+    qapp.processEvents()
+    assert window.db.revision == revision_before  # 何も変わっていない
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    qapp.processEvents()
+    assert window.tab_gantt._request_seq == seq_before  # 再計算していない
+    assert window.tab_gantt._result_df is not None
+
+
+def test_schedule_completing_after_a_concurrent_edit_does_not_mask_it(window, qapp):
+    """回帰テスト: 計算がワーカースレッドで走っている間に他タブでDBを編集すると、
+    完了した結果には「要求した時点」のrevisionを刻むこと。
+
+    以前は計算が完了した時点の db.revision を刻んでいたため、計算中の編集で
+    revision が先に進んでいると、まだ反映されていない編集を「反映済み」と
+    誤認していた——次にこのタブへ切り替えても再計算がスキップされ、編集前の
+    古い結果がそのまま「最新」として画面に残り続けていた。"""
+    _build_schedulable_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    # ここではまだイベントを一度も回していない（＝ワーカースレッドはまだ
+    # 起動しただけで、Pythonコードとしてはまだ何も実行していない）ため、
+    # 次の編集は確実に「要求後・完了前」に割り込む。
+    assert window.tab_gantt._result_df is None
+    requested_revision = window.tab_gantt._pending_revision
+    assert requested_revision == window.db.revision
+
+    window.db.add_team("後から追加したチーム", 1)
+    assert window.db.revision != requested_revision
+
+    _wait_for_schedule(window, qapp)
+    # 結果には要求時点のrevisionが刻まれ、完了時点（編集後）の値ではないこと。
+    assert window.tab_gantt._computed_revision == requested_revision
+    assert window.tab_gantt._computed_revision != window.db.revision
+
+    # 食い違いが検知され、次に切り替えたときは再計算されること。
+    seq_before = window.tab_gantt._request_seq
+    window.tab_gantt.refresh_choices()
+    assert window.tab_gantt._request_seq == seq_before + 1
+    _wait_for_schedule(window, qapp)
+    assert window.tab_gantt._computed_revision == window.db.revision
+
+
+def test_shutdown_waits_for_every_in_flight_worker_thread(window, qapp):
+    """回帰テスト: 配置コントロールを連続して操作する等、結果が返る前に
+    次々と新しい要求を出すと、複数のワーカースレッドが同時に実行中の状態に
+    なり得る（_start_worker は古いスレッドを止めずに放置する方針のため）。
+
+    以前は self._thread に最後の1本しか保持していなかったため、shutdown()
+    （ウィンドウを閉じる際に呼ばれる）がそれより前の実行中スレッドを待たずに
+    戻ってしまい、"QThread: Destroyed while thread is still running" という
+    形でクラッシュしうる状態だった。"""
+    _build_schedulable_project(window.db)
+    tab = window.tab_gantt
+
+    # イベントを一度も回さずに複数回 refresh_choices() を呼び、前の要求が
+    # 完了する前に次の要求を出す（DBを毎回変えて再計算の対象にする）。
+    for i in range(3):
+        window.db.add_team(f"チーム{i}", 1)
+        tab.refresh_choices()
+    assert len(tab._threads) == 3  # 3本とも実行中（または実行待ち）として追跡されている
+
+    tab.shutdown()
+    assert tab._threads == []
+
+
 def test_gantt_chart_draws_overrun_tasks_with_a_red_border(window, qapp):
     """締切に間に合わないタスクのバーは、赤く太い枠線で描かれること。
 

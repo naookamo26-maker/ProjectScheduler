@@ -443,6 +443,129 @@ def _build_external_dep_map(df_extdeps):
     return dep_map
 
 
+# ---------------------------------------------------------------------------
+# 無効化されたタスク（Is_Active = N）をまたぐ依存の橋渡し
+#
+# ジョブ単位でタスクを1つ外すと、そのタスクを経由していた依存の鎖に穴が空く。
+# 穴の前後を繋ぎ直さないと、後続タスクは先行タスクの完了を待たずに着手できる
+# ことになり、外したタスクとは無関係な工程まで一斉に前倒しされてしまう
+# （A→B→C の B を外すと、C が A を待たなくなる）。実務上これはほぼ確実に
+# 意図と違うため、外したタスクは「所要0日で素通しする穴」とみなし、その
+# 上流と下流を直接繋ぐ。
+#
+# 種別・ラグの合成: 穴になったタスク B が所要0日なら B の開始日＝完了日なので、
+#   X --(k1, l1)--> B --(k2, l2)--> C
+# のとき C の下限は
+#   anchor(B, k2) + l2 = B.開始 + l2 = anchor(X, k1) + l1 + l2
+# となる（k2 が FS でも SS でも B の開始＝完了なので同じ）。よって合成後は
+# 「種別は上流側の k1 を引き継ぎ、ラグは足し合わせる」。穴が連続している
+# 場合も同じ規則を繰り返し適用すればよい。
+# ---------------------------------------------------------------------------
+
+def _task_dependency_refs(job_id, wf_task_row, ext_dep_map):
+    """1タスクの依存を (依存先g_id, 種別, ラグ) のリストに揃えて返す。
+
+    ワークフロー内の依存（Internal_Depends、種別・ラグ付き）と、ジョブをまたぐ
+    依存（External_Dependencies、現状は常に FS・ラグ0）を同じ形にして、
+    橋渡し処理が両者を区別せずに扱えるようにする。
+    """
+    refs = []
+    internal_depends = wf_task_row.get("Internal_Depends")
+    if pd.notna(internal_depends):
+        for ref in str(internal_depends).split(","):
+            if not ref.strip():
+                continue
+            dep_task, dep_kind, dep_lag = parse_dependency_ref(ref)
+            refs.append((f"{job_id}:{dep_task}", dep_kind, dep_lag))
+    for ext_g_id in ext_dep_map.get((job_id, wf_task_row["Task_ID"]), []):
+        refs.append((ext_g_id, *DEFAULT_DEPENDENCY))
+    return refs
+
+
+def _tighter_dependency(a, b):
+    """同じ依存先へ複数の経路で辿り着いた場合に、制約として厳しい方を返す。
+
+    FS は先行タスクの「完了」、SS は「開始」を起点にするため、同じラグなら
+    FS の方が必ず遅い（＝厳しい）。同じ種別ならラグが大きい方が厳しい。
+    """
+    a_kind, a_lag = a
+    b_kind, b_lag = b
+    if a_kind != b_kind:
+        return a if a_kind == "FS" else b
+    return a if a_lag >= b_lag else b
+
+
+def _merge_dependency(resolved, dep_g_id, spec):
+    """resolved（{依存先g_id: (種別, ラグ)}）へ1件を、厳しい方を残して畳み込む。"""
+    current = resolved.get(dep_g_id)
+    resolved[dep_g_id] = spec if current is None else _tighter_dependency(current, spec)
+
+
+def _resolve_inactive_ref(dep_g_id, active_ids, inactive_deps, cache, path):
+    """無効化されたタスク dep_g_id を、実際に待つべきアクティブなタスクの集合へ
+    展開する。戻り値は ({アクティブなg_id: (種別, ラグ)}, 見つからなかった依存先)。
+
+    ラグは dep_g_id 自身までの累積で、呼び出し側が「穴より下流のラグ」を
+    足し込む。上流も無効化されていれば再帰的に辿る（穴が連続する場合）。
+
+    無効化されたタスクだけで閉じた循環は、その経路を打ち切って解消する
+    （アクティブなタスク間の循環は _build_scheduling_order が別途検出する。
+    ここで例外にすると、既に無効化して使っていないタスクのせいで
+    スケジューリング全体が止まってしまう）。
+    """
+    if dep_g_id in cache:
+        return cache[dep_g_id]
+    if dep_g_id in path:
+        return {}, frozenset()
+
+    resolved = {}
+    missing = set()
+    for up_id, kind, lag in inactive_deps.get(dep_g_id, []):
+        if up_id in active_ids:
+            _merge_dependency(resolved, up_id, (kind, lag))
+        elif up_id in inactive_deps:
+            up_resolved, up_missing = _resolve_inactive_ref(
+                up_id, active_ids, inactive_deps, cache, path | {dep_g_id}
+            )
+            for a_id, (a_kind, a_lag) in up_resolved.items():
+                _merge_dependency(resolved, a_id, (a_kind, a_lag + lag))
+            missing |= up_missing
+        else:
+            missing.add(up_id)
+
+    result = (resolved, frozenset(missing))
+    cache[dep_g_id] = result
+    return result
+
+
+def _bridge_inactive_deps(g_id, refs, active_ids, inactive_deps, cache):
+    """1タスクぶんの依存を、無効化されたタスクを飛ばした形に解決する。
+
+    Returns: (解決後の {依存先g_id: (種別, ラグ)}, 橋渡しの内訳, 見つからなかった依存先)
+    """
+    resolved = {}
+    bridged = {}
+    missing = set()
+    for dep_g_id, kind, lag in refs:
+        if dep_g_id in active_ids:
+            candidates = {dep_g_id: (kind, lag)}
+        elif dep_g_id in inactive_deps:
+            upstream, up_missing = _resolve_inactive_ref(
+                dep_g_id, active_ids, inactive_deps, cache, frozenset()
+            )
+            candidates = {a: (k, l + lag) for a, (k, l) in upstream.items()}
+            missing |= up_missing
+            bridged[dep_g_id] = sorted(candidates)
+        else:
+            missing.add(dep_g_id)
+            continue
+        for a_id, spec in candidates.items():
+            # 穴を通って自分自身へ戻る経路（循環）は無視する。
+            if a_id != g_id:
+                _merge_dependency(resolved, a_id, spec)
+    return resolved, bridged, missing
+
+
 def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project_start):
     teams_dict = df_teams.set_index("Team_ID")["Max_Lines"].to_dict()
     ext_dep_map = _build_external_dep_map(df_extdeps)
@@ -472,6 +595,11 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
             overrides_by_key[key] = row
 
     active_tasks = {}
+    # 依存の解決は全ジョブを読み終えてから行う（後ろのジョブのタスクを
+    # 参照する依存があるため）。無効化されたタスクも、その依存だけは
+    # 覚えておく——前後を繋ぎ直す「穴」として使う（_bridge_inactive_deps 参照）。
+    raw_deps = {}
+    inactive_deps = {}
 
     for job in df_jobs.to_dict("records"):
         job_id, job_name = job["Job_ID"], job["Job_Name"]
@@ -495,7 +623,13 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
 
             override = overrides_by_key.get((job_id, t_id), {})
 
+            # 依存は、このタスクが無効化されていても先に読んでおく。無効化された
+            # タスクは依存の鎖に空いた「所要0日の穴」として扱い、その上流と下流を
+            # 繋ぎ直すため（_bridge_inactive_deps 参照）。
+            deps = _task_dependency_refs(job_id, t, ext_dep_map)
+
             if str(override.get("Is_Active", "Y")).strip().upper() == "N":
+                inactive_deps[g_id] = deps
                 continue
 
             override_days = override.get("Override_Days")
@@ -548,22 +682,7 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
                         f"マイルストーン '{task_ms}'（タスク '{g_id}' が参照）の End_Date が空です"
                     )
 
-            internal_depends = t.get("Internal_Depends")
-            int_deps = []
-            # 既定（FS・ラグ0）以外の依存だけを dep_specs に載せる。ラグを使って
-            # いないプロジェクトでは空のままになり、日程計算のループが従来と
-            # まったく同じ経路を通る（大規模データでの速度を落とさないため）。
-            dep_specs = {}
-            if pd.notna(internal_depends):
-                for ref in str(internal_depends).split(","):
-                    if not ref.strip():
-                        continue
-                    dep_task, dep_kind, dep_lag = parse_dependency_ref(ref)
-                    dep_g_id = f"{job_id}:{dep_task}"
-                    int_deps.append(dep_g_id)
-                    if (dep_kind, dep_lag) != DEFAULT_DEPENDENCY:
-                        dep_specs[dep_g_id] = (dep_kind, dep_lag)
-            ext_deps = ext_dep_map.get((job_id, t_id), [])
+            raw_deps[g_id] = deps
 
             # 開始固定日（実績確定・外部都合のピン留め）。読めない日付を黙って
             # 無視すると「固定が無かったこと」になり、意図と違う日程が静かに
@@ -582,20 +701,50 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
                 "start_pin_ord": start_pin_ord,
                 "job_id": job_id, "job_name": job_name, "task_id": t_id,
                 "task_name": t["Task_Name"], "days": days,
-                "deps": int_deps + list(ext_deps), "dep_specs": dep_specs,
+                # deps / dep_specs は全ジョブを読み終えてから
+                # （無効化されたタスクを飛ばして）確定させる。
+                "deps": [], "dep_specs": {},
                 "milestone": task_ms,
                 "team_id": team_id, "ms_end": ms_end, "ms_end_ord": ms_end.toordinal(),
                 "priority": priority, "workflow_id": wf_id,
             }
 
     active_ids = set(active_tasks.keys())
+    bridge_cache = {}
+    bridged_count = 0
     for g_id, t_data in active_tasks.items():
-        dropped = [d for d in t_data["deps"] if d not in active_ids]
-        if dropped:
-            logger.warning(f"タスク '{g_id}' の依存先 {dropped} は存在しない、または非アクティブなため無視します")
-            for d in dropped:
-                t_data["dep_specs"].pop(d, None)
-        t_data["deps"] = [d for d in t_data["deps"] if d in active_ids]
+        resolved, bridged, missing = _bridge_inactive_deps(
+            g_id, raw_deps[g_id], active_ids, inactive_deps, bridge_cache
+        )
+        if missing:
+            logger.warning(
+                f"タスク '{g_id}' の依存先 {sorted(missing)} は存在しないため無視します"
+            )
+        for hole_id, upstream in bridged.items():
+            bridged_count += 1
+            if upstream:
+                logger.info(
+                    f"タスク '{g_id}' の依存先 '{hole_id}' は無効化されているため、"
+                    f"その先行タスク {upstream} への依存に繋ぎ替えます"
+                )
+            else:
+                logger.info(
+                    f"タスク '{g_id}' の依存先 '{hole_id}' は無効化されており、"
+                    f"さらに手前に待つべきタスクが無いため依存を解除します"
+                )
+        # 既定（FS・ラグ0）以外の依存だけを dep_specs に載せる。ラグを使って
+        # いないプロジェクトでは空のままになり、日程計算のループが従来と
+        # まったく同じ経路を通る（大規模データでの速度を落とさないため）。
+        t_data["deps"] = list(resolved)
+        t_data["dep_specs"] = {
+            d: spec for d, spec in resolved.items() if spec != DEFAULT_DEPENDENCY
+        }
+
+    if bridged_count:
+        logger.info(
+            f"無効化されたタスクをまたぐ依存 {bridged_count} 件を、"
+            f"その先行タスクへ繋ぎ替えました"
+        )
 
     return teams_dict, active_tasks, active_ids
 

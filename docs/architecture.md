@@ -212,6 +212,47 @@ T_003(FS-1)        FS・1営業日のリード（先行の完了前に着手可�
 `parse_dependency_ref()`。解釈できない書き方は警告で握りつぶさず
 `SchedulingError` にする（依存を黙って落とすと日程が静かに間違うため）。
 
+### 無効化したタスク（`Is_Active = N`）をまたぐ依存の橋渡し
+
+ジョブ単位でタスクを外す（タブ3の「有効」チェックを外す）と、そのタスクを
+経由していた依存の鎖に穴が空く。**穴の前後は繋ぎ直す**——外したタスクを
+「所要0日で素通しする穴」とみなし、その上流と下流を直接依存させる。
+
+繋ぎ直さずに依存を捨てると、A→B→C の B を外しただけで C が A を待たなく
+なり、外したタスクとは無関係な工程まで一斉にプロジェクト開始日へ前倒しされる。
+これは「1タスクだけ省く」という操作の意図とほぼ確実に食い違ううえ、
+`logger.warning` はGUIに出ないため誰も気付けない。ワークフロー設計タブの
+タスク削除が同じ橋渡しを行う（「タスク削除時の依存関係の橋渡し」参照）のとも
+挙動が揃う——**タスクを消しても外しても、残りの前後関係は保たれる**。
+
+種別・ラグの合成規則: 穴になったタスク B は所要0日なので開始日＝完了日になる。
+
+```
+X --(k1, l1)--> B --(k2, l2)--> C
+  ⇒ C の下限 = anchor(B, k2) + l2 = B.開始 + l2 = anchor(X, k1) + l1 + l2
+  ⇒ X --(k1, l1 + l2)--> C
+```
+
+つまり**種別は上流側（k1）を引き継ぎ、ラグは足し合わせる**。B の開始＝完了
+なので k2 が FS でも SS でも結果は変わらない。穴が連続する場合は同じ規則を
+繰り返し適用する。同じ先行タスクへ複数の経路で辿り着いた場合は制約の厳しい方
+（FS > SS、同種別ならラグの大きい方）を残す。
+
+実装は `project_scheduler.py` の `_task_dependency_refs()` /
+`_bridge_inactive_deps()` / `_resolve_inactive_ref()`。`_parse_tasks()` は
+無効化されたタスクについても依存だけは読んで `inactive_deps` に控えておき、
+全ジョブを読み終えてからまとめて解決する（後ろのジョブのタスクを参照する
+ジョブ間依存があるため、その場では解決できない）。ジョブ内の依存と
+ジョブをまたぐ依存（`job_external_dependencies`）は同じ形に揃えて扱うため、
+**依存先ジョブ側のタスクが無効化されている場合も繋ぎ替わる**。
+
+穴より手前に待つべきタスクが無ければ（＝先頭のタスクを外した場合）、
+繋ぎ直す相手がいないので依存は素直に消える。無効化されたタスクだけで閉じた
+循環があるデータは、その経路を打ち切って解消する——既に使っていないタスクの
+せいでスケジューリング全体が止まる方が有害なため（アクティブなタスク間の
+循環は従来どおり `_build_scheduling_order()` が `CircularDependencyError` に
+する）。
+
 ### 開始固定日（`job_task_overrides.start_pin_date`）と2パス構成
 
 「この日から着手する」を扱うために、開始日を1つだけ**固定**として持てる。
@@ -470,6 +511,60 @@ GUIのガントチャートタブは件数と最大超過日数を画面上部�
 害がない）。ウィンドウを閉じる/プロジェクトを開き直す際は、
 `MainWindow._shutdown_gantt_tab()` がスレッドの終了を待ち合わせる。
 
+### revisionは「要求時点」の値を刻む
+
+結果のキャッシュ判定（`self._computed_revision == self.db.revision`）に使う
+`_computed_revision`は、計算が**完了した時点**の`db.revision`ではなく、
+`build_frames()`を呼んだ**要求時点**の`db.revision`（`refresh_choices()`が
+`request_revision`として控え、`_pending_revision`経由で`_on_schedule_finished`
+に渡す）を刻む。
+
+計算は非同期のため、ワーカーが走っている間に他タブでDBが編集されて
+`db.revision`が先に進むことがある。完了時点の値を刻んでいると、この
+「計算中の編集」を誤って「結果に反映済み」とみなしてしまい——結果は
+編集前の古いDB内容のままなのに、以降`refresh_choices()`が
+`_computed_revision == db.revision`の一致を見て再計算をスキップし続け、
+編集がガントチャートに反映されないまま「最新」として画面に残ってしまう。
+要求時点の値を刻めば、計算中の編集で`db.revision`との食い違いが必ず残るため、
+次の`refresh_choices()`が正しく再計算を走らせる。
+
+### `sync_dependency_templates()`が無変更でrevisionを進めないこと
+
+タブ2・タブ3への切り替えは、それぞれの`refresh_choices()`から
+`sync_dependency_templates()`（`gui/db.py`）を「保険」として毎回呼ぶ。
+この関数は、実際にDBの内容が変わった場合にだけ`_commit()`する（＝実際には
+何も変わらなかった呼び出しでは`db.revision`を進めない）。無条件に
+`_commit()`していた頃は、ジョブタブへ寄り道するだけで`db.revision`が
+必ず進み、上記のキャッシュ判定が「内容が変わった」と誤認して、タブを
+行き来するたびに毎回フルの再スケジューリングが走っていた（詳細は
+`gui/db.py`の`sync_dependency_templates()`のdocstring参照）。
+
+### 複数のワーカースレッドをまとめて追跡する
+
+`_start_worker()`は、実行中の古いワーカーを止めずに放置する方針（上記）
+のため、タブを連続して切り替えたり配置スライダーを繰り返し操作したりすると、
+複数本のスレッドが同時に実行中の状態になり得る。`GanttTab._threads`は
+`(QThread, _ScheduleWorker)`の**一覧**として全件を保持し、`shutdown()`は
+その全件を待ち合わせる。「最後の1本」だけを`self._thread`に保持していた
+頃は、それより前に始まった実行中のスレッドを待たずにウィンドウが閉じてしまい、
+"QThread: Destroyed while thread is still running" でクラッシュしうる状態
+だった。
+
+スレッドの終了通知（`thread.finished`）を追跡リストから外す処理
+（`_on_worker_thread_finished`）は、`self`（GUIスレッドに属するQObject）の
+束縛メソッドとして繋ぐ。ラムダ等の素のPython callableをそのまま繋ぐと、
+PySide側が接続をキュー接続だと判定できず、ワーカースレッド側で直接
+実行されてしまう（`self._threads`というGUIスレッド専有のリストを、
+ロック無しでワーカースレッドから書き換えることになり危険）。束縛メソッドを
+繋げば、PySide側が送信元と受信側の所属スレッドの違いを見てキュー接続を
+選ぶため、実行は必ずGUIスレッド側に回る（受信側で`self.sender()`を使い、
+「どのスレッドが終わったか」を判定する）。
+
+回帰テストは`tests/test_gui_undo_redo.py`
+（`test_schedule_completing_after_a_concurrent_edit_does_not_mask_it` /
+`test_switching_to_jobs_tab_and_back_does_not_force_a_recomputation` /
+`test_shutdown_waits_for_every_in_flight_worker_thread`）。
+
 ## ノードグラフの循環依存検出
 
 `gui/node_canvas.py`の`WorkflowGraphScene`は、ワークフロー内のタスク依存を
@@ -707,6 +802,27 @@ GUI側でダイアログ表示する（プロジェクト全体の依存グラ�
 
 計画と適用を分けているのは、**確認ダイアログに出した内容と実際に適用される
 内容を必ず一致させる**ため（シミュレーションと本適用でロジックが分岐しない）。
+
+#### 調整はマイルストーン列だけを書き換える
+
+`enforce_milestone_floor` / `cascade_milestone_to_successors` /
+`apply_milestone_consistency_repair` の3経路は、いずれも
+`_set_override_milestone()`（`milestone_id` 列だけのUPDATE）を使うこと。
+
+`upsert_job_task_override()` は**行ごと置き換える**APIで、呼び出し元が渡さ
+なかった列は既定値（`start_pin_date=None`, `tags=""`, `is_active=True`）で
+上書きされる。マイルストーン以外を変えるつもりが無いこれらの経路が全列版を
+使うと、**開始固定日とタスク タグが黙って消える**（実際に v13 でタグ列を
+足した際にこの形で壊れていた）。特に危険なのはタブ3の編集経路で、
+`gui/tab_jobs.py` の `_on_override_changed()` は正しく全列を渡して upsert した
+直後に `enforce_milestone_floor()` を呼ぶため、**ユーザーが入力したばかりの
+開始固定日がその同じ操作の中で消える**。同じUndo単位なので戻せはするが、
+画面に出る通知はマイルストーン調整のことだけで、固定日が消えたことは
+伝わらない。
+
+列を1つ足すたびに同じ事故が起きる形を残さないため、「一部の列だけ変えたい」
+経路には全列版を使わず、専用の部分更新を用意する。回帰テストは
+`tests/test_job_task_overrides.py`（`core`）。
 
 GUI側は`confirm_and_repair_milestone_consistency()`（`gui/widgets_common.py`）が
 両経路から共有される。呼び出し側の`db.undo_group`がまだ開いているうちに呼ぶ

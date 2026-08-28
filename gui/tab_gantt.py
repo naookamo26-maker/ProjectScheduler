@@ -126,10 +126,16 @@ class GanttTab(QWidget):
         # 実行中のスケジューリング要求の通し番号。結果が返ってきたときに
         # 「最後に出した要求のものか」を判定し、古い結果は捨てる。
         self._request_seq = 0
-        self._thread = None
-        self._worker = None
+        # 実行中（または終了直後の後始末待ち）の (QThread, _ScheduleWorker) の
+        # 一覧。タブを連続して切り替える等で複数本が同時に走ることがあるため、
+        # 「最後の1本」ではなく全件を保持する（shutdown() 参照）。
+        self._threads = []
         # 計算中の要求に対応する表示用補助情報（結果が返ってきたら _display へ移す）
         self._pending_display = None
+        # 計算中の要求が「どの時点のDB内容」を元にしたものか（frames を組み立てた
+        # 瞬間の db.revision）。結果が返ってきた時点の db.revision ではなく、
+        # 要求時点のこの値を _computed_revision に刻む（_on_schedule_finished 参照）。
+        self._pending_revision = None
 
         layout = QVBoxLayout(self)
 
@@ -312,6 +318,11 @@ class GanttTab(QWidget):
             return
 
         # DBの読み出しはGUIスレッドで行い、DataFrameだけをワーカーへ渡す。
+        # revisionは、渡すDataFrame群が実際に対応する時点の値として、
+        # build_frames() の直前で読む（計算中に他タブが編集して revision が
+        # 進んでも、この要求の結果には要求時点の値を使う。
+        # _on_schedule_finished 参照）。
+        request_revision = self.db.revision
         try:
             frames = build_frames(self.db)
             display = build_display(self.db)
@@ -321,6 +332,7 @@ class GanttTab(QWidget):
             return
 
         self._pending_display = display
+        self._pending_revision = request_revision
         self._request_seq += 1
         seq = self._request_seq
         self._start_worker(seq, frames)
@@ -356,7 +368,13 @@ class GanttTab(QWidget):
         実行中の古いスレッドは、結果を捨てる（通し番号で判定）だけで止めずに
         放置する。スケジューリングはDBに触れない純粋な計算なので、放置しても
         害はなく、途中で強制終了させるより安全なため（終了は quit()/wait() を
-        shutdown() でまとめて待つ）。"""
+        shutdown() でまとめて待つ）。
+
+        タブを連続して切り替える・配置スライダーを繰り返し操作する等で、
+        複数本が同時に走っている状態になり得る。self._threads に全件を
+        保持しておかないと、shutdown() が最後の1本しか待たずに終了し、
+        それより前に始まった実行中のスレッドを残したままウィンドウが
+        閉じてしまう（"QThread: Destroyed while thread is still running"）。"""
         thread = QThread(self)
         worker = _ScheduleWorker(seq, frames, self._distribution_ratio)
         worker.moveToThread(thread)
@@ -367,22 +385,36 @@ class GanttTab(QWidget):
         worker.failed.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        self._thread = thread
-        self._worker = worker
+        # deleteLater() によるQt側の破棄後、追跡リストからも手放す
+        # （self._threads がPython側の唯一の参照であり続けないよう、
+        # 終わったスレッドをいつまでも溜め込まない）。self（GUIスレッドに
+        # 属するQObject）の束縛メソッドを繋ぐことで、PySide側が自動的に
+        # キュー接続にしてくれる——ラムダ等の素のcallableを直接繋ぐと
+        # ワーカースレッド側で実行されてしまい、GUIスレッドの self._threads を
+        # ロック無しで書き換えることになる（sender()で「どのスレッドが
+        # 終わったか」をGUIスレッド側から安全に判定する）。
+        thread.finished.connect(self._on_worker_thread_finished)
+        self._threads.append((thread, worker))
         thread.start()
+
+    def _on_worker_thread_finished(self):
+        thread = self.sender()
+        self._threads = [(t, w) for t, w in self._threads if t is not thread]
 
     def _cancel_pending_request(self):
         """実行中の要求の結果を無視する（通し番号を進めるだけ）。"""
         self._request_seq += 1
 
     def shutdown(self):
-        """ウィンドウを閉じる際に、走っているスケジューリングの終了を待つ。
+        """ウィンドウを閉じる際に、走っているスケジューリングすべての終了を待つ。
 
         ワーカーはDBに触れないため放置しても壊れないが、QThreadが動いたまま
-        プロセスを終えるとQt側が警告を出すため、明示的に待ち合わせる。"""
+        プロセスを終えるとQt側が警告を出すため、明示的に待ち合わせる
+        （_start_worker のコメント参照——「最後の1本」だけでなく、
+        追跡している全スレッドを待つ）。"""
         self._cancel_pending_request()
-        thread = self._thread
-        if thread is not None:
+        threads, self._threads = self._threads, []
+        for thread, _worker in threads:
             try:
                 if thread.isRunning():
                     thread.quit()
@@ -390,15 +422,18 @@ class GanttTab(QWidget):
             except RuntimeError:
                 # 既にdeleteLater()で破棄済み（＝計算は完了している）
                 pass
-        self._thread = None
-        self._worker = None
 
     def _on_schedule_finished(self, seq, result_df):
         if seq != self._request_seq:
             return  # 追い越された古い要求の結果なので捨てる
         self._result_df = result_df
         self._display = self._pending_display
-        self._computed_revision = self.db.revision
+        # 計算完了時点ではなく、要求時点（frames を組み立てた瞬間）の revision を
+        # 刻む。計算は非同期のため、計算中に他タブの編集で revision が進むことが
+        # あり、ここで self.db.revision を読むとその新しいrevisionが刻まれて
+        # しまう——結果は古いDB内容のままなのに「最新」として扱われ、以降の
+        # refresh_choices() が再計算をスキップして編集が反映されないままになる。
+        self._computed_revision = self._pending_revision
         self._apply_result()
 
     def _on_schedule_failed(self, seq, message):

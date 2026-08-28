@@ -1220,6 +1220,38 @@ class ProjectDatabase:
         )
         self._commit()
 
+    def _set_override_milestone(self, job_id, workflow_task_id, milestone_id):
+        """上書き行のマイルストーンだけを差し替える（他の列には触れない）。
+
+        upsert_job_task_override() は全列を受け取って行ごと置き換えるAPIであり、
+        呼び出し元が渡さなかった列は既定値（start_pin_date=None, tags=""）で
+        上書きされる。マイルストーンの自動調整（enforce_milestone_floor /
+        cascade_milestone_to_successors / apply_milestone_consistency_repair）は
+        マイルストーン以外を変えるつもりが無いため、全列版を使うと
+        「開始固定日とタスク タグが黙って消える」ことになる。列を1つ足すたびに
+        同じ事故が起きる形を残さないよう、これらの経路は最初から
+        「マイルストーン列だけのUPDATE」を使う。
+
+        まだ上書き行が無い場合は、マイルストーンだけを持つ行を新規に作る
+        （他の列は既定のまま＝「上書きなし」）。
+        """
+        existing = self._conn.execute(
+            "SELECT id FROM job_task_overrides WHERE job_id = ? AND workflow_task_id = ?",
+            (job_id, workflow_task_id),
+        ).fetchone()
+        if existing:
+            self._conn.execute(
+                "UPDATE job_task_overrides SET milestone_id = ? WHERE id = ?",
+                (milestone_id, existing["id"]),
+            )
+        else:
+            self._conn.execute(
+                "INSERT INTO job_task_overrides(job_id, workflow_task_id, is_active, "
+                "milestone_id) VALUES (?, ?, 1, ?)",
+                (job_id, workflow_task_id, milestone_id),
+            )
+        self._commit()
+
     # -- マイルストーンの整合性（先行/後続タスク間） -----------------------------------
     # 「後継タスクが先行タスクのマイルストーンより早まらないようにする」ための
     # ヘルパー群。先行/後続の対象は同一ワークフロー内のtask_dependenciesのみ
@@ -1296,18 +1328,7 @@ class ProjectDatabase:
             seen.add(succ_id)
             succ_ms = self.effective_milestone(job_id, succ_id)
             if succ_ms is None or succ_ms["end_date"] < this_ms["end_date"]:
-                existing = self._conn.execute(
-                    "SELECT is_active, override_days, team_id FROM job_task_overrides "
-                    "WHERE job_id = ? AND workflow_task_id = ?",
-                    (job_id, succ_id),
-                ).fetchone()
-                self.upsert_job_task_override(
-                    job_id, succ_id,
-                    is_active=bool(existing["is_active"]) if existing else True,
-                    override_days=existing["override_days"] if existing else None,
-                    milestone_id=this_ms["milestone_id"],
-                    team_id=existing["team_id"] if existing else None,
-                )
+                self._set_override_milestone(job_id, succ_id, this_ms["milestone_id"])
                 changed.append(succ_id)
                 queue.extend(succ_map.get(succ_id, []))
         return changed
@@ -1335,18 +1356,7 @@ class ProjectDatabase:
         if this_ms is not None and this_ms["end_date"] >= floor["end_date"]:
             return False
 
-        existing = self._conn.execute(
-            "SELECT is_active, override_days, team_id FROM job_task_overrides "
-            "WHERE job_id = ? AND workflow_task_id = ?",
-            (job_id, workflow_task_id),
-        ).fetchone()
-        self.upsert_job_task_override(
-            job_id, workflow_task_id,
-            is_active=bool(existing["is_active"]) if existing else True,
-            override_days=existing["override_days"] if existing else None,
-            milestone_id=floor["milestone_id"],
-            team_id=existing["team_id"] if existing else None,
-        )
+        self._set_override_milestone(job_id, workflow_task_id, floor["milestone_id"])
         return True
 
     # -- マイルストーン整合性の一括検査・再調整 -------------------------------------
@@ -1444,17 +1454,8 @@ class ProjectDatabase:
         計画と適用を分けているため、確認ダイアログに出した内容と実際に適用される
         内容が食い違うことはない。"""
         for item in plan:
-            existing = self._conn.execute(
-                "SELECT is_active, override_days, team_id FROM job_task_overrides "
-                "WHERE job_id = ? AND workflow_task_id = ?",
-                (item["job_id"], item["workflow_task_id"]),
-            ).fetchone()
-            self.upsert_job_task_override(
-                item["job_id"], item["workflow_task_id"],
-                is_active=bool(existing["is_active"]) if existing else True,
-                override_days=existing["override_days"] if existing else None,
-                milestone_id=item["to_milestone_id"],
-                team_id=existing["team_id"] if existing else None,
+            self._set_override_milestone(
+                item["job_id"], item["workflow_task_id"], item["to_milestone_id"]
             )
 
     # -- job_external_dependencies ----------------------------------------------
@@ -1599,7 +1600,16 @@ class ProjectDatabase:
         このリンクから自動生成された対応（source_link_id一致）のうち、
         現在どのテンプレートにも合致しなくなったもの（テンプレートの編集・
         削除で古くなったもの）は削除する。手動追加分（source_link_idが
-        NULL）には一切触れない。"""
+        NULL）には一切触れない。
+
+        実際に何も変わらなかった場合はcommitしない（revisionを進めない）。
+        この関数は各タブのrefresh_choices()（gui/tab_jobs.py）からタブを
+        切り替えるたびに呼ばれる「保険」の同期であり、ほとんどの呼び出しは
+        何も変えずに終わる。無条件にcommitするとrevisionが毎回進み、
+        gui/tab_gantt.pyがrevisionの一致でスケジューリングの再実行を省く
+        判定をしているため、タブを切り替えるだけで毎回フルの再スケジュー
+        リングが走ってしまう（実際には何も変わっていないのに、である）。"""
+        changes_before = self._conn.total_changes
         links = self._conn.execute(
             "SELECT l.id AS link_id, l.job_id, l.depends_on_job_id, "
             "j.workflow_id AS job_workflow_id, dj.workflow_id AS depends_on_workflow_id "
@@ -1632,6 +1642,8 @@ class ProjectDatabase:
                     self._conn.execute(
                         "DELETE FROM job_external_dependencies WHERE id = ?", (row["id"],)
                     )
+        if self._conn.total_changes == changes_before:
+            return  # 実際には何も変わらなかった（revisionを進めない）
         self._commit()
 
     @undoable("依存先ジョブを追加")
