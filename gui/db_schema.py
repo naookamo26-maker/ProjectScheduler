@@ -16,7 +16,7 @@ CRUD本体（gui/db.py）から分離しているのは、この2つが「増え
 4. `docs/db_design.md` のテーブル一覧を追随させる。
 """
 
-SCHEMA_VERSION = "12"
+SCHEMA_VERSION = "13"
 
 _SCHEMA_SQL = """
 CREATE TABLE schema_meta (
@@ -27,7 +27,11 @@ CREATE TABLE schema_meta (
 CREATE TABLE project (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     project_name TEXT NOT NULL DEFAULT '',
-    start_date   TEXT NOT NULL DEFAULT ''
+    start_date   TEXT NOT NULL DEFAULT '',
+    -- ガントチャートタブの「配置コントロール」で調整する
+    -- project_scheduler.py の distribution_ratio（0.0=最速 ASAP 〜
+    -- 1.0=ギリギリ ALAP）。既定はスケジューラ本体の既定値と同じ0.7。
+    distribution_ratio REAL NOT NULL DEFAULT 0.7
 );
 
 CREATE TABLE milestones (
@@ -435,6 +439,19 @@ def migrate(conn):
         conn.commit()
         conn.execute("PRAGMA foreign_keys = ON")
         version = "12"
+
+    if version == "12":
+        # v13: project.distribution_ratio を追加。ガントチャートタブの
+        # 「配置コントロール」（スライダー）で調整する project_scheduler.py の
+        # distribution_ratio を、これまでタブ内だけの一時パラメータだった
+        # ものからプロジェクトの永続設定へ格上げする。既存ファイルは
+        # スケジューラ本体の既定値と同じ0.7で補う。
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(project)").fetchall()]
+        if cols and "distribution_ratio" not in cols:
+            conn.execute(
+                "ALTER TABLE project ADD COLUMN distribution_ratio REAL NOT NULL DEFAULT 0.7"
+            )
+        version = "13"
 
     conn.execute(
         "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)

@@ -22,7 +22,7 @@ gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、ホイー
 表示する。
 """
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -42,15 +42,23 @@ from gui.gantt_generator import (
     validate_for_generation,
 )
 from gui.gantt_view import FrozenGanttPane, build_gantt_scenes
-from gui.widgets_common import ChoiceFilterGroup, CollapsibleSection, NoWheelSlider, NoWheelSpinBox
+from gui.widgets_common import (
+    ChoiceFilterGroup,
+    CollapsibleSection,
+    NoWheelSlider,
+    NoWheelSpinBox,
+    bind_undo_session,
+)
 from project_scheduler import SchedulingError
 
 # ジョブが1つもタグを持たない場合にまとめる擬似キー（gui/tab_jobs.py と同じ考え方）。
 _NO_TAG_FILTER_KEY = None
 _NO_TAG_FILTER_LABEL = "（タグなし）"
 
-# project_scheduler.py の distribution_ratio 既定値と同じ（配置コントロールの初期値）。
-_DEFAULT_DISTRIBUTION_RATIO = 0.7
+# 配置コントロール（チャート本体右下にオーバーレイ表示する小さな操作パネル）の
+# 幅・チャート右端／下端からの余白(px)。
+_PLACEMENT_CONTROL_WIDTH = 200
+_PLACEMENT_CONTROL_MARGIN = 12
 
 # ジョブ名検索は1文字入力するたびに絞り込みを走らせず、入力が止まってから
 # まとめて反映する（デバウンス）。値はキー入力の間隔として自然に感じられる
@@ -99,55 +107,26 @@ class GanttTab(QWidget):
         self.db = db
         self._result_df = None
         self._display = None
-        # 「配置コントロール」スライダーで調整する distribution_ratio
-        # （project_scheduler.py 参照。各タスクを [ASAP, ALAP] のどのあたりに
-        # 配置するかの基準点）。DBには保存しない、このタブだけの表示用パラメータ
-        # （ワークフロー／チーム等の絞り込みと同じ扱い。Undo/Redoの対象にもしない）。
-        self._distribution_ratio = _DEFAULT_DISTRIBUTION_RATIO
-        # 直近の計算結果がどの時点のDB内容・distribution_ratioに対応するか
-        # （db.revision, distribution_ratio）の組。一致している間は再計算しない
-        # （タブを行き来するたびに数秒かかるスケジューリングを走らせないため）。
-        self._computed_signature = None
+        # 「配置コントロール」で調整する distribution_ratio（project_scheduler.py
+        # 参照。各タスクを[ASAP, ALAP]のどのあたりに配置するかの基準点）。
+        # プロジェクト設定としてDB（project.distribution_ratio）に保存する。
+        # ここに持つのは表示用のキャッシュで、DB側が正——Undo/Redo等でDBの値が
+        # 変わった場合は refresh_choices() の先頭で読み直して同期する。
+        self._distribution_ratio = self.db.get_project()["distribution_ratio"]
+        # 直近の計算結果がどの時点のDB内容に対応するか（db.revision の値）。
+        # 一致している間は再計算しない（タブを行き来するたびに数秒かかる
+        # スケジューリングを走らせないため）。distribution_ratioの変更もDBへの
+        # 書き込みを伴う＝db.revisionが進むため、これだけで両方カバーできる。
+        self._computed_revision = None
         # 実行中のスケジューリング要求の通し番号。結果が返ってきたときに
         # 「最後に出した要求のものか」を判定し、古い結果は捨てる。
         self._request_seq = 0
         self._thread = None
         self._worker = None
-        # 計算中の要求に対応する表示用補助情報・distribution_ratio
-        # （結果が返ってきたら _display へ移す／_computed_signature に使う）。
+        # 計算中の要求に対応する表示用補助情報（結果が返ってきたら _display へ移す）
         self._pending_display = None
-        self._pending_distribution_ratio = None
 
         layout = QVBoxLayout(self)
-
-        # 配置コントロール（distribution_ratio の調整）。ドラッグ中に毎回
-        # 再計算すると重い上にUndoできない中間状態が大量にできてしまうため、
-        # スライダーを離した時にだけ再計算する（_on_placement_slider_released）。
-        self.placement_group = QGroupBox("配置コントロール")
-        placement_layout = QHBoxLayout(self.placement_group)
-        placement_layout.addWidget(QLabel("最速"))
-        self.placement_slider = NoWheelSlider(Qt.Horizontal)
-        self.placement_slider.setRange(0, 100)
-        self.placement_slider.setValue(round(self._distribution_ratio * 100))
-        self.placement_slider.setToolTip(
-            "各タスクを、依存関係が満たされ次第の最速開始～締切から逆算した"
-            "最遅開始の範囲内のどこに配置するかの基準点（distribution_ratio）。"
-        )
-        placement_layout.addWidget(self.placement_slider, 1)
-        placement_layout.addWidget(QLabel("ギリギリ"))
-        self.placement_spinbox = NoWheelSpinBox()
-        self.placement_spinbox.setRange(0, 100)
-        self.placement_spinbox.setSuffix("%")
-        self.placement_spinbox.setValue(round(self._distribution_ratio * 100))
-        # 数字入力中に1文字ごと反映されるのを防ぐ（Enter/フォーカスアウト、
-        # または矢印ボタン操作でのみ valueChanged が飛ぶようにする）。
-        self.placement_spinbox.setKeyboardTracking(False)
-        placement_layout.addWidget(self.placement_spinbox)
-        layout.addWidget(self.placement_group)
-
-        self.placement_slider.valueChanged.connect(self._on_placement_slider_value_changed)
-        self.placement_slider.sliderReleased.connect(self._on_placement_slider_released)
-        self.placement_spinbox.valueChanged.connect(self._on_placement_spinbox_value_changed)
 
         # ワークフロー／チーム／タグの3つの絞り込み（いずれもOR条件の
         # チェックボックス一覧で、3つの間はAND条件で組み合わせる。
@@ -203,6 +182,73 @@ class GanttTab(QWidget):
         self.view = FrozenGanttPane()
         layout.addWidget(self.view, 1)
 
+        # 配置コントロール（distribution_ratio の調整）。チャート本体（self.view）
+        # の右下に、レイアウトへは組み込まないフローティングパネルとして重ねる
+        # （self.viewのリサイズに追従させて位置合わせし直す。_reposition_placement_control
+        # /eventFilter参照）。ドラッグ中に毎回再計算すると重い上にUndoできない
+        # 中間状態が大量にできてしまうため、スライダーを離した時にだけ
+        # DBへ書き込み・再計算する（_on_placement_slider_released）。
+        self.placement_group = QGroupBox("配置コントロール", self.view)
+        self.placement_group.setFixedWidth(_PLACEMENT_CONTROL_WIDTH)
+        placement_layout = QVBoxLayout(self.placement_group)
+        placement_labels_row = QHBoxLayout()
+        placement_labels_row.addWidget(QLabel("最速"))
+        placement_labels_row.addStretch(1)
+        placement_labels_row.addWidget(QLabel("ギリギリ"))
+        placement_layout.addLayout(placement_labels_row)
+        self.placement_slider = NoWheelSlider(Qt.Horizontal)
+        self.placement_slider.setRange(0, 100)
+        self.placement_slider.setToolTip(
+            "各タスクを、依存関係が満たされ次第の最速開始～締切から逆算した"
+            "最遅開始の範囲内のどこに配置するかの基準点（distribution_ratio）。"
+        )
+        placement_layout.addWidget(self.placement_slider)
+        self.placement_spinbox = NoWheelSpinBox()
+        self.placement_spinbox.setRange(0, 100)
+        self.placement_spinbox.setSuffix("%")
+        self.placement_spinbox.setAlignment(Qt.AlignRight)
+        # 数字入力中に1文字ごと反映されるのを防ぐ（Enter/フォーカスアウト、
+        # または矢印ボタン操作でのみ valueChanged が飛ぶようにする）。
+        self.placement_spinbox.setKeyboardTracking(False)
+        # スピンボックスでの連続した増減（矢印連打・入力し直し）を、
+        # フォーカスの出入り単位で1つのUndoにまとめる（docs/architecture.md
+        # 「Undo/Redo」参照）。スライダーはドラッグ中DBに書き込まず離した時に
+        # 1回だけ書き込むため、これ自体で既に1操作1Undoになっており不要。
+        bind_undo_session(self.placement_spinbox, self.db, "配置コントロールを変更")
+        placement_layout.addWidget(self.placement_spinbox)
+        self._sync_placement_widgets(self._distribution_ratio)
+
+        self.placement_slider.valueChanged.connect(self._on_placement_slider_value_changed)
+        self.placement_slider.sliderReleased.connect(self._on_placement_slider_released)
+        self.placement_spinbox.valueChanged.connect(self._on_placement_spinbox_value_changed)
+        self.view.installEventFilter(self)
+        self.placement_group.adjustSize()
+        self.placement_group.raise_()
+        QTimer.singleShot(0, self._reposition_placement_control)
+
+    def eventFilter(self, obj, event):
+        if obj is self.view and event.type() == QEvent.Resize:
+            self._reposition_placement_control()
+        return super().eventFilter(obj, event)
+
+    def _reposition_placement_control(self):
+        """配置コントロールをチャート本体（self.view）の右下に留め直す。"""
+        self.placement_group.adjustSize()
+        x = self.view.width() - self.placement_group.width() - _PLACEMENT_CONTROL_MARGIN
+        y = self.view.height() - self.placement_group.height() - _PLACEMENT_CONTROL_MARGIN
+        self.placement_group.move(max(0, x), max(0, y))
+
+    def _sync_placement_widgets(self, ratio):
+        """配置コントロールのスライダー・スピンボックスの表示をratioに合わせる
+        （シグナルを止めて行う——ここからの再計算・DB書き込みは発生させない）。"""
+        value = round(ratio * 100)
+        self.placement_slider.blockSignals(True)
+        self.placement_slider.setValue(value)
+        self.placement_slider.blockSignals(False)
+        self.placement_spinbox.blockSignals(True)
+        self.placement_spinbox.setValue(value)
+        self.placement_spinbox.blockSignals(False)
+
     def refresh_choices(self):
         """このタブに切り替わるたびに gui/main.py の _on_tab_changed から呼ばれ、
         現在のDB内容でスケジューリングを実行し直す。
@@ -210,9 +256,10 @@ class GanttTab(QWidget):
         タスク数が増えるとスケジューリングは数秒かかるため、次の2つでUIが
         固まらないようにしている。
 
-        1. 前回計算した時点からDBの内容・distribution_ratioが変わっていなければ
-           再計算しない（_computed_signature で判定）。タブを行き来しただけで
-           毎回計算し直すのを防ぐ。
+        1. 前回計算した時点からDBの内容が変わっていなければ再計算しない
+           （db.revision で判定）。タブを行き来しただけで毎回計算し直すのを防ぐ。
+           distribution_ratioの変更もDBへの書き込みを伴う（db.set_distribution_ratio）
+           ためdb.revisionが進み、これだけで両方カバーできる。
         2. 計算本体はワーカースレッドで実行する（_ScheduleWorker）。DBを読むのは
            GUIスレッド（build_frames）、計算だけ別スレッド、という分割にしている。
            計算中も画面は操作でき、途中で内容を変えれば新しい要求が古い要求を
@@ -226,6 +273,14 @@ class GanttTab(QWidget):
         避けるための特別扱いが、gui/main.py 側で必要になっていた）。
         明示的な操作であるFileメニューの「ガントチャートを生成」は、従来どおり
         ダイアログでエラーを知らせる。"""
+        # 配置コントロールはDBのproject.distribution_ratioが正。Undo/Redo等で
+        # DB側の値がこのタブの知らないうちに変わっている場合があるため、
+        # 毎回ここで読み直して表示（スライダー・スピンボックス）を合わせ直す。
+        db_ratio = self.db.get_project()["distribution_ratio"]
+        if db_ratio != self._distribution_ratio:
+            self._distribution_ratio = db_ratio
+            self._sync_placement_widgets(db_ratio)
+
         errors = validate_for_generation(self.db)
         if errors:
             self._cancel_pending_request()
@@ -235,8 +290,7 @@ class GanttTab(QWidget):
             )
             return
 
-        signature = (self.db.revision, self._distribution_ratio)
-        if self._result_df is not None and self._computed_signature == signature:
+        if self._result_df is not None and self._computed_revision == self.db.revision:
             # 前回計算した時点から内容が変わっていないので、表示だけ作り直す。
             self._apply_result()
             return
@@ -251,7 +305,6 @@ class GanttTab(QWidget):
             return
 
         self._pending_display = display
-        self._pending_distribution_ratio = self._distribution_ratio
         self._request_seq += 1
         seq = self._request_seq
         self._start_worker(seq, frames)
@@ -259,20 +312,26 @@ class GanttTab(QWidget):
 
     def _on_placement_slider_value_changed(self, value):
         """ドラッグ中は毎回ここが呼ばれる。スピンボックスの表示だけ追従させ、
-        重い再計算はスライダーを離すまで行わない（_on_placement_slider_released）。"""
+        重いDB書き込み・再計算はスライダーを離すまで行わない
+        （_on_placement_slider_released）。"""
         self.placement_spinbox.blockSignals(True)
         self.placement_spinbox.setValue(value)
         self.placement_spinbox.blockSignals(False)
 
     def _on_placement_slider_released(self):
-        self._distribution_ratio = self.placement_slider.value() / 100.0
-        self.refresh_choices()
+        self._commit_distribution_ratio(self.placement_slider.value() / 100.0)
 
     def _on_placement_spinbox_value_changed(self, value):
         self.placement_slider.blockSignals(True)
         self.placement_slider.setValue(value)
         self.placement_slider.blockSignals(False)
-        self._distribution_ratio = value / 100.0
+        self._commit_distribution_ratio(value / 100.0)
+
+    def _commit_distribution_ratio(self, ratio):
+        if ratio == self._distribution_ratio:
+            return  # 実際には変わっていない（ドラッグして元の値に戻した等）
+        self._distribution_ratio = ratio
+        self.db.set_distribution_ratio(ratio)
         self.refresh_choices()
 
     def _start_worker(self, seq, frames):
@@ -323,7 +382,7 @@ class GanttTab(QWidget):
             return  # 追い越された古い要求の結果なので捨てる
         self._result_df = result_df
         self._display = self._pending_display
-        self._computed_signature = (self.db.revision, self._pending_distribution_ratio)
+        self._computed_revision = self.db.revision
         self._apply_result()
 
     def _on_schedule_failed(self, seq, message):
@@ -380,7 +439,7 @@ class GanttTab(QWidget):
         ように誤解させてしまうため。"""
         self._result_df = None
         self._display = None
-        self._computed_signature = None
+        self._computed_revision = None
         self.view.setScene(None)
         self._rebuild_filters()
         self._set_status(status_message, is_error=is_error)

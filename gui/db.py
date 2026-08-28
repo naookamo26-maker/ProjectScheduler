@@ -98,6 +98,20 @@ def _validate_start_pin_date(value):
         ) from None
 
 
+def _validate_distribution_ratio(value):
+    """配置コントロール（distribution_ratio）の値を検証する。
+    ALTER TABLE で後から足した列にはCHECK制約を付けられないため、他の
+    後付け列（normalize_dependency_kind 等）と同様に書き込み経路で守る。
+    """
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ProjectDatabaseError("配置コントロールの値は数値で指定してください") from None
+    if not 0.0 <= value <= 1.0:
+        raise ProjectDatabaseError("配置コントロールの値は0.0〜1.0の範囲で指定してください")
+    return value
+
+
 def normalize_tags(tags):
     """ジョブのタグ入力（カンマ区切りの1文字列、またはリスト）を、正規化した
     カンマ区切り文字列に変換する。前後の空白を落とし、空要素は除外し、
@@ -456,15 +470,30 @@ class ProjectDatabase:
 
     def get_project(self):
         row = self._conn.execute(
-            "SELECT project_name, start_date FROM project WHERE id = 1"
+            "SELECT project_name, start_date, distribution_ratio FROM project WHERE id = 1"
         ).fetchone()
-        return {"project_name": row["project_name"], "start_date": row["start_date"]}
+        return {
+            "project_name": row["project_name"],
+            "start_date": row["start_date"],
+            "distribution_ratio": row["distribution_ratio"],
+        }
 
     @undoable("プロジェクト概要を変更")
     def set_project(self, project_name, start_date):
         self._conn.execute(
             "UPDATE project SET project_name = ?, start_date = ? WHERE id = 1",
             (project_name, start_date),
+        )
+        self._commit()
+
+    @undoable("配置コントロールを変更")
+    def set_distribution_ratio(self, distribution_ratio):
+        """ガントチャートタブの「配置コントロール」で調整する distribution_ratio
+        （project_scheduler.py 参照）をプロジェクト設定として保存する。"""
+        distribution_ratio = _validate_distribution_ratio(distribution_ratio)
+        self._conn.execute(
+            "UPDATE project SET distribution_ratio = ? WHERE id = 1",
+            (distribution_ratio,),
         )
         self._commit()
 

@@ -265,12 +265,17 @@ def compute_schedule(db, **scheduler_kwargs):
     まとめて同期実行する薄いラッパー。GUIから使う場合は、計算部分だけを
     ワーカースレッドへ逃がすため、この3つを個別に呼ぶ（gui/tab_gantt.py）。
 
+    distribution_ratio を明示指定しなければ、プロジェクト設定
+    （db.get_project()["distribution_ratio"]、ガントチャートタブの
+    「配置コントロール」で調整・保存する値）を既定値として使う。
+
     Returns: (result_df, display) のタプル。
       result_df: run_resource_constrained_scheduler_from_frames() の戻り値そのもの。
       display: build_display() の戻り値。
 
     SchedulingError系の例外はそのまま呼び出し元に伝播させる。
     """
+    scheduler_kwargs.setdefault("distribution_ratio", db.get_project()["distribution_ratio"])
     result_df = compute_schedule_from_frames(build_frames(db), **scheduler_kwargs)
     return result_df, build_display(db)
 
@@ -278,8 +283,14 @@ def compute_schedule(db, **scheduler_kwargs):
 def generate_gantt(db, plotly_output_path=None, **scheduler_kwargs):
     """build_frames() の結果を project_scheduler.run_resource_constrained_scheduler_from_frames()
     にそのまま渡す。SchedulingError系（循環依存・リソース不足・マイルストーン不整合等）は
-    そのまま呼び出し元に伝播させる（GUI側でダイアログに変換する）。"""
+    そのまま呼び出し元に伝播させる（GUI側でダイアログに変換する）。
+
+    distribution_ratio を明示指定しなければ、プロジェクト設定
+    （db.get_project()["distribution_ratio"]）を既定値として使う——
+    ガントチャートタブで調整した基準点が、メニューの「ガントチャートを
+    生成」（HTMLファイル出力）でもそのまま使われるようにするため。"""
     frames = build_frames(db)
+    scheduler_kwargs.setdefault("distribution_ratio", db.get_project()["distribution_ratio"])
     return run_resource_constrained_scheduler_from_frames(
         frames["project"], frames["teams"], frames["milestones"], frames["workflows"],
         frames["jobs"], frames["job_tasks"], frames["holidays"], frames["external_dependencies"],
