@@ -1380,6 +1380,78 @@ def test_task_table_orders_tasks_upstream_to_downstream(window, qapp):
     assert table.item(c_row, 3).text() == "B"
 
 
+def test_compute_workflow_min_duration_follows_critical_path():
+    """FS/SSの依存種別とラグを踏まえた最短完了日数（クリティカルパス）を
+    正しく計算すること。チームの同時ライン数・休業日は一切考慮しない
+    （純粋にタスクの所要日数と内部依存だけで決まる下限）。"""
+    from gui.node_canvas import compute_workflow_min_duration
+
+    tasks = [
+        {"id": 1, "default_days": 5},  # A
+        {"id": 2, "default_days": 3},  # B: Aの完了(FS)+2日後に開始
+        {"id": 3, "default_days": 4},  # C: Aの開始(SS)+1日後に開始
+    ]
+    deps = [
+        {"predecessor_task_id": 1, "successor_task_id": 2, "dep_type": "FS", "lag_days": 2},
+        {"predecessor_task_id": 1, "successor_task_id": 3, "dep_type": "SS", "lag_days": 1},
+    ]
+    # A: 0〜5。B: FSなのでAの終了(5)+2=7に開始、3日で10に終了。
+    # C: SSなのでAの開始(0)+1=1に開始、4日で5に終了。全体は最も遅いBの10。
+    assert compute_workflow_min_duration(tasks, deps) == 10
+
+
+def test_compute_workflow_min_duration_clamps_negative_lead_to_zero():
+    """リード（負のラグ）で計算上マイナスの開始日になっても、0未満には
+    しない（プロジェクト開始日より前には遡れないため）。"""
+    from gui.node_canvas import compute_workflow_min_duration
+
+    tasks = [{"id": 1, "default_days": 2}, {"id": 2, "default_days": 3}]
+    deps = [{"predecessor_task_id": 1, "successor_task_id": 2, "dep_type": "FS", "lag_days": -100}]
+    assert compute_workflow_min_duration(tasks, deps) == 3  # 開始日は0に丸められ、3日タスクで終了
+
+
+def test_compute_workflow_min_duration_returns_zero_for_no_tasks():
+    from gui.node_canvas import compute_workflow_min_duration
+
+    assert compute_workflow_min_duration([], []) == 0
+
+
+def test_node_canvas_shows_duration_marker_above_all_nodes(window, qapp):
+    """ノードビュー上部に、ワークフロー全体の最短完了日数を示す目盛り
+    （｜←-- 最短N日 --→｜）が表示され、常に全ノードより上（yが小さい）に
+    位置すること。"""
+    from PySide6.QtWidgets import QGraphicsSimpleTextItem
+
+    wf_tab = window.tab_workflows
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    wf_tab.refresh_workflows(select_id=wf_id)
+    window.tabs.setCurrentWidget(wf_tab)
+    qapp.processEvents()
+
+    scene = wf_tab.current_scene
+    a = scene.add_task("A", team_id, 5, 0, 0)
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    b = scene.add_task("B", team_id, 3, 0, 0)
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+    scene.try_add_edge(scene.nodes[a.workflow_task_id], scene.nodes[b.workflow_task_id])
+    qapp.processEvents()
+    scene = wf_tab.current_scene
+
+    labels = [
+        item for item in scene.items()
+        if isinstance(item, QGraphicsSimpleTextItem) and item.text().startswith("最短")
+    ]
+    assert len(labels) == 1
+    assert labels[0].text() == "最短8日"  # A(5日)→B(3日、FS+0)の直列で8日
+
+    marker_y = labels[0].y()
+    node_tops = [node.y() for node in scene.nodes.values()]
+    assert marker_y < min(node_tops)
+
+
 def test_task_table_edit_and_delete_reuse_the_node_view_dialog_flow(window, qapp):
     """テーブルビューの「編集...」「削除」ボタンは、ノードビューと同じ
     scene操作（Undo・確認ダイアログ込み）を経由すること。"""
