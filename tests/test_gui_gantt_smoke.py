@@ -1391,3 +1391,128 @@ def test_malformed_start_pin_date_raises_instead_of_being_ignored(tmp_path):
     with pytest.raises(SchedulingError):
         compute_schedule_from_frames(frames, verbose=False)
     db.close()
+
+
+# -- 無効化したタスクをまたぐ依存の橋渡し（Is_Active = N） -------------------------------
+#
+# ジョブ単位でタスクを1つ外すと依存の鎖に穴が空く。穴の前後を繋ぎ直さないと、
+# 後続タスクが先行タスクの完了を待たずに着手できることになり、外したタスクとは
+# 無関係な工程まで一斉に前倒しされてしまう。外したタスクは「所要0日で素通しする
+# 穴」として扱う（project_scheduler.py の _bridge_inactive_deps 参照）。
+
+def _build_three_task_chain_project(db_path):
+    """A(3日) → B(2日) → C(2日) の一直線。開発開始日 2026-01-05 は月曜。"""
+    db = ProjectDatabase.create_new(str(db_path))
+    db.set_project("無効化検証", "2026-01-05")
+    team_id = db.add_team("チームA", 5)
+    ms_id = db.add_milestone("マイルストーン1", "2026-06-30")
+    wf_id = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf_id, "A", team_id, 3)
+    t2 = db.add_workflow_task(wf_id, "B", team_id, 2)
+    t3 = db.add_workflow_task(wf_id, "C", team_id, 2)
+    dep_ab = db.add_task_dependency(wf_id, t1, t2)
+    dep_bc = db.add_task_dependency(wf_id, t2, t3)
+    job_id = db.add_job("ジョブ1", wf_id, ms_id, 1)
+    return db, {"job": job_id, "wf": wf_id, "ms": ms_id,
+                "t1": t1, "t2": t2, "t3": t3, "ab": dep_ab, "bc": dep_bc}
+
+
+def test_deactivating_a_middle_task_keeps_the_chain_connected(tmp_path):
+    """回帰テスト: A→B→C の B を無効化しても、C は A の完了を待つこと。
+
+    以前は無効化タスクへの依存を単に捨てていたため、C が依存を1つも持たない
+    タスクになり開発開始日まで前倒しされていた（外したのは B だけなのに、
+    C の日程まで動いてしまう）。"""
+    db, ids = _build_three_task_chain_project(tmp_path / "p.pschedule")
+    assert _dates(db)["C"][0] == "2026-01-12"  # A(1/5-1/8) → B(1/8-1/12) → C
+
+    db.upsert_job_task_override(ids["job"], ids["t2"], is_active=False)
+
+    dates = _dates(db)
+    assert "B" not in dates                    # B は日程に現れない
+    assert dates["A"][1] == "2026-01-08"
+    assert dates["C"][0] == "2026-01-08"       # B のぶんだけ詰まるが、A は待つ
+    db.close()
+
+
+def test_bridging_an_inactive_task_composes_lag_and_keeps_upstream_kind(tmp_path):
+    """穴を挟む2つの依存は合成される。無効化タスクは所要0日＝開始日と完了日が
+    同じなので、ラグは足し算になり、種別は上流側（A→B）のものを引き継ぐ。"""
+    db, ids = _build_three_task_chain_project(tmp_path / "p.pschedule")
+    db.update_task_dependency(ids["ab"], "FS", 1)
+    db.update_task_dependency(ids["bc"], "FS", 2)
+    db.upsert_job_task_override(ids["job"], ids["t2"], is_active=False)
+    # A の完了 1/8(木) から稼働日3日（1+2）を空け、着手は 1/13(火)
+    assert _dates(db)["C"][0] == "2026-01-13"
+
+    # 上流が SS なら合成後も SS: A の「開始」1/5 から稼働日3日後 = 1/8
+    db.update_task_dependency(ids["ab"], "SS", 1)
+    assert _dates(db)["C"][0] == "2026-01-08"
+    db.close()
+
+
+def test_bridging_spans_consecutive_inactive_tasks(tmp_path):
+    """穴が連続していても、生きている先行タスクまで遡って繋ぐこと。"""
+    db, ids = _build_three_task_chain_project(tmp_path / "p.pschedule")
+    t4 = db.add_workflow_task(ids["wf"], "D", db.list_teams()[0]["id"], 2)
+    db.add_task_dependency(ids["wf"], ids["t3"], t4)
+    db.upsert_job_task_override(ids["job"], ids["t2"], is_active=False)
+    db.upsert_job_task_override(ids["job"], ids["t3"], is_active=False)
+
+    dates = _dates(db)
+    assert set(dates) == {"A", "D"}
+    assert dates["D"][0] == dates["A"][1] == "2026-01-08"
+    db.close()
+
+
+def test_deactivating_the_first_task_releases_its_successors(tmp_path):
+    """穴より手前に待つべきタスクが無ければ、依存は素直に消えること
+    （繋ぎ直す相手がいないので、後続は開発開始日から着手できる）。"""
+    db, ids = _build_three_task_chain_project(tmp_path / "p.pschedule")
+    db.upsert_job_task_override(ids["job"], ids["t1"], is_active=False)
+
+    dates = _dates(db)
+    assert "A" not in dates
+    assert dates["B"][0] == "2026-01-05"
+    db.close()
+
+
+def test_bridging_works_across_jobs(tmp_path):
+    """ジョブをまたぐ依存（job_external_dependencies）の相手が無効化された
+    場合も、その先行タスクへ繋ぎ替えること。"""
+    db, ids = _build_three_task_chain_project(tmp_path / "p.pschedule")
+    other = db.add_job("ジョブ2", ids["wf"], ids["ms"], 1)
+    # ジョブ2のAだけを残し、B・Cは無効化する
+    for t in (ids["t2"], ids["t3"]):
+        db.upsert_job_task_override(other, t, is_active=False)
+    # ジョブ1のA が「ジョブ2のC（無効）」を待つ → ジョブ2のA へ繋ぎ替わるはず
+    db.add_job_dependency_link(ids["job"], other)
+    db.add_external_dependency(ids["job"], ids["t1"], other, ids["t3"])
+
+    result = compute_schedule_from_frames(
+        build_frames(db), verbose=False, distribution_ratio=0.0,
+        auto_exclude_jp_holidays=False,
+    )
+    by_job = {
+        (row["Job_Name"], row["Task_Name"]): (str(row["Start_Date"])[:10], str(row["End_Date"])[:10])
+        for _, row in result.iterrows()
+    }
+    assert ("ジョブ2", "A") in by_job and ("ジョブ2", "C") not in by_job
+    # ジョブ1のA は、ジョブ2のA の完了(1/8)を待って着手する
+    assert by_job[("ジョブ1", "A")][0] == by_job[("ジョブ2", "A")][1] == "2026-01-08"
+    db.close()
+
+
+def test_bridging_survives_a_cycle_made_only_of_inactive_tasks(tmp_path):
+    """無効化されたタスク同士で循環しているデータでも、例外にせずその経路を
+    打ち切ること（既に使っていないタスクのせいで全体が止まらないように）。"""
+    db, ids = _build_three_task_chain_project(tmp_path / "p.pschedule")
+    # B → C に加えて C → B を張り、B・C の両方を無効化する
+    db.add_task_dependency(ids["wf"], ids["t3"], ids["t2"])
+    for t in (ids["t2"], ids["t3"]):
+        db.upsert_job_task_override(ids["job"], t, is_active=False)
+
+    dates = _dates(db)
+    assert set(dates) == {"A"}
+    assert dates["A"][0] == "2026-01-05"
+    db.close()
