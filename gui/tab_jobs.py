@@ -8,14 +8,16 @@
   ／マイルストーン／ジョブ タグ／タスク タグの4段が現れる（いずれも
   チェックボックスのOR条件で、4つの間はAND条件。一時的に表示件数を絞る
   だけでデータは削除されない。タスク タグは、そのタグを持つタスクを
-  1つでも含むジョブを表示する）。「ジョブ タグ」列はStretchで残り幅を
-  吸収し、パネル幅にかかわらず横スクロールなしで5列すべてが収まるように
-  している。「複製」ボタンで選択中のジョブをタスク上書き・依存先ジョブ
-  ごと複製できる（このジョブに依存している側は複製先へ引き継がない。
-  db.duplicate_job参照）。ジョブ タグは単純なカンマ区切りのテキスト入力
-  （例:「緊急, 顧客A」）で、保存時に前後の空白除去・重複排除・「, 」区切り
-  への正規化を行う（gui/db.py の normalize_tags 参照。タスク タグも同じ
-  仕様・同じ正規化関数を使う）。
+  1つでも含むジョブを表示する）。ジョブ一覧の「タグ」列（列見出しは冗長さを
+  避けて単に「タグ」とする——テーブルの文脈からジョブ タグと分かるため。
+  絞り込み側の「ジョブ タグ」「タスク タグ」は同じセクションに並ぶため
+  区別が要る）はStretchで残り幅を吸収し、パネル幅にかかわらず横スクロール
+  なしで5列すべてが収まるようにしている。「複製」ボタンで選択中のジョブを
+  タスク上書き・依存先ジョブごと複製できる（このジョブに依存している側は
+  複製先へ引き継がない。db.duplicate_job参照）。ジョブ タグは単純な
+  カンマ区切りのテキスト入力（例:「緊急, 顧客A」）で、保存時に前後の
+  空白除去・重複排除・「, 」区切りへの正規化を行う（gui/db.py の
+  normalize_tags 参照。タスク タグも同じ仕様・同じ正規化関数を使う）。
 - 右: 上下2分割（QSplitter）で、選択中ジョブのタスク上書き表と依存先ジョブを
   縦に並べる。
   - タスク上書き表: 選択ジョブが使うワークフローのタスク一覧をそのまま
@@ -280,7 +282,7 @@ class JobsTab(QWidget):
         self.filters_section.content_layout.addWidget(self.task_tag_filter)
 
         self.jobs_section = CrudSection(
-            "ジョブ", ["ジョブ名", "ワークフロー", "既定マイルストーン", "優先度", "ジョブ タグ"],
+            "ジョブ", ["ジョブ名", "ワークフロー", "既定マイルストーン", "優先度", "タグ"],
             on_add=self._add_job, on_delete=self._delete_job, on_duplicate=self._duplicate_job,
         )
         self.jobs_section.table.itemChanged.connect(self._on_job_cell_text_changed)
@@ -291,8 +293,9 @@ class JobsTab(QWidget):
         jobs_header.setSortIndicatorShown(True)
         jobs_header.setSortIndicator(self._sort_column, Qt.AscendingOrder)
         jobs_header.sectionClicked.connect(self._on_job_header_clicked)
-        # 「ジョブ タグ」列（内容の長さが最も変動する）に残り幅を吸収させ、
-        # パネル幅にかかわらず横スクロールなしで5列すべてが収まるようにする。
+        # 「タグ」列（ジョブ タグ。内容の長さが最も変動する）に残り幅を
+        # 吸収させ、パネル幅にかかわらず横スクロールなしで5列すべてが
+        # 収まるようにする。
         jobs_header.setSectionResizeMode(4, QHeaderView.Stretch)
         # スクロールや表示領域の変化に追従して、見えている行にだけ
         # セルウィジェットを用意する。
@@ -305,7 +308,7 @@ class JobsTab(QWidget):
 
         self.override_table = QTableWidget(0, 7)
         self.override_table.setHorizontalHeaderLabels(
-            ["タスク名", "有効", "日数", "マイルストーン", "チーム", "開始固定日", "タスク タグ"]
+            ["タスク名", "有効", "日数", "マイルストーン", "チーム", "開始固定日", "タグ"]
         )
         self.override_table.verticalHeader().setVisible(False)
         self.override_table.setSelectionMode(QTableWidget.NoSelection)
@@ -860,11 +863,12 @@ class JobsTab(QWidget):
                 return
 
     def _on_override_tag_text_changed(self, item):
-        """タスク上書き表の「タスク タグ」列（6列目）の編集完了時に呼ばれる。
-        他の列（チェックボックス・コンボ・スピンボックス等）はセルウィジェットの
-        シグナルで直接 _on_override_changed に繋いでいるが、タスク タグ列は
-        ジョブ タグ列と同じくウィジェットを持たない常時編集可能なitemのため、
-        テーブル全体のitemChangedを購読してここで列を判定する。"""
+        """タスク上書き表の「タグ」列（6列目、タスク タグ）の編集完了時に
+        呼ばれる。他の列（チェックボックス・コンボ・スピンボックス等）は
+        セルウィジェットのシグナルで直接 _on_override_changed に繋いでいるが、
+        タスク タグ列はジョブ一覧の「タグ」列と同じくウィジェットを持たない
+        常時編集可能なitemのため、テーブル全体のitemChangedを購読してここで
+        列を判定する。"""
         if item.column() != 6:
             return
         workflow_task_id = row_id(self.override_table, item.row())

@@ -851,7 +851,7 @@ def test_override_days_edit_keeps_its_spinbox_alive(window, qapp):
 
 
 def test_task_tag_edit_persists_and_filters_jobs(window, qapp):
-    """タスク上書き表の「タスク タグ」列（7列目）を編集すると
+    """タスク上書き表の「タグ」列（7列目、タスク タグ）を編集すると
     job_task_overrides.tags に保存され、ジョブ タグと同じ正規化（前後の
     空白除去・重複排除・「, 」区切り）を経て表示に書き戻ること。また、
     「絞り込み」のタスク タグフィルタで、そのタグを持つタスクを含む
@@ -867,7 +867,7 @@ def test_task_tag_edit_persists_and_filters_jobs(window, qapp):
     qapp.processEvents()
 
     table = window.tab_jobs.override_table
-    assert table.horizontalHeaderItem(6).text() == "タスク タグ"
+    assert table.horizontalHeaderItem(6).text() == "タグ"
     table.item(0, 6).setText(" 確認 ,レビュー,, 確認")
     qapp.processEvents()
 
