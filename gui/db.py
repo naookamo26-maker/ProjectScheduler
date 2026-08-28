@@ -1600,7 +1600,16 @@ class ProjectDatabase:
         このリンクから自動生成された対応（source_link_id一致）のうち、
         現在どのテンプレートにも合致しなくなったもの（テンプレートの編集・
         削除で古くなったもの）は削除する。手動追加分（source_link_idが
-        NULL）には一切触れない。"""
+        NULL）には一切触れない。
+
+        実際に何も変わらなかった場合はcommitしない（revisionを進めない）。
+        この関数は各タブのrefresh_choices()（gui/tab_jobs.py）からタブを
+        切り替えるたびに呼ばれる「保険」の同期であり、ほとんどの呼び出しは
+        何も変えずに終わる。無条件にcommitするとrevisionが毎回進み、
+        gui/tab_gantt.pyがrevisionの一致でスケジューリングの再実行を省く
+        判定をしているため、タブを切り替えるだけで毎回フルの再スケジュー
+        リングが走ってしまう（実際には何も変わっていないのに、である）。"""
+        changes_before = self._conn.total_changes
         links = self._conn.execute(
             "SELECT l.id AS link_id, l.job_id, l.depends_on_job_id, "
             "j.workflow_id AS job_workflow_id, dj.workflow_id AS depends_on_workflow_id "
@@ -1633,6 +1642,8 @@ class ProjectDatabase:
                     self._conn.execute(
                         "DELETE FROM job_external_dependencies WHERE id = ?", (row["id"],)
                     )
+        if self._conn.total_changes == changes_before:
+            return  # 実際には何も変わらなかった（revisionを進めない）
         self._commit()
 
     @undoable("依存先ジョブを追加")

@@ -511,6 +511,60 @@ GUIのガントチャートタブは件数と最大超過日数を画面上部�
 害がない）。ウィンドウを閉じる/プロジェクトを開き直す際は、
 `MainWindow._shutdown_gantt_tab()` がスレッドの終了を待ち合わせる。
 
+### revisionは「要求時点」の値を刻む
+
+結果のキャッシュ判定（`self._computed_revision == self.db.revision`）に使う
+`_computed_revision`は、計算が**完了した時点**の`db.revision`ではなく、
+`build_frames()`を呼んだ**要求時点**の`db.revision`（`refresh_choices()`が
+`request_revision`として控え、`_pending_revision`経由で`_on_schedule_finished`
+に渡す）を刻む。
+
+計算は非同期のため、ワーカーが走っている間に他タブでDBが編集されて
+`db.revision`が先に進むことがある。完了時点の値を刻んでいると、この
+「計算中の編集」を誤って「結果に反映済み」とみなしてしまい——結果は
+編集前の古いDB内容のままなのに、以降`refresh_choices()`が
+`_computed_revision == db.revision`の一致を見て再計算をスキップし続け、
+編集がガントチャートに反映されないまま「最新」として画面に残ってしまう。
+要求時点の値を刻めば、計算中の編集で`db.revision`との食い違いが必ず残るため、
+次の`refresh_choices()`が正しく再計算を走らせる。
+
+### `sync_dependency_templates()`が無変更でrevisionを進めないこと
+
+タブ2・タブ3への切り替えは、それぞれの`refresh_choices()`から
+`sync_dependency_templates()`（`gui/db.py`）を「保険」として毎回呼ぶ。
+この関数は、実際にDBの内容が変わった場合にだけ`_commit()`する（＝実際には
+何も変わらなかった呼び出しでは`db.revision`を進めない）。無条件に
+`_commit()`していた頃は、ジョブタブへ寄り道するだけで`db.revision`が
+必ず進み、上記のキャッシュ判定が「内容が変わった」と誤認して、タブを
+行き来するたびに毎回フルの再スケジューリングが走っていた（詳細は
+`gui/db.py`の`sync_dependency_templates()`のdocstring参照）。
+
+### 複数のワーカースレッドをまとめて追跡する
+
+`_start_worker()`は、実行中の古いワーカーを止めずに放置する方針（上記）
+のため、タブを連続して切り替えたり配置スライダーを繰り返し操作したりすると、
+複数本のスレッドが同時に実行中の状態になり得る。`GanttTab._threads`は
+`(QThread, _ScheduleWorker)`の**一覧**として全件を保持し、`shutdown()`は
+その全件を待ち合わせる。「最後の1本」だけを`self._thread`に保持していた
+頃は、それより前に始まった実行中のスレッドを待たずにウィンドウが閉じてしまい、
+"QThread: Destroyed while thread is still running" でクラッシュしうる状態
+だった。
+
+スレッドの終了通知（`thread.finished`）を追跡リストから外す処理
+（`_on_worker_thread_finished`）は、`self`（GUIスレッドに属するQObject）の
+束縛メソッドとして繋ぐ。ラムダ等の素のPython callableをそのまま繋ぐと、
+PySide側が接続をキュー接続だと判定できず、ワーカースレッド側で直接
+実行されてしまう（`self._threads`というGUIスレッド専有のリストを、
+ロック無しでワーカースレッドから書き換えることになり危険）。束縛メソッドを
+繋げば、PySide側が送信元と受信側の所属スレッドの違いを見てキュー接続を
+選ぶため、実行は必ずGUIスレッド側に回る（受信側で`self.sender()`を使い、
+「どのスレッドが終わったか」を判定する）。
+
+回帰テストは`tests/test_gui_undo_redo.py`
+（`test_schedule_completing_after_a_concurrent_edit_does_not_mask_it` /
+`test_switching_to_jobs_tab_and_back_does_not_force_a_recomputation` /
+`test_shutdown_waits_for_every_in_flight_worker_thread`）。
+
 ## ノードグラフの循環依存検出
 
 `gui/node_canvas.py`の`WorkflowGraphScene`は、ワークフロー内のタスク依存を
