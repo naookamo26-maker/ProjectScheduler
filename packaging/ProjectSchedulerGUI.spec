@@ -25,10 +25,10 @@ a = Analysis(
     pathex=[REPO_ROOT],
     binaries=[],
     datas=[],
-    # pandas/openpyxl/plotly はいずれも project_scheduler.py が使用する実行時依存で、
+    # pandas/plotly はいずれも project_scheduler.py が使用する実行時依存で、
     # pyinstaller-hooks-contrib が同梱するフックにより通常は自動検出されるが、
     # 明示しておくことで検出漏れ時の切り分けを容易にする。
-    hiddenimports=["pandas", "openpyxl", "plotly"],
+    hiddenimports=["pandas", "plotly"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

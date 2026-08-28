@@ -43,7 +43,7 @@ pyinstaller packaging\ProjectSchedulerGUI.spec
 ## spec ファイルの構成（`packaging/ProjectSchedulerGUI.spec`）
 
 - エントリポイントは `run_gui.py`。
-- `pandas`/`openpyxl`/`plotly` を `hiddenimports` に明示している（通常は
+- `pandas`/`plotly` を `hiddenimports` に明示している（通常は
   `pyinstaller-hooks-contrib` 同梱のフックで自動検出されるが、検出漏れ時の
   切り分けを容易にするため）。特に `plotly` はガントチャートHTML生成に
   `plotly.min.js`（パッケージ内データファイル）を埋め込むため、この
@@ -65,7 +65,7 @@ pyinstaller packaging\ProjectSchedulerGUI.spec
 本リポジトリのLinux開発環境では、以下をビルドが通ることで確認済み
 （Windows実機での最終確認はGitHub Actions側で行う）:
 
-- PySide6・pandas・openpyxl・plotly を含む依存グラフ全体が解析エラーなく
+- PySide6・pandas・plotly を含む依存グラフ全体が解析エラーなく
   ビルドできること
 - `plotly.min.js` がデータファイルとして正しく同梱されること
 - ビルドされた実行ファイルが実際に起動し、（オフスクリーンQtプラットフォーム

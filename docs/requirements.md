@@ -76,10 +76,9 @@ External_Dependencies という多シート構成のExcelを手編集する方�
   `project_scheduler.py` のスケジューリングエンジンを呼び出し、インタラクティブ
   HTML形式でガントチャートを出力する（Mermaid Markdown出力は、大規模時に
   レンダラー側の文字数上限で表示できず実用にならないため廃止した）。
-- **サンプルデータのDB化**: 既存のExcelサンプル
-  （`data/Project_Schedule_Sample_GameDev_v22.xlsx`）を一度きりの移行
-  スクリプト（`scripts/migrate_excel_to_db.py`）でDB形式に変換し、GUIで
-  すぐに開いて試せるようにする。
+- **サンプルデータのDB化**: 既存のExcelサンプルを一度きりの移行スクリプトで
+  DB形式に変換し、GUIですぐに開いて試せるようにする（移行完了後、
+  Excelサンプル本体と移行スクリプトは削除済み。「主要な意思決定」5参照）。
 - **Windows向け配布**: PyInstallerによる `.exe` パッケージング
   （GitHub Actionsでの自動ビルドに対応）。
 
@@ -128,6 +127,11 @@ External_Dependencies という多シート構成のExcelを手編集する方�
    リファクタリングした（詳細は `docs/architecture.md`）。
 5. **既存のExcelサンプルはDB形式に変換**し、GUIですぐ試せるようにする
    （常設のインポート機能ではなく、一度きりの移行スクリプトとして提供）。
+   移行が完了した後、移行スクリプト（`scripts/migrate_excel_to_db.py`）・
+   Excelサンプル本体・Excel読み込み層（`_load_data`）とそれに依存していた
+   CLIエントリポイント（`run_resource_constrained_scheduler`、`python
+   project_scheduler.py`での直接実行）は削除済み。GUIが唯一の入力経路になった
+   （詳細は `project_scheduler.py` 冒頭の変更履歴v18、`docs/architecture.md`）。
 6. **配布はWindows向け `.exe`**。ビルド環境の制約（PyInstallerはクロス
    コンパイル非対応）から、GitHub Actionsでの自動ビルドを整備する
    （詳細は `docs/packaging.md`）。
@@ -138,7 +142,7 @@ External_Dependencies という多シート構成のExcelを手編集する方�
   意図的に廃止した（多シートをID（`WF_CHAR`、`JOB:TASK`等）で相互参照する構造が
   タイプミス・参照ミスの温床であり、依存関係の全体像も掴めなかったため。これを
   解消することがGUI新設の目的そのもの）。既存Excelの継続的なインポート機能も
-  設けない（一度きりの移行スクリプト `scripts/migrate_excel_to_db.py` のみ提供）。
+  設けない（一度きりの移行スクリプトのみ提供し、移行完了後に削除した）。
 
   ただしこれは「**計画のマスタデータをExcelで持たない**」という意味であり、
   Excelというファイル形式そのものを否定するものではない。この記述は

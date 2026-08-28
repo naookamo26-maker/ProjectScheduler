@@ -72,6 +72,17 @@ v8での変更点（大規模プロジェクトへの対応）:
     ならないため。出力はインタラクティブHTML（Plotly製）に一本化する。
 17. マイルストーンの締切に間に合わないタスクを、HTMLガントチャートと
     GUIのガントチャートタブの両方で赤く太い枠線で強調するようにした。
+
+v18での変更点:
+18. Excelファイルからの読み込み（`_load_data`）と、それを使うCLIエントリ
+    ポイント（`run_resource_constrained_scheduler`、`python
+    project_scheduler.py`での直接実行）を削除した。入力フォーマットとして
+    のExcelは`docs/requirements.md`「対象外」に記載のとおり意図的に廃止
+    済みで、この読み込み層は「常設のインポート機能ではなく後方互換のためだけ
+    に残していたもの」（`scripts/migrate_excel_to_db.py`による一度きりの
+    移行が既に完了している）だった。以後、GUI（`gui/gantt_generator.py`が
+    SQLiteから直接組み立てるDataFrame経由）が唯一の入力経路になる
+    （`run_resource_constrained_scheduler_from_frames`）。
 """
 
 import hashlib
@@ -134,7 +145,7 @@ DEFAULT_DEPENDENCY = ("FS", 0)
 
 # Internal_Depends 列の1件ぶんの書式: "T_003" / "T_003(SS+2)" / "T_003(FS-1)"。
 # 種別・ラグが既定（FS・0）の依存は括弧を付けず、従来とまったく同じ文字列に
-# なるようにしている（旧Excel・既存の.pscheduleと相互に読み書きできる）。
+# なるようにしている（既存の.pscheduleと後方互換に読み書きできる）。
 _DEP_REF_RE = re.compile(
     r"^(?P<task>[^()\s]+)"
     r"(?:\(\s*(?P<kind>[A-Za-z]{2})\s*(?P<lag>[+-]\s*\d+)?\s*\))?$"
@@ -305,15 +316,14 @@ def _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
                             df_wf_names=None, df_team_capacity=None):
     """
     既に読み込み済みのDataFrame群を検証・整形する（列チェック・インデックス設定・
-    任意データの既定値補完）。Excel由来（_load_data経由）・DB由来（GUIの
-    gui/gantt_generator.py経由）を問わない共通の入口。
+    任意データの既定値補完）。呼び出し元は`gui/gantt_generator.py`の
+    `build_frames()`（SQLiteの内容からDataFrameを組み立てる）。
 
     df_project/df_teams/df_ms/df_wf/df_jobs は必須。
     df_jtasks/df_holidays/df_extdeps/df_wf_names/df_team_capacity は、Noneなら
     「対応するデータがそもそも存在しない」ことを表し既定の空DataFrameを使う。
-    DataFrame（0行でも可）を渡した場合は「存在する」ことを表し、Excelで対応
-    シートが存在する場合と同じ列検証を行う（Excel側の「シートが存在するか
-    どうか」と1対1に対応する）。
+    DataFrame（0行でも可）を渡した場合は「存在する」ことを表し、対応する
+    列検証を行う。
     """
     _require_columns(df_project, ["Project_ID", "Project_Name", "Start_Date"], "Project")
     _require_columns(df_teams, ["Team_ID", "Max_Lines"], "Teams")
@@ -370,40 +380,6 @@ def _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
 
     return (df_project, df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_holidays, df_extdeps,
             df_wf_names, df_team_capacity)
-
-
-def _load_data(excel_file):
-    """Excelファイル（またはExcel形式のバイト列/バッファ）を読み込み、
-    _load_data_from_frames に検証・整形を委譲する。"""
-    try:
-        xls = pd.ExcelFile(excel_file)
-    except Exception as e:
-        raise MissingSheetOrColumnError(f"Excelファイルを開けませんでした: {excel_file} ({e})")
-
-    for required_sheet in ["Project", "Teams", "Milestones", "Workflows", "Jobs"]:
-        if required_sheet not in xls.sheet_names:
-            raise MissingSheetOrColumnError(f"必須シート '{required_sheet}' が見つかりません")
-
-    df_project = pd.read_excel(xls, sheet_name="Project")
-    df_teams = pd.read_excel(xls, sheet_name="Teams")
-    df_ms = pd.read_excel(xls, sheet_name="Milestones")
-    df_wf = pd.read_excel(xls, sheet_name="Workflows")
-    df_jobs = pd.read_excel(xls, sheet_name="Jobs")
-
-    df_jtasks = pd.read_excel(xls, sheet_name="Job_Tasks") if "Job_Tasks" in xls.sheet_names else None
-    df_holidays = pd.read_excel(xls, sheet_name="Holidays") if "Holidays" in xls.sheet_names else None
-    df_extdeps = (
-        pd.read_excel(xls, sheet_name="External_Dependencies")
-        if "External_Dependencies" in xls.sheet_names else None
-    )
-    df_wf_names = pd.read_excel(xls, sheet_name="Workflow_Names") if "Workflow_Names" in xls.sheet_names else None
-    df_team_capacity = (
-        pd.read_excel(xls, sheet_name="Team_Capacity_Changes")
-        if "Team_Capacity_Changes" in xls.sheet_names else None
-    )
-    return _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
-                                   df_jtasks, df_holidays, df_extdeps, df_wf_names,
-                                   df_team_capacity)
 
 
 def _load_project_start(df_project):
@@ -1861,8 +1837,8 @@ renderAll();
 def export_plotly_gantt(result_df, output_path, project_name="プロジェクトスケジュール",
                          team_name_map=None, workflow_name_map=None, team_order=None,
                          milestone_markers=None):
-    """result_df（run_resource_constrained_schedulerの戻り値）から、サーバー不要で
-    ブラウザで直接開けるインタラクティブなガントチャート（単一HTMLファイル、
+    """result_df（run_resource_constrained_scheduler_from_framesの戻り値）から、
+    サーバー不要でブラウザで直接開けるインタラクティブなガントチャート（単一HTMLファイル、
     Plotly製）を書き出す。
 
     - **ワークフローごとに別々のガントチャートに分割**する。
@@ -1977,14 +1953,25 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
     return output_path
 
 
-def run_resource_constrained_scheduler(excel_file, verbose=True,
-                                        auto_exclude_weekends=True,
-                                        auto_exclude_jp_holidays=True,
-                                        plotly_output_path=None,
-                                        project_name=None,
-                                        distribution_ratio=0.7):
+def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
+                                                     df_jtasks=None, df_holidays=None,
+                                                     df_extdeps=None, df_wf_names=None,
+                                                     df_team_capacity=None,
+                                                     verbose=True,
+                                                     auto_exclude_weekends=True,
+                                                     auto_exclude_jp_holidays=True,
+                                                     plotly_output_path=None,
+                                                     project_name=None,
+                                                     distribution_ratio=0.7):
     """
     リソース制約付きスケジューリングを実行し、結果を DataFrame で返す。
+
+    df_project 以降 df_team_capacity までが、GUI（`gui/gantt_generator.py`の
+    `build_frames()`）がSQLiteの内容から組み立てるDataFrame群。
+    df_jtasks/df_holidays/df_extdeps/df_wf_names/df_team_capacity は None なら
+    「データなし」を表す。df_team_capacity は Team_ID/Start_Date/Lines 列を持ち、
+    チームの同時ライン数（Teams.Max_Lines）を途中の日付から変動させる場合の
+    変更点を表す。
 
     スケジューリングの考え方:
     1. 依存関係のみを考慮した最速日程（ASAP）と、締切（マイルストーン）から
@@ -2027,45 +2014,11 @@ def run_resource_constrained_scheduler(excel_file, verbose=True,
     0なら間に合っている）と Milestone_ID 列を持つ。
 
     Raises:
-        MissingSheetOrColumnError: シート/列が不足している場合
+        MissingSheetOrColumnError: 必須列が不足している場合
         MissingMilestoneError: マイルストーン参照が不正な場合
         CircularDependencyError: 循環依存がある場合
         ResourceOverflowError: 締切を無視しても配置できる日程が見つからない場合
         SchedulingError: その他のスケジューリング不整合（稼働日が1日も無い等）
-    """
-    frames = _load_data(excel_file)
-    return _run_scheduler_on_frames(
-        *frames, verbose=verbose,
-        auto_exclude_weekends=auto_exclude_weekends,
-        auto_exclude_jp_holidays=auto_exclude_jp_holidays,
-        plotly_output_path=plotly_output_path,
-        project_name=project_name,
-        distribution_ratio=distribution_ratio,
-    )
-
-
-def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
-                                                     df_jtasks=None, df_holidays=None,
-                                                     df_extdeps=None, df_wf_names=None,
-                                                     df_team_capacity=None,
-                                                     verbose=True,
-                                                     auto_exclude_weekends=True,
-                                                     auto_exclude_jp_holidays=True,
-                                                     plotly_output_path=None,
-                                                     project_name=None,
-                                                     distribution_ratio=0.7):
-    """
-    run_resource_constrained_scheduler() のDataFrame直接指定版。Excel読み込みを
-    一切経由せず、既にDataFrameとして構築済みのデータ（例: GUIのSQLiteデータベース
-    から組み立てたもの）から直接スケジューリングする。
-
-    各引数は run_resource_constrained_scheduler() と同じ意味・既定値を持つ
-    （df_project 以降 df_team_capacity までが Excel の各シートに相当するDataFrame、
-    df_jtasks/df_holidays/df_extdeps/df_wf_names/df_team_capacity は None なら
-    「データなし」を表す。df_team_capacity は Team_ID/Start_Date/Lines 列を持ち、
-    チームの同時ライン数（Teams.Max_Lines）を途中の日付から変動させる場合の
-    変更点を表す）。それ以外のキーワード引数・戻り値・送出しうる例外は
-    run_resource_constrained_scheduler() のdocstringを参照。
     """
     frames = _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
                                      df_jtasks, df_holidays, df_extdeps, df_wf_names,
@@ -2181,8 +2134,8 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
                               auto_exclude_weekends=True, auto_exclude_jp_holidays=True,
                               plotly_output_path=None, project_name=None,
                               distribution_ratio=0.7):
-    """run_resource_constrained_scheduler() / run_resource_constrained_scheduler_from_frames()
-    が共有するスケジューリング本体（_load_data* による検証・整形済みのDataFrameを受け取る）。"""
+    """run_resource_constrained_scheduler_from_frames() のスケジューリング本体
+    （_load_data_from_frames() による検証・整形済みのDataFrameを受け取る）。"""
     project_start = _load_project_start(df_project)
     if project_name is None:
         project_name = str(df_project.iloc[0].get("Project_Name", "プロジェクトスケジュール"))
@@ -2319,35 +2272,3 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
                              milestone_markers=milestone_markers)
 
     return result_df
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="リソース制約付きプロジェクトスケジューラー")
-    parser.add_argument(
-        "excel_file", nargs="?",
-        default="data/Project_Schedule_Sample_GameDev_v22.xlsx",
-        help="入力Excelファイルのパス（既定: サンプルデータ）",
-    )
-    parser.add_argument(
-        "-o", "--output", "--html-output", dest="output",
-        default="output/schedule_gantt.html",
-        help="サーバー不要で開けるPlotly製インタラクティブガントチャート"
-             "（チーム別色分け）の出力先HTMLパス。空文字を指定すると出力しない",
-    )
-    parser.add_argument(
-        "--distribution-ratio", type=float, default=0.7,
-        help="ASAP(0.0)〜ALAP(1.0)間の配置基準点（既定0.7）",
-    )
-    args = parser.parse_args()
-
-    try:
-        run_resource_constrained_scheduler(
-            args.excel_file,
-            plotly_output_path=args.output or None,
-            distribution_ratio=args.distribution_ratio,
-        )
-    except SchedulingError as e:
-        logger.error(f"スケジューリングに失敗しました: {e}")
-        raise

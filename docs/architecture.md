@@ -8,14 +8,12 @@
 ## 全体構成
 
 ```
-data/*.xlsx, data/*.pschedule ─┐
-                                │  (Excel/DBそれぞれの読み込み)
+data/*.pschedule ──────────────┐
+                                │  (DBの読み込み)
 project_scheduler.py ──────────┤  スケジューリングエンジン
-  ├ _load_data(excel_file) ────┤  Excel専用の読み込み口（後方互換・CLI用）
-  ├ _load_data_from_frames(…) ─┤  検証・整形の共通ロジック（Excel/DB共有）
-  ├ run_resource_constrained_scheduler(excel_file, …)
+  ├ _load_data_from_frames(…) ─┤  検証・整形
   ├ run_resource_constrained_scheduler_from_frames(df_project, …, …)
-  └ _run_scheduler_on_frames(…) ┘  スケジューリング本体（共有）
+  └ _run_scheduler_on_frames(…) ┘  スケジューリング本体
 
 gui/ ───────────────────────────  PySide6デスクトップアプリ（.pschedule編集用）
   ├ db.py            CRUD（Qt非依存）+ Undo記録の仕組み・明示的な保存
@@ -39,32 +37,24 @@ gui/ ─────────────────────────
 
 ## project_scheduler.py との連携方式
 
-GUIは`project_scheduler.py`を**変更しつつ取り込む**方針を採る（Excelファイルへの
-書き出しは行わない）。連携の核は、Excel専用だった読み込み処理をDataFrame処理と
-Excel-IOに分離したことにある。
+GUIは`project_scheduler.py`を**変更しつつ取り込む**方針を採る。
 
 - `_load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jtasks=None, df_holidays=None, df_extdeps=None, df_wf_names=None)`
   — 列検証・`Milestone_ID`のインデックス化・任意データの既定値補完など、
   「DataFrームとして受け取ったデータを検証・整形する」ロジックのみを持つ。
-  Excel由来かDB由来かを問わない共通の入口。`df_jtasks`等の任意項目は、
-  `None`なら「そもそもデータが存在しない」、DataFrame（0行でも可）なら
-  「存在する」ことを表す——Excelでシートの有無を見ていたのと同じ判定を、
-  引数が`None`かどうかに一般化している。
-- `_load_data(excel_file)` — `pd.ExcelFile`/`pd.read_excel`でシートを読み、
-  `_load_data_from_frames`に委譲する薄いラッパー（Excel専用、CLI後方互換用）。
+  `df_jtasks`等の任意項目は、`None`なら「そもそもデータが存在しない」、
+  DataFrame（0行でも可）なら「存在する」ことを表す。
 - `_run_scheduler_on_frames(...)` — スケジューリング本体（`_parse_tasks`〜
   `_build_scheduling_order`〜`_run_leveling`〜Gantt出力）。
-  `run_resource_constrained_scheduler`と`run_resource_constrained_scheduler_from_frames`の
-  両方から共有される。
-- `run_resource_constrained_scheduler(excel_file, ...)` — 既存のExcelベース入口
-  （CLIと過去の呼び出し互換のために維持）。
 - `run_resource_constrained_scheduler_from_frames(df_project, ..., df_wf_names=None, ...)` —
-  **GUIが使う新しい入口**。`gui/gantt_generator.py`がSQLiteの内容から直接
-  DataFrameを組み立て、Excelファイル/バッファを一切経由せずにこの関数を呼ぶ。
+  **GUIが使う唯一の入口**。`gui/gantt_generator.py`がSQLiteの内容から直接
+  DataFrameを組み立て、この関数を呼ぶ。
 
-この分離は純粋なリファクタリング（挙動変更なし）で、既存のサンプルデータに対する
-出力（CSV相当のDataFrame内容）がリファクタ前後で完全一致する
-ことを確認済み。
+以前はExcelファイルを直接読む`_load_data(excel_file)`/
+`run_resource_constrained_scheduler(excel_file, ...)`（CLI後方互換用）も
+存在したが、入力フォーマットとしてのExcelは`docs/requirements.md`
+「対象外」に記載のとおり意図的に廃止済みであり、この読み込み層自体を
+削除した（`project_scheduler.py`冒頭の変更履歴v18参照）。
 
 ## GUI → スケジューラー のデータフロー
 
@@ -198,8 +188,8 @@ Mermaid側のレンダラーが持つ文字数上限（既定50,000文字）に�
 
 DataFrame経由の受け渡し（`build_frames` → `_parse_tasks`）では、既存の
 `Internal_Depends` 列（カンマ区切り）に種別・ラグを載せる。列を増やさない
-のは、Excel入力（CLI後方互換）と`.pschedule`入力の双方が同じ1列を読むためで、
-**既定の依存は従来とまったく同じ文字列になる**（＝旧データをそのまま読める）。
+のは既存の`.pschedule`との後方互換のためで、**既定の依存は従来とまったく
+同じ文字列になる**（＝旧データをそのまま読める）。
 
 ```
 T_003              FS・ラグ0（従来どおり）
