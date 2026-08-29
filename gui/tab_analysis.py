@@ -197,9 +197,10 @@ class AnalysisTab(QWidget):
         project_start = self.db.get_project()["start_date"]
         project_start_ts = pd.Timestamp(project_start) if project_start else None
         today = date.today()
+        task_status_map = display["task_status"]
 
-        self._render_kpi(result_df, project_start_ts, milestones, today)
-        self._render_milestone_table(result_df, display, milestones, today)
+        self._render_kpi(result_df, project_start_ts, milestones, task_status_map)
+        self._render_milestone_table(result_df, display, milestones, today, task_status_map)
 
     def _show_no_result(self):
         self.status_label.setStyleSheet("color: #b3261e;")
@@ -215,8 +216,8 @@ class AnalysisTab(QWidget):
         self.breakdown_hint_label.setText("")
         self._dimension_combo.setVisible(False)
 
-    def _render_kpi(self, result_df, project_start_ts, milestones, today):
-        kpi = compute_kpi(result_df, project_start_ts, milestones, today)
+    def _render_kpi(self, result_df, project_start_ts, milestones, task_status_map):
+        kpi = compute_kpi(result_df, project_start_ts, milestones, task_status_map)
 
         self.kpi_scale.set_value(_fmt_int(kpi["jobs"]) + " ジョブ", f"{_fmt_int(kpi['tasks'])} タスク")
 
@@ -257,7 +258,7 @@ class AnalysisTab(QWidget):
             alert=kpi["start_pin_violations"] > 0,
         )
 
-    def _render_milestone_table(self, result_df, display, milestones, today):
+    def _render_milestone_table(self, result_df, display, milestones, today, task_status_map):
         mode = self._breakdown_mode
         filtered_df = self._sync_dimension_combo(mode, display, result_df)
 
@@ -273,7 +274,7 @@ class AnalysisTab(QWidget):
         # 間に合うか」はチーム別・ワークフロー別に絞り込んでも変わらない事実
         # のため（設計案参照）。内訳（右側の5列）だけを選択対象で絞り込む。
         base_rows = compute_milestone_rows(result_df, milestones, today)
-        breakdown_rows = compute_milestone_breakdown_all(filtered_df, milestones, today)
+        breakdown_rows = compute_milestone_breakdown_all(filtered_df, milestones, task_status_map)
 
         self.milestone_table.setRowCount(len(base_rows))
         for row_index, (base, breakdown) in enumerate(zip(base_rows, breakdown_rows)):

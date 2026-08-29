@@ -17,7 +17,6 @@
   符号が一致する。
 """
 
-import numpy as np
 import pandas as pd
 
 STATUS_NOT_STARTED = "not_started"
@@ -25,21 +24,20 @@ STATUS_IN_PROGRESS = "in_progress"
 STATUS_DONE = "done"
 
 
-def task_status_series(result_df, today):
+def task_status_series(result_df, task_status_map):
     """タスクごとの状態（未着手/進行中/完了）を、result_dfと同じ添字のSeriesで
     返す。空のresult_dfには空のSeriesを返す。
 
-    実績（進捗記録）をまだ持たないため、「今日時点で計画上どの状態か」を
-    Start_Date/End_Dateとtodayだけから導く（記録された実績ではなく計画値。
-    docs/project_analysis_tab_design.md §8-5参照）。End_Dateはexclusiveなので、
-    「今日稼働している」は Start_Date <= today < End_Date で判定する。"""
+    task_status_map: {(Job_ID, Task_ID): "in_progress"/"done"}
+    （`gui/gantt_generator.build_display()` の `task_status`。
+    `gui/tab_jobs.py`のタスク上書き欄でユーザーが実際に記録した状態で、
+    日付からの推測ではない）。マップに無いタスクは未着手として扱う
+    （job_task_overrides.status のNULL＝未着手という既定と同じ）。"""
     if result_df.empty:
         return pd.Series(dtype=object)
-    today_ts = pd.Timestamp(today)
-    start, end = result_df["Start_Date"], result_df["End_Date"]
+    keys = zip(result_df["Job_ID"], result_df["Task_ID"])
     return pd.Series(
-        np.where(end <= today_ts, STATUS_DONE,
-                 np.where(start <= today_ts, STATUS_IN_PROGRESS, STATUS_NOT_STARTED)),
+        [task_status_map.get(key, STATUS_NOT_STARTED) for key in keys],
         index=result_df.index,
     )
 
@@ -66,14 +64,14 @@ def peak_concurrency(result_df):
     return peak, pd.Timestamp(peak_day).strftime("%Y-%m")
 
 
-def compute_kpi(result_df, project_start, milestones, today):
+def compute_kpi(result_df, project_start, milestones, task_status_map):
     """KPIタイル6枚ぶんの値を辞書で返す。
 
     milestones: [(id, name, due_date(pd.Timestamp)), ...]（締切順、
     プロジェクト開始日マーカーは含めない。
     `gui/gantt_generator.build_display()` の `milestone_markers` から
     "PROJECT_START" を除いたものをそのまま渡せる）。
-    project_start: pd.Timestamp。today: date。"""
+    project_start: pd.Timestamp。task_status_map: task_status_series参照。"""
     jobs_count = int(result_df["Job_ID"].nunique()) if not result_df.empty else 0
     tasks_count = len(result_df)
     plan_end = result_df["End_Date"].max() if not result_df.empty else None
@@ -83,7 +81,7 @@ def compute_kpi(result_df, project_start, milestones, today):
         (last_due - plan_end).days if plan_end is not None and last_due is not None else None
     )
 
-    status = task_status_series(result_df, today)
+    status = task_status_series(result_df, task_status_map)
     done = int((status == STATUS_DONE).sum())
     in_progress = int((status == STATUS_IN_PROGRESS).sum())
     not_started = int((status == STATUS_NOT_STARTED).sum())
@@ -149,10 +147,10 @@ def compute_milestone_rows(result_df, milestones, today):
     return rows
 
 
-def compute_milestone_breakdown_all(result_df, milestones, today):
+def compute_milestone_breakdown_all(result_df, milestones, task_status_map):
     """マイルストーン別サマリー「全体」内訳: milestonesと同じ順で
     {jobs（延べ）, tasks, done, in_progress, not_started} の辞書のリスト。"""
-    status = task_status_series(result_df, today)
+    status = task_status_series(result_df, task_status_map)
     rows = []
     for ms_id, _name, _due in milestones:
         mask = result_df["Milestone_ID"] == ms_id if not result_df.empty else None

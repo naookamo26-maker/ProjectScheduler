@@ -16,7 +16,7 @@ CRUD本体（gui/db.py）から分離しているのは、この2つが「増え
 4. `docs/db_design.md` のテーブル一覧を追随させる。
 """
 
-SCHEMA_VERSION = "15"
+SCHEMA_VERSION = "16"
 
 
 class SchemaError(Exception):
@@ -181,6 +181,9 @@ CREATE TABLE job_task_overrides (
     start_pin_date TEXT,
     -- タスク タグ（ジョブ タグ=jobs.tagsと同じ仕様、カンマ区切りの1文字列）。
     tags TEXT NOT NULL DEFAULT '',
+    -- 実際の進捗（ユーザーが手動で記録する）。NULL＝未着手、'in_progress'＝
+    -- 進行中、'done'＝完了。日付からの推測ではなく、記録された実データ。
+    status TEXT,
     UNIQUE(job_id, workflow_task_id)
 );
 
@@ -589,6 +592,16 @@ def migrate(conn):
         conn.commit()
         conn.execute("PRAGMA foreign_keys = ON")
         version = "15"
+
+    if version == "15":
+        # v16: job_task_overrides.status を追加（実際の進捗をユーザーが手動で
+        # 記録する。NULL＝未着手、'in_progress'＝進行中、'done'＝完了）。
+        # プロジェクト分析タブの「タスクの状態」KPIは、日付からの推測ではなく
+        # この実データを集計する（docs/project_analysis_tab_design.md参照）。
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(job_task_overrides)").fetchall()]
+        if cols and "status" not in cols:
+            conn.execute("ALTER TABLE job_task_overrides ADD COLUMN status TEXT")
+        version = "16"
 
     conn.execute(
         "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)

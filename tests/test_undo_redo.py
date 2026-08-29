@@ -1332,6 +1332,88 @@ def test_opening_pre_optional_lines_schema_preserves_values_and_allows_null(tmp_
     db.close()
 
 
+def test_opening_pre_task_status_schema_adds_status_column(tmp_path):
+    """job_task_overrides.statusが無かった旧バージョン(v15)の.pscheduleを
+    開いた際、statusカラムが追加され既存の上書き行はそのまま（status=None＝
+    未着手）保持されること（ALTER TABLE ADD COLUMNのため既存データは無傷）。"""
+    import sqlite3
+
+    path = tmp_path / "legacy.pschedule"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE project (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            project_name TEXT NOT NULL DEFAULT '',
+            start_date TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE teams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+            max_lines INTEGER CHECK (max_lines IS NULL OR max_lines >= 0)
+        );
+        CREATE TABLE workflows (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+        CREATE TABLE workflow_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+            name TEXT NOT NULL, team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE RESTRICT,
+            default_days INTEGER NOT NULL CHECK (default_days >= 1),
+            UNIQUE(workflow_id, name)
+        );
+        CREATE TABLE milestones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+            end_date TEXT NOT NULL, note TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+            workflow_id INTEGER NOT NULL, default_milestone_id INTEGER,
+            priority INTEGER, tags TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE job_task_overrides (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            override_days INTEGER, milestone_id INTEGER, team_id INTEGER,
+            start_pin_date TEXT, tags TEXT NOT NULL DEFAULT '',
+            UNIQUE(job_id, workflow_task_id)
+        );
+        CREATE TABLE task_dependencies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+            predecessor_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
+            successor_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
+            dep_type TEXT NOT NULL DEFAULT 'FS', lag_days INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '15')")
+    conn.execute("INSERT INTO project(id, project_name, start_date) VALUES (1, '', '')")
+    conn.execute("INSERT INTO teams(name, max_lines) VALUES ('チームA', 2)")
+    conn.execute("INSERT INTO workflows(name) VALUES ('WF1')")
+    conn.execute(
+        "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days) VALUES (1, 'タスク', 1, 3)"
+    )
+    conn.execute("INSERT INTO jobs(name, workflow_id, priority) VALUES ('J1', 1, 100)")
+    conn.execute(
+        "INSERT INTO job_task_overrides(job_id, workflow_task_id, is_active, tags) "
+        "VALUES (1, 1, 1, '確認')"
+    )
+    conn.commit()
+    conn.close()
+
+    db = ProjectDatabase.open_existing(str(path))
+
+    row = db.list_job_tasks_with_overrides(1)[0]
+    assert row["tags"] == "確認"  # 既存の上書き行は保持される
+    assert row["status"] is None  # 追加された列は未着手（NULL）
+
+    # 以後はstatusを保存できる。
+    db.upsert_job_task_override(1, 1, status="in_progress")
+    assert db.list_job_tasks_with_overrides(1)[0]["status"] == "in_progress"
+    db.close()
+
+
 # -- ファイルを開く際の検証（gui/db_schema.py の check_openable） -----------------------
 #
 # open_existing() が、素のsqlite3例外をそのまま伝播させず、原因が分かる

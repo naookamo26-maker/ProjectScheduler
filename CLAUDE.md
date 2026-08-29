@@ -22,9 +22,9 @@
 
 | マーカー | 対象モジュール | 必要な依存 | 件数 / 時間 |
 | --- | --- | --- | --- |
-| `core` | `gui/db.py` `gui/db_schema.py` `gui/undo_manager.py` | pytestのみ | 54件 / 約0.5秒 |
-| `scheduler` | `project_scheduler.py` `gui/gantt_generator.py` `gui/summary_metrics.py` | + pandas, numpy | 84件 / 約1.5秒 |
-| `gui` | `gui/`のウィジェット層・描画層 | + PySide6 + システムライブラリ | 81件 / 約7秒 |
+| `core` | `gui/db.py` `gui/db_schema.py` `gui/undo_manager.py` | pytestのみ | 58件 / 約0.6秒 |
+| `scheduler` | `project_scheduler.py` `gui/gantt_generator.py` `gui/summary_metrics.py` | + pandas, numpy | 83件 / 約1.5秒 |
+| `gui` | `gui/`のウィジェット層・描画層 | + PySide6 + システムライブラリ | 83件 / 約8秒 |
 
 変更したファイル → 実行するコマンド:
 

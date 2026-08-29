@@ -842,7 +842,7 @@ def test_override_days_edit_keeps_its_spinbox_alive(window, qapp):
 
 
 def test_task_tag_edit_persists_and_filters_jobs(window, qapp):
-    """タスク上書き表の「タグ」列（7列目、タスク タグ）を編集すると
+    """タスク上書き表の「タグ」列（8列目、タスク タグ）を編集すると
     job_task_overrides.tags に保存され、ジョブ タグと同じ正規化（前後の
     空白除去・重複排除・「, 」区切り）を経て表示に書き戻ること。また、
     「絞り込み」のタスク タグフィルタで、そのタグを持つタスクを含む
@@ -858,13 +858,13 @@ def test_task_tag_edit_persists_and_filters_jobs(window, qapp):
     qapp.processEvents()
 
     table = window.tab_jobs.override_table
-    assert table.horizontalHeaderItem(6).text() == "タグ"
-    table.item(0, 6).setText(" 確認 ,レビュー,, 確認")
+    assert table.horizontalHeaderItem(7).text() == "タグ"
+    table.item(0, 7).setText(" 確認 ,レビュー,, 確認")
     qapp.processEvents()
 
     rows = window.db.list_job_tasks_with_overrides(job1)
     assert rows[0]["tags"] == "確認, レビュー"
-    assert table.item(0, 6).text() == "確認, レビュー"  # 正規化した表記へ書き戻る
+    assert table.item(0, 7).text() == "確認, レビュー"  # 正規化した表記へ書き戻る
 
     # 絞り込みの選択肢は（ジョブ タグと同様）refresh_jobs() 時にDBから
     # 作り直される。タグ編集直後は即座には反映されないため、タブの
@@ -1423,6 +1423,63 @@ def test_analysis_tab_renders_kpi_and_milestone_table_from_gantt_result(window, 
     assert window.tab_analysis.kpi_scale.value_label.text() == "1 ジョブ"
     assert window.tab_analysis.milestone_table.rowCount() == 1
     assert window.tab_analysis.milestone_table.item(0, 0).text() == "マイルストーン1"
+
+
+def test_analysis_tab_status_kpi_reflects_recorded_status_not_a_date_guess(window, qapp):
+    """「タスクの状態」は日付からの推測ではなく、job_task_overrides.statusに
+    実際に記録された値を使うこと。今日を挟む長い所要日数のタスクでも、
+    statusを記録していなければ（日付上は「進行中」に見えても）未着手のまま
+    集計され、記録して初めて反映されることを確認する。"""
+    window.db.set_project("状態テスト", "2020-01-01")
+    team_id = window.db.add_team("チームA", 2)
+    ms_id = window.db.add_milestone("マイルストーン1", "2040-06-30")
+    wf_id = window.db.add_workflow("WF1")
+    # 2020年から約20年（5000営業日）と、今日をまたぐ長い所要日数にする——
+    # 日付だけで判定していれば「進行中」に見えるはずの状況を作る。
+    task_id = window.db.add_workflow_task(wf_id, "タスク", team_id, 5000)
+    job_id = window.db.add_job("ジョブ1", wf_id, ms_id, 100)
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    # statusを記録していないので、日付上は今日を挟んでいても「未着手」のまま。
+    assert window.tab_analysis.kpi_status.value_label.text() == "0 完了"
+    assert "未着手 1" in window.tab_analysis.kpi_status.sub_label.text()
+
+    window.db.upsert_job_task_override(job_id, task_id, status="in_progress")
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    qapp.processEvents()
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    assert "進行中 1" in window.tab_analysis.kpi_status.sub_label.text()
+    assert "未着手 0" in window.tab_analysis.kpi_status.sub_label.text()
+
+
+def test_task_status_combo_in_override_table_persists_to_db(window, qapp):
+    """タスク上書き表の「状態」列（7列目）でコンボを選ぶと
+    job_task_overrides.status に保存されること。"""
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    window.db.add_workflow_task(wf_id, "タスク1", team_id, 3)
+    job_id = window.db.add_job("J1", wf_id, None, 100)
+    window.tabs.setCurrentWidget(window.tab_jobs)
+    window.tab_jobs.refresh_jobs(select_id=job_id)
+    qapp.processEvents()
+
+    table = window.tab_jobs.override_table
+    assert table.horizontalHeaderItem(6).text() == "状態"
+    status_combo = table.cellWidget(0, 6)
+    assert status_combo.currentData() is None  # 既定は未着手
+
+    idx = status_combo.findData("done")
+    status_combo.setCurrentIndex(idx)
+    qapp.processEvents()
+
+    rows = window.db.list_job_tasks_with_overrides(job_id)
+    assert rows[0]["status"] == "done"
 
 
 def _build_two_team_project(db):

@@ -49,30 +49,29 @@ EMPTY_DF = pd.DataFrame(columns=[
 
 # -- task_status_series -------------------------------------------------------
 
-def test_task_status_not_started_when_start_is_after_today():
+def test_task_status_defaults_to_not_started_when_absent_from_the_map():
     df = _result_df([("J1", "T1", "TEAM_1", "WF_1", "MS_1",
                        "2026-02-01", "2026-02-05", 0, "")])
-    status = task_status_series(df, date(2026, 1, 1))
+    status = task_status_series(df, {})
     assert status.iloc[0] == STATUS_NOT_STARTED
 
 
-def test_task_status_in_progress_when_today_within_start_inclusive_end_exclusive():
+def test_task_status_uses_the_recorded_value_for_a_matching_job_task_key():
     df = _result_df([("J1", "T1", "TEAM_1", "WF_1", "MS_1",
                        "2026-02-01", "2026-02-05", 0, "")])
-    # 開始日当日は進行中。
-    assert task_status_series(df, date(2026, 2, 1)).iloc[0] == STATUS_IN_PROGRESS
-    # End_Dateはexclusiveなので、End_Dateの前日はまだ進行中。
-    assert task_status_series(df, date(2026, 2, 4)).iloc[0] == STATUS_IN_PROGRESS
+    assert task_status_series(df, {("J1", "T1"): STATUS_IN_PROGRESS}).iloc[0] == STATUS_IN_PROGRESS
+    assert task_status_series(df, {("J1", "T1"): STATUS_DONE}).iloc[0] == STATUS_DONE
 
 
-def test_task_status_done_when_today_reaches_the_exclusive_end_date():
+def test_task_status_ignores_entries_for_other_job_task_keys():
     df = _result_df([("J1", "T1", "TEAM_1", "WF_1", "MS_1",
                        "2026-02-01", "2026-02-05", 0, "")])
-    assert task_status_series(df, date(2026, 2, 5)).iloc[0] == STATUS_DONE
+    status = task_status_series(df, {("J1", "T2"): STATUS_DONE, ("J2", "T1"): STATUS_DONE})
+    assert status.iloc[0] == STATUS_NOT_STARTED
 
 
 def test_task_status_series_is_empty_for_empty_result_df():
-    assert task_status_series(EMPTY_DF, date(2026, 1, 1)).empty
+    assert task_status_series(EMPTY_DF, {}).empty
 
 
 # -- peak_concurrency ----------------------------------------------------------
@@ -106,7 +105,7 @@ def test_peak_concurrency_excludes_the_exclusive_end_date_itself():
 # -- compute_kpi -----------------------------------------------------------------
 
 def test_compute_kpi_on_empty_result_df():
-    kpi = compute_kpi(EMPTY_DF, _ts("2026-01-01"), [], date(2026, 1, 1))
+    kpi = compute_kpi(EMPTY_DF, _ts("2026-01-01"), [], {})
     assert kpi["jobs"] == 0
     assert kpi["tasks"] == 0
     assert kpi["plan_end"] is None
@@ -117,14 +116,15 @@ def test_compute_kpi_on_empty_result_df():
     assert kpi["start_pin_violations"] == 0
 
 
-def test_compute_kpi_aggregates_jobs_tasks_overruns_and_violations():
+def test_compute_kpi_aggregates_jobs_tasks_overruns_violations_and_recorded_status():
     df = _result_df([
         ("J1", "T1", "TEAM_1", "WF_1", "MS_1", "2026-01-05", "2026-01-10", 0, ""),
         ("J1", "T2", "TEAM_1", "WF_1", "MS_1", "2026-01-10", "2026-01-20", 5, ""),
         ("J2", "T1", "TEAM_1", "WF_1", "MS_1", "2026-01-15", "2026-01-25", 3, "開始固定日を満たせません"),
     ])
     milestones = [("MS_1", "MS1", _ts("2026-01-18"))]
-    kpi = compute_kpi(df, _ts("2026-01-01"), milestones, date(2026, 1, 12))
+    task_status_map = {("J1", "T1"): STATUS_DONE, ("J1", "T2"): STATUS_IN_PROGRESS}
+    kpi = compute_kpi(df, _ts("2026-01-01"), milestones, task_status_map)
     assert kpi["jobs"] == 2
     assert kpi["tasks"] == 3
     assert kpi["plan_end"] == _ts("2026-01-25")
@@ -133,8 +133,7 @@ def test_compute_kpi_aggregates_jobs_tasks_overruns_and_violations():
     assert kpi["overrun_jobs"] == 2
     assert kpi["max_overrun_days"] == 5
     assert kpi["start_pin_violations"] == 1
-    # today=2026-01-12: T1(01-05~01-10)は完了、T2(01-10~01-20)は進行中、
-    # J2のT1(01-15~01-25)は未着手。
+    # J1:T1は記録上「完了」、J1:T2は「進行中」、J2:T1はマップに無いので未着手。
     assert kpi["done"] == 1
     assert kpi["in_progress"] == 1
     assert kpi["not_started"] == 1
@@ -182,23 +181,24 @@ def test_milestone_row_remaining_days_is_zero_after_due_date():
     assert rows[0]["remaining_days"] == 0
 
 
-# -- compute_milestone_breakdown_all / _by ------------------------------------------
+# -- compute_milestone_breakdown_all ------------------------------------------------
 
-def test_milestone_breakdown_all_matches_task_counts_and_status():
+def test_milestone_breakdown_all_matches_task_counts_and_recorded_status():
     df = _result_df([
         ("J1", "T1", "TEAM_1", "WF_1", "MS_1", "2026-01-01", "2026-01-05", 0, ""),
         ("J1", "T2", "TEAM_1", "WF_1", "MS_1", "2026-01-05", "2026-01-10", 0, ""),
         ("J2", "T1", "TEAM_1", "WF_1", "MS_2", "2026-01-01", "2026-01-05", 0, ""),
     ])
     milestones = [("MS_1", "MS1", _ts("2026-02-01")), ("MS_2", "MS2", _ts("2026-02-01"))]
-    rows = compute_milestone_breakdown_all(df, milestones, date(2026, 1, 20))
+    task_status_map = {("J1", "T1"): STATUS_DONE, ("J1", "T2"): STATUS_DONE, ("J2", "T1"): STATUS_DONE}
+    rows = compute_milestone_breakdown_all(df, milestones, task_status_map)
     assert rows[0] == {"jobs": 1, "tasks": 2, "done": 2, "in_progress": 0, "not_started": 0}
     assert rows[1] == {"jobs": 1, "tasks": 1, "done": 1, "in_progress": 0, "not_started": 0}
 
 
 def test_milestone_breakdown_all_is_zeroed_for_a_milestone_with_no_tasks():
     milestones = [("MS_1", "MS1", _ts("2026-02-01"))]
-    rows = compute_milestone_breakdown_all(EMPTY_DF, milestones, date(2026, 1, 1))
+    rows = compute_milestone_breakdown_all(EMPTY_DF, milestones, {})
     assert rows[0] == {"jobs": 0, "tasks": 0, "done": 0, "in_progress": 0, "not_started": 0}
 
 
@@ -214,5 +214,5 @@ def test_milestone_breakdown_all_on_a_team_filtered_result_df_only_counts_that_t
     ])
     milestones = [("MS_1", "MS1", _ts("2026-02-01"))]
     team1_only = df[df["Team_ID"] == "TEAM_1"]
-    rows = compute_milestone_breakdown_all(team1_only, milestones, date(2026, 1, 20))
-    assert rows[0] == {"jobs": 2, "tasks": 2, "done": 2, "in_progress": 0, "not_started": 0}
+    rows = compute_milestone_breakdown_all(team1_only, milestones, {})
+    assert rows[0] == {"jobs": 2, "tasks": 2, "done": 0, "in_progress": 0, "not_started": 2}
