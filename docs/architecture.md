@@ -46,10 +46,10 @@ gui/ ─────────────────────────
   ├ tab_analysis.py             タブ5「プロジェクト分析」（schedule_cache.py
   │                              経由で結果を集計する表示専用タブ。自分では
   │                              スケジューリングを起こさない）
-  ├ team_summary_view.py         タブ5「チーム別サマリー」の描画（積み上げ
-  │                              グラフ・選択チームの詳細グラフ。gantt_view.py
-  │                              と同じQGraphicsScene直接描画・GanttGraphicsView
-  │                              再利用パターン）
+  ├ team_summary_view.py         タブ5「チーム別サマリー」の描画（チーム別の
+  │                              折れ線グラフ・選択チームの詳細グラフ。
+  │                              gantt_view.pyと同じQGraphicsScene直接描画・
+  │                              GanttGraphicsView再利用パターン）
   └ widgets_common.py        タブ横断の共通UI部品（列幅自動調整含む）
 ```
 
@@ -1025,23 +1025,18 @@ GUIで編集できる項目はすべてUndo/Redoで元に戻せる。個々の�
 
 ## 階段関数の区間化（`gui/resource_histogram.py`）
 
-`compute_step_segments(breakpoints, range_start, range_end)` /
-`value_at(breakpoints, d)` / `shared_boundaries(breakpoints_by_key, range_start, range_end)`
-は、「日付→値」の変化点リストから階段関数の区間を作る・複数系列を積み上げる
-ための、特定の用途に依存しない汎用関数（いずれもQt非依存）。
+`compute_step_segments(breakpoints, range_start, range_end)` は、
+「日付→値」の変化点リストから階段関数の区間を作るだけの、特定の用途に
+依存しない汎用関数（Qt非依存）。
 
 元はタブ1「基本情報設定」のチーム欄と連動する「リソースヒストグラム」
 （チームの計画上の同時ライン数の推移を表示する機能）の一部だったが、
 その機能自体はプロジェクト分析タブへ移管して廃止した
-（`docs/project_analysis_tab_design.md`参照）。この3関数は、プロジェクト
-分析タブの「チーム別サマリー」（`gui/team_summary_view.py`）が
-- `compute_step_segments`: 選択チームの詳細グラフで、同時タスク数・設定上限
-  それぞれの階段区間を作る
-- `value_at` / `shared_boundaries`: 全チーム積み上げグラフで、チームごとに
-  異なる変化点の集合を共通の区切りへ揃えて積み上げる
-
-という形でそのまま使い回しているため残している。積み上げグラフの区間数は
-「全チームの変化点の日付数（重複除去後）」のオーダーに収まる——同じ日に
+（`docs/project_analysis_tab_design.md`参照）。この関数は、プロジェクト
+分析タブの「チーム別サマリー」（`gui/team_summary_view.py`）が、チーム別
+折れ線グラフ・選択チームの詳細グラフ（同時タスク数・設定上限それぞれの
+階段区間）でそのまま使い回しているため残している。各チームの区間数は
+「そのチームの変化点の日付数（重複除去後）」のオーダーに収まる——同じ日に
 複数のタスクが開始・終了しても、`gui/summary_metrics.team_concurrency_steps`
 のdiff+cumsumで日付ごとに1つの変化点へ畳み込まれるため、タスク数ではなく
 実際の日数のオーダーになり、大規模プロジェクトでも描画コストが跳ね上がらない。

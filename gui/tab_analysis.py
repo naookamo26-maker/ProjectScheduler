@@ -36,7 +36,7 @@ from gui.summary_metrics import (
     compute_team_summary_rows,
     team_concurrency_steps,
 )
-from gui.team_summary_view import TeamSummaryChartView, build_team_detail_scene, build_team_stacked_scene
+from gui.team_summary_view import TeamSummaryChartView, build_team_detail_scene, build_team_lines_scene
 from gui.widgets_common import NoWheelComboBox, auto_size_columns
 
 _BREAKDOWN_ALL = "all"
@@ -174,17 +174,16 @@ class AnalysisTab(QWidget):
         self.team_group = QGroupBox("チーム別サマリー")
         team_layout = QVBoxLayout(self.team_group)
 
-        team_layout.addWidget(QLabel("同時タスク数の推移（チーム別・積み上げ）"))
-        self.team_stacked_view = TeamSummaryChartView()
-        self.team_stacked_view.setMinimumHeight(220)
-        team_layout.addWidget(self.team_stacked_view, 1)
+        team_layout.addWidget(QLabel("同時タスク数の推移（チーム別）"))
+        self.team_lines_view = TeamSummaryChartView()
+        self.team_lines_view.setMinimumHeight(220)
+        team_layout.addWidget(self.team_lines_view, 1)
 
-        # 積み上げグラフの凡例。区間ごとに色分けされたバー自体にチーム名は
-        # 描き込まない（gui/team_summary_view.py参照——大規模プロジェクトで
-        # 帯が細くなるとラベル文字が重なって読めなくなるため）。色とチーム名の
-        # 対応は、この凡例とバーのツールチップで補う
-        # （docs/project_analysis_tab_design.md §7-6「凡例とツールチップの
-        # 文字で必ず補う」）。
+        # 折れ線グラフの凡例。線自体にチーム名は描き込まない
+        # （gui/team_summary_view.py参照——多チーム・長期間のプロジェクトで
+        # 線が重なると文字も重なって読めなくなるため）。色とチーム名の対応は、
+        # この凡例と線のツールチップで補う（docs/project_analysis_tab_design.md
+        # §7-6「凡例とツールチップの文字で必ず補う」）。
         self.team_legend_label = QLabel("")
         self.team_legend_label.setWordWrap(True)
         self.team_legend_label.setTextFormat(Qt.RichText)
@@ -285,7 +284,7 @@ class AnalysisTab(QWidget):
         self.breakdown_hint_label.setText("")
         self._dimension_combo.setVisible(False)
         self.team_table.setRowCount(0)
-        self.team_stacked_view.setScene(None)
+        self.team_lines_view.setScene(None)
         self.team_legend_label.setText("")
         self.team_detail_view.setScene(None)
         self.team_detail_label.setText("")
@@ -383,7 +382,7 @@ class AnalysisTab(QWidget):
         auto_size_columns(self.milestone_table, stretch_last=False)
 
     def _render_team_summary(self, result_df, display, milestones, project_start_ts):
-        """チーム別サマリー（積み上げグラフ＋表）を作り直す。選択中チームの
+        """チーム別サマリー（折れ線グラフ＋表）を作り直す。選択中チームの
         詳細グラフは、表の行選択に連動して別途 _render_team_detail() が描く
         ——ここでは選択を（可能なら）維持したまま表を再構築するだけに留める。"""
         team_names = display["team_names"]
@@ -416,7 +415,7 @@ class AnalysisTab(QWidget):
         self.team_table.blockSignals(False)
 
         if result_df.empty:
-            self.team_stacked_view.setScene(None)
+            self.team_lines_view.setScene(None)
             self.team_detail_view.setScene(None)
             self.team_detail_label.setText("")
             self._team_summary_result_df = None
@@ -427,11 +426,11 @@ class AnalysisTab(QWidget):
         range_start = result_df["Start_Date"].min()
         range_end = result_df["End_Date"].max()
         concurrency_by_team = {team_id: team_concurrency_steps(result_df, team_id) for team_id in team_names}
-        stacked_scene = build_team_stacked_scene(
+        lines_scene = build_team_lines_scene(
             concurrency_by_team, team_colors, team_names, milestones, project_start_ts, range_start, range_end,
         )
-        self.team_stacked_view.setScene(stacked_scene)
-        QTimer.singleShot(0, self.team_stacked_view.fit_all)
+        self.team_lines_view.setScene(lines_scene)
+        QTimer.singleShot(0, self.team_lines_view.fit_all)
         self.team_legend_label.setText(self._build_team_legend_html(team_names, team_colors))
 
         self._team_summary_result_df = result_df
@@ -455,7 +454,7 @@ class AnalysisTab(QWidget):
         self.team_table.setItem(row, column, item)
 
     def _build_team_legend_html(self, team_names, team_colors):
-        """積み上げグラフの凡例（色付きの四角＋チーム名を折り返しで並べる）。
+        """折れ線グラフの凡例（色付きの四角＋チーム名を折り返しで並べる）。
         gui/team_summary_view.py がバー自体にチーム名を描き込まない代わりに、
         ここで色とチーム名の対応を示す（設計案§7-6）。"""
         swatches = [

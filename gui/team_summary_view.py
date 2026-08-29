@@ -8,10 +8,10 @@ docs/project_analysis_tab_design.md §5参照）。ズーム・パン・A/Fキ�
 （旧`ResourceHistogramView`と同じ考え方）、フィット処理だけ
 `TeamSummaryChartView`に自己完結で追加する。
 
-積み上げグラフの描画区間数は「全チームの変化点の日付数（重複除去後）」の
-オーダーに収まる（`gui/resource_histogram.shared_boundaries`参照）。同じ日に
-複数のタスクが開始・終了しても変化点は1つに畳み込まれるため、タスク数
-そのものではなく実際の日数のオーダーになり、タスク数の多い大規模
+各チームの描画区間数は「そのチームの変化点の日付数（重複除去後）」の
+オーダーに収まる（`gui/summary_metrics.team_concurrency_steps`のdiff+cumsum
+参照）。同じ日に複数のタスクが開始・終了しても変化点は1つに畳み込まれるため、
+タスク数ではなく実際の日数のオーダーになり、タスク数の多い大規模
 プロジェクトでも描画コストが跳ね上がらない。
 """
 
@@ -22,7 +22,7 @@ from PySide6.QtGui import QBrush, QColor, QFont, QPainterPath, QPen
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsSimpleTextItem
 
 from gui.gantt_view import GanttGraphicsView
-from gui.resource_histogram import compute_step_segments, shared_boundaries, value_at
+from gui.resource_histogram import compute_step_segments
 from project_scheduler import _UNLIMITED_LINES
 
 DAY_WIDTH = 4
@@ -138,52 +138,51 @@ def _new_scene_with_axes(max_value, milestone_markers, project_start, range_star
     return scene, x_of, chart_bottom, chart_right
 
 
-def build_team_stacked_scene(concurrency_by_team, color_map, labels_by_team,
-                              milestone_markers, project_start, range_start, range_end):
-    """全チームの同時タスク数を積み上げた面グラフ。
+_LINE_WIDTH = 2
+
+
+def build_team_lines_scene(concurrency_by_team, color_map, labels_by_team,
+                            milestone_markers, project_start, range_start, range_end):
+    """全チームの同時タスク数を、チームごとの折れ線（階段状）で重ねて表示する。
+
+    積み上げ（面グラフ）ではなく、チームごとに独立した折れ線にする——多チーム
+    ・長期間のプロジェクトでは積み上げた帯の色分けが読み取りづらいという
+    フィードバックを受けての変更。Y軸は「同時タスク数」の合計ではなく、
+    各チームの折れ線の最大値（重ならない）。
 
     concurrency_by_team: {Team_ID: [(date, 同時タスク数), ...]}
     （`gui/summary_metrics.team_concurrency_steps()` をチームごとに呼んだもの）。
     color_map/labels_by_team: `gui/gantt_generator.build_display()` の
     team_colors/team_names をそのまま渡せる。"""
-    boundaries = shared_boundaries(concurrency_by_team, range_start, range_end)
-    max_value = 0
-    band_items = []
-    for i in range(len(boundaries) - 1):
-        seg_start, seg_end = boundaries[i], boundaries[i + 1]
-        bottom = 0
-        for team_id, breakpoints in concurrency_by_team.items():
-            value = value_at(breakpoints, seg_start)
-            if value > 0:
-                band_items.append((seg_start, seg_end, bottom, bottom + value, team_id))
-            bottom += value
-        max_value = max(max_value, bottom)
+    segments_by_team = {
+        team_id: compute_step_segments(steps, range_start, range_end)
+        for team_id, steps in concurrency_by_team.items()
+    }
+    max_value = max(
+        (value for segments in segments_by_team.values() for _s, _e, value in segments),
+        default=0,
+    )
 
     scene, x_of, chart_bottom, _chart_right = _new_scene_with_axes(
         max_value, milestone_markers, project_start, range_start, range_end,
     )
 
-    # チーム名は帯の中に描き込まない。積み上げグラフは区間数が日数のオーダー
-    # まで増えうるため、A/Fキーでのフィット後に大きく縮小された表示（多チーム・
-    # 長期間のプロジェクトほど縮小率が上がる）では、ItemIgnoresTransformations
-    # で画面上一定サイズを保つラベル文字がその縮小に追従せず、狭い帯に対して
-    # 相対的に巨大化して重なり合ってしまう。どの色がどのチームかは、
-    # 呼び出し側（gui/tab_analysis.py）がチャートの外に置く凡例と、この
-    # バーのツールチップで補う（docs/project_analysis_tab_design.md §7-6）。
-    for seg_start, seg_end, lo, hi, team_id in band_items:
-        x1, x2 = x_of(seg_start), x_of(seg_end)
-        y_top = chart_bottom - hi * ROW_UNIT_HEIGHT
-        y_bottom = chart_bottom - lo * ROW_UNIT_HEIGHT
-        path = QPainterPath()
-        path.addRect(QRectF(x1, y_top, max(x2 - x1, 1), y_bottom - y_top))
-        rect = QGraphicsPathItem(path)
-        rect.setBrush(QBrush(QColor(color_map.get(team_id, "#cbc9c2"))))
-        rect.setPen(QPen(QColor("#0b0b0b"), 1))
+    for team_id, segments in segments_by_team.items():
+        if not segments:
+            continue
+        color = QColor(color_map.get(team_id, "#cbc9c2"))
+        first_start, _first_end, first_value = segments[0]
+        path = QPainterPath(QPointF(x_of(first_start), chart_bottom - first_value * ROW_UNIT_HEIGHT))
+        for seg_start, seg_end, value in segments:
+            y = chart_bottom - value * ROW_UNIT_HEIGHT
+            path.lineTo(x_of(seg_start), y)  # 前の区間との値の差（垂直の跳び）
+            path.lineTo(x_of(seg_end), y)    # その値が続く区間（水平線）
+        line_item = QGraphicsPathItem(path)
+        line_item.setPen(QPen(color, _LINE_WIDTH))
         name = labels_by_team.get(team_id, team_id)
-        rect.setToolTip(
-            f"{name}\n{seg_start.strftime('%Y-%m-%d')} 〜 {seg_end.strftime('%Y-%m-%d')}\n同時 {hi - lo} 本"
-        )
-        scene.addItem(rect)
+        peak = max(value for _s, _e, value in segments)
+        line_item.setToolTip(f"{name}\nピーク {peak} 本")
+        scene.addItem(line_item)
 
     scene.team_summary_max_value = max_value
     return scene
