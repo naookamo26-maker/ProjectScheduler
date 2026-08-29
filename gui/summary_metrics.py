@@ -17,6 +17,8 @@
   符号が一致する。
 """
 
+import bisect
+
 import pandas as pd
 
 from gui.resource_histogram import compute_step_segments
@@ -172,6 +174,137 @@ def team_concurrency_steps(result_df, team_id=None):
     return list(zip(counts.index, counts.values.astype(int)))
 
 
+def week_starts(range_start, range_end):
+    """[range_start, range_end] を覆う各週の月曜日（`pd.Timestamp`）の昇順リスト。
+
+    チーム別サマリーのグラフは、日次の変化点をそのまま描くと営業日数ぶんの
+    ギザギザになって読めないため、**週次に集計してから描く**。月次にすると
+    数か月しかない短いプロジェクトでは点が数個しか並ばず形が読めないので、
+    週を単位にしている（この関数がそのX軸の目盛りにあたる）。"""
+    start = pd.Timestamp(range_start).normalize()
+    cursor = start - pd.Timedelta(days=start.weekday())  # その週の月曜
+    last = pd.Timestamp(range_end).normalize()
+    weeks = []
+    while cursor <= last:
+        weeks.append(cursor)
+        cursor += pd.Timedelta(days=7)
+    return weeks
+
+
+def _week_index(ts, first_monday):
+    return (pd.Timestamp(ts).normalize() - first_monday).days // 7
+
+
+def _iter_step_weeks(steps, weeks):
+    """階段関数 steps の各区間を、その区間が覆う週インデックスの範囲へ展開して
+    (週インデックス, 値) を順に返す。
+
+    steps は変化点の列なので、値 value は [day, next_day) の間だけ有効。
+    末尾の点は必ず0（全タスクが終わる）ため、ペアで走査すれば漏れない。
+    区間は時間軸を分割しているだけなので、総反復回数は
+    O(区間数 + 週数)——タスク数が増えても跳ね上がらない。"""
+    if not weeks:
+        return
+    first_monday = weeks[0]
+    last_index = len(weeks) - 1
+    for (day, value), (next_day, _next) in zip(steps, steps[1:]):
+        if value <= 0:
+            continue
+        lo = max(_week_index(day, first_monday), 0)
+        hi = min(_week_index(pd.Timestamp(next_day) - pd.Timedelta(days=1), first_monday), last_index)
+        for i in range(lo, hi + 1):
+            yield i, value
+
+
+def weekly_concurrency_by_team(result_df, team_ids, range_start, range_end):
+    """週ごとの「その週の最大同時タスク数」を、チームごとの系列として返す。
+
+    Returns: {team_id: [値, ...]}（`week_starts(range_start, range_end)` と同じ順）。
+
+    週内の**最大**を採るのは、この画面が「その週に最大何本同時に走るか」＝
+    必要な人数を読む場所であるため（平均を採ると、週の一部だけ突出した山が
+    均されて消えてしまい、`compute_team_summary_rows` が出すピーク・ピーク時期
+    とも食い違う）。"""
+    weeks = week_starts(range_start, range_end)
+    series = {}
+    for team_id in team_ids:
+        values = [0] * len(weeks)
+        for i, value in _iter_step_weeks(team_concurrency_steps(result_df, team_id), weeks):
+            if value > values[i]:
+                values[i] = value
+        series[team_id] = values
+    return series
+
+
+def weekly_peak_breakdown_by_team(result_df, team_ids, range_start, range_end):
+    """週ごとに「その週で**全体の**同時タスク数が最大になった日」を選び、
+    その日の各チームの同時タスク数（＝合計の内訳）を返す。
+
+    Returns: ({team_id: [値, ...]}, [週ごとの合計, ...])
+    （いずれも `week_starts(range_start, range_end)` と同じ順）。
+
+    積み上げグラフ専用の集計。`weekly_concurrency_by_team()`（チームごとの
+    週内最大）をそのまま積み上げてはいけない——設計案§3が明示しているとおり
+    **「全体のピークは各チームのピークの和にはならない（時期がずれるため）」**
+    ので、単純に足すと実際には同時に起きていない高さの山を描いてしまう。
+    ある1日を選んでその日の内訳を積めば、合計は必ず実在した同時タスク数に
+    なり、KPIタイルの「同時タスク数のピーク」とも一致する
+    （どの週でも `sum(series[t][i] for t) == totals[i]`）。"""
+    weeks = week_starts(range_start, range_end)
+    totals = [0] * len(weeks)
+    peak_days = [None] * len(weeks)
+
+    # 全チーム合算の階段関数から、週ごとの「合計が最大の日」を拾う。
+    # 区間 [day, next_day) は合計が一定なので、その週に入る先頭の日
+    # （週をまたぐ場合はその週の月曜）を代表日にすれば十分。
+    total_steps = team_concurrency_steps(result_df)
+    for (day, value), (next_day, _next) in zip(total_steps, total_steps[1:]):
+        if value <= 0:
+            continue
+        for i, _v in _iter_step_weeks([(day, value), (next_day, 0)], weeks):
+            if value > totals[i]:
+                totals[i] = value
+                peak_days[i] = max(pd.Timestamp(day), weeks[i])
+
+    series = {}
+    for team_id in team_ids:
+        values = [0] * len(weeks)
+        steps = team_concurrency_steps(result_df, team_id)
+        if steps:
+            days = [pd.Timestamp(day) for day, _value in steps]
+            counts = [value for _day, value in steps]
+            for i, peak_day in enumerate(peak_days):
+                if peak_day is None:
+                    continue
+                # peak_day の時点で有効な値＝peak_day以下で最後の変化点の値。
+                k = bisect.bisect_right(days, peak_day) - 1
+                if k >= 0:
+                    values[i] = counts[k]
+        series[team_id] = values
+    return series, totals
+
+
+def weekly_capacity(capacity_periods, weeks):
+    """週ごとの設定上限（その週の月曜時点で有効な値）。上限が「指定なし」
+    （`project_scheduler._UNLIMITED_LINES`）の週は None を返す——呼び出し側は
+    Noneの週に破線を描かないことで「まだ人数を決めていない」ことを表す
+    （docs/project_analysis_tab_design.md §2-3）。
+
+    capacity_periods: `gui/gantt_generator.build_display()` の
+    team_capacity_schedule の1チームぶん（[(適用開始日, ライン数), ...]）。"""
+    periods = sorted(capacity_periods)
+    values = []
+    for week_start in weeks:
+        cap = None
+        for start, lines in periods:
+            if start <= week_start:
+                cap = lines
+            else:
+                break
+        values.append(None if cap is None or cap == _UNLIMITED_LINES else cap)
+    return values
+
+
 def _team_pinned_days(result_df, team_id, capacity_periods):
     """指定チームで、同時タスク数が設定上限に達していた（＝上限が効いていた）
     日数を返す。対象期間はそのチームの実際の活動期間
@@ -243,6 +376,31 @@ def compute_team_summary_rows(result_df, team_names, team_capacity_schedule):
             "overrun": int((df["Deadline_Overrun_Days"] > 0).sum()) if not df.empty else 0,
         })
     return rows
+
+
+ALL_TEAMS_ROW_NAME = "全チーム"
+
+
+def compute_all_teams_row(result_df):
+    """チーム別サマリーの表の先頭に置く「全チーム」行。
+
+    `compute_team_summary_rows()` と同じ形の辞書を返す（team_id は None）。
+    ピークは各チームのピークの和ではなく**全体の同時タスク数の最大**
+    （`peak_concurrency()` と同じ値＝KPIタイルの「同時タスク数のピーク」と
+    一致する）。「上限に張り付いた日数」はチーム単位の上限に対してしか
+    意味を持たないので None（表では空欄）。"""
+    peak, peak_month = peak_concurrency(result_df)
+    empty = result_df.empty
+    return {
+        "team_id": None,
+        "name": ALL_TEAMS_ROW_NAME,
+        "tasks": int(len(result_df)),
+        "peak": peak,
+        "peak_month": peak_month,
+        "pinned_days": None,
+        "resource_adjusted": 0 if empty else int(result_df["Resource_Adjusted"].sum()),
+        "overrun": 0 if empty else int((result_df["Deadline_Overrun_Days"] > 0).sum()),
+    }
 
 
 def compute_milestone_breakdown_all(result_df, milestones, task_status_map):

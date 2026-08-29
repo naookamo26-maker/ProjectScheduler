@@ -1,9 +1,9 @@
 """
 gui/resource_histogram.py の純粋関数（Qt/DB非依存）の単体テスト。
 
-compute_step_segments はプロジェクト分析タブの「設定上限の階段線」表示に
-使い回す想定の汎用関数のため、境界値（範囲外・範囲境界ちょうど・変化点の
-重複）を中心に検証する。
+compute_step_segments はプロジェクト分析タブの「上限に張り付いた日数」の
+集計（gui/summary_metrics._team_pinned_days）に使い回している汎用関数のため、
+境界値（範囲外・範囲境界ちょうど・変化点の重複）を中心に検証する。
 """
 
 import sys

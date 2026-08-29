@@ -19,10 +19,15 @@ from gui.summary_metrics import (  # noqa: E402
     STATUS_DONE,
     STATUS_IN_PROGRESS,
     STATUS_NOT_STARTED,
+    compute_all_teams_row,
     compute_kpi,
     compute_milestone_breakdown_all,
     compute_milestone_rows,
     compute_team_summary_rows,
+    week_starts,
+    weekly_capacity,
+    weekly_concurrency_by_team,
+    weekly_peak_breakdown_by_team,
     peak_concurrency,
     task_status_series,
     team_concurrency_steps,
@@ -303,6 +308,185 @@ def test_compute_team_summary_rows_pinned_days_is_none_when_never_capped():
     capacity_schedule = {"TEAM_1": [(pd.Timestamp.min, _UNLIMITED_LINES)]}
     rows = compute_team_summary_rows(df, {"TEAM_1": "チームA"}, capacity_schedule)
     assert rows[0]["pinned_days"] is None
+
+
+# -- compute_all_teams_row（表の先頭「全チーム」行） ------------------------------------
+
+def test_all_teams_row_peak_is_the_overall_peak_not_the_sum_of_team_peaks():
+    """「全チーム」行のピークは、各チームのピークの和ではなく全体の最大
+    （＝KPIタイルの「同時タスク数のピーク」と一致する）。TEAM_1が前半に2本、
+    TEAM_2が後半に2本で重ならないので、和なら4だが実際の最大は2。"""
+    df = _team_result_df([
+        ("J1", "T1", "TEAM_1", "2026-01-05", "2026-01-10", 0, False),
+        ("J1", "T2", "TEAM_1", "2026-01-05", "2026-01-10", 0, False),
+        ("J2", "T1", "TEAM_2", "2026-01-20", "2026-01-25", 0, False),
+        ("J2", "T2", "TEAM_2", "2026-01-20", "2026-01-25", 0, False),
+    ])
+    row = compute_all_teams_row(df)
+    overall_peak, overall_month = peak_concurrency(df)
+    assert row["peak"] == overall_peak == 2
+    assert row["peak_month"] == overall_month
+
+
+def test_all_teams_row_totals_tasks_adjusted_and_overrun_across_teams():
+    df = _team_result_df([
+        ("J1", "T1", "TEAM_1", "2026-01-05", "2026-01-10", 3, True),
+        ("J2", "T1", "TEAM_2", "2026-01-20", "2026-01-25", 0, False),
+    ])
+    row = compute_all_teams_row(df)
+    assert row["team_id"] is None       # 個別チームの行と見分けるための目印
+    assert row["name"] == "全チーム"
+    assert row["tasks"] == 2
+    assert row["resource_adjusted"] == 1
+    assert row["overrun"] == 1
+    # 上限はチーム単位の設定なので、全チームまとめた行では空欄にする。
+    assert row["pinned_days"] is None
+
+
+def test_all_teams_row_on_empty_result_df():
+    row = compute_all_teams_row(EMPTY_TEAM_DF)
+    assert row["tasks"] == 0
+    assert row["peak"] == 0
+    assert row["peak_month"] is None
+    assert row["resource_adjusted"] == 0
+    assert row["overrun"] == 0
+
+
+# -- 週次集計（チーム別サマリーのグラフ用） -------------------------------------------
+
+def test_week_starts_are_mondays_covering_both_ends():
+    """2026-01-15は木曜。その週の月曜（01-12）から始まり、range_endを含む
+    週まで並ぶこと。"""
+    assert week_starts(_ts("2026-01-15"), _ts("2026-02-02")) == [
+        _ts("2026-01-12"), _ts("2026-01-19"), _ts("2026-01-26"), _ts("2026-02-02"),
+    ]
+
+
+def test_week_starts_of_a_range_inside_one_week_is_one_entry():
+    assert week_starts(_ts("2026-01-13"), _ts("2026-01-16")) == [_ts("2026-01-12")]
+
+
+def test_weekly_concurrency_takes_the_max_within_each_week_not_the_average():
+    """週内の最大を採る（平均だと、週の一部だけ突出した山が均されて消える）。
+    T1が2週間ずっと1本、T2が2週目の火・水だけ重なって2本になる。"""
+    df = _team_result_df([
+        ("J1", "T1", "TEAM_1", "2026-01-12", "2026-01-26", 0, False),
+        ("J1", "T2", "TEAM_1", "2026-01-20", "2026-01-22", 0, False),
+    ])
+    series = weekly_concurrency_by_team(df, ["TEAM_1"], _ts("2026-01-12"), _ts("2026-01-26"))
+    assert series["TEAM_1"][0] == 1   # 1週目: T1のみ
+    assert series["TEAM_1"][1] == 2   # 2週目: 重なった瞬間の2本
+    assert series["TEAM_1"][2] == 0   # 3週目: 01-26はEnd_Date(exclusive)なので0
+
+
+def test_weekly_concurrency_spans_every_week_a_long_task_runs_through():
+    """1本のタスクが数週間にまたがる場合、その全週に1が立つこと
+    （変化点のある週だけでなく、間の週も埋まる）。"""
+    df = _team_result_df([("J1", "T1", "TEAM_1", "2026-01-12", "2026-02-09", 0, False)])
+    series = weekly_concurrency_by_team(df, ["TEAM_1"], _ts("2026-01-12"), _ts("2026-02-09"))
+    assert series["TEAM_1"] == [1, 1, 1, 1, 0]
+
+
+def test_weekly_concurrency_separates_teams():
+    df = _team_result_df([
+        ("J1", "T1", "TEAM_1", "2026-01-12", "2026-01-19", 0, False),
+        ("J2", "T1", "TEAM_2", "2026-01-19", "2026-01-26", 0, False),
+    ])
+    series = weekly_concurrency_by_team(
+        df, ["TEAM_1", "TEAM_2"], _ts("2026-01-12"), _ts("2026-01-26")
+    )
+    assert series["TEAM_1"] == [1, 0, 0]
+    assert series["TEAM_2"] == [0, 1, 0]
+
+
+def test_weekly_concurrency_of_a_team_with_no_tasks_is_all_zero():
+    df = _team_result_df([("J1", "T1", "TEAM_1", "2026-01-12", "2026-01-26", 0, False)])
+    series = weekly_concurrency_by_team(
+        df, ["TEAM_1", "TEAM_2"], _ts("2026-01-12"), _ts("2026-01-26")
+    )
+    assert series["TEAM_2"] == [0, 0, 0]
+
+
+def test_weekly_peak_breakdown_totals_are_a_real_simultaneous_count_not_a_sum_of_peaks():
+    """積み上げグラフの高さ＝実在した同時タスク数であること。
+
+    設計案§3が明示しているとおり「全体のピークは各チームのピークの和には
+    ならない（時期がずれるため）」——TEAM_1は週の月〜火に2本、TEAM_2は木〜金に
+    2本で、両者が重なる日は無い。チームごとの週内最大を足すと4になるが、
+    実際に同時に走った本数の最大は2。"""
+    df = _team_result_df([
+        ("J1", "T1", "TEAM_1", "2026-01-12", "2026-01-14", 0, False),
+        ("J1", "T2", "TEAM_1", "2026-01-12", "2026-01-14", 0, False),
+        ("J2", "T1", "TEAM_2", "2026-01-15", "2026-01-17", 0, False),
+        ("J2", "T2", "TEAM_2", "2026-01-15", "2026-01-17", 0, False),
+    ])
+    team_ids = ["TEAM_1", "TEAM_2"]
+    args = (df, team_ids, _ts("2026-01-12"), _ts("2026-01-17"))
+
+    # 単純な週内最大の和なら 2+2=4 になってしまう。
+    naive = weekly_concurrency_by_team(*args)
+    assert naive["TEAM_1"][0] + naive["TEAM_2"][0] == 4
+
+    series, totals = weekly_peak_breakdown_by_team(*args)
+    assert totals[0] == 2  # 実際に同時に走った最大は2本
+    assert series["TEAM_1"][0] + series["TEAM_2"][0] == totals[0]
+
+
+def test_weekly_peak_breakdown_totals_always_equal_the_sum_of_the_bands():
+    """積み上げの不変条件: どの週でも「帯の合計＝totals」であること
+    （グラフの高さと合計ツールチップが食い違わないため）。"""
+    df = _team_result_df([
+        ("J1", "T1", "TEAM_1", "2026-01-05", "2026-03-10", 0, False),
+        ("J1", "T2", "TEAM_2", "2026-01-20", "2026-02-15", 0, False),
+        ("J2", "T1", "TEAM_2", "2026-02-01", "2026-03-01", 0, False),
+        ("J2", "T2", "TEAM_3", "2026-01-01", "2026-03-20", 0, False),
+    ])
+    team_ids = ["TEAM_1", "TEAM_2", "TEAM_3"]
+    series, totals = weekly_peak_breakdown_by_team(
+        df, team_ids, _ts("2026-01-01"), _ts("2026-03-20")
+    )
+    for i in range(len(totals)):
+        assert sum(series[team_id][i] for team_id in team_ids) == totals[i]
+
+
+def test_weekly_peak_breakdown_max_total_equals_the_overall_peak():
+    """週ごとの合計の最大は、全体のピーク（peak_concurrency）と一致すること
+    ——グラフのピーク目印とKPIタイルが食い違わないため。"""
+    df = _team_result_df([
+        ("J1", "T1", "TEAM_1", "2026-01-05", "2026-02-10", 0, False),
+        ("J1", "T2", "TEAM_2", "2026-01-20", "2026-02-15", 0, False),
+    ])
+    _series, totals = weekly_peak_breakdown_by_team(
+        df, ["TEAM_1", "TEAM_2"], _ts("2026-01-05"), _ts("2026-02-15")
+    )
+    overall_peak, _month = peak_concurrency(df)
+    assert max(totals) == overall_peak
+
+
+def test_weekly_peak_breakdown_is_all_zero_for_a_team_with_no_tasks():
+    df = _team_result_df([("J1", "T1", "TEAM_1", "2026-01-12", "2026-01-26", 0, False)])
+    series, _totals = weekly_peak_breakdown_by_team(
+        df, ["TEAM_1", "TEAM_2"], _ts("2026-01-12"), _ts("2026-01-26")
+    )
+    assert series["TEAM_2"] == [0, 0, 0]
+
+
+def test_weekly_capacity_returns_none_for_unlimited_weeks():
+    """上限「指定なし」の週はNone（呼び出し側が破線を描かない目印）。"""
+    weeks = [_ts("2026-01-12"), _ts("2026-01-19")]
+    assert weekly_capacity([(pd.Timestamp.min, _UNLIMITED_LINES)], weeks) == [None, None]
+
+
+def test_weekly_capacity_follows_a_mid_period_change():
+    """週の月曜時点で有効な値を採る。2026-01-19から3になるので、2週目以降が3。"""
+    weeks = [_ts("2026-01-12"), _ts("2026-01-19"), _ts("2026-01-26")]
+    periods = [(pd.Timestamp.min, 1), (_ts("2026-01-19"), 3)]
+    assert weekly_capacity(periods, weeks) == [1, 3, 3]
+
+
+def test_weekly_capacity_keeps_zero_meaning_inactive():
+    """0（稼働なし）はNULL（指定なし）と区別してそのまま返す。"""
+    assert weekly_capacity([(pd.Timestamp.min, 0)], [_ts("2026-01-12")]) == [0]
 
 
 def test_compute_team_summary_rows_pinned_days_follows_a_mid_period_capacity_change():

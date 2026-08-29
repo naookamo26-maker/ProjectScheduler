@@ -1590,6 +1590,65 @@ def test_analysis_tab_capture_and_restore_breakdown_mode(window, qapp):
     assert window.tab_analysis._dimension_combo.currentText() == "チームB"
 
 
+# -- チーム別サマリー（gui/team_summary_view.py） ---------------------------------------
+
+def test_team_summary_table_starts_with_an_all_teams_row_driving_the_stacked_chart(window, qapp):
+    """表の先頭は「全チーム」行で、既定でそれが選択されていること。グラフは
+    1枚に統合してあり、この行のときは積み上げ（凡例あり）になる。"""
+    from gui.tab_analysis import _ALL_TEAMS_KEY
+
+    _build_two_team_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    table = tab.team_table
+    assert table.item(0, 0).text() == "全チーム"
+    assert table.item(0, 0).data(Qt.UserRole) == _ALL_TEAMS_KEY
+    assert table.rowCount() == 3  # 全チーム + チームA + チームB
+    assert tab._selected_team_summary_id == _ALL_TEAMS_KEY
+    assert "積み上げ" in tab.team_chart_label.text()
+    assert tab.team_legend_label.text()  # 積み上げのときだけ凡例を出す
+
+
+def test_team_summary_chart_switches_to_the_selected_teams_detail(window, qapp):
+    """個別チームの行を選ぶと、同じ1枚のグラフがそのチームの詳細に切り替わり、
+    凡例（1色なので不要）が消えること。"""
+    _build_two_team_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    tab.team_table.selectRow(1)  # 「全チーム」の次＝最初の個別チーム
+    qapp.processEvents()
+
+    assert tab._selected_team_summary_id is not None
+    assert "チームA" in tab.team_chart_label.text()
+    assert "破線＝設定上限" in tab.team_chart_label.text()
+    assert tab.team_legend_label.text() == ""
+
+
+def test_capacity_line_merges_consecutive_weeks_so_the_dash_pattern_is_visible():
+    """回帰テスト: 設定上限の破線は、同じ値が続く週をまとめて1本にすること。
+
+    週ごと（9px）の細切れで描くと、QtのDashLineはダッシュ長を線幅の倍数で
+    決めるため1ダッシュも入りきらず、実線にしか見えなくなっていた。"""
+    from gui.team_summary_view import _merge_runs
+
+    # 同じ値が続く区間は1本にまとまる。
+    assert _merge_runs([2, 2, 2]) == [(0, 2, 2)]
+    # 値が変わったところで切れる（階段になる）。
+    assert _merge_runs([1, 1, 3, 3]) == [(0, 1, 1), (2, 3, 3)]
+    # None（＝上限「指定なし」）は区間を作らず、そこで切る。
+    assert _merge_runs([1, 1, None, 1]) == [(0, 1, 1), (3, 3, 1)]
+    assert _merge_runs([None, None]) == []
+    assert _merge_runs([]) == []
+
+
 # -- ガントチャート描画（gui/gantt_view.py）: 「今日」の縦線・1行飛ばしの行背景 ------------
 #
 # build_gantt_scenes() はDB/スケジューラーを介さずDataFrameだけで呼べるため、
