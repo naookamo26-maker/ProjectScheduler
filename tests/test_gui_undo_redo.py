@@ -1571,7 +1571,7 @@ def test_analysis_tab_breakdown_dimension_selector_filters_to_one_team_at_a_time
     qapp.processEvents()
 
     tab = window.tab_analysis
-    headers = ["マイルストーン", "進捗", "締切日", "残", "最終終了日", "スラック", "超過",
+    headers = ["マイルストーン", "進捗", "締切日", "最終終了日", "スラック", "超過",
                "ジョブ", "タスク", "完了", "進行中", "未着手"]
     assert [tab.milestone_table.horizontalHeaderItem(i).text() for i in range(len(headers))] == headers
     assert not tab._dimension_combo.isVisible()
@@ -1580,17 +1580,92 @@ def test_analysis_tab_breakdown_dimension_selector_filters_to_one_team_at_a_time
     qapp.processEvents()
     assert tab._dimension_combo.isVisible()
     assert tab._dimension_combo.currentText() == "チームA"
-    assert tab.milestone_table.item(0, 8).text() == "2"  # タスク: チームAの2件
+    assert tab.milestone_table.item(0, 7).text() == "2"  # タスク: チームAの2件
 
     idx_team_b = tab._dimension_combo.findText("チームB")
     tab._dimension_combo.setCurrentIndex(idx_team_b)
     qapp.processEvents()
-    assert tab.milestone_table.item(0, 8).text() == "1"  # タスク: チームBの1件
+    assert tab.milestone_table.item(0, 7).text() == "1"  # タスク: チームBの1件
 
     tab._breakdown_buttons["workflow"].click()
     qapp.processEvents()
     assert tab._dimension_combo.currentText() == "WF1"
-    assert tab.milestone_table.item(0, 8).text() == "2"  # タスク: WF1の2件
+    assert tab.milestone_table.item(0, 7).text() == "2"  # タスク: WF1の2件
+
+
+def test_analysis_tab_milestone_progress_uses_the_selected_breakdown_target_as_the_denominator(
+    window, qapp,
+):
+    """「チーム別」「ワークフロー別」表示中は、「進捗」列の基準（分母）が
+    プロジェクト全体ではなく選択中の対象の件数になること。"""
+    db = window.db
+    db.set_project("進捗内訳テスト", "2026-01-05")
+    team_a = db.add_team("チームA", 2)
+    team_b = db.add_team("チームB", 1)
+    ms1 = db.add_milestone("マイルストーン1", "2026-03-01")
+    ms2 = db.add_milestone("マイルストーン2", "2026-06-01")
+    wf_id = db.add_workflow("WF1")
+    db.add_workflow_task(wf_id, "タスク", team_a, 3)
+    db.add_workflow_task(wf_id, "タスク2", team_b, 3)
+    # チームAはMS1に1件・MS2に1件（計2件）。チームBはMS1に1件のみ（計1件）。
+    job1 = db.add_job("ジョブA1", wf_id, ms1, 100)
+    db.upsert_job_task_override(job1, db.list_workflow_tasks(wf_id)[1]["id"], is_active=False)
+    job2 = db.add_job("ジョブA2", wf_id, ms2, 100)
+    db.upsert_job_task_override(job2, db.list_workflow_tasks(wf_id)[1]["id"], is_active=False)
+    job3 = db.add_job("ジョブB1", wf_id, ms1, 100)
+    db.upsert_job_task_override(job3, db.list_workflow_tasks(wf_id)[0]["id"], is_active=False)
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    tab._breakdown_buttons["team"].click()
+    qapp.processEvents()
+    assert tab._dimension_combo.currentText() == "チームA"
+    # チームAはMS1・MS2に1件ずつ（計2件）なので累積は 1/2=50%, 2/2=100%。
+    assert tab.milestone_table.item(0, 1).text() == "50%"
+    assert tab.milestone_table.item(1, 1).text() == "100%"
+
+    idx_team_b = tab._dimension_combo.findText("チームB")
+    tab._dimension_combo.setCurrentIndex(idx_team_b)
+    qapp.processEvents()
+    # チームBはMS1に1件のみ（計1件）なので、MS1時点で既に100%。
+    assert tab.milestone_table.item(0, 1).text() == "100%"
+    assert tab.milestone_table.item(1, 1).text() == "100%"
+
+
+def test_analysis_tab_milestone_table_handles_a_workflow_with_no_tasks(window, qapp):
+    """ワークフロー別の絞り込み対象に「タスクを1件も持たないワークフロー」を
+    選んでも、進捗・内訳が0扱いになるだけでクラッシュしないこと
+    （プロジェクト全体としては別のワークフローにタスクがあるため、
+    スケジューリング自体は成立する）。"""
+    db = window.db
+    db.set_project("空ワークフローテスト", "2026-01-05")
+    team_id = db.add_team("チームA", 2)
+    ms_id = db.add_milestone("マイルストーン1", "2026-06-30")
+    wf_used = db.add_workflow("使用中WF")
+    db.add_workflow_task(wf_used, "タスク", team_id, 3)
+    db.add_job("ジョブ1", wf_used, ms_id, 100)
+    db.add_workflow("未使用WF")  # タスクを1件も持たない
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    tab._breakdown_buttons["workflow"].click()
+    qapp.processEvents()
+    idx_unused = tab._dimension_combo.findText("未使用WF")
+    assert idx_unused >= 0
+    tab._dimension_combo.setCurrentIndex(idx_unused)
+    qapp.processEvents()
+
+    assert tab.milestone_table.item(0, 1).text() == "0%"
+    assert tab.milestone_table.item(0, 7).text() == "0"  # タスク
+    assert "タスクがありません" in tab.breakdown_hint_label.text()
 
 
 def test_analysis_tab_capture_and_restore_breakdown_mode(window, qapp):

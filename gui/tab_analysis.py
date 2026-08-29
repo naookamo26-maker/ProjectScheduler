@@ -11,7 +11,6 @@
 （`refresh_choices()` 内の `self.cache.ensure_fresh()`）。"""
 
 import html
-from datetime import date
 
 import pandas as pd
 from PySide6.QtCore import Qt, QTimer
@@ -30,10 +29,11 @@ from PySide6.QtWidgets import (
 )
 
 from gui.summary_metrics import (
+    compute_all_teams_row,
     compute_kpi,
     compute_milestone_breakdown_all,
+    compute_milestone_cumulative_progress_pct,
     compute_milestone_rows,
-    compute_all_teams_row,
     compute_team_summary_rows,
     week_starts,
     weekly_capacity,
@@ -53,7 +53,7 @@ _BREAKDOWN_LABELS = [
 ]
 _BREAKDOWN_EXTRA_COLUMNS = ["ジョブ", "タスク", "完了", "進行中", "未着手"]
 
-_BASE_COLUMNS = ["マイルストーン", "進捗", "締切日", "残", "最終終了日", "スラック", "超過"]
+_BASE_COLUMNS = ["マイルストーン", "進捗", "締切日", "最終終了日", "スラック", "超過"]
 
 _TEAM_COLUMNS = ["チーム", "ピーク", "ピーク時期", "上限に張り付いた日数", "タスク件数", "押し出された件数", "超過件数"]
 # チーム別サマリーの表の先頭「全チーム」行を、個別チームの行と見分けるための
@@ -271,11 +271,10 @@ class AnalysisTab(QWidget):
         ]
         project_start = self.db.get_project()["start_date"]
         project_start_ts = pd.Timestamp(project_start) if project_start else None
-        today = date.today()
         task_status_map = display["task_status"]
 
         self._render_kpi(result_df, project_start_ts, milestones, task_status_map)
-        self._render_milestone_table(result_df, display, milestones, today, task_status_map)
+        self._render_milestone_table(result_df, display, milestones, task_status_map)
         self._render_team_summary(result_df, display, milestones, project_start_ts)
 
     def _show_status_only(self, message, is_error):
@@ -346,13 +345,17 @@ class AnalysisTab(QWidget):
             alert=kpi["start_pin_violations"] > 0,
         )
 
-    def _render_milestone_table(self, result_df, display, milestones, today, task_status_map):
+    def _render_milestone_table(self, result_df, display, milestones, task_status_map):
         mode = self._breakdown_mode
         filtered_df = self._sync_dimension_combo(mode, display, result_df)
 
-        self.breakdown_hint_label.setText(
-            "ジョブ件数は延べ（1ジョブが複数マイルストーンにまたがりうる）"
-        )
+        hint = "ジョブ件数は延べ（1ジョブが複数マイルストーンにまたがりうる）"
+        if mode != _BREAKDOWN_ALL and filtered_df.empty:
+            # 対象が1件も無い（例: ワークフローが登録されていない、選択中の
+            # チーム/ワークフローにタスクが1件も無い）場合、内訳・進捗の列は
+            # すべて0扱いになる——テーブル自体は表示したまま、理由をここで補う。
+            hint = "選択中の対象にはタスクがありません（内訳・進捗は0になります）。" + hint
+        self.breakdown_hint_label.setText(hint)
         headers = _BASE_COLUMNS + _BREAKDOWN_EXTRA_COLUMNS
         self.milestone_table.setColumnCount(len(headers))
         self.milestone_table.setHorizontalHeaderLabels(headers)
@@ -360,17 +363,21 @@ class AnalysisTab(QWidget):
         # 基本列（締切・スラック等）は内訳モードによらず常にプロジェクト全体
         # （全チーム・全ワークフロー）の結果から計算する——「そのマイルストーンが
         # 間に合うか」はチーム別・ワークフロー別に絞り込んでも変わらない事実
-        # のため（設計案参照）。内訳（右側の5列）だけを選択対象で絞り込む。
-        base_rows = compute_milestone_rows(result_df, milestones, today)
+        # のため（設計案参照）。内訳（右側の5列）・進捗（%）は選択対象で絞り込む
+        # ——「進捗」はチーム別/ワークフロー別のときその対象の件数を基準
+        # （＝100%）にする、という利用者の要望による。
+        base_rows = compute_milestone_rows(result_df, milestones)
+        progress_values = compute_milestone_cumulative_progress_pct(filtered_df, milestones)
         breakdown_rows = compute_milestone_breakdown_all(filtered_df, milestones, task_status_map)
 
         self.milestone_table.setRowCount(len(base_rows))
-        for row_index, (base, breakdown) in enumerate(zip(base_rows, breakdown_rows)):
+        for row_index, (base, progress_pct, breakdown) in enumerate(
+            zip(base_rows, progress_values, breakdown_rows)
+        ):
             self._set_item(row_index, 0, base["name"])
-            self._set_item(row_index, 1, f"{base['cumulative_progress_pct']:.0f}%", right=True)
+            self._set_item(row_index, 1, f"{progress_pct:.0f}%", right=True)
             self._set_item(row_index, 2, _fmt_date(base["due_date"]))
-            self._set_item(row_index, 3, f"{base['remaining_days']}日" if base["remaining_days"] else "—")
-            self._set_item(row_index, 4, _fmt_date(base["last_end_date"]))
+            self._set_item(row_index, 3, _fmt_date(base["last_end_date"]))
 
             slack = base["slack_days"]
             slack_text = "—" if slack is None else (f"+{slack}日" if slack >= 0 else f"{slack}日")
@@ -378,19 +385,19 @@ class AnalysisTab(QWidget):
             if slack is not None and slack < 0:
                 slack_item.setForeground(_ALERT_COLOR)
             slack_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            self.milestone_table.setItem(row_index, 5, slack_item)
+            self.milestone_table.setItem(row_index, 4, slack_item)
 
             overrun_item = QTableWidgetItem(_fmt_int(base["overrun_count"]) if base["overrun_count"] else "—")
             if base["overrun_count"]:
                 overrun_item.setForeground(_ALERT_COLOR)
             overrun_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            self.milestone_table.setItem(row_index, 6, overrun_item)
+            self.milestone_table.setItem(row_index, 5, overrun_item)
 
-            self._set_item(row_index, 7, _fmt_int(breakdown["jobs"]), right=True)
-            self._set_item(row_index, 8, _fmt_int(breakdown["tasks"]), right=True)
-            self._set_item(row_index, 9, _fmt_int(breakdown["done"]), right=True)
-            self._set_item(row_index, 10, _fmt_int(breakdown["in_progress"]), right=True)
-            self._set_item(row_index, 11, _fmt_int(breakdown["not_started"]), right=True)
+            self._set_item(row_index, 6, _fmt_int(breakdown["jobs"]), right=True)
+            self._set_item(row_index, 7, _fmt_int(breakdown["tasks"]), right=True)
+            self._set_item(row_index, 8, _fmt_int(breakdown["done"]), right=True)
+            self._set_item(row_index, 9, _fmt_int(breakdown["in_progress"]), right=True)
+            self._set_item(row_index, 10, _fmt_int(breakdown["not_started"]), right=True)
 
         auto_size_columns(self.milestone_table, stretch_last=False)
 

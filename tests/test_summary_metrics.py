@@ -3,7 +3,6 @@ gui/summary_metrics.py の純粋関数（Qt非依存）の単体テスト。
 """
 
 import sys
-from datetime import date
 from pathlib import Path
 
 import pytest
@@ -22,6 +21,7 @@ from gui.summary_metrics import (  # noqa: E402
     compute_all_teams_row,
     compute_kpi,
     compute_milestone_breakdown_all,
+    compute_milestone_cumulative_progress_pct,
     compute_milestone_rows,
     compute_team_summary_rows,
     week_starts,
@@ -154,7 +154,7 @@ def test_milestone_row_slack_is_negative_when_overrun():
         ("J1", "T1", "TEAM_1", "WF_1", "MS_1", "2026-01-01", "2026-02-01", 0, ""),
     ])
     milestones = [("MS_1", "MS1", _ts("2026-01-20"))]
-    rows = compute_milestone_rows(df, milestones, date(2026, 1, 1))
+    rows = compute_milestone_rows(df, milestones)
     row = rows[0]
     assert row["last_end_date"] == _ts("2026-02-01")
     assert row["slack_days"] == (_ts("2026-01-20") - _ts("2026-02-01")).days
@@ -167,7 +167,7 @@ def test_milestone_row_slack_is_positive_when_finished_early():
         ("J1", "T1", "TEAM_1", "WF_1", "MS_1", "2026-01-01", "2026-01-10", 0, ""),
     ])
     milestones = [("MS_1", "MS1", _ts("2026-01-20"))]
-    rows = compute_milestone_rows(df, milestones, date(2026, 1, 1))
+    rows = compute_milestone_rows(df, milestones)
     row = rows[0]
     assert row["slack_days"] == (_ts("2026-01-20") - _ts("2026-01-10")).days
     assert row["on_time"] is True
@@ -175,7 +175,7 @@ def test_milestone_row_slack_is_positive_when_finished_early():
 
 def test_milestone_row_with_no_tasks_has_no_slack_but_counts_as_on_time():
     milestones = [("MS_1", "MS1", _ts("2026-01-20"))]
-    rows = compute_milestone_rows(EMPTY_DF, milestones, date(2026, 1, 1))
+    rows = compute_milestone_rows(EMPTY_DF, milestones)
     row = rows[0]
     assert row["last_end_date"] is None
     assert row["slack_days"] is None
@@ -183,13 +183,9 @@ def test_milestone_row_with_no_tasks_has_no_slack_but_counts_as_on_time():
     assert row["on_time"] is True
 
 
-def test_milestone_row_remaining_days_is_zero_after_due_date():
-    milestones = [("MS_1", "MS1", _ts("2026-01-01"))]
-    rows = compute_milestone_rows(EMPTY_DF, milestones, date(2026, 2, 1))
-    assert rows[0]["remaining_days"] == 0
+# -- compute_milestone_cumulative_progress_pct ---------------------------------------
 
-
-def test_milestone_row_cumulative_progress_is_independent_of_task_status():
+def test_milestone_progress_is_independent_of_task_status():
     """進捗%はタスクの完了状態と無関係（計画上のタスク配分だけで決まる）。
     全タスク未着手でも、マイルストーンに割り当てられていれば進捗に数える。"""
     df = _result_df([
@@ -198,13 +194,13 @@ def test_milestone_row_cumulative_progress_is_independent_of_task_status():
         ("J2", "T1", "TEAM_1", "WF_1", "MS_2", "2026-01-01", "2026-01-05", 0, ""),
     ])
     milestones = [("MS_1", "MS1", _ts("2026-06-01")), ("MS_2", "MS2", _ts("2026-07-01"))]
-    rows = compute_milestone_rows(df, milestones, date(2026, 1, 1))
+    progress = compute_milestone_cumulative_progress_pct(df, milestones)
     # MS_1に2件、MS_2に1件。全体は3件なので累積は 2/3, 3/3。
-    assert rows[0]["cumulative_progress_pct"] == pytest.approx(200 / 3)
-    assert rows[1]["cumulative_progress_pct"] == pytest.approx(100.0)
+    assert progress[0] == pytest.approx(200 / 3)
+    assert progress[1] == pytest.approx(100.0)
 
 
-def test_milestone_row_cumulative_progress_reaches_100_percent_at_the_last_milestone():
+def test_milestone_progress_reaches_100_percent_at_the_last_milestone():
     """タスクは必ずどれか1つのマイルストーンに属するので、最後のマイルストーン
     では累積が必ず100%になる（重複も漏れも無い）。"""
     df = _result_df([
@@ -217,17 +213,32 @@ def test_milestone_row_cumulative_progress_reaches_100_percent_at_the_last_miles
         ("MS_2", "MS2", _ts("2026-06-01")),
         ("MS_3", "MS3", _ts("2026-09-01")),
     ]
-    rows = compute_milestone_rows(df, milestones, date(2026, 1, 1))
-    assert rows[-1]["cumulative_progress_pct"] == pytest.approx(100.0)
-    # 単調増加であること。
-    values = [r["cumulative_progress_pct"] for r in rows]
-    assert values == sorted(values)
+    progress = compute_milestone_cumulative_progress_pct(df, milestones)
+    assert progress[-1] == pytest.approx(100.0)
+    assert progress == sorted(progress)  # 単調増加であること。
 
 
-def test_milestone_row_cumulative_progress_is_zero_when_there_are_no_tasks():
+def test_milestone_progress_is_zero_when_there_are_no_tasks():
     milestones = [("MS_1", "MS1", _ts("2026-01-20"))]
-    rows = compute_milestone_rows(EMPTY_DF, milestones, date(2026, 1, 1))
-    assert rows[0]["cumulative_progress_pct"] == 0.0
+    assert compute_milestone_cumulative_progress_pct(EMPTY_DF, milestones) == [0.0]
+
+
+def test_milestone_progress_denominator_follows_the_df_passed_in():
+    """「進捗」の基準（分母）は呼び出し側が渡すdf次第——チーム別/ワークフロー別
+    表示のときは、絞り込んだdfを渡すことでその対象の件数が基準になる
+    （gui/tab_analysis.py._render_milestone_table参照）。TEAM_1だけに絞ると、
+    TEAM_2のタスクは分母からも分子からも除外される。"""
+    df = _result_df([
+        ("J1", "T1", "TEAM_1", "WF_1", "MS_1", "2026-01-01", "2026-01-05", 0, ""),
+        ("J1", "T2", "TEAM_1", "WF_1", "MS_2", "2026-01-05", "2026-01-10", 0, ""),
+        ("J2", "T1", "TEAM_2", "WF_1", "MS_1", "2026-01-01", "2026-01-05", 0, ""),
+    ])
+    milestones = [("MS_1", "MS1", _ts("2026-06-01")), ("MS_2", "MS2", _ts("2026-07-01"))]
+    team1_only = df[df["Team_ID"] == "TEAM_1"]
+    progress = compute_milestone_cumulative_progress_pct(team1_only, milestones)
+    # TEAM_1は2件（MS_1に1件、MS_2に1件）なので累積は 1/2, 2/2。
+    assert progress[0] == pytest.approx(50.0)
+    assert progress[1] == pytest.approx(100.0)
 
 
 # -- compute_milestone_breakdown_all ------------------------------------------------
