@@ -198,8 +198,6 @@ class BasicInfoTab(QWidget):
         scroll.setWidget(content)
         layout = QVBoxLayout(content)
 
-        layout.addWidget(self._build_project_group())
-
         self.milestones_section = CrudSection(
             "マイルストーン", ["マイルストーン名", "締切日", "備考"],
             on_add=self._add_milestone, on_delete=self._delete_milestone,
@@ -212,15 +210,18 @@ class BasicInfoTab(QWidget):
         )
         self.holidays_section.table.itemChanged.connect(self._on_holiday_note_changed)
 
+        # 1段目: プロジェクト概要／休業日（上下）。2段目: マイルストーン／
+        # チーム（左右5:5、`QSplitter` でユーザーがドラッグ調整可）。
+        layout.addWidget(self._build_project_group())
+        layout.addWidget(self.holidays_section)
+
         row2 = QSplitter(Qt.Horizontal)
         row2.addWidget(self.milestones_section)
-        row2.addWidget(self.holidays_section)
-        row2.setStretchFactor(0, 1)
-        row2.setStretchFactor(1, 1)
-        layout.addWidget(row2)
+        row2.addWidget(self._build_teams_group())
+        row2.setStretchFactor(0, 5)
+        row2.setStretchFactor(1, 5)
+        layout.addWidget(row2, 1)
         self._row2_splitter = row2
-
-        layout.addWidget(self._build_teams_group(), 1)
 
         # コンストラクタ時点（実際のウィジェット幅が確定する前）にsetSizes()を
         # 呼んでも比率が反映されない（表示後の最初のレイアウトで上書きされる）
@@ -265,9 +266,9 @@ class BasicInfoTab(QWidget):
         return False
 
     def _apply_initial_splitter_sizes(self):
-        total2 = self._row2_splitter.width()
-        if total2 > 0:
-            self._row2_splitter.setSizes([total2 // 2, total2 - total2 // 2])
+        total = self._row2_splitter.width()
+        if total > 0:
+            self._row2_splitter.setSizes([total // 2, total - total // 2])
 
     # -- プロジェクト概要 -----------------------------------------------------
 
