@@ -29,13 +29,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.summary_metrics import (
-    compute_kpi,
-    compute_milestone_breakdown_all,
-    compute_milestone_breakdown_by,
-    compute_milestone_rows,
-)
-from gui.widgets_common import auto_size_columns
+from gui.summary_metrics import compute_kpi, compute_milestone_breakdown_all, compute_milestone_rows
+from gui.widgets_common import NoWheelComboBox, auto_size_columns
 
 _BREAKDOWN_ALL = "all"
 _BREAKDOWN_TEAM = "team"
@@ -45,8 +40,9 @@ _BREAKDOWN_LABELS = [
     (_BREAKDOWN_TEAM, "チーム別"),
     (_BREAKDOWN_WORKFLOW, "ワークフロー別"),
 ]
+_BREAKDOWN_EXTRA_COLUMNS = ["ジョブ", "タスク", "完了", "進行中", "未着手"]
 
-_BASE_COLUMNS = ["マイルストーン", "締切日", "残", "最終終了日", "スラック", "超過", "判定"]
+_BASE_COLUMNS = ["マイルストーン", "締切日", "残", "最終終了日", "スラック", "超過"]
 # ガントチャートタブのエラー表示と同じ赤（gui/tab_gantt.py の _set_status 参照）。
 _ALERT_COLOR = QColor("#b3261e")
 
@@ -90,6 +86,10 @@ class AnalysisTab(QWidget):
         self.db = db
         self.gantt_tab = gantt_tab
         self._breakdown_mode = _BREAKDOWN_ALL
+        # 「チーム別」「ワークフロー別」で個別に選んだ対象（それぞれ別々に覚えて
+        # おき、モードを行き来しても選択が保たれるようにする）。
+        self._selected_team_id = None
+        self._selected_workflow_id = None
 
         layout = QVBoxLayout(self)
 
@@ -127,6 +127,13 @@ class AnalysisTab(QWidget):
             self._breakdown_group.addButton(btn)
             self._breakdown_buttons[key] = btn
             breakdown_bar.addWidget(btn)
+        # 「チーム別」「ワークフロー別」のときだけ表示する、対象を1件選ぶコンボ
+        # （すべてのチーム/ワークフローを列として並べるのではなく、選んだ1件の
+        # 内訳を「全体」と同じ列構成で表示する）。
+        self._dimension_combo = NoWheelComboBox()
+        self._dimension_combo.currentIndexChanged.connect(self._on_dimension_changed)
+        self._dimension_combo.setVisible(False)
+        breakdown_bar.addWidget(self._dimension_combo)
         breakdown_bar.addStretch(1)
         self.breakdown_hint_label = QLabel("")
         self.breakdown_hint_label.setStyleSheet("color: #6d6b66;")
@@ -146,6 +153,16 @@ class AnalysisTab(QWidget):
         if key == self._breakdown_mode:
             return
         self._breakdown_mode = key
+        self._render()
+
+    def _on_dimension_changed(self, _index):
+        selected = self._dimension_combo.currentData()
+        if selected is None:
+            return
+        if self._breakdown_mode == _BREAKDOWN_TEAM:
+            self._selected_team_id = selected
+        elif self._breakdown_mode == _BREAKDOWN_WORKFLOW:
+            self._selected_workflow_id = selected
         self._render()
 
     # -- 結果の取得（段階2の暫定: GanttTabの内部状態を直接覗く） -----------------------
@@ -196,6 +213,7 @@ class AnalysisTab(QWidget):
             tile.set_value("—", "")
         self.milestone_table.setRowCount(0)
         self.breakdown_hint_label.setText("")
+        self._dimension_combo.setVisible(False)
 
     def _render_kpi(self, result_df, project_start_ts, milestones, today):
         kpi = compute_kpi(result_df, project_start_ts, milestones, today)
@@ -241,34 +259,21 @@ class AnalysisTab(QWidget):
 
     def _render_milestone_table(self, result_df, display, milestones, today):
         mode = self._breakdown_mode
-        if mode == _BREAKDOWN_TEAM:
-            dim_ids = list(display["team_names"].keys())
-            dim_labels = display["team_names"]
-            column = "Team_ID"
-            hint = "値はタスク件数。行方向の合計はタスク件数と一致する"
-        elif mode == _BREAKDOWN_WORKFLOW:
-            dim_ids = list(display["workflow_names"].keys())
-            dim_labels = display["workflow_names"]
-            column = "Workflow_ID"
-            hint = "値はタスク件数。行方向の合計はタスク件数と一致する"
-        else:
-            dim_ids, dim_labels, column = None, None, None
-            hint = "ジョブ件数は延べ（1ジョブが複数マイルストーンにまたがりうる）"
-        self.breakdown_hint_label.setText(hint)
+        filtered_df = self._sync_dimension_combo(mode, display, result_df)
 
-        if mode == _BREAKDOWN_ALL:
-            extra_columns = ["ジョブ", "タスク", "完了", "進行中", "未着手"]
-        else:
-            extra_columns = [dim_labels[d] for d in dim_ids]
-        headers = _BASE_COLUMNS + extra_columns
+        self.breakdown_hint_label.setText(
+            "ジョブ件数は延べ（1ジョブが複数マイルストーンにまたがりうる）"
+        )
+        headers = _BASE_COLUMNS + _BREAKDOWN_EXTRA_COLUMNS
         self.milestone_table.setColumnCount(len(headers))
         self.milestone_table.setHorizontalHeaderLabels(headers)
 
+        # 基本列（締切・スラック等）は内訳モードによらず常にプロジェクト全体
+        # （全チーム・全ワークフロー）の結果から計算する——「そのマイルストーンが
+        # 間に合うか」はチーム別・ワークフロー別に絞り込んでも変わらない事実
+        # のため（設計案参照）。内訳（右側の5列）だけを選択対象で絞り込む。
         base_rows = compute_milestone_rows(result_df, milestones, today)
-        if mode == _BREAKDOWN_ALL:
-            breakdown_rows = compute_milestone_breakdown_all(result_df, milestones, today)
-        else:
-            breakdown_rows = compute_milestone_breakdown_by(result_df, milestones, column, dim_ids)
+        breakdown_rows = compute_milestone_breakdown_all(filtered_df, milestones, today)
 
         self.milestone_table.setRowCount(len(base_rows))
         for row_index, (base, breakdown) in enumerate(zip(base_rows, breakdown_rows)):
@@ -291,25 +296,46 @@ class AnalysisTab(QWidget):
             overrun_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.milestone_table.setItem(row_index, 5, overrun_item)
 
-            judge_item = QTableWidgetItem("○" if base["on_time"] else "×")
-            judge_item.setTextAlignment(Qt.AlignCenter)
-            if not base["on_time"]:
-                judge_item.setForeground(_ALERT_COLOR)
-            self.milestone_table.setItem(row_index, 6, judge_item)
-
-            if mode == _BREAKDOWN_ALL:
-                self._set_item(row_index, 7, _fmt_int(breakdown["jobs"]), right=True)
-                self._set_item(row_index, 8, _fmt_int(breakdown["tasks"]), right=True)
-                self._set_item(row_index, 9, _fmt_int(breakdown["done"]), right=True)
-                self._set_item(row_index, 10, _fmt_int(breakdown["in_progress"]), right=True)
-                self._set_item(row_index, 11, _fmt_int(breakdown["not_started"]), right=True)
-            else:
-                for col_offset, dim_id in enumerate(dim_ids):
-                    value = breakdown[dim_id]
-                    text = _fmt_int(value) if value else "—"
-                    self._set_item(row_index, len(_BASE_COLUMNS) + col_offset, text, right=True)
+            self._set_item(row_index, 6, _fmt_int(breakdown["jobs"]), right=True)
+            self._set_item(row_index, 7, _fmt_int(breakdown["tasks"]), right=True)
+            self._set_item(row_index, 8, _fmt_int(breakdown["done"]), right=True)
+            self._set_item(row_index, 9, _fmt_int(breakdown["in_progress"]), right=True)
+            self._set_item(row_index, 10, _fmt_int(breakdown["not_started"]), right=True)
 
         auto_size_columns(self.milestone_table, stretch_last=False)
+
+    def _sync_dimension_combo(self, mode, display, result_df):
+        """「チーム別」「ワークフロー別」のときだけ対象選択コンボを表示し、
+        選択中の対象でresult_dfを絞り込んで返す（「全体」なら絞り込まず
+        result_dfをそのまま返す）。"""
+        if mode == _BREAKDOWN_ALL:
+            self._dimension_combo.setVisible(False)
+            return result_df
+
+        column = "Team_ID" if mode == _BREAKDOWN_TEAM else "Workflow_ID"
+        id_to_label = display["team_names"] if mode == _BREAKDOWN_TEAM else display["workflow_names"]
+        current_id = self._selected_team_id if mode == _BREAKDOWN_TEAM else self._selected_workflow_id
+
+        self._dimension_combo.setVisible(True)
+        self._dimension_combo.blockSignals(True)
+        self._dimension_combo.clear()
+        for dim_id, label in id_to_label.items():
+            self._dimension_combo.addItem(label, dim_id)
+        idx = self._dimension_combo.findData(current_id) if current_id is not None else -1
+        if idx < 0 and self._dimension_combo.count() > 0:
+            idx = 0
+        self._dimension_combo.setCurrentIndex(idx)
+        selected_id = self._dimension_combo.currentData()
+        self._dimension_combo.blockSignals(False)
+
+        if mode == _BREAKDOWN_TEAM:
+            self._selected_team_id = selected_id
+        else:
+            self._selected_workflow_id = selected_id
+
+        if selected_id is None:
+            return result_df.iloc[0:0]
+        return result_df[result_df[column] == selected_id]
 
     def _set_item(self, row, column, text, right=False):
         item = QTableWidgetItem(text)
@@ -320,7 +346,11 @@ class AnalysisTab(QWidget):
     # -- Undo/Redo用の選択・表示状態 -------------------------------------------------
 
     def capture_ui_state(self):
-        return {"breakdown_mode": self._breakdown_mode}
+        return {
+            "breakdown_mode": self._breakdown_mode,
+            "selected_team_id": self._selected_team_id,
+            "selected_workflow_id": self._selected_workflow_id,
+        }
 
     def restore_ui_state(self, state):
         if not state:
@@ -329,5 +359,7 @@ class AnalysisTab(QWidget):
         if mode not in (_BREAKDOWN_ALL, _BREAKDOWN_TEAM, _BREAKDOWN_WORKFLOW):
             return
         self._breakdown_mode = mode
+        self._selected_team_id = state.get("selected_team_id")
+        self._selected_workflow_id = state.get("selected_workflow_id")
         self._breakdown_buttons[mode].setChecked(True)
         self._render()

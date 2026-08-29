@@ -21,7 +21,6 @@ from gui.summary_metrics import (  # noqa: E402
     STATUS_NOT_STARTED,
     compute_kpi,
     compute_milestone_breakdown_all,
-    compute_milestone_breakdown_by,
     compute_milestone_rows,
     peak_concurrency,
     task_status_series,
@@ -203,18 +202,17 @@ def test_milestone_breakdown_all_is_zeroed_for_a_milestone_with_no_tasks():
     assert rows[0] == {"jobs": 0, "tasks": 0, "done": 0, "in_progress": 0, "not_started": 0}
 
 
-def test_milestone_breakdown_by_team_sums_to_the_row_task_count():
+def test_milestone_breakdown_all_on_a_team_filtered_result_df_only_counts_that_team():
+    """gui/tab_analysis.py は「チーム別」「ワークフロー別」で選んだ1件の対象に
+    result_dfを絞り込んでから compute_milestone_breakdown_all() に渡す
+    （表示列は「全体」と同じ構成のまま）。事前に絞り込まれたDataFrameに
+    対しても、その対象ぶんだけの集計になることを確認する。"""
     df = _result_df([
         ("J1", "T1", "TEAM_1", "WF_1", "MS_1", "2026-01-01", "2026-01-05", 0, ""),
         ("J1", "T2", "TEAM_2", "WF_1", "MS_1", "2026-01-05", "2026-01-10", 0, ""),
         ("J2", "T1", "TEAM_1", "WF_1", "MS_1", "2026-01-01", "2026-01-05", 0, ""),
     ])
     milestones = [("MS_1", "MS1", _ts("2026-02-01"))]
-    rows = compute_milestone_breakdown_by(df, milestones, "Team_ID", ["TEAM_1", "TEAM_2", "TEAM_3"])
-    assert rows[0] == {"TEAM_1": 2, "TEAM_2": 1, "TEAM_3": 0}
-
-
-def test_milestone_breakdown_by_on_empty_result_df_is_all_zero():
-    milestones = [("MS_1", "MS1", _ts("2026-02-01"))]
-    rows = compute_milestone_breakdown_by(EMPTY_DF, milestones, "Team_ID", ["TEAM_1"])
-    assert rows[0] == {"TEAM_1": 0}
+    team1_only = df[df["Team_ID"] == "TEAM_1"]
+    rows = compute_milestone_breakdown_all(team1_only, milestones, date(2026, 1, 20))
+    assert rows[0] == {"jobs": 2, "tasks": 2, "done": 2, "in_progress": 0, "not_started": 0}

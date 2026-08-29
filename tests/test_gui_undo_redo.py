@@ -1425,45 +1425,81 @@ def test_analysis_tab_renders_kpi_and_milestone_table_from_gantt_result(window, 
     assert window.tab_analysis.milestone_table.item(0, 0).text() == "マイルストーン1"
 
 
-def test_analysis_tab_breakdown_toggle_switches_milestone_table_columns(window, qapp):
-    """「内訳」を切り替えると、マイルストーン別表の基本列は変わらず、
-    右側の内訳列群だけがチーム別／ワークフロー別に差し替わること。"""
-    _build_schedulable_project(window.db)
+def _build_two_team_project(db):
+    """チームAに2タスク・チームBに1タスクが乗る、同一マイルストーンの
+    プロジェクト（「チーム別」内訳の選択切り替えを件数で見分けるため、
+    チームごとの件数をわざと変えてある）。"""
+    db.set_project("チーム別テスト", "2026-01-05")
+    team_a = db.add_team("チームA", 2)
+    team_b = db.add_team("チームB", 1)
+    ms_id = db.add_milestone("マイルストーン1", "2026-06-30")
+    wf1 = db.add_workflow("WF1")
+    db.add_workflow_task(wf1, "タスク", team_a, 3)
+    wf2 = db.add_workflow("WF2")
+    db.add_workflow_task(wf2, "タスク", team_b, 3)
+    db.add_job("ジョブA1", wf1, ms_id, 100)
+    db.add_job("ジョブA2", wf1, ms_id, 100)
+    db.add_job("ジョブB1", wf2, ms_id, 100)
+    return team_a, team_b, wf1, wf2
+
+
+def test_analysis_tab_breakdown_dimension_selector_filters_to_one_team_at_a_time(window, qapp):
+    """「チーム別」「ワークフロー別」は全チーム/全ワークフローを列に並べるの
+    ではなく、コンボで選んだ1件だけを「全体」と同じ列構成（ジョブ/タスク/
+    完了/進行中/未着手）で表示すること。"""
+    _build_two_team_project(window.db)
     window.tabs.setCurrentWidget(window.tab_gantt)
     _wait_for_schedule(window, qapp)
     window.tabs.setCurrentWidget(window.tab_analysis)
     qapp.processEvents()
 
     tab = window.tab_analysis
-    assert tab.milestone_table.horizontalHeaderItem(0).text() == "マイルストーン"
+    headers = ["マイルストーン", "締切日", "残", "最終終了日", "スラック", "超過",
+               "ジョブ", "タスク", "完了", "進行中", "未着手"]
+    assert [tab.milestone_table.horizontalHeaderItem(i).text() for i in range(len(headers))] == headers
+    assert not tab._dimension_combo.isVisible()
 
     tab._breakdown_buttons["team"].click()
     qapp.processEvents()
-    assert tab.milestone_table.horizontalHeaderItem(7).text() == "チームA"
+    assert tab._dimension_combo.isVisible()
+    assert tab._dimension_combo.currentText() == "チームA"
+    assert tab.milestone_table.item(0, 7).text() == "2"  # タスク: チームAの2件
+
+    idx_team_b = tab._dimension_combo.findText("チームB")
+    tab._dimension_combo.setCurrentIndex(idx_team_b)
+    qapp.processEvents()
+    assert tab.milestone_table.item(0, 7).text() == "1"  # タスク: チームBの1件
 
     tab._breakdown_buttons["workflow"].click()
     qapp.processEvents()
-    assert tab.milestone_table.horizontalHeaderItem(7).text() == "WF1"
+    assert tab._dimension_combo.currentText() == "WF1"
+    assert tab.milestone_table.item(0, 7).text() == "2"  # タスク: WF1の2件
 
 
 def test_analysis_tab_capture_and_restore_breakdown_mode(window, qapp):
-    _build_schedulable_project(window.db)
+    _build_two_team_project(window.db)
     window.tabs.setCurrentWidget(window.tab_gantt)
     _wait_for_schedule(window, qapp)
     window.tabs.setCurrentWidget(window.tab_analysis)
     qapp.processEvents()
 
-    window.tab_analysis._breakdown_buttons["workflow"].click()
+    window.tab_analysis._breakdown_buttons["team"].click()
     qapp.processEvents()
+    idx_team_b = window.tab_analysis._dimension_combo.findText("チームB")
+    window.tab_analysis._dimension_combo.setCurrentIndex(idx_team_b)
+    qapp.processEvents()
+
     state = window.tab_analysis.capture_ui_state()
-    assert state == {"breakdown_mode": "workflow"}
+    assert state["breakdown_mode"] == "team"
+    assert state["selected_team_id"] is not None
 
     window.tab_analysis._breakdown_buttons["all"].click()
     qapp.processEvents()
     window.tab_analysis.restore_ui_state(state)
     qapp.processEvents()
-    assert window.tab_analysis._breakdown_mode == "workflow"
-    assert window.tab_analysis._breakdown_buttons["workflow"].isChecked()
+    assert window.tab_analysis._breakdown_mode == "team"
+    assert window.tab_analysis._breakdown_buttons["team"].isChecked()
+    assert window.tab_analysis._dimension_combo.currentText() == "チームB"
 
 
 # -- ガントチャート描画（gui/gantt_view.py）: 「今日」の縦線・1行飛ばしの行背景 ------------

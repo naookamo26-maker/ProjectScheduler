@@ -168,22 +168,3 @@ def compute_milestone_breakdown_all(result_df, milestones, today):
             "not_started": int((group_status == STATUS_NOT_STARTED).sum()),
         })
     return rows
-
-
-def compute_milestone_breakdown_by(result_df, milestones, column, dimension_ids):
-    """マイルストーン別サマリーの「チーム別」／「ワークフロー別」内訳。
-    column: "Team_ID" または "Workflow_ID"。dimension_ids: 表示したい列の並び順
-    （チーム一覧／ワークフロー一覧の順）。
-
-    戻り値は milestones と同じ順で、各要素が {dimension_id: タスク件数, ...}
-    （dimension_idsの全キーぶん、0件も含む）の辞書のリスト。行方向の合計は
-    その行のタスク件数と一致する。"""
-    rows = []
-    for ms_id, _name, _due in milestones:
-        if result_df.empty:
-            rows.append({d: 0 for d in dimension_ids})
-            continue
-        group = result_df[result_df["Milestone_ID"] == ms_id]
-        counts = group[column].value_counts()
-        rows.append({d: int(counts.get(d, 0)) for d in dimension_ids})
-    return rows
