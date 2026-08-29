@@ -16,7 +16,7 @@ CRUD本体（gui/db.py）から分離しているのは、この2つが「増え
 4. `docs/db_design.md` のテーブル一覧を追随させる。
 """
 
-SCHEMA_VERSION = "14"
+SCHEMA_VERSION = "15"
 
 
 class SchemaError(Exception):
@@ -114,14 +114,16 @@ CREATE TABLE milestones (
 CREATE TABLE teams (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
-    max_lines INTEGER NOT NULL CHECK (max_lines >= 0)
+    -- NULL＝指定なし（上限を設けない。新規チームの既定）、0＝その期間は
+    -- 稼働なし、N＝N本。
+    max_lines INTEGER CHECK (max_lines IS NULL OR max_lines >= 0)
 );
 
 CREATE TABLE team_capacity_changes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
     start_date TEXT NOT NULL,
-    lines INTEGER NOT NULL CHECK (lines >= 0),
+    lines INTEGER CHECK (lines IS NULL OR lines >= 0),
     UNIQUE(team_id, start_date)
 );
 
@@ -533,6 +535,60 @@ def migrate(conn):
         if cols and "tags" not in cols:
             conn.execute("ALTER TABLE job_task_overrides ADD COLUMN tags TEXT NOT NULL DEFAULT ''")
         version = "14"
+
+    if version == "14":
+        # v15: teams.max_lines / team_capacity_changes.lines の NOT NULL を
+        # 外し、NULL＝「指定なし」（上限を設けない）を表現できるようにする
+        # （docs/project_analysis_tab_design.md参照）。0＝その期間は稼働なし、
+        # N＝N本という既存の意味はそのまま変えない。
+        #
+        # 既存の値をNULLに書き換えない——「意図して設定した本数」と「既定値
+        # のまま放置された本数」を区別する情報が無いため。既存ファイルは
+        # 全チーム上限ありのまま開く。
+        #
+        # SQLiteはALTER TABLEでCHECK制約を直接変更できないため、v11のとき
+        # と同じ手順（テーブルを作り直して既存データを移し替える）を使う。
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = OFF")
+
+        team_cols = [r["name"] for r in conn.execute("PRAGMA table_info(teams)").fetchall()]
+        if team_cols and "max_lines" in team_cols:
+            conn.execute(
+                "CREATE TABLE teams_new ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "name TEXT NOT NULL UNIQUE, "
+                "max_lines INTEGER CHECK (max_lines IS NULL OR max_lines >= 0))"
+            )
+            conn.execute(
+                "INSERT INTO teams_new(id, name, max_lines) SELECT id, name, max_lines FROM teams"
+            )
+            conn.execute("DROP TABLE teams")
+            conn.execute("ALTER TABLE teams_new RENAME TO teams")
+
+        capacity_cols = [
+            r["name"] for r in
+            conn.execute("PRAGMA table_info(team_capacity_changes)").fetchall()
+        ]
+        if capacity_cols and "lines" in capacity_cols:
+            conn.execute(
+                "CREATE TABLE team_capacity_changes_new ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE, "
+                "start_date TEXT NOT NULL, "
+                "lines INTEGER CHECK (lines IS NULL OR lines >= 0), "
+                "UNIQUE(team_id, start_date))"
+            )
+            conn.execute(
+                "INSERT INTO team_capacity_changes_new(id, team_id, start_date, lines) "
+                "SELECT id, team_id, start_date, lines FROM team_capacity_changes"
+            )
+            conn.execute("DROP TABLE team_capacity_changes")
+            conn.execute(
+                "ALTER TABLE team_capacity_changes_new RENAME TO team_capacity_changes"
+            )
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = ON")
+        version = "15"
 
     conn.execute(
         "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)

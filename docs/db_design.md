@@ -25,8 +25,8 @@ PySide6（Qt）に一切依存しないため、GUIを起動せずに単体で�
 | `schema_meta` | スキーマバージョン管理用。`ProjectDatabase.open_existing`が旧バージョンの`.pschedule`を検出すると`_migrate_schema`で自動的に不足カラム等を追加する（例: v1→v2で`workflows.sort_order`を追加）。`open_existing`はマイグレーションの前に`check_openable`（`gui/db_schema.py`）でこのテーブル・行の有無と`schema_version`がこのアプリの対応範囲内かを検証し、ProjectSchedulerのファイルとして扱えない場合は`ProjectDatabaseError`にして拒否する（詳細は`docs/architecture.md`「ファイルを開く際の検証」参照） |
 | `project` | プロジェクト名・開始日・`distribution_ratio`（ガントチャートタブの「配置コントロール」で調整する配置基準点、既定0.7。`project_scheduler.py`参照）（常に1行、`id=1`固定） |
 | `milestones` | マイルストーン（名前・締切日・備考） |
-| `teams` | チーム（名前・開発開始日からの既定の同時ライン数）。ライン数は0以上（0＝その期間は稼働なし。遅く合流する・早めに引き上げるチームの表現に使う） |
-| `team_capacity_changes` | チームの同時ライン数が期間の途中で変わる場合の変更点（適用開始日・その日以降のライン数、こちらも0以上）。`teams.max_lines`はいつまでも「最初の期間」の値として残る |
+| `teams` | チーム（名前・開発開始日からの既定の同時ライン数）。ライン数は3状態: NULL＝指定なし（上限を設けない。新規チームの既定）、0＝その期間は稼働なし、N＝N本 |
+| `team_capacity_changes` | チームの同時ライン数が期間の途中で変わる場合の変更点（適用開始日・その日以降のライン数、こちらも同じ3状態）。`teams.max_lines`はいつまでも「最初の期間」の値として残る |
 | `holidays` | 休業日（日付、任意でチームを指定。未指定は全チーム共通。備考あり） |
 | `workflows` | ワークフロー（テンプレートの名前と、一覧での表示順`sort_order`） |
 | `workflow_tasks` | ワークフロー内のタスク（名前・担当チーム・所要日数）。ノードグラフ上の座標は保持しない——依存の深さから毎回計算し直す（下記「座標は保存しない」参照） |

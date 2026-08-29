@@ -160,7 +160,7 @@ def test_focus_is_never_moved_into_cell_widgets_by_undo(window, qapp):
 def test_teams_tree_shows_default_capacity_as_first_undeletable_child(window, qapp):
     """開発開始日からの既定値（teams.max_lines）は、他の変動点と同じ見た目の
     最初の子行として表示され、日付は開発開始日で固定（編集不可）・ライン数は
-    インライン編集可能（NoWheelSpinBox）で、削除ボタンでは削除できないこと。"""
+    インライン編集可能（OptionalSpinBox）で、削除ボタンでは削除できないこと。"""
     bi = window.tab_basic_info
     window.tabs.setCurrentWidget(bi)
     window.db.set_project("P", "2026-01-01")
@@ -184,6 +184,36 @@ def test_teams_tree_shows_default_capacity_as_first_undeletable_child(window, qa
     with patch.object(QMessageBox, "information", return_value=QMessageBox.Ok):
         bi._delete_capacity_change_selected()
     assert bi.teams_tree.topLevelItem(0).childCount() == 1  # 既定値は削除されない
+
+
+def test_teams_tree_shows_unspecified_lines_as_special_value(window, qapp):
+    """ライン数「指定なし」（max_lines=None）のチームは、ツリー上のスピン
+    ボックスが特殊値表示（specialValueText）になり、optional_value()が
+    Noneを返すこと。"""
+    bi = window.tab_basic_info
+    window.tabs.setCurrentWidget(bi)
+    window.db.set_project("P", "2026-01-01")
+    window.db.add_team("チームA", None)
+    bi.refresh_all()
+    qapp.processEvents()
+
+    top = bi.teams_tree.topLevelItem(0)
+    default_child = top.child(0)
+    spin = bi.teams_tree.itemWidget(default_child, 1)
+    assert spin.value() == spin.minimum()
+    assert spin.optional_value() is None
+    assert spin.text() == "指定なし"
+
+
+def test_add_team_dialog_defaults_lines_to_unspecified(window, qapp):
+    """「＋チーム」ダイアログの既定ライン数は「指定なし」（NULL）であること
+    （docs/project_analysis_tab_design.md「新規チームの既定を『指定なし』に」）。"""
+    from gui.tab_basic_info import AddTeamDialog
+
+    dialog = AddTeamDialog("新しいチーム", window)
+    assert dialog.values() == ("新しいチーム", None)
+    dialog.deleteLater()
+    qapp.processEvents()
 
 
 def test_teams_tree_capacity_changes_are_inline_editable_children(window, qapp):
@@ -380,45 +410,6 @@ def test_selecting_a_capacity_change_child_resolves_to_its_parent_team(window, q
     # 明示的にフォーカスを外して確定させる（他のテストと同じ後始末）。
     bi.project_name_edit.setFocus()
     qapp.processEvents()
-
-
-def test_histogram_shows_placeholder_when_project_incomplete(window, qapp):
-    """開発開始日・チームが揃っていない間は、モーダルではなくパネル内の
-    赤字ラベルで案内し、グラフは空のままであること
-    （gui/tab_gantt.py のエラー表示方針と同じ考え方）。"""
-    bi = window.tab_basic_info
-    window.tabs.setCurrentWidget(bi)
-    qapp.processEvents()
-
-    assert bi.histogram_status_label.text() != ""
-    assert bi.histogram_view.scene() is None or bi.histogram_view.scene().items() == []
-
-
-def test_histogram_switches_between_stacked_and_single_team_on_selection(window, qapp):
-    """チームツリーで何も選択していなければ全チーム積み上げ、1件選択すれば
-    そのチーム単独の表示に切り替わること。"""
-    bi = window.tab_basic_info
-    window.tabs.setCurrentWidget(bi)
-    window.db.set_project("P", "2026-01-01")
-    team_a = window.db.add_team("チームA", 2)
-    window.db.add_team("チームB", 3)
-    bi.refresh_all()
-    qapp.processEvents()
-
-    assert bi.histogram_status_label.text() == ""
-    scene = bi.histogram_view.scene()
-    assert scene is not None
-    assert scene.histogram_mode == "stacked"
-
-    bi._select_team_tree_item(team_a)
-    qapp.processEvents()
-    scene = bi.histogram_view.scene()
-    assert scene.histogram_mode == "single"
-
-    bi.teams_tree.setCurrentItem(None)
-    qapp.processEvents()
-    scene = bi.histogram_view.scene()
-    assert scene.histogram_mode == "stacked"
 
 
 def test_workflow_task_add_is_single_undo_step_and_restores_canvas_selection(window, qapp):

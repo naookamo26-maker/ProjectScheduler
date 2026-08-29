@@ -320,6 +320,26 @@ def test_team_lines_can_be_zero(tmp_path):
     db.close()
 
 
+def test_team_lines_can_be_null_meaning_unspecified(tmp_path):
+    """ライン数上限は「指定なし」（NULL＝上限を設けない）も設定できること。
+    0（その期間は稼働なし）とは別の値として区別される
+    （docs/project_analysis_tab_design.md参照）。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    team_id = db.add_team("チームA", None)
+    assert db.list_teams()[0]["max_lines"] is None
+
+    db.update_team(team_id, "チームA", 3)
+    assert db.list_teams()[0]["max_lines"] == 3
+    db.update_team(team_id, "チームA", None)
+    assert db.list_teams()[0]["max_lines"] is None
+
+    change_id = db.add_team_capacity_change(team_id, "2026-02-01", None)
+    assert db.list_team_capacity_changes(team_id)[0]["lines"] is None
+    db.update_team_capacity_change(change_id, "2026-02-01", 5)
+    assert db.list_team_capacity_changes(team_id)[0]["lines"] == 5
+    db.close()
+
+
 def test_nested_calls_collapse_into_one_undo_entry(tmp_path):
     """add_job_dependency_link は内部で sync_dependency_templates を呼ぶが、
     Undoスタックには1エントリだけ積まれ、Undo1回で両方まとめて元に戻ること。"""
@@ -1248,6 +1268,67 @@ def test_opening_pre_optional_priority_schema_preserves_values_and_allows_null(t
     # 以後は未指定（NULL）を保存できる。
     new_id = db.add_job("J3", 1, None, None)
     assert db.list_jobs()[[j["id"] for j in db.list_jobs()].index(new_id)]["priority"] is None
+    db.close()
+
+
+def test_opening_pre_optional_lines_schema_preserves_values_and_allows_null(tmp_path):
+    """teams.max_lines/team_capacity_changes.linesがNOT NULLだった旧バージョン
+    (v14)の.pscheduleを開いた際、既存の値はそのまま保持され、かつ以後は
+    NULL（指定なし＝上限を設けない）を保存できるようになること
+    （テーブルを作り直すため）。"""
+    import sqlite3
+
+    path = tmp_path / "legacy.pschedule"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE project (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            project_name TEXT NOT NULL DEFAULT '',
+            start_date TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE teams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            max_lines INTEGER NOT NULL CHECK (max_lines >= 0)
+        );
+        CREATE TABLE team_capacity_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+            start_date TEXT NOT NULL,
+            lines INTEGER NOT NULL CHECK (lines >= 0),
+            UNIQUE(team_id, start_date)
+        );
+        CREATE TABLE workflows (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+        CREATE TABLE milestones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+            end_date TEXT NOT NULL, note TEXT NOT NULL DEFAULT ''
+        );
+        """
+    )
+    conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '14')")
+    conn.execute("INSERT INTO project(id, project_name, start_date) VALUES (1, '', '')")
+    conn.execute("INSERT INTO teams(name, max_lines) VALUES ('チームA', 2)")
+    conn.execute(
+        "INSERT INTO team_capacity_changes(team_id, start_date, lines) VALUES (1, '2026-02-01', 3)"
+    )
+    conn.commit()
+    conn.close()
+
+    db = ProjectDatabase.open_existing(str(path))
+
+    # 既存の値は勝手にNULLへ書き換えない。
+    assert db.list_teams() == [{"id": 1, "name": "チームA", "max_lines": 2}]
+    assert db.list_team_capacity_changes(1) == [
+        {"id": 1, "team_id": 1, "start_date": "2026-02-01", "lines": 3}
+    ]
+
+    # 以後はNULL（指定なし）を保存できる。
+    new_id = db.add_team("チームB", None)
+    assert db.list_teams()[1]["max_lines"] is None
+    db.add_team_capacity_change(new_id, "2026-03-01", None)
+    assert db.list_team_capacity_changes(new_id)[0]["lines"] is None
     db.close()
 
 

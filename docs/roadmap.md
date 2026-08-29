@@ -245,7 +245,9 @@ DataFrameの組み立て）と、QGraphicsSceneの構築が占める。
 その考え方を素直に拡張できる。**シナリオを持つ意味は比較にある**ので、
 `result_df` 同士を `Job:Task` キーで結合した差分表示（何日動いたか、締切超過が
 増減したか、チーム別の負荷ピークがどう変わったか）を必ずセットで作ること。
-`gui/resource_histogram.py` は流用できる設計になっている。
+`gui/resource_histogram.py` の描画部分（`build_histogram_scene`等）は
+プロジェクト分析タブへの機能移管に伴い廃止済み。汎用の階段関数区間化
+（`compute_step_segments`）だけが残っているので、描画自体は改めて作る必要がある。
 
 ---
 
