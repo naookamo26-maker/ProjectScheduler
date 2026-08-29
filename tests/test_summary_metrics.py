@@ -22,9 +22,12 @@ from gui.summary_metrics import (  # noqa: E402
     compute_kpi,
     compute_milestone_breakdown_all,
     compute_milestone_rows,
+    compute_team_summary_rows,
     peak_concurrency,
     task_status_series,
+    team_concurrency_steps,
 )
+from project_scheduler import _UNLIMITED_LINES  # noqa: E402
 
 
 def _ts(s):
@@ -216,3 +219,97 @@ def test_milestone_breakdown_all_on_a_team_filtered_result_df_only_counts_that_t
     team1_only = df[df["Team_ID"] == "TEAM_1"]
     rows = compute_milestone_breakdown_all(team1_only, milestones, {})
     assert rows[0] == {"jobs": 2, "tasks": 2, "done": 0, "in_progress": 0, "not_started": 2}
+
+
+# -- team_concurrency_steps / compute_team_summary_rows（チーム別サマリー） --------------
+
+def _team_result_df(rows):
+    """rows: [(job, task, team, start, end, overrun, adjusted), ...]
+    チーム別サマリーの集計に必要な最小限の列だけを持つDataFrameを組み立てる。"""
+    return pd.DataFrame([{
+        "Job_ID": job, "Task_ID": task, "Team_ID": team,
+        "Start_Date": _ts(start), "End_Date": _ts(end),
+        "Deadline_Overrun_Days": overrun, "Resource_Adjusted": adjusted,
+    } for job, task, team, start, end, overrun, adjusted in rows])
+
+
+EMPTY_TEAM_DF = pd.DataFrame(columns=[
+    "Job_ID", "Task_ID", "Team_ID", "Start_Date", "End_Date",
+    "Deadline_Overrun_Days", "Resource_Adjusted",
+])
+
+
+def test_team_concurrency_steps_only_counts_the_given_team():
+    df = _team_result_df([
+        ("J1", "T1", "TEAM_1", "2026-01-01", "2026-01-10", 0, False),
+        ("J2", "T1", "TEAM_2", "2026-01-01", "2026-01-10", 0, False),
+    ])
+    steps = team_concurrency_steps(df, "TEAM_1")
+    assert steps == [(_ts("2026-01-01"), 1), (_ts("2026-01-10"), 0)]
+
+
+def test_team_concurrency_steps_sums_all_teams_when_team_id_is_none():
+    df = _team_result_df([
+        ("J1", "T1", "TEAM_1", "2026-01-01", "2026-01-10", 0, False),
+        ("J2", "T1", "TEAM_2", "2026-01-05", "2026-01-15", 0, False),
+    ])
+    steps = dict(team_concurrency_steps(df))
+    assert steps[_ts("2026-01-05")] == 2  # 両チームのタスクが重なる
+
+
+def test_team_concurrency_steps_of_empty_result_is_empty():
+    assert team_concurrency_steps(EMPTY_TEAM_DF, "TEAM_1") == []
+
+
+def test_compute_team_summary_rows_counts_peak_tasks_adjusted_and_overrun():
+    # A: 01-01〜01-06、B: 01-03〜01-08 -> 01-03〜01-05の3日だけ2本重なる。
+    df = _team_result_df([
+        ("J1", "T1", "TEAM_1", "2026-01-01", "2026-01-06", 5, True),
+        ("J1", "T2", "TEAM_1", "2026-01-03", "2026-01-08", 0, False),
+    ])
+    team_names = {"TEAM_1": "チームA"}
+    capacity_schedule = {"TEAM_1": [(pd.Timestamp.min, 2)]}
+    rows = compute_team_summary_rows(df, team_names, capacity_schedule)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["team_id"] == "TEAM_1"
+    assert row["name"] == "チームA"
+    assert row["tasks"] == 2
+    assert row["peak"] == 2
+    assert row["peak_month"] == "2026-01"
+    assert row["pinned_days"] == 3  # 上限2に達していた01-03,04,05の3日
+    assert row["resource_adjusted"] == 1
+    assert row["overrun"] == 1
+
+
+def test_compute_team_summary_rows_includes_a_team_with_no_tasks():
+    """タスクを1件も持たないチームも表に出す（ピーク0・空欄扱い）。"""
+    team_names = {"TEAM_1": "チームA", "TEAM_2": "チームB（未使用）"}
+    rows = compute_team_summary_rows(EMPTY_TEAM_DF, team_names, {})
+    assert [r["team_id"] for r in rows] == ["TEAM_1", "TEAM_2"]
+    for row in rows:
+        assert row["tasks"] == 0
+        assert row["peak"] == 0
+        assert row["peak_month"] is None
+        assert row["pinned_days"] is None
+        assert row["resource_adjusted"] == 0
+        assert row["overrun"] == 0
+
+
+def test_compute_team_summary_rows_pinned_days_is_none_when_never_capped():
+    """上限を一度も設定していない（指定なしのまま）チームは、タスクがあっても
+    pinned_daysはNone（設計案§3「上限が『指定なし』のチームでは空欄」）。"""
+    df = _team_result_df([("J1", "T1", "TEAM_1", "2026-01-01", "2026-01-10", 0, False)])
+    capacity_schedule = {"TEAM_1": [(pd.Timestamp.min, _UNLIMITED_LINES)]}
+    rows = compute_team_summary_rows(df, {"TEAM_1": "チームA"}, capacity_schedule)
+    assert rows[0]["pinned_days"] is None
+
+
+def test_compute_team_summary_rows_pinned_days_follows_a_mid_period_capacity_change():
+    """上限が期間中に変わる場合も、変化点をまたいで正しく判定できること。
+    同時タスク数は常に1（Aのみ）。上限は01-05を境に1→3に変わるので、
+    「上限=1」と一致する01-01〜01-04の4日だけがpinned。"""
+    df = _team_result_df([("J1", "T1", "TEAM_1", "2026-01-01", "2026-01-10", 0, False)])
+    capacity_schedule = {"TEAM_1": [(pd.Timestamp.min, 1), (_ts("2026-01-05"), 3)]}
+    rows = compute_team_summary_rows(df, {"TEAM_1": "チームA"}, capacity_schedule)
+    assert rows[0]["pinned_days"] == 4

@@ -32,16 +32,24 @@ gui/ ─────────────────────────
   ├ tab_jobs.py            タブ3「ジョブ」（ワークフロー絞り込み、依存ジョブ
   │                          セクションを含む。旧タブ4はここに統合済み）
   ├ gantt_generator.py       DB → project_scheduler.py 呼び出し → ガントチャート出力
-  ├ tab_gantt.py              タブ4「ガントチャート」（ワーカースレッドで
-  │                            スケジューリングを実行し、gantt_view.pyで描画）
+  ├ schedule_cache.py          スケジューリング結果のキャッシュ（ワーカー
+  │                              スレッド管理・revision判定）。tab_gantt.pyと
+  │                              tab_analysis.pyが共有する（MainWindowが1つ
+  │                              保持）——詳細はdocs/project_analysis_tab_design.md §5
+  ├ tab_gantt.py              タブ4「ガントチャート」（schedule_cache.pyへ
+  │                            計算を要求し、結果をgantt_view.pyで描画）
   ├ gantt_view.py              QGraphicsScene直接描画のガントチャート本体
   ├ summary_metrics.py          タブ5の集計（Qt非依存の純粋関数。
   │                              gantt_generator.build_frames()が組み立てた
   │                              result_dfを受け取って集計するだけで、自分では
   │                              スケジューリングしない）
-  ├ tab_analysis.py             タブ5「プロジェクト分析」（段階2の暫定実装:
-  │                              tab_gantt.pyの計算結果を直接読む——詳細は
-  │                              docs/project_analysis_tab_design.md）
+  ├ tab_analysis.py             タブ5「プロジェクト分析」（schedule_cache.py
+  │                              経由で結果を集計する表示専用タブ。自分では
+  │                              スケジューリングを起こさない）
+  ├ team_summary_view.py         タブ5「チーム別サマリー」の描画（積み上げ
+  │                              グラフ・選択チームの詳細グラフ。gantt_view.py
+  │                              と同じQGraphicsScene直接描画・GanttGraphicsView
+  │                              再利用パターン）
   └ widgets_common.py        タブ横断の共通UI部品（列幅自動調整含む）
 ```
 
@@ -491,7 +499,7 @@ GUIのガントチャートタブは件数と最大超過日数を画面上部�
   というシンプルな仕様のため、専用ウィジェットを持たずジョブ名列（列0）と
   同様に常時editableなitemとして扱う。
 
-## ガントチャートタブのバックグラウンド計算
+## スケジューリング結果の共有キャッシュ（`gui/schedule_cache.py`）
 
 スケジューリングは規模によっては数秒かかるため、そのままGUIスレッドで実行すると
 タブを開くたびにウィンドウ全体が固まる。次の2つで回避している。
@@ -499,34 +507,48 @@ GUIのガントチャートタブは件数と最大超過日数を画面上部�
 1. **結果のキャッシュ**: `ProjectDatabase.revision`（内容が変わるたびに増える
    通し番号）を結果と一緒に覚えておき、一致している間は再計算せず表示だけ
    作り直す。タブを行き来しただけで計算し直さない。
-2. **ワーカースレッド**: 計算本体を `_ScheduleWorker`（`gui/tab_gantt.py`）で
+2. **ワーカースレッド**: 計算本体を `_ScheduleWorker`（`gui/schedule_cache.py`）で
    実行する。分割の境界は「DBを読むのはGUIスレッド、計算だけ別スレッド」。
    sqlite3の接続はスレッドをまたげず、計算中にGUI側がDBを書き換えると結果が
    壊れるため、`build_frames()` / `build_display()` はGUIスレッドで先に済ませ、
    ワーカーへはDataFrameだけを渡す（`compute_schedule_from_frames`）。
 
+タブ4「ガントチャート」（`gui/tab_gantt.py`）とタブ5「プロジェクト分析」
+（`gui/tab_analysis.py`）はこのキャッシュを共有する（`MainWindow`が
+プロジェクトを開くたびに1つ作り、両タブへ渡す）。どちらのタブも
+`refresh_choices()`（タブに切り替わるたびに呼ばれる）の中で
+`ScheduleCache.ensure_fresh()`を呼んで最新化を要求できるため、
+ガントチャートタブを一度も開いていなくても、プロジェクト分析タブを開けば
+それだけで計算が起動する。計算が非同期に完了した際は`ScheduleCache.updated`
+シグナルで両タブへ通知するが、実際に画面を作り直すのは**自分が表示中の
+タブだけ**（`isVisible()`で判定）——非表示のタブは、次に実際に切り替えられた
+時点で`refresh_choices()`が同期的に最新の内容を反映すればよく、見えていない
+間の再描画は無駄なため。
+
 計算中に内容を変えた場合は、新しい要求が古い要求を追い越す。ワーカーは強制終了
 させず、要求ごとの通し番号で「最後に出した要求の結果か」を判定し、古い結果は
 捨てる（スケジューリングはDBに触れない純粋な計算なので、走らせたままにしても
-害がない）。ウィンドウを閉じる/プロジェクトを開き直す際は、
-`MainWindow._shutdown_gantt_tab()` がスレッドの終了を待ち合わせる。
+害がない）。同じrevisionに対して2つのタブがほぼ同時に`ensure_fresh()`を
+呼んでも、`_computing_revision`で「既に同じ内容の計算が進行中か」を判定し、
+二重にワーカーを起動しない。ウィンドウを閉じる/プロジェクトを開き直す際は、
+`MainWindow._shutdown_schedule_cache()` がスレッドの終了を待ち合わせる。
 
 ### revisionは「要求時点」の値を刻む
 
 結果のキャッシュ判定（`self._computed_revision == self.db.revision`）に使う
 `_computed_revision`は、計算が**完了した時点**の`db.revision`ではなく、
-`build_frames()`を呼んだ**要求時点**の`db.revision`（`refresh_choices()`が
+`build_frames()`を呼んだ**要求時点**の`db.revision`（`ensure_fresh()`が
 `request_revision`として控え、`_pending_revision`経由で`_on_schedule_finished`
 に渡す）を刻む。
 
 計算は非同期のため、ワーカーが走っている間に他タブでDBが編集されて
 `db.revision`が先に進むことがある。完了時点の値を刻んでいると、この
 「計算中の編集」を誤って「結果に反映済み」とみなしてしまい——結果は
-編集前の古いDB内容のままなのに、以降`refresh_choices()`が
+編集前の古いDB内容のままなのに、以降`ensure_fresh()`が
 `_computed_revision == db.revision`の一致を見て再計算をスキップし続け、
 編集がガントチャートに反映されないまま「最新」として画面に残ってしまう。
 要求時点の値を刻めば、計算中の編集で`db.revision`との食い違いが必ず残るため、
-次の`refresh_choices()`が正しく再計算を走らせる。
+次の`ensure_fresh()`が正しく再計算を走らせる。
 
 ### `sync_dependency_templates()`が無変更でrevisionを進めないこと
 
@@ -543,7 +565,7 @@ GUIのガントチャートタブは件数と最大超過日数を画面上部�
 
 `_start_worker()`は、実行中の古いワーカーを止めずに放置する方針（上記）
 のため、タブを連続して切り替えたり配置スライダーを繰り返し操作したりすると、
-複数本のスレッドが同時に実行中の状態になり得る。`GanttTab._threads`は
+複数本のスレッドが同時に実行中の状態になり得る。`ScheduleCache._threads`は
 `(QThread, _ScheduleWorker)`の**一覧**として全件を保持し、`shutdown()`は
 その全件を待ち合わせる。「最後の1本」だけを`self._thread`に保持していた
 頃は、それより前に始まった実行中のスレッドを待たずにウィンドウが閉じてしまい、
@@ -563,7 +585,8 @@ PySide側が接続をキュー接続だと判定できず、ワーカースレ�
 回帰テストは`tests/test_gui_undo_redo.py`
 （`test_schedule_completing_after_a_concurrent_edit_does_not_mask_it` /
 `test_switching_to_jobs_tab_and_back_does_not_force_a_recomputation` /
-`test_shutdown_waits_for_every_in_flight_worker_thread`）。
+`test_shutdown_waits_for_every_in_flight_worker_thread` /
+`test_analysis_tab_computes_its_own_result_without_opening_gantt_tab`）。
 
 ## ノードグラフの循環依存検出
 
@@ -1002,13 +1025,23 @@ GUIで編集できる項目はすべてUndo/Redoで元に戻せる。個々の�
 
 ## 階段関数の区間化（`gui/resource_histogram.py`）
 
-`compute_step_segments(breakpoints, range_start, range_end)` は、
-「日付→値」の変化点リストから階段関数の区間を作るだけの、特定の用途に
-依存しない汎用関数。
+`compute_step_segments(breakpoints, range_start, range_end)` /
+`value_at(breakpoints, d)` / `shared_boundaries(breakpoints_by_key, range_start, range_end)`
+は、「日付→値」の変化点リストから階段関数の区間を作る・複数系列を積み上げる
+ための、特定の用途に依存しない汎用関数（いずれもQt非依存）。
 
 元はタブ1「基本情報設定」のチーム欄と連動する「リソースヒストグラム」
 （チームの計画上の同時ライン数の推移を表示する機能）の一部だったが、
 その機能自体はプロジェクト分析タブへ移管して廃止した
-（`docs/project_analysis_tab_design.md`参照）。`compute_step_segments`
-だけは、プロジェクト分析タブの「設定上限の階段線」表示にそのまま使い回せる
-Qt非依存の純粋関数のため残している。
+（`docs/project_analysis_tab_design.md`参照）。この3関数は、プロジェクト
+分析タブの「チーム別サマリー」（`gui/team_summary_view.py`）が
+- `compute_step_segments`: 選択チームの詳細グラフで、同時タスク数・設定上限
+  それぞれの階段区間を作る
+- `value_at` / `shared_boundaries`: 全チーム積み上げグラフで、チームごとに
+  異なる変化点の集合を共通の区切りへ揃えて積み上げる
+
+という形でそのまま使い回しているため残している。積み上げグラフの区間数は
+「全チームの変化点の日付数（重複除去後）」のオーダーに収まる——同じ日に
+複数のタスクが開始・終了しても、`gui/summary_metrics.team_concurrency_steps`
+のdiff+cumsumで日付ごとに1つの変化点へ畳み込まれるため、タスク数ではなく
+実際の日数のオーダーになり、大規模プロジェクトでも描画コストが跳ね上がらない。

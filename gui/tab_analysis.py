@@ -1,20 +1,20 @@
 """
 タブ5「プロジェクト分析」。
 
-ガントチャートタブ（`gui/tab_gantt.py`）が計算したスケジューリング結果を
-集計するだけの表示専用タブ。自分では計算を起こさない（`gui/summary_metrics.py`
-の純粋関数に集計を任せる）——`docs/project_analysis_tab_design.md`参照。
+ガントチャートタブと共有する `ScheduleCache`（`gui/schedule_cache.py`）の
+計算結果を集計するだけの表示専用タブ。自分では計算を起こさず、集計は
+`gui/summary_metrics.py` の純粋関数に任せる——`docs/project_analysis_tab_design.md`
+参照。
 
-**段階2の暫定実装**: 結果はガントチャートタブのインスタンス（`gantt_tab`）が
-持つ `_result_df` / `_display` / `_computed_revision` を直接覗いて使う。
-本来はキャッシュ判定・結果の配布を専用の `ScheduleCache` に切り出す予定だが
-（設計案 §6）、段階2の時点では表とタイルの妥当性を先に確認するため、この
-簡易な直接参照のままにしてある。"""
+`ScheduleCache` はどちらのタブからでも起動できるため、ガントチャートタブを
+一度も開いていない状態でこのタブを開いても、自分で計算を要求する
+（`refresh_choices()` 内の `self.cache.ensure_fresh()`）。"""
 
+import html
 from datetime import date
 
 import pandas as pd
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -29,7 +29,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.summary_metrics import compute_kpi, compute_milestone_breakdown_all, compute_milestone_rows
+from gui.summary_metrics import (
+    compute_kpi,
+    compute_milestone_breakdown_all,
+    compute_milestone_rows,
+    compute_team_summary_rows,
+    team_concurrency_steps,
+)
+from gui.team_summary_view import TeamSummaryChartView, build_team_detail_scene, build_team_stacked_scene
 from gui.widgets_common import NoWheelComboBox, auto_size_columns
 
 _BREAKDOWN_ALL = "all"
@@ -43,6 +50,9 @@ _BREAKDOWN_LABELS = [
 _BREAKDOWN_EXTRA_COLUMNS = ["ジョブ", "タスク", "完了", "進行中", "未着手"]
 
 _BASE_COLUMNS = ["マイルストーン", "締切日", "残", "最終終了日", "スラック", "超過"]
+
+_TEAM_COLUMNS = ["チーム", "ピーク", "ピーク時期", "上限に張り付いた日数", "タスク件数", "押し出された件数", "超過件数"]
+
 # ガントチャートタブのエラー表示と同じ赤（gui/tab_gantt.py の _set_status 参照）。
 _ALERT_COLOR = QColor("#b3261e")
 
@@ -81,15 +91,26 @@ class _KpiTile(QGroupBox):
 
 
 class AnalysisTab(QWidget):
-    def __init__(self, db, gantt_tab, parent=None):
+    def __init__(self, db, schedule_cache, parent=None):
         super().__init__(parent)
         self.db = db
-        self.gantt_tab = gantt_tab
+        self.cache = schedule_cache
+        self.cache.updated.connect(self._on_cache_updated)
         self._breakdown_mode = _BREAKDOWN_ALL
         # 「チーム別」「ワークフロー別」で個別に選んだ対象（それぞれ別々に覚えて
         # おき、モードを行き来しても選択が保たれるようにする）。
         self._selected_team_id = None
         self._selected_workflow_id = None
+        # チーム別サマリーの表で選択中の行（詳細グラフに連動）。マイルストーン別
+        # サマリーの「チーム別」内訳で選ぶ対象とは別の状態として持つ
+        # （表・コンボが別ウィジェットのため、選択も独立させる）。
+        self._selected_team_summary_id = None
+        # _render_team_summary() が最後に描いた結果（行選択が変わるたびに
+        # detail_viewだけ作り直すために覚えておく。cache自体は最新のままでも
+        # 選択操作のたびに再取得する必要は無い）。
+        self._team_summary_result_df = None
+        self._team_summary_display = None
+        self._team_summary_chart_range = None
 
         layout = QVBoxLayout(self)
 
@@ -147,7 +168,45 @@ class AnalysisTab(QWidget):
         self.milestone_table.setSelectionMode(QAbstractItemView.NoSelection)
         ms_layout.addWidget(self.milestone_table)
 
-        layout.addWidget(self.milestones_group, 1)
+        layout.addWidget(self.milestones_group)
+
+        # -- チーム別サマリー ---------------------------------------------------------
+        self.team_group = QGroupBox("チーム別サマリー")
+        team_layout = QVBoxLayout(self.team_group)
+
+        team_layout.addWidget(QLabel("同時タスク数の推移（チーム別・積み上げ）"))
+        self.team_stacked_view = TeamSummaryChartView()
+        self.team_stacked_view.setMinimumHeight(220)
+        team_layout.addWidget(self.team_stacked_view, 1)
+
+        # 積み上げグラフの凡例。区間ごとに色分けされたバー自体にチーム名は
+        # 描き込まない（gui/team_summary_view.py参照——大規模プロジェクトで
+        # 帯が細くなるとラベル文字が重なって読めなくなるため）。色とチーム名の
+        # 対応は、この凡例とバーのツールチップで補う
+        # （docs/project_analysis_tab_design.md §7-6「凡例とツールチップの
+        # 文字で必ず補う」）。
+        self.team_legend_label = QLabel("")
+        self.team_legend_label.setWordWrap(True)
+        self.team_legend_label.setTextFormat(Qt.RichText)
+        team_layout.addWidget(self.team_legend_label)
+
+        self.team_table = QTableWidget(0, len(_TEAM_COLUMNS))
+        self.team_table.setHorizontalHeaderLabels(_TEAM_COLUMNS)
+        self.team_table.verticalHeader().setVisible(False)
+        self.team_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.team_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.team_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.team_table.setMinimumHeight(160)
+        self.team_table.itemSelectionChanged.connect(self._on_team_row_selected)
+        team_layout.addWidget(self.team_table)
+
+        self.team_detail_label = QLabel("")
+        team_layout.addWidget(self.team_detail_label)
+        self.team_detail_view = TeamSummaryChartView()
+        self.team_detail_view.setMinimumHeight(180)
+        team_layout.addWidget(self.team_detail_view, 1)
+
+        layout.addWidget(self.team_group, 1)
 
     def _on_breakdown_changed(self, key):
         if key == self._breakdown_mode:
@@ -165,28 +224,37 @@ class AnalysisTab(QWidget):
             self._selected_workflow_id = selected
         self._render()
 
-    # -- 結果の取得（段階2の暫定: GanttTabの内部状態を直接覗く） -----------------------
+    # -- 結果の取得（ScheduleCache経由。gui/schedule_cache.py参照） -----------------------
 
-    def _current_result(self):
-        """(result_df, display) を返す。結果が無い/古い場合は (None, None)。"""
-        gantt_tab = self.gantt_tab
-        if gantt_tab is None or gantt_tab._result_df is None:
-            return None, None
-        if gantt_tab._computed_revision != self.db.revision:
-            return None, None
-        return gantt_tab._result_df, gantt_tab._display
+    def _on_cache_updated(self):
+        """ScheduleCache の結果・エラーが更新されるたびに呼ばれる。
+
+        自分が非表示の間は反映を後回しにする——次にこのタブへ切り替わった際、
+        refresh_choices() が同期的に最新の内容を反映するため、ここで無駄に
+        表を作り直す必要がない（gui/tab_gantt.py の _on_cache_updated と同じ考え方）。"""
+        if not self.isVisible():
+            return
+        self._render()
 
     def refresh_choices(self):
         """タブに切り替わるたび（gui/main.py の _on_tab_changed）に呼ぶ。
-        自分では計算しない——ガントチャートタブ側の結果をそのまま集計し直す
-        だけなので軽い（設計案の実測で全集計0.1秒未満）。"""
+
+        自分では計算せず、共有の ScheduleCache（gui/schedule_cache.py）に
+        最新化を要求するだけ——DBの内容が変わっていなければ再計算しない
+        （設計案の実測で集計自体は全体で0.1秒未満）。ガントチャートタブを
+        一度も開いていなくても、ここで計算が起動する。"""
+        self.cache.ensure_fresh()
         self._render()
 
     def _render(self):
-        result_df, display = self._current_result()
-        if result_df is None:
-            self._show_no_result()
+        if self.cache.error_message is not None:
+            self._show_status_only(self.cache.error_message, is_error=True)
             return
+        if not self.cache.is_fresh():
+            self._show_status_only("スケジューリング結果を計算中です...", is_error=False)
+            return
+
+        result_df, display = self.cache.result_df, self.cache.display
         self.status_label.setStyleSheet("")
         self.status_label.setText("ガントチャートタブの計算結果を集計しています。")
 
@@ -201,12 +269,13 @@ class AnalysisTab(QWidget):
 
         self._render_kpi(result_df, project_start_ts, milestones, task_status_map)
         self._render_milestone_table(result_df, display, milestones, today, task_status_map)
+        self._render_team_summary(result_df, display, milestones, project_start_ts)
 
-    def _show_no_result(self):
-        self.status_label.setStyleSheet("color: #b3261e;")
-        self.status_label.setText(
-            "スケジューリング結果がありません。ガントチャートタブを開いて計算してください。"
-        )
+    def _show_status_only(self, message, is_error):
+        """結果がまだ無い（エラー／計算中）ときの表示。タイル・表・グラフを
+        すべて空にし、状況表示だけを message に差し替える。"""
+        self.status_label.setStyleSheet("color: #b3261e;" if is_error else "")
+        self.status_label.setText(message)
         for tile in (
             self.kpi_scale, self.kpi_period, self.kpi_status,
             self.kpi_peak, self.kpi_overrun, self.kpi_violation,
@@ -215,6 +284,14 @@ class AnalysisTab(QWidget):
         self.milestone_table.setRowCount(0)
         self.breakdown_hint_label.setText("")
         self._dimension_combo.setVisible(False)
+        self.team_table.setRowCount(0)
+        self.team_stacked_view.setScene(None)
+        self.team_legend_label.setText("")
+        self.team_detail_view.setScene(None)
+        self.team_detail_label.setText("")
+        self._team_summary_result_df = None
+        self._team_summary_display = None
+        self._team_summary_chart_range = None
 
     def _render_kpi(self, result_df, project_start_ts, milestones, task_status_map):
         kpi = compute_kpi(result_df, project_start_ts, milestones, task_status_map)
@@ -305,6 +382,122 @@ class AnalysisTab(QWidget):
 
         auto_size_columns(self.milestone_table, stretch_last=False)
 
+    def _render_team_summary(self, result_df, display, milestones, project_start_ts):
+        """チーム別サマリー（積み上げグラフ＋表）を作り直す。選択中チームの
+        詳細グラフは、表の行選択に連動して別途 _render_team_detail() が描く
+        ——ここでは選択を（可能なら）維持したまま表を再構築するだけに留める。"""
+        team_names = display["team_names"]
+        team_colors = display["team_colors"]
+        team_capacity_schedule = display["team_capacity_schedule"]
+        rows = compute_team_summary_rows(result_df, team_names, team_capacity_schedule)
+
+        self.team_table.blockSignals(True)
+        self.team_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            name_item = QTableWidgetItem(row["name"])
+            name_item.setData(Qt.UserRole, row["team_id"])
+            self.team_table.setItem(row_index, 0, name_item)
+            self._set_team_item(row_index, 1, _fmt_int(row["peak"]) if row["peak"] else "—")
+            self._set_team_item(
+                row_index, 2, row["peak_month"].replace("-", "/") if row["peak_month"] else "—"
+            )
+            pinned = row["pinned_days"]
+            self._set_team_item(row_index, 3, _fmt_int(pinned) if pinned is not None else "—")
+            self._set_team_item(row_index, 4, _fmt_int(row["tasks"]))
+            self._set_team_item(
+                row_index, 5, _fmt_int(row["resource_adjusted"]) if row["resource_adjusted"] else "—"
+            )
+            overrun_item = QTableWidgetItem(_fmt_int(row["overrun"]) if row["overrun"] else "—")
+            if row["overrun"]:
+                overrun_item.setForeground(_ALERT_COLOR)
+            overrun_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.team_table.setItem(row_index, 6, overrun_item)
+        auto_size_columns(self.team_table, stretch_last=False)
+        self.team_table.blockSignals(False)
+
+        if result_df.empty:
+            self.team_stacked_view.setScene(None)
+            self.team_detail_view.setScene(None)
+            self.team_detail_label.setText("")
+            self._team_summary_result_df = None
+            self._team_summary_display = None
+            self._team_summary_chart_range = None
+            return
+
+        range_start = result_df["Start_Date"].min()
+        range_end = result_df["End_Date"].max()
+        concurrency_by_team = {team_id: team_concurrency_steps(result_df, team_id) for team_id in team_names}
+        stacked_scene = build_team_stacked_scene(
+            concurrency_by_team, team_colors, team_names, milestones, project_start_ts, range_start, range_end,
+        )
+        self.team_stacked_view.setScene(stacked_scene)
+        QTimer.singleShot(0, self.team_stacked_view.fit_all)
+        self.team_legend_label.setText(self._build_team_legend_html(team_names, team_colors))
+
+        self._team_summary_result_df = result_df
+        self._team_summary_display = display
+        self._team_summary_chart_range = (range_start, range_end, milestones, project_start_ts)
+
+        # 選択を可能な限り維持する。前回選んでいたチームが今回の表にも
+        # あればそれを、無ければ（初回・チームが無くなった等）先頭行を選ぶ。
+        target_row = 0
+        for row_index in range(self.team_table.rowCount()):
+            if self.team_table.item(row_index, 0).data(Qt.UserRole) == self._selected_team_summary_id:
+                target_row = row_index
+                break
+        if self.team_table.rowCount() > 0:
+            self.team_table.selectRow(target_row)
+        self._render_team_detail()
+
+    def _set_team_item(self, row, column, text):
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.team_table.setItem(row, column, item)
+
+    def _build_team_legend_html(self, team_names, team_colors):
+        """積み上げグラフの凡例（色付きの四角＋チーム名を折り返しで並べる）。
+        gui/team_summary_view.py がバー自体にチーム名を描き込まない代わりに、
+        ここで色とチーム名の対応を示す（設計案§7-6）。"""
+        swatches = [
+            f'<span style="color:{team_colors.get(team_id, "#cbc9c2")};">■</span> {html.escape(name)}'
+            for team_id, name in team_names.items()
+        ]
+        return "&nbsp;&nbsp;&nbsp;".join(swatches)
+
+    def _on_team_row_selected(self):
+        selected_items = self.team_table.selectedItems()
+        self._selected_team_summary_id = (
+            selected_items[0].data(Qt.UserRole) if selected_items else None
+        )
+        self._render_team_detail()
+
+    def _render_team_detail(self):
+        """行選択に連動する、選択中チームの詳細グラフ（同時タスク数＋上限の
+        破線）を作り直す。"""
+        if self._team_summary_result_df is None or self._team_summary_chart_range is None:
+            return
+        selected_items = self.team_table.selectedItems()
+        if not selected_items:
+            self.team_detail_view.setScene(None)
+            self.team_detail_label.setText("行を選択すると、そのチームの同時タスク数と上限を表示します。")
+            return
+
+        team_id = selected_items[0].data(Qt.UserRole)
+        display = self._team_summary_display
+        team_names = display["team_names"]
+        team_colors = display["team_colors"]
+        capacity_periods = display["team_capacity_schedule"].get(team_id, [])
+        steps = team_concurrency_steps(self._team_summary_result_df, team_id)
+        range_start, range_end, milestones, project_start_ts = self._team_summary_chart_range
+
+        scene = build_team_detail_scene(
+            steps, capacity_periods, team_colors.get(team_id, "#cbc9c2"),
+            milestones, project_start_ts, range_start, range_end,
+        )
+        self.team_detail_view.setScene(scene)
+        QTimer.singleShot(0, self.team_detail_view.fit_all)
+        self.team_detail_label.setText(f"選択中のチーム: {team_names.get(team_id, team_id)}")
+
     def _sync_dimension_combo(self, mode, display, result_df):
         """「チーム別」「ワークフロー別」のときだけ対象選択コンボを表示し、
         選択中の対象でresult_dfを絞り込んで返す（「全体」なら絞り込まず
@@ -351,6 +544,7 @@ class AnalysisTab(QWidget):
             "breakdown_mode": self._breakdown_mode,
             "selected_team_id": self._selected_team_id,
             "selected_workflow_id": self._selected_workflow_id,
+            "selected_team_summary_id": self._selected_team_summary_id,
         }
 
     def restore_ui_state(self, state):
@@ -362,5 +556,6 @@ class AnalysisTab(QWidget):
         self._breakdown_mode = mode
         self._selected_team_id = state.get("selected_team_id")
         self._selected_workflow_id = state.get("selected_workflow_id")
+        self._selected_team_summary_id = state.get("selected_team_summary_id")
         self._breakdown_buttons[mode].setChecked(True)
         self._render()

@@ -19,6 +19,9 @@
 
 import pandas as pd
 
+from gui.resource_histogram import compute_step_segments
+from project_scheduler import _UNLIMITED_LINES
+
 STATUS_NOT_STARTED = "not_started"
 STATUS_IN_PROGRESS = "in_progress"
 STATUS_DONE = "done"
@@ -143,6 +146,101 @@ def compute_milestone_rows(result_df, milestones, today):
             "slack_days": slack_days,
             "overrun_count": overrun_count,
             "on_time": slack_days is None or slack_days >= 0,
+        })
+    return rows
+
+
+def team_concurrency_steps(result_df, team_id=None):
+    """指定チーム（Noneなら全チーム合算）の同時タスク数を、変化点だけを持つ
+    階段関数として [(日付, 同時タスク数), ...]（日付昇順）で返す。0件なら
+    空リスト。`gui/resource_histogram.py` の `compute_step_segments()` と
+    組み合わせれば、任意区間の区間列（積み上げグラフ・詳細グラフの描画用）に
+    変換できる。
+
+    peak_concurrency() と同じ差分＋累積和（O(タスク数)）。値が変わる日付
+    でしか記録しないため、階段関数の折れ点＝ピークの候補が漏れなく含まれる
+    （区間内で値が変わるのは折れ点だけのため、最大値は必ずいずれかの折れ点で
+    観測される）。"""
+    df = result_df if team_id is None else result_df[result_df["Team_ID"] == team_id]
+    if df.empty:
+        return []
+    deltas = pd.concat([
+        pd.Series(1, index=df["Start_Date"].values),
+        pd.Series(-1, index=df["End_Date"].values),
+    ]).groupby(level=0).sum().sort_index()
+    counts = deltas.cumsum()
+    return list(zip(counts.index, counts.values.astype(int)))
+
+
+def _team_pinned_days(result_df, team_id, capacity_periods):
+    """指定チームで、同時タスク数が設定上限に達していた（＝上限が効いていた）
+    日数を返す。対象期間はそのチームの実際の活動期間
+    （最初のStart_Date〜最後のEnd_Date、exclusive）に限る——期間外は
+    そもそも「上限に張り付く」以前にタスクが存在しないため。
+
+    上限を一度も設定していない（期間を通じて`_UNLIMITED_LINES`）チームは
+    Noneを返す（設計案§3「上限が『指定なし』のチームでは空欄」）。"""
+    df = result_df[result_df["Team_ID"] == team_id]
+    if df.empty:
+        return None
+    range_start = df["Start_Date"].min()
+    range_end = df["End_Date"].max()
+    cap_segments = compute_step_segments(capacity_periods, range_start, range_end)
+    if all(v == _UNLIMITED_LINES for _s, _e, v in cap_segments):
+        return None
+
+    concurrency_segments = compute_step_segments(
+        team_concurrency_steps(result_df, team_id), range_start, range_end
+    )
+    boundaries = sorted(
+        {p for seg in concurrency_segments for p in (seg[0], seg[1])}
+        | {p for seg in cap_segments for p in (seg[0], seg[1])}
+    )
+
+    def _value_at(segments, point):
+        for seg_start, seg_end, value in segments:
+            if seg_start <= point < seg_end:
+                return value
+        return None
+
+    total_days = 0
+    for a, b in zip(boundaries, boundaries[1:]):
+        concurrency = _value_at(concurrency_segments, a)
+        cap = _value_at(cap_segments, a)
+        if concurrency is not None and cap is not None and cap != _UNLIMITED_LINES and cap > 0:
+            if concurrency == cap:
+                total_days += (b - a).days
+    return total_days
+
+
+def compute_team_summary_rows(result_df, team_names, team_capacity_schedule):
+    """チーム別サマリーの表の行。team_names（{Team_ID: 名前}、
+    `gui/gantt_generator.build_display()` の同名キー）と同じ順で、
+    team_id/name/tasks/peak/peak_month/pinned_days（Noneなら『指定なし』の
+    まま上限を一度も設定していない）/resource_adjusted（押し出された件数）/
+    overrun の辞書のリストを返す。
+
+    team_capacity_schedule: `gui/gantt_generator.build_display()` の同名キー
+    （{Team_ID: [(適用開始日, ライン数), ...]}）。"""
+    rows = []
+    for team_id, name in team_names.items():
+        df = result_df[result_df["Team_ID"] == team_id] if not result_df.empty else result_df
+        steps = team_concurrency_steps(result_df, team_id)
+        peak = max((count for _day, count in steps), default=0)
+        peak_month = None
+        if peak > 0:
+            peak_day = next(day for day, count in steps if count == peak)
+            peak_month = pd.Timestamp(peak_day).strftime("%Y-%m")
+        capacity_periods = team_capacity_schedule.get(team_id, [])
+        rows.append({
+            "team_id": team_id,
+            "name": name,
+            "tasks": int(len(df)),
+            "peak": int(peak),
+            "peak_month": peak_month,
+            "pinned_days": _team_pinned_days(result_df, team_id, capacity_periods),
+            "resource_adjusted": int(df["Resource_Adjusted"].sum()) if not df.empty else 0,
+            "overrun": int((df["Deadline_Overrun_Days"] > 0).sum()) if not df.empty else 0,
         })
     return rows
 

@@ -58,7 +58,7 @@ def window(qapp):
     # （gui/main.py の _confirm_discard_unsaved）。テストではダイアログを
     # 操作できず無限にブロックしてしまうため、後片付けはダイアログを経由
     # しない形で行う。
-    w._shutdown_gantt_tab()
+    w._shutdown_schedule_cache()
     w.db.on_change = None
     w.db.undo_manager = None
     w.db.close()
@@ -1092,15 +1092,15 @@ def test_gantt_tab_reuses_result_until_the_db_changes(window, qapp):
     window.tabs.setCurrentWidget(window.tab_gantt)
     _wait_for_schedule(window, qapp)
 
-    seq_before = window.tab_gantt._request_seq
+    seq_before = window.schedule_cache._request_seq
     window.tab_gantt.refresh_choices()
     qapp.processEvents()
-    assert window.tab_gantt._request_seq == seq_before  # 再計算していない
+    assert window.schedule_cache._request_seq == seq_before  # 再計算していない
     assert window.tab_gantt._result_df is not None
 
     window.db.add_team("チームB", 1)  # 内容が変わったら計算し直す
     window.tab_gantt.refresh_choices()
-    assert window.tab_gantt._request_seq == seq_before + 1
+    assert window.schedule_cache._request_seq == seq_before + 1
     _wait_for_schedule(window, qapp)
     assert window.tab_gantt._result_df is not None
 
@@ -1117,7 +1117,7 @@ def test_switching_to_jobs_tab_and_back_does_not_force_a_recomputation(window, q
     window.tabs.setCurrentWidget(window.tab_gantt)
     _wait_for_schedule(window, qapp)
 
-    seq_before = window.tab_gantt._request_seq
+    seq_before = window.schedule_cache._request_seq
     revision_before = window.db.revision
 
     window.tabs.setCurrentWidget(window.tab_jobs)
@@ -1126,7 +1126,7 @@ def test_switching_to_jobs_tab_and_back_does_not_force_a_recomputation(window, q
 
     window.tabs.setCurrentWidget(window.tab_gantt)
     qapp.processEvents()
-    assert window.tab_gantt._request_seq == seq_before  # 再計算していない
+    assert window.schedule_cache._request_seq == seq_before  # 再計算していない
     assert window.tab_gantt._result_df is not None
 
 
@@ -1144,7 +1144,7 @@ def test_schedule_completing_after_a_concurrent_edit_does_not_mask_it(window, qa
     # 起動しただけで、Pythonコードとしてはまだ何も実行していない）ため、
     # 次の編集は確実に「要求後・完了前」に割り込む。
     assert window.tab_gantt._result_df is None
-    requested_revision = window.tab_gantt._pending_revision
+    requested_revision = window.schedule_cache._pending_revision
     assert requested_revision == window.db.revision
 
     window.db.add_team("後から追加したチーム", 1)
@@ -1152,15 +1152,15 @@ def test_schedule_completing_after_a_concurrent_edit_does_not_mask_it(window, qa
 
     _wait_for_schedule(window, qapp)
     # 結果には要求時点のrevisionが刻まれ、完了時点（編集後）の値ではないこと。
-    assert window.tab_gantt._computed_revision == requested_revision
-    assert window.tab_gantt._computed_revision != window.db.revision
+    assert window.schedule_cache._computed_revision == requested_revision
+    assert window.schedule_cache._computed_revision != window.db.revision
 
     # 食い違いが検知され、次に切り替えたときは再計算されること。
-    seq_before = window.tab_gantt._request_seq
+    seq_before = window.schedule_cache._request_seq
     window.tab_gantt.refresh_choices()
-    assert window.tab_gantt._request_seq == seq_before + 1
+    assert window.schedule_cache._request_seq == seq_before + 1
     _wait_for_schedule(window, qapp)
-    assert window.tab_gantt._computed_revision == window.db.revision
+    assert window.schedule_cache._computed_revision == window.db.revision
 
 
 def test_shutdown_waits_for_every_in_flight_worker_thread(window, qapp):
@@ -1171,19 +1171,21 @@ def test_shutdown_waits_for_every_in_flight_worker_thread(window, qapp):
     以前は self._thread に最後の1本しか保持していなかったため、shutdown()
     （ウィンドウを閉じる際に呼ばれる）がそれより前の実行中スレッドを待たずに
     戻ってしまい、"QThread: Destroyed while thread is still running" という
-    形でクラッシュしうる状態だった。"""
+    形でクラッシュしうる状態だった。このワーカー管理は ScheduleCache
+    （gui/schedule_cache.py）へ移した。"""
     _build_schedulable_project(window.db)
     tab = window.tab_gantt
+    cache = window.schedule_cache
 
     # イベントを一度も回さずに複数回 refresh_choices() を呼び、前の要求が
     # 完了する前に次の要求を出す（DBを毎回変えて再計算の対象にする）。
     for i in range(3):
         window.db.add_team(f"チーム{i}", 1)
         tab.refresh_choices()
-    assert len(tab._threads) == 3  # 3本とも実行中（または実行待ち）として追跡されている
+    assert len(cache._threads) == 3  # 3本とも実行中（または実行待ち）として追跡されている
 
-    tab.shutdown()
-    assert tab._threads == []
+    cache.shutdown()
+    assert cache._threads == []
 
 
 def test_gantt_chart_draws_overrun_tasks_with_a_red_border(window, qapp):
@@ -1399,20 +1401,49 @@ def test_gantt_column_shows_workflow_color_swatch_next_to_job_name(window, qapp)
 # -- プロジェクト分析タブ（gui/tab_analysis.py） ---------------------------------------
 
 def test_analysis_tab_shows_reason_instead_of_a_dialog_when_no_schedule_result(window, qapp):
-    """ガントチャートタブで一度も計算していない間は、モーダルダイアログでは
-    なくタブ内に赤字で理由を表示すること（ガントチャートタブと同じ方針）。"""
+    """ガントチャートタブで一度も計算していなくても、プロジェクト分析タブ自身が
+    ScheduleCache に計算を要求する（gui/schedule_cache.py）。プロジェクトが
+    未完成で検証エラーになる場合、モーダルダイアログではなくタブ内に赤字で
+    理由を表示すること（ガントチャートタブと同じ方針）。"""
     window.tabs.setCurrentWidget(window.tab_analysis)
     qapp.processEvents()
 
-    assert "スケジューリング結果がありません" in window.tab_analysis.status_label.text()
+    assert "解決してください" in window.tab_analysis.status_label.text()
     assert window.tab_analysis.kpi_scale.value_label.text() == "—"
     assert window.tab_analysis.milestone_table.rowCount() == 0
 
 
+def test_analysis_tab_computes_its_own_result_without_opening_gantt_tab(window, qapp):
+    """ガントチャートタブを一度も開かなくても、プロジェクト分析タブを開けば
+    共有の ScheduleCache 経由で自分から計算を起動できること
+    （docs/project_analysis_tab_design.md §5）。"""
+    _build_schedulable_project(window.db)
+    assert not hasattr(window, "tab_gantt") or window.tab_gantt._result_df is None
+
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    # まだイベントを回していないので、この時点では計算中の表示のはず。
+    assert "計算中" in window.tab_analysis.status_label.text()
+
+    deadline = time.monotonic() + 15.0
+    while window.tab_analysis.kpi_scale.value_label.text() == "—" and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    qapp.processEvents()
+
+    assert window.tab_analysis.kpi_scale.value_label.text() == "1 ジョブ"
+    assert window.tab_analysis.milestone_table.rowCount() == 1
+    # ガントチャートタブも同じキャッシュを見るので、後から開いても再計算しない。
+    seq_before = window.schedule_cache._request_seq
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    qapp.processEvents()
+    assert window.schedule_cache._request_seq == seq_before
+    assert window.tab_gantt._result_df is not None
+
+
 def test_analysis_tab_renders_kpi_and_milestone_table_from_gantt_result(window, qapp):
     """ガントチャートタブの計算結果をもとに、KPIタイルとマイルストーン別表の
-    基本列が埋まること。自分では計算を起こさない（ガントチャートタブの
-    _result_df/_display をそのまま集計する）。"""
+    基本列が埋まること。自分では計算を起こさない（共有の ScheduleCache が
+    持つ結果をそのまま集計する）。"""
     _build_schedulable_project(window.db)
     window.tabs.setCurrentWidget(window.tab_gantt)
     _wait_for_schedule(window, qapp)
