@@ -54,6 +54,7 @@ python run_gui.py
 - [`docs/db_design.md`](docs/db_design.md) — DB設計（`.pschedule`のテーブル定義）
 - [`docs/packaging.md`](docs/packaging.md) — Windows `.exe` パッケージング手順
 - [`docs/roadmap.md`](docs/roadmap.md) — 今後の検討事項（未着手の課題と設計方針の記録）
+- [`docs/summary_tab_design.md`](docs/summary_tab_design.md) — サマリータブの設計案（未実装）
 
 ### インタラクティブHTMLガントチャート
 
