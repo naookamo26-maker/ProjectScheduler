@@ -1454,6 +1454,35 @@ def test_analysis_tab_renders_kpi_and_milestone_table_from_gantt_result(window, 
     assert window.tab_analysis.kpi_scale.value_label.text() == "1 ジョブ"
     assert window.tab_analysis.milestone_table.rowCount() == 1
     assert window.tab_analysis.milestone_table.item(0, 0).text() == "マイルストーン1"
+    # マイルストーンが1件だけなので、全タスクがそこに属し進捗は必ず100%。
+    assert window.tab_analysis.milestone_table.item(0, 1).text() == "100%"
+
+
+def test_analysis_tab_milestone_progress_column_is_cumulative_across_milestones(window, qapp):
+    """「進捗」列はタスクの完了状態と無関係の計画上の指標で、締切順に
+    マイルストーンをまたいで累積し、最後のマイルストーンで必ず100%になる
+    こと（gui/summary_metrics.compute_milestone_rows参照）。"""
+    db = window.db
+    db.set_project("進捗列テスト", "2026-01-05")
+    team_id = db.add_team("チームA", 2)
+    ms1 = db.add_milestone("マイルストーン1", "2026-03-01")
+    ms2 = db.add_milestone("マイルストーン2", "2026-06-01")
+    wf_id = db.add_workflow("WF1")
+    db.add_workflow_task(wf_id, "タスク", team_id, 3)
+    db.add_job("ジョブA", wf_id, ms1, 100)  # MS1に1タスク
+    db.add_job("ジョブB", wf_id, ms2, 100)  # MS2に1タスク
+    db.add_job("ジョブC", wf_id, ms2, 100)  # MS2に1タスク（MS2は計2タスク）
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    table = window.tab_analysis.milestone_table
+    assert table.rowCount() == 2
+    # 全体3タスク中、MS1に1件・MS2に2件 -> 累積は 1/3=33%, 3/3=100%。
+    assert table.item(0, 1).text() == "33%"
+    assert table.item(1, 1).text() == "100%"
 
 
 def test_analysis_tab_status_kpi_reflects_recorded_status_not_a_date_guess(window, qapp):
@@ -1542,7 +1571,7 @@ def test_analysis_tab_breakdown_dimension_selector_filters_to_one_team_at_a_time
     qapp.processEvents()
 
     tab = window.tab_analysis
-    headers = ["マイルストーン", "締切日", "残", "最終終了日", "スラック", "超過",
+    headers = ["マイルストーン", "進捗", "締切日", "残", "最終終了日", "スラック", "超過",
                "ジョブ", "タスク", "完了", "進行中", "未着手"]
     assert [tab.milestone_table.horizontalHeaderItem(i).text() for i in range(len(headers))] == headers
     assert not tab._dimension_combo.isVisible()
@@ -1551,17 +1580,17 @@ def test_analysis_tab_breakdown_dimension_selector_filters_to_one_team_at_a_time
     qapp.processEvents()
     assert tab._dimension_combo.isVisible()
     assert tab._dimension_combo.currentText() == "チームA"
-    assert tab.milestone_table.item(0, 7).text() == "2"  # タスク: チームAの2件
+    assert tab.milestone_table.item(0, 8).text() == "2"  # タスク: チームAの2件
 
     idx_team_b = tab._dimension_combo.findText("チームB")
     tab._dimension_combo.setCurrentIndex(idx_team_b)
     qapp.processEvents()
-    assert tab.milestone_table.item(0, 7).text() == "1"  # タスク: チームBの1件
+    assert tab.milestone_table.item(0, 8).text() == "1"  # タスク: チームBの1件
 
     tab._breakdown_buttons["workflow"].click()
     qapp.processEvents()
     assert tab._dimension_combo.currentText() == "WF1"
-    assert tab.milestone_table.item(0, 7).text() == "2"  # タスク: WF1の2件
+    assert tab.milestone_table.item(0, 8).text() == "2"  # タスク: WF1の2件
 
 
 def test_analysis_tab_capture_and_restore_breakdown_mode(window, qapp):

@@ -23,8 +23,8 @@
 | マーカー | 対象モジュール | 必要な依存 | 件数 / 時間 |
 | --- | --- | --- | --- |
 | `core` | `gui/db.py` `gui/db_schema.py` `gui/undo_manager.py` | pytestのみ | 58件 / 約0.6秒 |
-| `scheduler` | `project_scheduler.py` `gui/gantt_generator.py` `gui/summary_metrics.py` | + pandas, numpy | 106件 / 約2.5秒 |
-| `gui` | `gui/`のウィジェット層・描画層 | + PySide6 + システムライブラリ | 87件 / 約8秒 |
+| `scheduler` | `project_scheduler.py` `gui/gantt_generator.py` `gui/summary_metrics.py` | + pandas, numpy | 109件 / 約2.5秒 |
+| `gui` | `gui/`のウィジェット層・描画層 | + PySide6 + システムライブラリ | 88件 / 約8秒 |
 
 変更したファイル → 実行するコマンド:
 
@@ -41,7 +41,7 @@
 
 ### 全実行（`pytest`）を行う条件
 
-次のいずれかに当てはまるときだけ、引数なしの`pytest`で251件すべてを回す。
+次のいずれかに当てはまるときだけ、引数なしの`pytest`で255件すべてを回す。
 
 - 利用者から明示的に「全部回して」と指示があったとき。
 - 影響が横断的な変更をしたとき。具体的には、DBスキーマの変更（`gui/db_schema.py`・
@@ -53,7 +53,7 @@
 ### 出力を増やさない
 
 - `pytest.ini`の`addopts`で`-q --no-header --tb=short`が既定になっている。
-  **`-v`は付けない**（251件のテスト名が出力を埋めるだけで、得られる情報は増えない）。
+  **`-v`は付けない**（255件のテスト名が出力を埋めるだけで、得られる情報は増えない）。
 - 失敗を追うときは、全体を回し直さず、失敗したテストだけを名指しで再実行する:
   `pytest tests/test_undo_redo.py::test_foo --tb=long`
 
@@ -77,12 +77,12 @@
 | ファイル | 内容 | 読むとき |
 | --- | --- | --- |
 | `docs/architecture.md` (1050行) | 全体構成・データフロー・Undo/Redo・各機能の内部設計 | 実装の設計判断に関わるとき。長いので`grep -n '^## ' docs/architecture.md`で目次を出し、該当する節だけを読む |
-| `docs/screens.md` (674行) | タブごとの画面仕様 | GUIの画面仕様を変えるとき。該当タブの節だけ |
+| `docs/screens.md` (681行) | タブごとの画面仕様 | GUIの画面仕様を変えるとき。該当タブの節だけ |
 | `docs/db_design.md` (183行) | テーブル定義・設計判断 | スキーマ・永続化を変えるとき |
 | `docs/requirements.md` (172行) | 要件定義・スコープ | 仕様の妥当性やスコープ外かどうかを判断するとき |
 | `docs/roadmap.md` (494行) | 今後の検討メモ | 今後の方針を問われたときだけ。通常の実装時には不要 |
 | `docs/packaging.md` (72行) | `.exe`ビルド手順 | `packaging/`やビルドを触るとき |
-| `docs/project_analysis_tab_design.md` (309行) | プロジェクト分析タブ（実装中）の設計案 | プロジェクト分析タブの実装・仕様を検討するときだけ |
+| `docs/project_analysis_tab_design.md` (310行) | プロジェクト分析タブ（実装中）の設計案 | プロジェクト分析タブの実装・仕様を検討するときだけ |
 
 コードを読むときは、まず`grep -n`で対象の定義位置を特定し、その周辺だけを読む。
 特に大きいモジュール（`gui/db.py` 1550行、`project_scheduler.py` 1839行、

@@ -127,9 +127,19 @@ def compute_milestone_rows(result_df, milestones, today):
     """マイルストーン別サマリーの基本列（内訳モードによらず共通）。
     戻り値は milestones と同じ順の辞書のリスト:
     milestone_id / name / due_date / remaining_days / last_end_date /
-    slack_days（Noneならタスクなし） / overrun_count / on_time。"""
+    slack_days（Noneならタスクなし） / overrun_count / on_time /
+    cumulative_progress_pct。
+
+    cumulative_progress_pct: タスクの完了状態とは無関係の**計画上の指標**。
+    milestones は締切の早い順に並んでいる前提で、「そのマイルストーンまでに
+    割り当てられているタスクが、プロジェクト全体のタスク数のうち何%を
+    占めるか」の累積値（マイルストーンが進むほど単調増加し、最後の
+    マイルストーンで必ず100%になる。タスク1件は必ずどれか1つのマイルストーンに
+    属するため——重複も漏れも無い）。全体のタスクが0件なら全マイルストーンで0.0。"""
     today_ts = pd.Timestamp(today)
+    total_tasks = len(result_df)
     rows = []
+    cumulative_tasks = 0
     for ms_id, name, due in milestones:
         group = result_df[result_df["Milestone_ID"] == ms_id] if not result_df.empty else result_df
         if group.empty:
@@ -139,6 +149,8 @@ def compute_milestone_rows(result_df, milestones, today):
             slack_days = (due - last_end).days
             overrun_count = int((group["Deadline_Overrun_Days"] > 0).sum())
         remaining_days = max(0, (due - today_ts).days)
+        cumulative_tasks += len(group)
+        progress_pct = (cumulative_tasks / total_tasks * 100) if total_tasks else 0.0
         rows.append({
             "milestone_id": ms_id,
             "name": name,
@@ -148,6 +160,7 @@ def compute_milestone_rows(result_df, milestones, today):
             "slack_days": slack_days,
             "overrun_count": overrun_count,
             "on_time": slack_days is None or slack_days >= 0,
+            "cumulative_progress_pct": progress_pct,
         })
     return rows
 

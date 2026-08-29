@@ -53,7 +53,7 @@ _BREAKDOWN_LABELS = [
 ]
 _BREAKDOWN_EXTRA_COLUMNS = ["ジョブ", "タスク", "完了", "進行中", "未着手"]
 
-_BASE_COLUMNS = ["マイルストーン", "締切日", "残", "最終終了日", "スラック", "超過"]
+_BASE_COLUMNS = ["マイルストーン", "進捗", "締切日", "残", "最終終了日", "スラック", "超過"]
 
 _TEAM_COLUMNS = ["チーム", "ピーク", "ピーク時期", "上限に張り付いた日数", "タスク件数", "押し出された件数", "超過件数"]
 # チーム別サマリーの表の先頭「全チーム」行を、個別チームの行と見分けるための
@@ -367,9 +367,10 @@ class AnalysisTab(QWidget):
         self.milestone_table.setRowCount(len(base_rows))
         for row_index, (base, breakdown) in enumerate(zip(base_rows, breakdown_rows)):
             self._set_item(row_index, 0, base["name"])
-            self._set_item(row_index, 1, _fmt_date(base["due_date"]))
-            self._set_item(row_index, 2, f"{base['remaining_days']}日" if base["remaining_days"] else "—")
-            self._set_item(row_index, 3, _fmt_date(base["last_end_date"]))
+            self._set_item(row_index, 1, f"{base['cumulative_progress_pct']:.0f}%", right=True)
+            self._set_item(row_index, 2, _fmt_date(base["due_date"]))
+            self._set_item(row_index, 3, f"{base['remaining_days']}日" if base["remaining_days"] else "—")
+            self._set_item(row_index, 4, _fmt_date(base["last_end_date"]))
 
             slack = base["slack_days"]
             slack_text = "—" if slack is None else (f"+{slack}日" if slack >= 0 else f"{slack}日")
@@ -377,19 +378,19 @@ class AnalysisTab(QWidget):
             if slack is not None and slack < 0:
                 slack_item.setForeground(_ALERT_COLOR)
             slack_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            self.milestone_table.setItem(row_index, 4, slack_item)
+            self.milestone_table.setItem(row_index, 5, slack_item)
 
             overrun_item = QTableWidgetItem(_fmt_int(base["overrun_count"]) if base["overrun_count"] else "—")
             if base["overrun_count"]:
                 overrun_item.setForeground(_ALERT_COLOR)
             overrun_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            self.milestone_table.setItem(row_index, 5, overrun_item)
+            self.milestone_table.setItem(row_index, 6, overrun_item)
 
-            self._set_item(row_index, 6, _fmt_int(breakdown["jobs"]), right=True)
-            self._set_item(row_index, 7, _fmt_int(breakdown["tasks"]), right=True)
-            self._set_item(row_index, 8, _fmt_int(breakdown["done"]), right=True)
-            self._set_item(row_index, 9, _fmt_int(breakdown["in_progress"]), right=True)
-            self._set_item(row_index, 10, _fmt_int(breakdown["not_started"]), right=True)
+            self._set_item(row_index, 7, _fmt_int(breakdown["jobs"]), right=True)
+            self._set_item(row_index, 8, _fmt_int(breakdown["tasks"]), right=True)
+            self._set_item(row_index, 9, _fmt_int(breakdown["done"]), right=True)
+            self._set_item(row_index, 10, _fmt_int(breakdown["in_progress"]), right=True)
+            self._set_item(row_index, 11, _fmt_int(breakdown["not_started"]), right=True)
 
         auto_size_columns(self.milestone_table, stretch_last=False)
 

@@ -189,6 +189,47 @@ def test_milestone_row_remaining_days_is_zero_after_due_date():
     assert rows[0]["remaining_days"] == 0
 
 
+def test_milestone_row_cumulative_progress_is_independent_of_task_status():
+    """進捗%はタスクの完了状態と無関係（計画上のタスク配分だけで決まる）。
+    全タスク未着手でも、マイルストーンに割り当てられていれば進捗に数える。"""
+    df = _result_df([
+        ("J1", "T1", "TEAM_1", "WF_1", "MS_1", "2026-01-01", "2026-01-05", 0, ""),
+        ("J1", "T2", "TEAM_1", "WF_1", "MS_1", "2026-01-05", "2026-01-10", 0, ""),
+        ("J2", "T1", "TEAM_1", "WF_1", "MS_2", "2026-01-01", "2026-01-05", 0, ""),
+    ])
+    milestones = [("MS_1", "MS1", _ts("2026-06-01")), ("MS_2", "MS2", _ts("2026-07-01"))]
+    rows = compute_milestone_rows(df, milestones, date(2026, 1, 1))
+    # MS_1に2件、MS_2に1件。全体は3件なので累積は 2/3, 3/3。
+    assert rows[0]["cumulative_progress_pct"] == pytest.approx(200 / 3)
+    assert rows[1]["cumulative_progress_pct"] == pytest.approx(100.0)
+
+
+def test_milestone_row_cumulative_progress_reaches_100_percent_at_the_last_milestone():
+    """タスクは必ずどれか1つのマイルストーンに属するので、最後のマイルストーン
+    では累積が必ず100%になる（重複も漏れも無い）。"""
+    df = _result_df([
+        ("J1", "T1", "TEAM_1", "WF_1", "MS_1", "2026-01-01", "2026-01-05", 0, ""),
+        ("J2", "T1", "TEAM_1", "WF_1", "MS_2", "2026-01-01", "2026-01-05", 0, ""),
+        ("J3", "T1", "TEAM_1", "WF_1", "MS_3", "2026-01-01", "2026-01-05", 0, ""),
+    ])
+    milestones = [
+        ("MS_1", "MS1", _ts("2026-03-01")),
+        ("MS_2", "MS2", _ts("2026-06-01")),
+        ("MS_3", "MS3", _ts("2026-09-01")),
+    ]
+    rows = compute_milestone_rows(df, milestones, date(2026, 1, 1))
+    assert rows[-1]["cumulative_progress_pct"] == pytest.approx(100.0)
+    # 単調増加であること。
+    values = [r["cumulative_progress_pct"] for r in rows]
+    assert values == sorted(values)
+
+
+def test_milestone_row_cumulative_progress_is_zero_when_there_are_no_tasks():
+    milestones = [("MS_1", "MS1", _ts("2026-01-20"))]
+    rows = compute_milestone_rows(EMPTY_DF, milestones, date(2026, 1, 1))
+    assert rows[0]["cumulative_progress_pct"] == 0.0
+
+
 # -- compute_milestone_breakdown_all ------------------------------------------------
 
 def test_milestone_breakdown_all_matches_task_counts_and_recorded_status():
