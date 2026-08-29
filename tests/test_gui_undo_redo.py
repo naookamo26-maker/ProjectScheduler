@@ -1396,6 +1396,76 @@ def test_gantt_column_shows_workflow_color_swatch_next_to_job_name(window, qapp)
     assert swatches["ワークフロー: WF1"] != swatches["ワークフロー: WF2"]
 
 
+# -- プロジェクト分析タブ（gui/tab_analysis.py） ---------------------------------------
+
+def test_analysis_tab_shows_reason_instead_of_a_dialog_when_no_schedule_result(window, qapp):
+    """ガントチャートタブで一度も計算していない間は、モーダルダイアログでは
+    なくタブ内に赤字で理由を表示すること（ガントチャートタブと同じ方針）。"""
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    assert "スケジューリング結果がありません" in window.tab_analysis.status_label.text()
+    assert window.tab_analysis.kpi_scale.value_label.text() == "—"
+    assert window.tab_analysis.milestone_table.rowCount() == 0
+
+
+def test_analysis_tab_renders_kpi_and_milestone_table_from_gantt_result(window, qapp):
+    """ガントチャートタブの計算結果をもとに、KPIタイルとマイルストーン別表の
+    基本列が埋まること。自分では計算を起こさない（ガントチャートタブの
+    _result_df/_display をそのまま集計する）。"""
+    _build_schedulable_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    assert window.tab_analysis.kpi_scale.value_label.text() == "1 ジョブ"
+    assert window.tab_analysis.milestone_table.rowCount() == 1
+    assert window.tab_analysis.milestone_table.item(0, 0).text() == "マイルストーン1"
+
+
+def test_analysis_tab_breakdown_toggle_switches_milestone_table_columns(window, qapp):
+    """「内訳」を切り替えると、マイルストーン別表の基本列は変わらず、
+    右側の内訳列群だけがチーム別／ワークフロー別に差し替わること。"""
+    _build_schedulable_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    assert tab.milestone_table.horizontalHeaderItem(0).text() == "マイルストーン"
+
+    tab._breakdown_buttons["team"].click()
+    qapp.processEvents()
+    assert tab.milestone_table.horizontalHeaderItem(7).text() == "チームA"
+
+    tab._breakdown_buttons["workflow"].click()
+    qapp.processEvents()
+    assert tab.milestone_table.horizontalHeaderItem(7).text() == "WF1"
+
+
+def test_analysis_tab_capture_and_restore_breakdown_mode(window, qapp):
+    _build_schedulable_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    window.tab_analysis._breakdown_buttons["workflow"].click()
+    qapp.processEvents()
+    state = window.tab_analysis.capture_ui_state()
+    assert state == {"breakdown_mode": "workflow"}
+
+    window.tab_analysis._breakdown_buttons["all"].click()
+    qapp.processEvents()
+    window.tab_analysis.restore_ui_state(state)
+    qapp.processEvents()
+    assert window.tab_analysis._breakdown_mode == "workflow"
+    assert window.tab_analysis._breakdown_buttons["workflow"].isChecked()
+
+
 # -- ガントチャート描画（gui/gantt_view.py）: 「今日」の縦線・1行飛ばしの行背景 ------------
 #
 # build_gantt_scenes() はDB/スケジューラーを介さずDataFrameだけで呼べるため、

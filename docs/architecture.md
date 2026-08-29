@@ -19,11 +19,11 @@ gui/ ─────────────────────────
   ├ db.py            CRUD（Qt非依存）+ Undo記録の仕組み・明示的な保存
   ├ db_schema.py      SQLiteスキーマ定義 + 旧バージョンからのマイグレーション
   ├ undo_manager.py   Undo/Redoスタック（Qt非依存）
-  ├ main.py           MainWindow・4タブ組み立て・File/Editメニュー・D&Dで開く
+  ├ main.py           MainWindow・5タブ組み立て・File/Editメニュー・D&Dで開く
   ├ tab_basic_info.py  タブ1「基本情報設定」（チームは変動点付きのツリー表示）
   ├ resource_histogram.py  階段関数の区間化（純粋関数。旧リソース
   │                          ヒストグラム機能の名残で、プロジェクト分析
-  │                          タブの表示に転用予定）
+  │                          タブの表示に使う）
   ├ tab_workflows.py    タブ2「ワークフロー設計」（node_canvas.pyのノードビューと、
   │                       タスク表・依存テンプレート表のテーブルビューを切り替える）
   ├ node_canvas.py       ノードグラフエディタ（タスク依存関係の視覚編集、
@@ -31,8 +31,18 @@ gui/ ─────────────────────────
   │                       フィット表示、ダイアログ開閉の共通ロジック）
   ├ tab_jobs.py            タブ3「ジョブ」（ワークフロー絞り込み、依存ジョブ
   │                          セクションを含む。旧タブ4はここに統合済み）
-  ├ widgets_common.py        タブ横断の共通UI部品（列幅自動調整含む）
-  └ gantt_generator.py        DB → project_scheduler.py 呼び出し → ガントチャート出力
+  ├ gantt_generator.py       DB → project_scheduler.py 呼び出し → ガントチャート出力
+  ├ tab_gantt.py              タブ4「ガントチャート」（ワーカースレッドで
+  │                            スケジューリングを実行し、gantt_view.pyで描画）
+  ├ gantt_view.py              QGraphicsScene直接描画のガントチャート本体
+  ├ summary_metrics.py          タブ5の集計（Qt非依存の純粋関数。
+  │                              gantt_generator.build_frames()が組み立てた
+  │                              result_dfを受け取って集計するだけで、自分では
+  │                              スケジューリングしない）
+  ├ tab_analysis.py             タブ5「プロジェクト分析」（段階2の暫定実装:
+  │                              tab_gantt.pyの計算結果を直接読む——詳細は
+  │                              docs/project_analysis_tab_design.md）
+  └ widgets_common.py        タブ横断の共通UI部品（列幅自動調整含む）
 ```
 
 ## project_scheduler.py との連携方式

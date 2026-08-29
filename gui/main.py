@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from gui.db import ProjectDatabase
 from gui.gantt_generator import generate_gantt, validate_for_generation
+from gui.tab_analysis import AnalysisTab
 from gui.tab_basic_info import BasicInfoTab
 from gui.tab_gantt import GanttTab
 from gui.tab_jobs import JobsTab
@@ -120,6 +121,12 @@ class MainWindow(QMainWindow):
             ),
             "ガントチャート",
         )
+        self.tabs.addTab(
+            self._placeholder_tab(
+                "ガントチャートタブの計算結果を、KPI・マイルストーン別サマリーとして集計表示します。"
+            ),
+            "プロジェクト分析",
+        )
         self.tabs.setEnabled(False)
 
     def _shutdown_gantt_tab(self):
@@ -152,6 +159,9 @@ class MainWindow(QMainWindow):
 
         self.tab_gantt = GanttTab(self.db)
         self.tabs.addTab(self.tab_gantt, "ガントチャート")
+
+        self.tab_analysis = AnalysisTab(self.db, self.tab_gantt)
+        self.tabs.addTab(self.tab_analysis, "プロジェクト分析")
 
         self.tabs.setEnabled(True)
         self.generate_action.setEnabled(True)
