@@ -384,7 +384,16 @@ class AnalysisTab(QWidget):
         self.milestone_table.setRowCount(0)
         self.breakdown_hint_label.setText("")
         self._dimension_combo.setVisible(False)
+        # setRowCount(0) は選択中の行があると itemSelectionChanged を同期的に
+        # 発火させ、_on_team_row_selected → _render_team_chart を再入させる。
+        # そこで参照する _team_summary_weeks 等はこの直後の
+        # _clear_team_summary_cache() でまだ None にしていない古い値のままなので、
+        # 直前の（別のスケジューリング結果に基づく）グラフを壊れた状態で
+        # 参照してしまう。表の更新中はシグナルを止めて再入を防ぐ
+        # （_render_team_summary() が同じ理由で行っているのと同じ対策）。
+        self.team_table.blockSignals(True)
         self.team_table.setRowCount(0)
+        self.team_table.blockSignals(False)
         self.team_chart_view.setScene(None)
         self.team_chart_label.setText("")
         self.team_legend_label.setText("")
