@@ -195,6 +195,57 @@ def team_concurrency_steps(result_df, team_id=None):
     return list(zip(counts.index, counts.values.astype(int)))
 
 
+# グラフのX軸の粒度。チーム別サマリーは週次固定、ワークフロー別サマリーは
+# 利用者が3段階から選ぶ（docs/project_analysis_tab_design.md §2-4）。
+GRANULARITY_MONTH = "month"
+GRANULARITY_WEEK = "week"
+GRANULARITY_DAY = "day"
+
+
+def period_start_of(ts, granularity):
+    """ts が属する期間の開始日（月次ならその月の1日、週次ならその週の月曜、
+    日次ならその日）。"""
+    day = pd.Timestamp(ts).normalize()
+    if granularity == GRANULARITY_MONTH:
+        return day.replace(day=1)
+    if granularity == GRANULARITY_WEEK:
+        return day - pd.Timedelta(days=day.weekday())
+    return day
+
+
+def period_end_of(start, granularity):
+    """開始日 start の期間の終了日（**exclusive**＝次の期間の開始日）。
+    `result_df` の `End_Date` と同じ半開区間 [start, end) の規約に揃える。"""
+    if granularity == GRANULARITY_MONTH:
+        return pd.Timestamp(start) + pd.offsets.MonthBegin(1)
+    if granularity == GRANULARITY_WEEK:
+        return pd.Timestamp(start) + pd.Timedelta(days=7)
+    return pd.Timestamp(start) + pd.Timedelta(days=1)
+
+
+def period_starts(range_start, range_end, granularity=GRANULARITY_WEEK):
+    """[range_start, range_end] を覆う各期間の開始日（`pd.Timestamp`）の昇順リスト
+    （グラフのX軸の目盛りにあたる）。"""
+    cursor = period_start_of(range_start, granularity)
+    last = pd.Timestamp(range_end).normalize()
+    periods = []
+    while cursor <= last:
+        periods.append(cursor)
+        cursor = period_end_of(cursor, granularity)
+    return periods
+
+
+def period_index(ts, first_start, granularity):
+    """ts が先頭期間 first_start から数えて何番目の期間に入るか（0始まり）。
+    範囲の外でも外挿した値（負・末尾超え）を返すので、呼び出し側で丸める。"""
+    day = pd.Timestamp(ts).normalize()
+    if granularity == GRANULARITY_MONTH:
+        return (day.year - first_start.year) * 12 + (day.month - first_start.month)
+    if granularity == GRANULARITY_WEEK:
+        return (day - first_start).days // 7
+    return (day - first_start).days
+
+
 def week_starts(range_start, range_end):
     """[range_start, range_end] を覆う各週の月曜日（`pd.Timestamp`）の昇順リスト。
 
@@ -202,14 +253,7 @@ def week_starts(range_start, range_end):
     ギザギザになって読めないため、**週次に集計してから描く**。月次にすると
     数か月しかない短いプロジェクトでは点が数個しか並ばず形が読めないので、
     週を単位にしている（この関数がそのX軸の目盛りにあたる）。"""
-    start = pd.Timestamp(range_start).normalize()
-    cursor = start - pd.Timedelta(days=start.weekday())  # その週の月曜
-    last = pd.Timestamp(range_end).normalize()
-    weeks = []
-    while cursor <= last:
-        weeks.append(cursor)
-        cursor += pd.Timedelta(days=7)
-    return weeks
+    return period_starts(range_start, range_end, GRANULARITY_WEEK)
 
 
 def _week_index(ts, first_monday):
@@ -422,6 +466,98 @@ def compute_all_teams_row(result_df):
         "resource_adjusted": 0 if empty else int(result_df["Resource_Adjusted"].sum()),
         "overrun": 0 if empty else int((result_df["Deadline_Overrun_Days"] > 0).sum()),
     }
+
+
+def active_task_counts(df, periods, granularity):
+    """期間ごとの**稼働タスク件数**（その期間に1日でも走っているタスクの本数）
+    を、periods と同じ順のリストで返す。
+
+    同時タスク数（`weekly_concurrency_by_team()` 等）とは別の量。開始件数でも
+    同時本数でもなく「その期間に走っているか」の1/0をタスクごとに数えるので、
+    **長いタスクが期間をまたいでも山が消えない**（設計案§2-4）。1タスクは
+    1期間で高々1回しか数えないため、ワークフローごとの値を積み上げれば
+    合計は「その期間に走っているタスクの総数」になる（重複しない）。
+
+    タスクが稼働している最後の日は `End_Date - 1日`（End_Dateはexclusive）。
+    期間の範囲へ丸めた上で差分＋累積和を取るので O(タスク数 + 期間数)。"""
+    if not periods:
+        return []
+    counts = [0] * (len(periods) + 1)
+    if df.empty:
+        return counts[:-1]
+    first_start = periods[0]
+    last_index = len(periods) - 1
+    for start, end in zip(df["Start_Date"], df["End_Date"]):
+        last_active_day = pd.Timestamp(end) - pd.Timedelta(days=1)
+        if last_active_day < start:
+            continue  # 稼働日を1日も持たないタスク（防御的）
+        lo = max(period_index(start, first_start, granularity), 0)
+        hi = min(period_index(last_active_day, first_start, granularity), last_index)
+        if hi < lo:
+            continue  # 描画範囲の外
+        counts[lo] += 1
+        counts[hi + 1] -= 1
+    running = 0
+    values = []
+    for i in range(len(periods)):
+        running += counts[i]
+        values.append(running)
+    return values
+
+
+def active_task_counts_by_workflow(result_df, workflow_ids, periods, granularity):
+    """`active_task_counts()` をワークフローごとに集計する。
+
+    Returns: ({workflow_id: [値, ...]}, [期間ごとの合計, ...])
+    （いずれも periods と同じ順）。合計は各系列の和として求める——積み上げ
+    グラフの高さと必ず一致させるため（1タスクは1ワークフローにしか属さないので
+    重複して数えることはない）。"""
+    series = {}
+    for workflow_id in workflow_ids:
+        df = result_df[result_df["Workflow_ID"] == workflow_id] if not result_df.empty else result_df
+        series[workflow_id] = active_task_counts(df, periods, granularity)
+    totals = [sum(values[i] for values in series.values()) for i in range(len(periods))]
+    return series, totals
+
+
+def _job_duration_days(df):
+    """ジョブごとの所要期間（最初のタスク開始〜最後のタスク終了の暦日）のリスト。
+    `End_Date` はexclusiveなので、その差がそのまま暦日数になる。"""
+    if df.empty:
+        return []
+    spans = df.groupby("Job_ID").agg(start=("Start_Date", "min"), end=("End_Date", "max"))
+    return [int((end - start).days) for start, end in zip(spans["start"], spans["end"])]
+
+
+def compute_workflow_summary_rows(result_df, workflow_names):
+    """ワークフロー別サマリーの表の行。workflow_names（{Workflow_ID: 名前}、
+    `gui/gantt_generator.build_display()` の同名キー）と同じ順で、
+    workflow_id / name / jobs / tasks / median_duration_days（0件ならNone） /
+    overrun の辞書のリストを返す。
+
+    所要期間は**合計を取らず中央値だけ**を見る（設計案§3）——パイプラインの
+    長さの比較に使う量であって、量の集計ではないため。"""
+    rows = []
+    for workflow_id, name in workflow_names.items():
+        df = result_df[result_df["Workflow_ID"] == workflow_id] if not result_df.empty else result_df
+        durations = sorted(_job_duration_days(df))
+        if durations:
+            mid = len(durations) // 2
+            median = (
+                durations[mid] if len(durations) % 2
+                else (durations[mid - 1] + durations[mid]) / 2
+            )
+        else:
+            median = None
+        rows.append({
+            "workflow_id": workflow_id,
+            "name": name,
+            "jobs": int(df["Job_ID"].nunique()) if not df.empty else 0,
+            "tasks": int(len(df)),
+            "median_duration_days": median,
+            "overrun": int((df["Deadline_Overrun_Days"] > 0).sum()) if not df.empty else 0,
+        })
+    return rows
 
 
 def compute_milestone_breakdown_all(result_df, milestones, task_status_map):

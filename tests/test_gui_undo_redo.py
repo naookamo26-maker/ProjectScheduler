@@ -1694,7 +1694,7 @@ def test_analysis_tab_capture_and_restore_breakdown_mode(window, qapp):
     assert window.tab_analysis._dimension_combo.currentText() == "チームB"
 
 
-# -- チーム別サマリー（gui/team_summary_view.py） ---------------------------------------
+# -- チーム別サマリー（gui/analysis_charts.py） ---------------------------------------
 
 def test_team_summary_table_starts_with_an_all_teams_row_driving_the_stacked_chart(window, qapp):
     """表の先頭は「全チーム」行で、既定でそれが選択されていること。グラフは
@@ -1741,7 +1741,7 @@ def test_capacity_line_merges_consecutive_weeks_so_the_dash_pattern_is_visible()
 
     週ごと（9px）の細切れで描くと、QtのDashLineはダッシュ長を線幅の倍数で
     決めるため1ダッシュも入りきらず、実線にしか見えなくなっていた。"""
-    from gui.team_summary_view import _merge_runs
+    from gui.analysis_charts import _merge_runs
 
     # 同じ値が続く区間は1本にまとまる。
     assert _merge_runs([2, 2, 2]) == [(0, 2, 2)]
@@ -1751,6 +1751,95 @@ def test_capacity_line_merges_consecutive_weeks_so_the_dash_pattern_is_visible()
     assert _merge_runs([1, 1, None, 1]) == [(0, 1, 1), (3, 3, 1)]
     assert _merge_runs([None, None]) == []
     assert _merge_runs([]) == []
+
+
+# -- サマリーのサブタブ・ワークフロー別サマリー ------------------------------------------
+
+def test_analysis_tab_splits_the_summaries_into_sub_tabs_with_the_kpi_tiles_outside(window, qapp):
+    """サマリーはサブタブに分け、KPIタイルはその外に常時表示すること
+    （全部を縦積みにするとウインドウの高さが足りないときに窮屈になるため）。"""
+    _build_two_team_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    labels = [tab.section_tabs.tabText(i) for i in range(tab.section_tabs.count())]
+    assert labels == ["マイルストーン", "チーム", "ワークフロー"]
+    # KPIタイルはサブタブの中ではなく、タブの外（＝どのサブタブでも見える）。
+    assert tab.kpi_scale.parent() is tab
+    assert not tab.section_tabs.isAncestorOf(tab.kpi_scale)
+    assert tab.section_tabs.isAncestorOf(tab.milestone_table)
+    assert tab.section_tabs.isAncestorOf(tab.workflow_table)
+
+
+def test_analysis_tab_workflow_table_lists_each_workflow_with_its_job_and_task_counts(window, qapp):
+    """ワークフロー別サマリーの表に、ワークフローごとのジョブ件数・タスク件数・
+    ジョブ所要期間の中央値・超過件数が並ぶこと。"""
+    _build_two_team_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    headers = ["ワークフロー", "ジョブ件数", "タスク件数", "ジョブ所要期間の中央値", "超過件数"]
+    assert [
+        tab.workflow_table.horizontalHeaderItem(i).text() for i in range(len(headers))
+    ] == headers
+    assert tab.workflow_table.rowCount() == 2
+    assert tab.workflow_table.item(0, 0).text() == "WF1"
+    assert tab.workflow_table.item(0, 1).text() == "2"  # WF1のジョブ2件
+    assert tab.workflow_table.item(1, 1).text() == "1"  # WF2のジョブ1件
+    # 積み上げグラフと、色とワークフロー名を対応させる凡例が出ている。
+    assert tab.workflow_chart_view.scene() is not None
+    assert "WF1" in tab.workflow_legend_label.text()
+
+
+def test_analysis_tab_workflow_chart_granularity_switch_changes_the_number_of_points(window, qapp):
+    """粒度（月次/週次/日次）を切り替えるとグラフを引き直すこと。粒度が細かい
+    ほど点が増えるので、シーンの横幅で見分けられる。"""
+    _build_two_team_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    widths = {}
+    for key in ("month", "week", "day"):
+        tab._granularity_buttons[key].click()
+        qapp.processEvents()
+        assert tab._granularity == key
+        widths[key] = tab.workflow_chart_view.scene().itemsBoundingRect().width()
+    assert widths["month"] < widths["week"] < widths["day"]
+
+
+def test_analysis_tab_restores_the_active_sub_tab_and_granularity(window, qapp):
+    """Undo/Redoでの復元対象に、サマリーのサブタブと粒度も含まれること
+    （CLAUDE.md「内容・選択・アクティブタブを復元」）。"""
+    _build_two_team_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    tab.section_tabs.setCurrentIndex(2)  # ワークフロー
+    tab._granularity_buttons["month"].click()
+    qapp.processEvents()
+    state = tab.capture_ui_state()
+
+    tab.section_tabs.setCurrentIndex(0)
+    tab._granularity_buttons["day"].click()
+    qapp.processEvents()
+
+    tab.restore_ui_state(state)
+    qapp.processEvents()
+    assert tab.section_tabs.currentIndex() == 2
+    assert tab._granularity == "month"
+    assert tab._granularity_buttons["month"].isChecked()
 
 
 # -- ガントチャート描画（gui/gantt_view.py）: 「今日」の縦線・1行飛ばしの行背景 ------------

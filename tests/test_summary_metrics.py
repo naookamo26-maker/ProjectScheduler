@@ -15,6 +15,9 @@ pytestmark = pytest.mark.scheduler
 pd = pytest.importorskip("pandas")
 
 from gui.summary_metrics import (  # noqa: E402
+    GRANULARITY_DAY,
+    GRANULARITY_MONTH,
+    GRANULARITY_WEEK,
     STATUS_DONE,
     STATUS_IN_PROGRESS,
     STATUS_NOT_STARTED,
@@ -24,6 +27,10 @@ from gui.summary_metrics import (  # noqa: E402
     compute_milestone_cumulative_progress_pct,
     compute_milestone_rows,
     compute_team_summary_rows,
+    compute_workflow_summary_rows,
+    active_task_counts,
+    active_task_counts_by_workflow,
+    period_starts,
     week_starts,
     weekly_capacity,
     weekly_concurrency_by_team,
@@ -549,3 +556,111 @@ def test_compute_team_summary_rows_pinned_days_follows_a_mid_period_capacity_cha
     capacity_schedule = {"TEAM_1": [(pd.Timestamp.min, 1), (_ts("2026-01-05"), 3)]}
     rows = compute_team_summary_rows(df, {"TEAM_1": "チームA"}, capacity_schedule)
     assert rows[0]["pinned_days"] == 4
+
+
+# -- period_starts / active_task_counts（ワークフロー別サマリー） ------------------------
+
+def test_period_starts_covers_the_range_at_each_granularity():
+    """月次は各月の1日、週次は各週の月曜、日次は各日。いずれも範囲を覆う。"""
+    assert period_starts("2026-02-10", "2026-04-03", GRANULARITY_MONTH) == [
+        _ts("2026-02-01"), _ts("2026-03-01"), _ts("2026-04-01"),
+    ]
+    assert period_starts("2026-02-10", "2026-02-24", GRANULARITY_WEEK) == [
+        _ts("2026-02-09"), _ts("2026-02-16"), _ts("2026-02-23"),
+    ]
+    assert period_starts("2026-02-10", "2026-02-12", GRANULARITY_DAY) == [
+        _ts("2026-02-10"), _ts("2026-02-11"), _ts("2026-02-12"),
+    ]
+
+
+def test_active_task_counts_counts_a_task_once_per_period_it_spans():
+    """稼働タスク件数は「その期間に1日でも走っているタスクの本数」。長いタスクが
+    期間をまたいでも、またいだ全期間で数える（開始件数だと山が消える）。"""
+    df = _result_df([("J1", "T1", "TEAM_1", "WF_1", "MS_1",
+                       "2026-02-10", "2026-04-02", 0, "")])
+    periods = period_starts("2026-02-01", "2026-04-30", GRANULARITY_MONTH)
+    # 2月・3月・4月。End_Dateはexclusiveなので最終稼働日は04-01＝4月も1件。
+    assert active_task_counts(df, periods, GRANULARITY_MONTH) == [1, 1, 1]
+
+
+def test_active_task_counts_excludes_periods_outside_the_task_span():
+    """End_Dateはexclusive。02-02終了のタスクは02-02の日次期間には入らない。"""
+    df = _result_df([("J1", "T1", "TEAM_1", "WF_1", "MS_1",
+                       "2026-02-01", "2026-02-02", 0, "")])
+    periods = period_starts("2026-02-01", "2026-02-03", GRANULARITY_DAY)
+    assert active_task_counts(df, periods, GRANULARITY_DAY) == [1, 0, 0]
+
+
+def test_active_task_counts_is_all_zero_for_an_empty_result_df():
+    periods = period_starts("2026-02-01", "2026-02-03", GRANULARITY_DAY)
+    assert active_task_counts(EMPTY_DF, periods, GRANULARITY_DAY) == [0, 0, 0]
+
+
+def test_active_task_counts_by_workflow_totals_match_the_sum_of_the_series():
+    """積み上げグラフの高さと合計が必ず一致すること（1タスクは1ワークフローに
+    しか属さないので、重複して数えない）。"""
+    df = _result_df([
+        ("J1", "T1", "TEAM_1", "WF_1", "MS_1", "2026-02-02", "2026-02-20", 0, ""),
+        ("J2", "T1", "TEAM_1", "WF_2", "MS_1", "2026-02-09", "2026-02-13", 0, ""),
+        ("J3", "T1", "TEAM_1", "WF_2", "MS_1", "2026-02-16", "2026-02-27", 0, ""),
+    ])
+    periods = period_starts("2026-02-02", "2026-02-27", GRANULARITY_WEEK)
+    series, totals = active_task_counts_by_workflow(
+        df, ["WF_1", "WF_2"], periods, GRANULARITY_WEEK,
+    )
+    assert series["WF_1"] == [1, 1, 1, 0]
+    assert series["WF_2"] == [0, 1, 1, 1]
+    assert totals == [1, 2, 2, 1]
+    for i in range(len(periods)):
+        assert sum(values[i] for values in series.values()) == totals[i]
+
+
+# -- compute_workflow_summary_rows ---------------------------------------------
+
+def test_compute_workflow_summary_rows_counts_jobs_tasks_and_overrun():
+    df = _result_df([
+        ("J1", "T1", "TEAM_1", "WF_1", "MS_1", "2026-02-02", "2026-02-06", 0, ""),
+        ("J1", "T2", "TEAM_1", "WF_1", "MS_1", "2026-02-06", "2026-02-10", 3, ""),
+        ("J2", "T1", "TEAM_1", "WF_2", "MS_1", "2026-02-02", "2026-02-04", 0, ""),
+    ])
+    rows = compute_workflow_summary_rows(df, {"WF_1": "WF1", "WF_2": "WF2"})
+    assert [row["name"] for row in rows] == ["WF1", "WF2"]
+    assert rows[0]["jobs"] == 1 and rows[0]["tasks"] == 2 and rows[0]["overrun"] == 1
+    assert rows[1]["jobs"] == 1 and rows[1]["tasks"] == 1 and rows[1]["overrun"] == 0
+
+
+def test_workflow_median_duration_is_the_span_of_each_job_not_the_sum():
+    """所要期間は「1ジョブの最初のタスク開始〜最後のタスク終了」の暦日で、
+    合計せず中央値だけを見る（設計案§3）。J1は8日、J2は2日、J3は4日→中央値4。"""
+    df = _result_df([
+        ("J1", "T1", "TEAM_1", "WF_1", "MS_1", "2026-02-02", "2026-02-06", 0, ""),
+        ("J1", "T2", "TEAM_1", "WF_1", "MS_1", "2026-02-06", "2026-02-10", 0, ""),
+        ("J2", "T1", "TEAM_1", "WF_1", "MS_1", "2026-03-02", "2026-03-04", 0, ""),
+        ("J3", "T1", "TEAM_1", "WF_1", "MS_1", "2026-04-02", "2026-04-06", 0, ""),
+    ])
+    rows = compute_workflow_summary_rows(df, {"WF_1": "WF1"})
+    assert rows[0]["median_duration_days"] == 4
+
+
+def test_workflow_median_duration_of_an_even_number_of_jobs_averages_the_middle_two():
+    df = _result_df([
+        ("J1", "T1", "TEAM_1", "WF_1", "MS_1", "2026-02-02", "2026-02-04", 0, ""),
+        ("J2", "T1", "TEAM_1", "WF_1", "MS_1", "2026-03-02", "2026-03-07", 0, ""),
+    ])
+    rows = compute_workflow_summary_rows(df, {"WF_1": "WF1"})
+    assert rows[0]["median_duration_days"] == 3.5
+
+
+def test_workflow_row_for_a_workflow_without_tasks_is_zero_and_has_no_median():
+    """タスクが1件も無いワークフローでも行は出す（中央値だけNone＝表では空欄）。"""
+    df = _result_df([("J1", "T1", "TEAM_1", "WF_1", "MS_1",
+                       "2026-02-02", "2026-02-06", 0, "")])
+    rows = compute_workflow_summary_rows(df, {"WF_1": "WF1", "WF_2": "WF2"})
+    assert rows[1]["jobs"] == 0 and rows[1]["tasks"] == 0
+    assert rows[1]["median_duration_days"] is None
+
+
+def test_compute_workflow_summary_rows_on_empty_result_df():
+    rows = compute_workflow_summary_rows(EMPTY_DF, {"WF_1": "WF1"})
+    assert rows[0]["jobs"] == 0 and rows[0]["tasks"] == 0
+    assert rows[0]["median_duration_days"] is None and rows[0]["overrun"] == 0

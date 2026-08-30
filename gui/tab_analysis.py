@@ -22,25 +22,37 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from gui.analysis_charts import (
+    AnalysisChartView,
+    build_team_detail_scene,
+    build_team_stacked_scene,
+    build_workflow_stacked_scene,
+)
 from gui.summary_metrics import (
+    GRANULARITY_DAY,
+    GRANULARITY_MONTH,
+    GRANULARITY_WEEK,
+    active_task_counts_by_workflow,
     compute_all_teams_row,
     compute_kpi,
     compute_milestone_breakdown_all,
     compute_milestone_cumulative_progress_pct,
     compute_milestone_rows,
     compute_team_summary_rows,
+    compute_workflow_summary_rows,
+    period_starts,
     week_starts,
     weekly_capacity,
     weekly_concurrency_by_team,
     weekly_peak_breakdown_by_team,
 )
-from gui.team_summary_view import TeamSummaryChartView, build_team_detail_scene, build_team_stacked_scene
 from gui.widgets_common import NoWheelComboBox, auto_size_columns
 
 _BREAKDOWN_ALL = "all"
@@ -59,6 +71,17 @@ _TEAM_COLUMNS = ["チーム", "ピーク", "ピーク時期", "上限に張り�
 # チーム別サマリーの表の先頭「全チーム」行を、個別チームの行と見分けるための
 # キー（Qt.UserRoleに入れる）。Noneのままだと「選択なし」と区別が付かない。
 _ALL_TEAMS_KEY = "__all_teams__"
+
+_WORKFLOW_COLUMNS = ["ワークフロー", "ジョブ件数", "タスク件数", "ジョブ所要期間の中央値", "超過件数"]
+_GRANULARITY_LABELS = [
+    (GRANULARITY_MONTH, "月次"),
+    (GRANULARITY_WEEK, "週次"),
+    (GRANULARITY_DAY, "日次"),
+]
+# 日次に切り替えたときに既定で見せる期間（日数）。全期間（サンプルで約590日）を
+# 一度に描くと横に潰れて読めないため、数か月ぶんに絞る（設計案§2-4）。
+# ホイールズーム・A/Fキーでの全体表示はそのまま効く。
+_DAILY_DEFAULT_PERIODS = 90
 
 # ガントチャートタブのエラー表示と同じ赤（gui/tab_gantt.py の _set_status 参照）。
 _ALERT_COLOR = QColor("#b3261e")
@@ -121,6 +144,10 @@ class AnalysisTab(QWidget):
         self._team_summary_concurrency = None
         self._team_summary_chart_context = None
 
+        # ワークフロー別サマリーのグラフの粒度（既定は週次——チーム別サマリーの
+        # グラフと同じ目盛りで読めるうえ、全期間を一度に出しても潰れない）。
+        self._granularity = GRANULARITY_WEEK
+
         layout = QVBoxLayout(self)
 
         self.status_label = QLabel("")
@@ -141,8 +168,17 @@ class AnalysisTab(QWidget):
             kpi_row.addWidget(tile)
         layout.addLayout(kpi_row)
 
-        self.milestones_group = QGroupBox("マイルストーン別サマリー")
+        # サマリーはサブタブに分ける。全部を縦積みにすると、ウインドウの高さが
+        # 足りないときに各セクションが窮屈になる（グラフ2枚＋表3枚で1700px超）。
+        # 同時に見比べる場面がほぼ無く1つずつ掘る使い方なので、切り替えにして
+        # 各サマリーに常にフル高さを与える（docs/screens.md タブ5の節）。
+        # KPIタイルだけはタブの外に残す——全体感は常に見えている必要があるため。
+        self.section_tabs = QTabWidget()
+        layout.addWidget(self.section_tabs, 1)
+
+        self.milestones_group = QWidget()
         ms_layout = QVBoxLayout(self.milestones_group)
+        ms_layout.setContentsMargins(0, 6, 0, 0)
 
         breakdown_bar = QHBoxLayout()
         breakdown_bar.addWidget(QLabel("内訳"))
@@ -177,23 +213,24 @@ class AnalysisTab(QWidget):
         self.milestone_table.setSelectionMode(QAbstractItemView.NoSelection)
         ms_layout.addWidget(self.milestone_table)
 
-        layout.addWidget(self.milestones_group)
+        self.section_tabs.addTab(self.milestones_group, "マイルストーン")
 
         # -- チーム別サマリー ---------------------------------------------------------
-        self.team_group = QGroupBox("チーム別サマリー")
+        self.team_group = QWidget()
         team_layout = QVBoxLayout(self.team_group)
+        team_layout.setContentsMargins(0, 6, 0, 0)
 
         # グラフは1枚だけ。表の行選択で中身を差し替える——「全チーム」行なら
         # 全チームの積み上げ、個別チームの行ならそのチームの詳細（塗り＋上限の
         # 破線）。2枚並べると縦を食うわりに、同時に見比べる場面がほぼ無い。
         self.team_chart_label = QLabel("")
         team_layout.addWidget(self.team_chart_label)
-        self.team_chart_view = TeamSummaryChartView()
+        self.team_chart_view = AnalysisChartView()
         self.team_chart_view.setMinimumHeight(260)
         team_layout.addWidget(self.team_chart_view, 1)
 
         # 積み上げグラフの凡例。帯自体にチーム名は描き込まない
-        # （gui/team_summary_view.py参照——帯が薄い区間では文字がはみ出して
+        # （gui/analysis_charts.py参照——帯が薄い区間では文字がはみ出して
         # 重なり、フィットで縮小されるほど読めなくなるため）。色とチーム名の
         # 対応は、この凡例と帯のツールチップで補う
         # （docs/project_analysis_tab_design.md §7-6「凡例とツールチップの
@@ -213,12 +250,68 @@ class AnalysisTab(QWidget):
         self.team_table.itemSelectionChanged.connect(self._on_team_row_selected)
         team_layout.addWidget(self.team_table)
 
-        layout.addWidget(self.team_group, 1)
+        self.section_tabs.addTab(self.team_group, "チーム")
+
+        # -- ワークフロー別サマリー ------------------------------------------------------
+        #
+        # 積み上げグラフの縦軸は**稼働タスク件数**（その期間に1日でも走っている
+        # タスクの本数）で、チーム別サマリーの「同時タスク数」とは別の量
+        # （設計案§2-4）。1タスクは1ワークフローにしか属さないので、積み上げても
+        # 重複せず、合計は「その期間に走っているタスクの総数」になる。
+        self.workflow_group = QWidget()
+        workflow_layout = QVBoxLayout(self.workflow_group)
+        workflow_layout.setContentsMargins(0, 6, 0, 0)
+
+        granularity_bar = QHBoxLayout()
+        granularity_bar.addWidget(QLabel("粒度"))
+        self._granularity_group = QButtonGroup(self)
+        self._granularity_group.setExclusive(True)
+        self._granularity_buttons = {}
+        for key, label in _GRANULARITY_LABELS:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setChecked(key == self._granularity)
+            btn.clicked.connect(lambda _checked, k=key: self._on_granularity_changed(k))
+            self._granularity_group.addButton(btn)
+            self._granularity_buttons[key] = btn
+            granularity_bar.addWidget(btn)
+        granularity_bar.addStretch(1)
+        self.workflow_chart_label = QLabel("")
+        granularity_bar.addWidget(self.workflow_chart_label)
+        workflow_layout.addLayout(granularity_bar)
+
+        self.workflow_chart_view = AnalysisChartView()
+        self.workflow_chart_view.setMinimumHeight(260)
+        workflow_layout.addWidget(self.workflow_chart_view, 1)
+
+        # 帯にワークフロー名は描き込まない（チーム別サマリーと同じ理由——
+        # `gui/analysis_charts.py` の `_add_stacked_bands` 参照）。色と名前の
+        # 対応はこの凡例と帯のツールチップで補う。
+        self.workflow_legend_label = QLabel("")
+        self.workflow_legend_label.setWordWrap(True)
+        self.workflow_legend_label.setTextFormat(Qt.RichText)
+        workflow_layout.addWidget(self.workflow_legend_label)
+
+        self.workflow_table = QTableWidget(0, len(_WORKFLOW_COLUMNS))
+        self.workflow_table.setHorizontalHeaderLabels(_WORKFLOW_COLUMNS)
+        self.workflow_table.verticalHeader().setVisible(False)
+        self.workflow_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.workflow_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.workflow_table.setMinimumHeight(160)
+        workflow_layout.addWidget(self.workflow_table)
+
+        self.section_tabs.addTab(self.workflow_group, "ワークフロー")
 
     def _on_breakdown_changed(self, key):
         if key == self._breakdown_mode:
             return
         self._breakdown_mode = key
+        self._render()
+
+    def _on_granularity_changed(self, key):
+        if key == self._granularity:
+            return
+        self._granularity = key
         self._render()
 
     def _on_dimension_changed(self, _index):
@@ -276,6 +369,7 @@ class AnalysisTab(QWidget):
         self._render_kpi(result_df, project_start_ts, milestones, task_status_map)
         self._render_milestone_table(result_df, display, milestones, task_status_map)
         self._render_team_summary(result_df, display, milestones, project_start_ts)
+        self._render_workflow_summary(result_df, display, milestones, project_start_ts)
 
     def _show_status_only(self, message, is_error):
         """結果がまだ無い（エラー／計算中）ときの表示。タイル・表・グラフを
@@ -295,6 +389,8 @@ class AnalysisTab(QWidget):
         self.team_chart_label.setText("")
         self.team_legend_label.setText("")
         self._clear_team_summary_cache()
+        self.workflow_table.setRowCount(0)
+        self._clear_workflow_chart()
 
     def _clear_team_summary_cache(self):
         self._team_summary_display = None
@@ -454,7 +550,7 @@ class AnalysisTab(QWidget):
 
         # グラフのX軸は週次（日次のままだと変化点が営業日数ぶん並んでギザギザに
         # なり読めず、月次だと数か月の短いプロジェクトで点が数個しか並ばない。
-        # gui/team_summary_view.py 参照）。集計は2種類を使い分ける——積み上げる
+        # gui/analysis_charts.py 参照）。集計は2種類を使い分ける——積み上げる
         # 全体グラフは「合計が実在した同時タスク数になる内訳」、個別チームは
         # そのチーム単独の週内最大（gui/summary_metrics.py の各docstring参照）。
         range_start = result_df["Start_Date"].min()
@@ -488,13 +584,13 @@ class AnalysisTab(QWidget):
         item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.team_table.setItem(row, column, item)
 
-    def _build_team_legend_html(self, team_names, team_colors):
-        """積み上げグラフの凡例（色付きの四角＋チーム名を折り返しで並べる）。
-        gui/team_summary_view.py が帯自体にチーム名を描き込まない代わりに、
-        ここで色とチーム名の対応を示す（設計案§7-6）。"""
+    def _build_legend_html(self, names, colors):
+        """積み上げグラフの凡例（色付きの四角＋名前を折り返しで並べる）。
+        gui/analysis_charts.py が帯自体に名前を描き込まない代わりに、
+        ここで色と名前の対応を示す（設計案§7-6）。"""
         swatches = [
-            f'<span style="color:{team_colors.get(team_id, "#cbc9c2")};">■</span> {html.escape(name)}'
-            for team_id, name in team_names.items()
+            f'<span style="color:{colors.get(key, "#cbc9c2")};">■</span> {html.escape(name)}'
+            for key, name in names.items()
         ]
         return "&nbsp;&nbsp;&nbsp;".join(swatches)
 
@@ -536,7 +632,7 @@ class AnalysisTab(QWidget):
                 milestones, project_start_ts,
             )
             self.team_chart_label.setText("同時タスク数の推移（チーム別・積み上げ）")
-            self.team_legend_label.setText(self._build_team_legend_html(team_names, team_colors))
+            self.team_legend_label.setText(self._build_legend_html(team_names, team_colors))
         else:
             capacity_values = weekly_capacity(
                 display["team_capacity_schedule"].get(selected, []), weeks,
@@ -553,6 +649,73 @@ class AnalysisTab(QWidget):
 
         self.team_chart_view.setScene(scene)
         QTimer.singleShot(0, self.team_chart_view.fit_all)
+
+    # -- ワークフロー別サマリー --------------------------------------------------------
+
+    def _render_workflow_summary(self, result_df, display, milestones, project_start_ts):
+        """ワークフロー別サマリー（稼働タスク件数の積み上げグラフ＋表）。
+
+        グラフの粒度（月次/週次/日次）は利用者が選ぶ。日次で全期間を一度に
+        描くと横に潰れて読めないので、切り替えた直後の表示範囲だけ
+        `_DAILY_DEFAULT_PERIODS` 日ぶんに絞る（設計案§2-4）。"""
+        workflow_names = display["workflow_names"]
+        workflow_colors = display["workflow_colors"]
+
+        rows = compute_workflow_summary_rows(result_df, workflow_names)
+        self.workflow_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            self.workflow_table.setItem(row_index, 0, QTableWidgetItem(row["name"]))
+            self._set_workflow_item(row_index, 1, _fmt_int(row["jobs"]))
+            self._set_workflow_item(row_index, 2, _fmt_int(row["tasks"]))
+            median = row["median_duration_days"]
+            self._set_workflow_item(
+                row_index, 3, "—" if median is None else f"{median:g} 日",
+            )
+            overrun_item = QTableWidgetItem(_fmt_int(row["overrun"]) if row["overrun"] else "—")
+            if row["overrun"]:
+                overrun_item.setForeground(_ALERT_COLOR)
+            overrun_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.workflow_table.setItem(row_index, 4, overrun_item)
+        auto_size_columns(self.workflow_table, stretch_last=False)
+
+        if result_df.empty or not workflow_names:
+            self._clear_workflow_chart()
+            return
+
+        periods = period_starts(
+            result_df["Start_Date"].min(), result_df["End_Date"].max(), self._granularity,
+        )
+        counts_by_workflow, totals = active_task_counts_by_workflow(
+            result_df, list(workflow_names), periods, self._granularity,
+        )
+        scene = build_workflow_stacked_scene(
+            periods, counts_by_workflow, totals, workflow_colors, workflow_names,
+            milestones, project_start_ts, self._granularity,
+        )
+        self.workflow_chart_view.setScene(scene)
+        self.workflow_chart_label.setText(
+            "縦軸＝稼働タスク件数（その期間に1日でも走っているタスクの本数）"
+        )
+        self.workflow_legend_label.setText(
+            self._build_legend_html(workflow_names, workflow_colors)
+        )
+
+        if self._granularity == GRANULARITY_DAY and len(periods) > _DAILY_DEFAULT_PERIODS:
+            QTimer.singleShot(
+                0, lambda: self.workflow_chart_view.fit_leading_periods(_DAILY_DEFAULT_PERIODS),
+            )
+        else:
+            QTimer.singleShot(0, self.workflow_chart_view.fit_all)
+
+    def _clear_workflow_chart(self):
+        self.workflow_chart_view.setScene(None)
+        self.workflow_chart_label.setText("")
+        self.workflow_legend_label.setText("")
+
+    def _set_workflow_item(self, row, column, text):
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.workflow_table.setItem(row, column, item)
 
     def _sync_dimension_combo(self, mode, display, result_df):
         """「チーム別」「ワークフロー別」のときだけ対象選択コンボを表示し、
@@ -601,6 +764,10 @@ class AnalysisTab(QWidget):
             "selected_team_id": self._selected_team_id,
             "selected_workflow_id": self._selected_workflow_id,
             "selected_team_summary_id": self._selected_team_summary_id,
+            # サマリーのサブタブと、ワークフロー別サマリーのグラフの粒度
+            # （CLAUDE.md「内容・選択・アクティブタブを復元」）。
+            "section_index": self.section_tabs.currentIndex(),
+            "granularity": self._granularity,
         }
 
     def restore_ui_state(self, state):
@@ -614,4 +781,11 @@ class AnalysisTab(QWidget):
         self._selected_workflow_id = state.get("selected_workflow_id")
         self._selected_team_summary_id = state.get("selected_team_summary_id")
         self._breakdown_buttons[mode].setChecked(True)
+        granularity = state.get("granularity")
+        if granularity in self._granularity_buttons:
+            self._granularity = granularity
+            self._granularity_buttons[granularity].setChecked(True)
+        section_index = state.get("section_index")
+        if section_index is not None and 0 <= section_index < self.section_tabs.count():
+            self.section_tabs.setCurrentIndex(section_index)
         self._render()
