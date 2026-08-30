@@ -188,8 +188,25 @@ class GanttTab(QWidget):
         self.placement_slider.valueChanged.connect(self._on_placement_slider_value_changed)
         self.placement_slider.sliderReleased.connect(self._on_placement_slider_released)
         self.placement_spinbox.valueChanged.connect(self._on_placement_spinbox_value_changed)
+        # 確定（＝DB書き込みと再計算）はここだけで行う。editingFinished は
+        # Enterでの確定時とフォーカスを失った時の両方で飛ぶ
+        # （_on_placement_spinbox_editing_finished 参照）。
+        self.placement_spinbox.editingFinished.connect(
+            self._on_placement_spinbox_editing_finished
+        )
         top_row.addWidget(self.placement_group, 0, Qt.AlignRight)
         layout.addLayout(top_row)
+
+        # 配置コントロールの外側——状況表示テキスト・枠の余白・タブの空き領域
+        # ——をクリックしたときにも、数値入力欄のフォーカスが外れる（＝その
+        # タイミングで確定・再計算が走る）ようにする。これらはいずれも既定では
+        # フォーカスを受け取らないため、クリックしてもスピンボックスが
+        # アクティブなままだった（フォーカスが外れるのはチャート本体を
+        # クリックした場合だけだった）。クリックされた子ウィジェットが
+        # フォーカスを受け取らないとき、Qtは祖先を辿ってクリックフォーカスを
+        # 受け取れる最初のウィジェットへフォーカスを移すため、タブ自身に
+        # ClickFocusを持たせるだけで上記すべてが解決する。
+        self.setFocusPolicy(Qt.ClickFocus)
 
         self.view = FrozenGanttPane()
         layout.addWidget(self.view, 1)
@@ -276,14 +293,41 @@ class GanttTab(QWidget):
         self._commit_distribution_ratio(self.placement_slider.value() / 100.0)
 
     def _on_placement_spinbox_value_changed(self, value):
+        """▲▼ボタン・キー操作・入力の確定で値が変わるたびに呼ばれる。
+
+        スライダーの表示だけ追従させ、DB書き込み・再計算はここでは行わない
+        ——▲▼を押すたびに再計算していると重いうえ、Undoが1操作ずつ
+        積み上がってしまうため（スライダーをドラッグ中に書き込まず、離した
+        時に1回だけ書き込むのと同じ考え方）。実際の確定は
+        _on_placement_spinbox_editing_finished に任せる。"""
         self.placement_slider.blockSignals(True)
         self.placement_slider.setValue(value)
         self.placement_slider.blockSignals(False)
-        self._commit_distribution_ratio(value / 100.0)
+
+    def _on_placement_spinbox_editing_finished(self):
+        """スピンボックスの値を確定する。`editingFinished` は Enterでの確定時と
+        フォーカスを失った時の両方で飛ぶため、▲▼で何度動かしても確定は
+        「Enterを押した時」か「他をクリックしてアクティブでなくなった時」の
+        1回だけになる。
+
+        Enterで確定済みの値に対して、その後フォーカスが外れて再び呼ばれても
+        _commit_distribution_ratio が値が変わっていないことを見て何もしない
+        （＝非アクティブになった瞬間に同じ再計算が走り直さない）。
+
+        フォーカスアウト経路では、bind_undo_session が開いたUndo単位がまだ
+        閉じられていないうちに呼ばれる（gui/widgets_common.py の
+        _UndoSessionMixin.focusOutEvent が super() を先に呼び、その中で
+        editingFinished が飛ぶため）。したがってここでのDB書き込みは、
+        一連の▲▼操作と同じ1つのUndoにまとまる。"""
+        self._commit_distribution_ratio(self.placement_spinbox.value() / 100.0)
 
     def _commit_distribution_ratio(self, ratio):
         if ratio == self._distribution_ratio:
-            return  # 実際には変わっていない（ドラッグして元の値に戻した等）
+            # 実際には変わっていない（ドラッグして元の値に戻した、Enterで確定
+            # した後にフォーカスが外れて再度呼ばれた等）。DB書き込みも再計算も
+            # 行わない——ここで素通しすると、Undoに空のエントリが積まれたり、
+            # 同じ内容の再計算が二重に走ったりする。
+            return
         self._distribution_ratio = ratio
         self.db.set_distribution_ratio(ratio)
         self.refresh_choices()

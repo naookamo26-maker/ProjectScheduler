@@ -28,7 +28,8 @@ pd = pytest.importorskip("pandas")
 # 分類: gui（PySide6 + offscreen QApplication が必要。最も重い）
 pytestmark = pytest.mark.gui
 
-from PySide6.QtCore import QDate, Qt  # noqa: E402
+from PySide6.QtCore import QDate, QPoint, Qt  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QDialog  # noqa: E402
 
 from gui.db import ProjectDatabase  # noqa: E402
@@ -2741,6 +2742,120 @@ def test_start_pin_date_typing_a_digit_does_not_corrupt_the_special_value_text(w
     # 値として読める日付になっていること（2000年代の番兵ではない）。
     assert pin_edit.value() is not None
     assert pin_edit.date().year() >= QDate.currentDate().year()
+
+
+def _focused_placement_spinbox(window, qapp):
+    """ガントチャートタブを開き、配置コントロールの数値入力欄にフォーカスを当てる。"""
+    _build_schedulable_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    spin = window.tab_gantt.placement_spinbox
+    spin.setFocus()
+    qapp.processEvents()
+    assert spin.hasFocus()
+    return spin
+
+
+def test_placement_spinbox_arrows_do_not_recompute_until_focus_leaves(window, qapp):
+    """回帰テスト: 配置コントロールの▲▼を押すたびにDB書き込み＋再計算が走って
+    いた（重いうえ、Undoが1押しずつ積み上がってしまう）。値の変更は表示だけに
+    留め、確定はアクティブ状態が外れた時（またはEnter）に1回だけ行う。"""
+    spin = _focused_placement_spinbox(window, qapp)
+    tab = window.tab_gantt
+
+    revision_before = window.db.revision
+    seq_before = window.schedule_cache._request_seq
+    start_value = spin.value()
+
+    for _ in range(3):
+        spin.stepBy(1)
+        qapp.processEvents()
+
+    # 表示（スピンボックスとスライダー）は追従するが、DBも再計算も動かない。
+    assert spin.value() == start_value + 3
+    assert tab.placement_slider.value() == start_value + 3
+    assert window.db.revision == revision_before
+    assert window.schedule_cache._request_seq == seq_before
+
+    # アクティブ状態が外れて初めて、1回だけ確定・再計算される。
+    spin.clearFocus()
+    qapp.processEvents()
+    assert window.db.revision != revision_before
+    assert window.schedule_cache._request_seq == seq_before + 1
+    assert window.db.get_project()["distribution_ratio"] == (start_value + 3) / 100.0
+
+
+def test_placement_spinbox_arrows_collapse_into_a_single_undo_entry(window, qapp):
+    """▲を複数回押してからフォーカスを外すまでが1つのUndo単位であること。
+
+    このUndoのまとめ自体は bind_undo_session（フォーカスの出入りで単位を
+    開閉する）が以前から担っており、確定を遅らせる変更の前後で壊れていない
+    ことを守るためのテスト。確定をフォーカスアウトへ移した際、DB書き込みが
+    Undo単位の「外」に出てしまうと（gui/widgets_common.py の
+    _UndoSessionMixin.focusOutEvent が end_undo_group を呼んだ後に書き込むと）
+    ここが壊れる。"""
+    spin = _focused_placement_spinbox(window, qapp)
+    original_ratio = window.db.get_project()["distribution_ratio"]
+
+    for _ in range(3):
+        spin.stepBy(1)
+        qapp.processEvents()
+    spin.clearFocus()
+    qapp.processEvents()
+
+    changed_ratio = window.db.get_project()["distribution_ratio"]
+    assert changed_ratio != original_ratio
+
+    # Undo1回で、3回ぶんの▲がまとめて元に戻る。
+    window.undo_manager.undo()
+    qapp.processEvents()
+    assert window.db.get_project()["distribution_ratio"] == original_ratio
+
+
+def test_placement_spinbox_enter_commits_once_and_focus_out_does_not_repeat_it(window, qapp):
+    """Enterでの確定は即座に反映してよいが、その後フォーカスが外れた際に
+    同じ内容の確定・再計算が二重に走らないこと。
+
+    確定をフォーカスアウトへ移したことで新たに生じる危険を守るためのテスト
+    ——editingFinished は Enter と フォーカスアウトの両方で飛ぶため、
+    _commit_distribution_ratio の「値が変わっていなければ何もしない」判定を
+    外すと、Enterで確定した直後にフォーカスを外しただけで同じ再計算が
+    もう一度走ってしまう。"""
+    spin = _focused_placement_spinbox(window, qapp)
+
+    spin.stepBy(1)
+    qapp.processEvents()
+
+    QTest.keyClick(spin, Qt.Key_Return)
+    qapp.processEvents()
+    revision_after_enter = window.db.revision
+    seq_after_enter = window.schedule_cache._request_seq
+    ratio_after_enter = window.db.get_project()["distribution_ratio"]
+    assert ratio_after_enter == spin.value() / 100.0
+
+    spin.clearFocus()
+    qapp.processEvents()
+    assert window.db.revision == revision_after_enter
+    assert window.schedule_cache._request_seq == seq_after_enter
+
+
+def test_placement_spinbox_loses_focus_when_clicking_elsewhere_in_the_tab(window, qapp):
+    """配置コントロールの外（状況表示テキスト・枠の余白・タブの空き領域）を
+    クリックしたら、数値入力欄のアクティブ状態が外れること。以前はこれらが
+    どれもフォーカスを受け取らないため、クリックしてもアクティブなままだった
+    （チャート本体をクリックした場合だけ外れていた）。"""
+    tab = window.tab_gantt
+    spin = _focused_placement_spinbox(window, qapp)
+
+    for target in (tab.status_label, tab.placement_group, tab):
+        spin.setFocus()
+        qapp.processEvents()
+        assert spin.hasFocus()
+
+        QTest.mouseClick(target, Qt.LeftButton, Qt.NoModifier, QPoint(3, 3))
+        qapp.processEvents()
+        assert not spin.hasFocus(), f"{type(target).__name__} のクリックでフォーカスが外れていない"
 
 
 def test_gantt_tab_reports_unsatisfiable_pin_in_the_status_line(window, qapp):
