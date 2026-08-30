@@ -230,6 +230,18 @@ class OptionalDateEdit(NoWheelDateEdit):
     Delete/Backspaceキーで直接「未設定」に戻せるようにする（値を持つ入力欄で
     Deleteが「クリア」を意味するのは一般的な操作感のため、追加のボタンを
     UIに増やさずに済む）。
+
+    逆に「未設定から日付を入れ始める」側も、素のQDateEditでは破綻する。
+    特殊値（_UNSET_DATE）は最小値でもあるため、Qtの既定動作では:
+
+    - ▲/▼キー・スピンの矢印・ホイールは、最小値の**年セクション**を1つ
+      動かして 2001-01-01 にしてしまう（実務で使う日付から20年以上離れる）。
+    - 表示が「（固定なし）」という特殊テキストなので、そこへ数字を打っても
+      Qtはセクションを更新できず、'（固定なし）0260415' のような壊れた表示に
+      なるだけで値が入らない。
+
+    どちらも「未設定から入力を始めた瞬間に今日を起点として置く」ことで解決する
+    （DefaultAwareSpinBoxが0から既定値を起点に増減するのと同じ考え方）。
     """
 
     def __init__(self, parent=None):
@@ -268,6 +280,22 @@ class OptionalDateEdit(NoWheelDateEdit):
             today = QDate.currentDate()
             self.calendarWidget().setCurrentPage(today.year(), today.month())
 
+    def _seed_from_unset(self):
+        """未設定の状態から日付の入力を始める際、今日を起点として置く
+        （クラスのdocstring参照）。実際に置き換えたらTrueを返す。"""
+        if self.date() == _UNSET_DATE:
+            self.setDate(QDate.currentDate())
+            return True
+        return False
+
+    def stepBy(self, steps):
+        # 未設定から▲▼・ホイールで動かしたときの1歩目は、最小値(2000-01-01)の
+        # 年セクションを動かす既定動作ではなく「今日」にする。2歩目以降は
+        # 通常どおりカーソル位置のセクションを増減する。
+        if self._seed_from_unset():
+            return
+        super().stepBy(steps)
+
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
         QTimer.singleShot(0, self._sync_calendar_page_to_today)
@@ -277,6 +305,11 @@ class OptionalDateEdit(NoWheelDateEdit):
             self.setDate(_UNSET_DATE)
             event.accept()
             return
+        # 数字の打鍵で入力を始めた場合は、先に今日を入れて通常の日付表示に
+        # してから、その打鍵をQtに渡してセクションへ適用させる（特殊テキストの
+        # ままでは打鍵がセクションに入らない）。
+        if event.text().isdigit():
+            self._seed_from_unset()
         super().keyPressEvent(event)
         QTimer.singleShot(0, self._sync_calendar_page_to_today)
 

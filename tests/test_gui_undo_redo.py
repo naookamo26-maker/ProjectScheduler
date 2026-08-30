@@ -2672,6 +2672,77 @@ def test_start_pin_date_calendar_popup_opens_near_today_not_year_2000(window, qa
     assert pin_edit.value() is None
 
 
+def _fresh_pin_edit(window, qapp, name_suffix=""):
+    """ジョブタブのタスク上書き表を1行だけ用意し、その「開始固定日」欄を返す。"""
+    team_id = window.db.add_team(f"チームA{name_suffix}", 1)
+    ms_id = window.db.add_milestone(f"MS1{name_suffix}", "2026-06-30")
+    wf_id = window.db.add_workflow(f"WF1{name_suffix}")
+    window.db.add_workflow_task(wf_id, "タスク1", team_id, 3)
+    job_id = window.db.add_job(f"ジョブ1{name_suffix}", wf_id, ms_id, 1)
+
+    window.tabs.setCurrentWidget(window.tab_jobs)
+    window.tab_jobs.refresh_jobs(select_id=job_id)
+    qapp.processEvents()
+
+    pin_edit = window.tab_jobs.override_table.cellWidget(0, 5)
+    assert pin_edit.value() is None  # 未設定（特殊値の2000-01-01）から始める
+    return pin_edit, job_id
+
+
+def test_start_pin_date_steps_from_today_not_from_the_year_2000_sentinel(window, qapp):
+    """回帰テスト: 未設定（特殊値の2000-01-01）の開始固定日を▲キー・スピンの
+    矢印・ホイールで動かすと、Qtの既定動作では最小値の**年セクション**が1つ
+    進んで 2001-01-01 になってしまい、「日付を変えようとすると2000年代に
+    なる」という状態だった。
+
+    未設定から動かした1歩目は今日を起点にする（DefaultAwareSpinBoxが0から
+    既定値を起点に増減するのと同じ考え方。gui/widgets_common.py の
+    OptionalDateEdit.stepBy 参照）。カレンダーの表示ページだけを直した以前の
+    修正では、この経路には効いていなかった。"""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    today_iso = QDate.currentDate().toString("yyyy-MM-dd")
+
+    # 経路1: スピンの矢印ボタン相当（stepBy）。
+    pin_edit, job_id = _fresh_pin_edit(window, qapp)
+    pin_edit.stepBy(1)
+    qapp.processEvents()
+    assert pin_edit.value() == today_iso
+    assert window.db.list_job_tasks_with_overrides(job_id)[0]["start_pin_date"] == today_iso
+
+    # 経路2: ▲キー（QDateEdit内部でstepByを呼ぶ）。
+    pin_edit2, _ = _fresh_pin_edit(window, qapp, name_suffix="_b")
+    pin_edit2.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Up, Qt.NoModifier))
+    qapp.processEvents()
+    assert pin_edit2.value() == today_iso
+
+    # 2歩目以降は通常どおりカーソル位置のセクションを増減する（今日に張り付かない）。
+    pin_edit2.stepBy(1)
+    qapp.processEvents()
+    assert pin_edit2.value() != today_iso
+    assert pin_edit2.value() is not None
+
+
+def test_start_pin_date_typing_a_digit_does_not_corrupt_the_special_value_text(window, qapp):
+    """回帰テスト: 未設定の間は表示が「（固定なし）」という特殊テキストのため、
+    そこへ数字を打つとQtはセクションを更新できず、'（固定なし）0260415' の
+    ような壊れた表示になったうえ値も入らなかった。数字の打鍵で入力を
+    始めた場合は、先に今日を入れて通常の日付表示にしてから打鍵を適用する。"""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    pin_edit, _ = _fresh_pin_edit(window, qapp)
+    pin_edit.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_2, Qt.NoModifier, "2"))
+    qapp.processEvents()
+
+    # 特殊テキストが残った壊れた表示になっていないこと。
+    assert "（固定なし）" not in pin_edit.text()
+    # 値として読める日付になっていること（2000年代の番兵ではない）。
+    assert pin_edit.value() is not None
+    assert pin_edit.date().year() >= QDate.currentDate().year()
+
+
 def test_gantt_tab_reports_unsatisfiable_pin_in_the_status_line(window, qapp):
     """満たせない開始固定日は例外ではなく結果として返るため、状況表示で
     件数を出さないと気付けない。"""
