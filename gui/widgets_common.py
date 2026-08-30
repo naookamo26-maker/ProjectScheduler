@@ -9,7 +9,7 @@
   それらをまとめて畳める折りたたみセクション（ジョブ・ガントチャートタブ共通）。
 """
 
-from PySide6.QtCore import QDate, Qt, Signal
+from PySide6.QtCore import QDate, Qt, QTimer, Signal
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -254,22 +254,31 @@ class OptionalDateEdit(NoWheelDateEdit):
         """未設定（_UNSET_DATE=2000-01-01）のままカレンダーを開くと表示月が
         2000年になってしまい、現在の年まで大きくスクロールする必要がある。
         実際の値（＝未設定という状態）は変えず、カレンダーの表示ページだけ
-        今日の月に合わせておく（ポップアップが開く直前のイベントで呼ぶ）。"""
+        今日の月に合わせておく。
+
+        ポップアップを開く操作（mousePressEvent/keyPressEvent）の直後に
+        呼ぶだけでは効果が無い——QDateTimeEdit側がポップアップを開く際、
+        自分自身の`date()`（＝未設定の2000-01-01）に合わせてカレンダーの
+        表示ページを自動的に上書きするため、そちらが後から効いて2000年に
+        戻ってしまう（実際に確認済み）。QDateTimeEdit自身の処理が終わった
+        「後」に上書きし直す必要があるため、呼び出し側で
+        `QTimer.singleShot(0, ...)` 経由で次のイベントループへ回してから
+        呼ぶ。"""
         if self.date() == _UNSET_DATE:
             today = QDate.currentDate()
             self.calendarWidget().setCurrentPage(today.year(), today.month())
 
     def mousePressEvent(self, event):
-        self._sync_calendar_page_to_today()
         super().mousePressEvent(event)
+        QTimer.singleShot(0, self._sync_calendar_page_to_today)
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
             self.setDate(_UNSET_DATE)
             event.accept()
             return
-        self._sync_calendar_page_to_today()
         super().keyPressEvent(event)
+        QTimer.singleShot(0, self._sync_calendar_page_to_today)
 
 
 def _to_qdate_or_unset(iso_str):

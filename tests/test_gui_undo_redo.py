@@ -2631,6 +2631,47 @@ def test_start_pin_date_column_edits_the_override_and_is_undoable(window, qapp):
     assert pin_edit.value() is None
 
 
+def test_start_pin_date_calendar_popup_opens_near_today_not_year_2000(window, qapp):
+    """回帰テスト: 「開始固定日」が未設定（特殊値の2000-01-01）のままカレンダーを
+    開くと、表示ページが2000年になってしまい現在の年まで大きくスクロールする
+    必要があった。gui/widgets_common.py の _sync_calendar_page_to_today は
+    以前から存在したが、mousePressEvent内でsuper()を呼ぶ「前」に効かせようと
+    していたため、QDateTimeEdit自身がポップアップを開く際に自分の日付
+    （＝2000-01-01）へ表示ページを上書きし直す処理が後から効いてしまい、
+    実際には直っていなかった（QTest.mouseClickで実際にポップアップを開いて
+    確認しないと検出できない——setDate()を直接呼ぶだけのテストでは再現しない）。"""
+    from PySide6.QtCore import QPoint
+    from PySide6.QtTest import QTest
+
+    jobs_tab = window.tab_jobs
+    team_id = window.db.add_team("チームA", 1)
+    ms_id = window.db.add_milestone("MS1", "2026-06-30")
+    wf_id = window.db.add_workflow("WF1")
+    window.db.add_workflow_task(wf_id, "タスク1", team_id, 3)
+    job_id = window.db.add_job("ジョブ1", wf_id, ms_id, 1)
+
+    window.tabs.setCurrentWidget(jobs_tab)
+    jobs_tab.refresh_jobs(select_id=job_id)
+    qapp.processEvents()
+
+    pin_edit = jobs_tab.override_table.cellWidget(0, 5)
+    assert pin_edit.value() is None  # 未設定（特殊値の2000-01-01）から始める
+
+    # ドロップダウンの矢印ボタンは右端にある。ウィジェット全体へのクリックとして
+    # 実際にQtのイベントを流し、QDateTimeEdit本体のポップアップ表示処理まで
+    # 走らせる（内部実装への依存を避けるため、正確なボタン矩形は問わない）。
+    QTest.mouseClick(
+        pin_edit, Qt.LeftButton, Qt.NoModifier, QPoint(pin_edit.width() - 10, pin_edit.height() // 2),
+    )
+    qapp.processEvents()
+
+    calendar = pin_edit.calendarWidget()
+    today = QDate.currentDate()
+    assert (calendar.yearShown(), calendar.monthShown()) == (today.year(), today.month())
+    # ポップアップを開いただけでは値そのものは変えない。
+    assert pin_edit.value() is None
+
+
 def test_gantt_tab_reports_unsatisfiable_pin_in_the_status_line(window, qapp):
     """満たせない開始固定日は例外ではなく結果として返るため、状況表示で
     件数を出さないと気付けない。"""
