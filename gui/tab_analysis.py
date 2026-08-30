@@ -33,6 +33,7 @@ from gui.analysis_charts import (
     AnalysisChartView,
     build_team_detail_scene,
     build_team_stacked_scene,
+    build_workflow_detail_scene,
     build_workflow_stacked_scene,
 )
 from gui.summary_metrics import (
@@ -41,6 +42,7 @@ from gui.summary_metrics import (
     GRANULARITY_WEEK,
     active_task_counts_by_workflow,
     compute_all_teams_row,
+    compute_all_workflows_row,
     compute_kpi,
     compute_milestone_breakdown_all,
     compute_milestone_cumulative_progress_pct,
@@ -73,6 +75,9 @@ _TEAM_COLUMNS = ["チーム", "ピーク", "ピーク時期", "上限に張り�
 _ALL_TEAMS_KEY = "__all_teams__"
 
 _WORKFLOW_COLUMNS = ["ワークフロー", "ジョブ件数", "タスク件数", "ジョブ所要期間の中央値", "超過件数"]
+# ワークフロー別サマリーの表の先頭「全ワークフロー」行を、個別ワークフローの
+# 行と見分けるためのキー（_ALL_TEAMS_KEYと同じ考え方）。
+_ALL_WORKFLOWS_KEY = "__all_workflows__"
 _GRANULARITY_LABELS = [
     (GRANULARITY_MONTH, "月次"),
     (GRANULARITY_WEEK, "週次"),
@@ -144,9 +149,25 @@ class AnalysisTab(QWidget):
         self._team_summary_concurrency = None
         self._team_summary_chart_context = None
 
+        # ワークフロー別サマリーの表で選択中の行（詳細グラフに連動。
+        # _selected_team_summary_idと同じ考え方）。
+        self._selected_workflow_summary_id = None
+        # _render_workflow_summary() が最後に描いた系列（行選択が変わるたびに
+        # チャートだけ作り直すために覚えておく——_team_summary_*と同じ考え方）。
+        self._workflow_summary_periods = None
+        self._workflow_summary_series = None
+        self._workflow_summary_totals = None
+        self._workflow_summary_colors = None
+        self._workflow_summary_names = None
+        self._workflow_summary_chart_context = None
+
         # ワークフロー別サマリーのグラフの粒度（既定は週次——チーム別サマリーの
         # グラフと同じ目盛りで読めるうえ、全期間を一度に出しても潰れない）。
         self._granularity = GRANULARITY_WEEK
+        # _render_workflow_summary() が最後に描いた期間数（_fit_workflow_chart()
+        # が「日次で全期間ぶんの点があるか」を、表が表示されていない間でも
+        # 再計算せずに判定できるようにするため）。
+        self._workflow_period_count = 0
 
         layout = QVBoxLayout(self)
 
@@ -296,11 +317,27 @@ class AnalysisTab(QWidget):
         self.workflow_table.setHorizontalHeaderLabels(_WORKFLOW_COLUMNS)
         self.workflow_table.verticalHeader().setVisible(False)
         self.workflow_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.workflow_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.workflow_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.workflow_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.workflow_table.setMinimumHeight(160)
+        self.workflow_table.itemSelectionChanged.connect(self._on_workflow_row_selected)
         workflow_layout.addWidget(self.workflow_table)
 
         self.section_tabs.addTab(self.workflow_group, "ワークフロー")
+
+        # 「チーム」「ワークフロー」サブタブは、初めて表示されるまでQTabWidgetの
+        # 非表示ページとしてのサイズ（既定の640x480）のままで、データ更新時に
+        # 予約したフィット（_render_team_chart / _render_workflow_summary の
+        # QTimer.singleShot）がそのタイミングで走ると、実際の表示サイズより
+        # 小さいビューを基準にフィットしてしまう。表示に切り替わった時点で
+        # 改めてフィットし直すことで、初回表示でも画面ぴったりに合わせる。
+        self.section_tabs.currentChanged.connect(self._on_section_tab_changed)
+
+    def _on_section_tab_changed(self, index):
+        if index == self.section_tabs.indexOf(self.team_group):
+            self._fit_team_chart()
+        elif index == self.section_tabs.indexOf(self.workflow_group):
+            self._fit_workflow_chart()
 
     def _on_breakdown_changed(self, key):
         if key == self._breakdown_mode:
@@ -384,12 +421,25 @@ class AnalysisTab(QWidget):
         self.milestone_table.setRowCount(0)
         self.breakdown_hint_label.setText("")
         self._dimension_combo.setVisible(False)
+        # setRowCount(0) は選択中の行があると itemSelectionChanged を同期的に
+        # 発火させ、_on_team_row_selected → _render_team_chart を再入させる。
+        # そこで参照する _team_summary_weeks 等はこの直後の
+        # _clear_team_summary_cache() でまだ None にしていない古い値のままなので、
+        # 直前の（別のスケジューリング結果に基づく）グラフを壊れた状態で
+        # 参照してしまう。表の更新中はシグナルを止めて再入を防ぐ
+        # （_render_team_summary() が同じ理由で行っているのと同じ対策）。
+        self.team_table.blockSignals(True)
         self.team_table.setRowCount(0)
+        self.team_table.blockSignals(False)
         self.team_chart_view.setScene(None)
         self.team_chart_label.setText("")
         self.team_legend_label.setText("")
         self._clear_team_summary_cache()
+        # ワークフローの表も選択可能なため、team_tableと同じ理由でシグナルを
+        # 止めてから空にする。
+        self.workflow_table.blockSignals(True)
         self.workflow_table.setRowCount(0)
+        self.workflow_table.blockSignals(False)
         self._clear_workflow_chart()
 
     def _clear_team_summary_cache(self):
@@ -448,21 +498,24 @@ class AnalysisTab(QWidget):
         hint = "ジョブ件数は延べ（1ジョブが複数マイルストーンにまたがりうる）"
         if mode != _BREAKDOWN_ALL and filtered_df.empty:
             # 対象が1件も無い（例: ワークフローが登録されていない、選択中の
-            # チーム/ワークフローにタスクが1件も無い）場合、内訳・進捗の列は
-            # すべて0扱いになる——テーブル自体は表示したまま、理由をここで補う。
-            hint = "選択中の対象にはタスクがありません（内訳・進捗は0になります）。" + hint
+            # チーム/ワークフローにタスクが1件も無い）場合、最終終了日・
+            # スラック・超過・内訳・進捗のすべてが0/空欄になる——テーブル自体は
+            # 表示したまま、理由をここで補う。
+            hint = "選択中の対象にはタスクがありません（締切に対する判定・内訳・進捗は空欄/0になります）。" + hint
         self.breakdown_hint_label.setText(hint)
         headers = _BASE_COLUMNS + _BREAKDOWN_EXTRA_COLUMNS
         self.milestone_table.setColumnCount(len(headers))
         self.milestone_table.setHorizontalHeaderLabels(headers)
 
-        # 基本列（締切・スラック等）は内訳モードによらず常にプロジェクト全体
-        # （全チーム・全ワークフロー）の結果から計算する——「そのマイルストーンが
-        # 間に合うか」はチーム別・ワークフロー別に絞り込んでも変わらない事実
-        # のため（設計案参照）。内訳（右側の5列）・進捗（%）は選択対象で絞り込む
-        # ——「進捗」はチーム別/ワークフロー別のときその対象の件数を基準
-        # （＝100%）にする、という利用者の要望による。
-        base_rows = compute_milestone_rows(result_df, milestones)
+        # 最終終了日・スラック・超過件数は、内訳（右側の5列）・進捗（%）と同じく
+        # 選択対象で絞り込んだ filtered_df から計算する——「チーム別」
+        # 「ワークフロー別」のときは、そのチーム/ワークフローだけのタスクで
+        # 締切に間に合うかを見る（利用者の要望による。以前はプロジェクト全体
+        # 固定だったが、対象を切り替えても値が変わらず個別の状況が読めない
+        # という指摘を受けて変更した——`docs/project_analysis_tab_design.md`
+        # §2-2参照）。マイルストーン名・締切日はタスクに依存しない値なので
+        # 絞り込みの影響を受けない。
+        base_rows = compute_milestone_rows(filtered_df, milestones)
         progress_values = compute_milestone_cumulative_progress_pct(filtered_df, milestones)
         breakdown_rows = compute_milestone_breakdown_all(filtered_df, milestones, task_status_map)
 
@@ -648,23 +701,45 @@ class AnalysisTab(QWidget):
             self.team_legend_label.setText("")  # 1色なので凡例は不要
 
         self.team_chart_view.setScene(scene)
-        QTimer.singleShot(0, self.team_chart_view.fit_all)
+        QTimer.singleShot(0, self._fit_team_chart)
+
+    def _fit_team_chart(self):
+        if self.team_chart_view.scene() is not None:
+            self.team_chart_view.fit_all()
 
     # -- ワークフロー別サマリー --------------------------------------------------------
 
     def _render_workflow_summary(self, result_df, display, milestones, project_start_ts):
-        """ワークフロー別サマリー（稼働タスク件数の積み上げグラフ＋表）。
+        """ワークフロー別サマリー（稼働タスク件数のグラフ＋表）。
 
         グラフの粒度（月次/週次/日次）は利用者が選ぶ。日次で全期間を一度に
         描くと横に潰れて読めないので、切り替えた直後の表示範囲だけ
-        `_DAILY_DEFAULT_PERIODS` 日ぶんに絞る（設計案§2-4）。"""
+        `_DAILY_DEFAULT_PERIODS` 日ぶんに絞る（設計案§2-4）。
+
+        表の行選択でグラフの中身が切り替わる（チーム別サマリーと同じ考え方。
+        _render_team_summary参照）。表の先頭に「全ワークフロー」行
+        （`compute_all_workflows_row`）を足し、その行なら全ワークフロー
+        積み上げ、個別ワークフローの行ならそのワークフロー単体になる。"""
         workflow_names = display["workflow_names"]
         workflow_colors = display["workflow_colors"]
 
-        rows = compute_workflow_summary_rows(result_df, workflow_names)
+        rows = [compute_all_workflows_row(result_df)] + compute_workflow_summary_rows(
+            result_df, workflow_names,
+        )
+        self.workflow_table.blockSignals(True)
         self.workflow_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
-            self.workflow_table.setItem(row_index, 0, QTableWidgetItem(row["name"]))
+            name_item = QTableWidgetItem(row["name"])
+            # 「全ワークフロー」行は workflow_id が None なので、専用のキーで
+            # 見分ける（Noneのままだと「選択なし」と区別が付かない）。
+            name_item.setData(
+                Qt.UserRole, _ALL_WORKFLOWS_KEY if row["workflow_id"] is None else row["workflow_id"],
+            )
+            if row["workflow_id"] is None:
+                font = name_item.font()
+                font.setBold(True)
+                name_item.setFont(font)
+            self.workflow_table.setItem(row_index, 0, name_item)
             self._set_workflow_item(row_index, 1, _fmt_int(row["jobs"]))
             self._set_workflow_item(row_index, 2, _fmt_int(row["tasks"]))
             median = row["median_duration_days"]
@@ -677,6 +752,7 @@ class AnalysisTab(QWidget):
             overrun_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.workflow_table.setItem(row_index, 4, overrun_item)
         auto_size_columns(self.workflow_table, stretch_last=False)
+        self.workflow_table.blockSignals(False)
 
         if result_df.empty or not workflow_names:
             self._clear_workflow_chart()
@@ -688,29 +764,106 @@ class AnalysisTab(QWidget):
         counts_by_workflow, totals = active_task_counts_by_workflow(
             result_df, list(workflow_names), periods, self._granularity,
         )
-        scene = build_workflow_stacked_scene(
-            periods, counts_by_workflow, totals, workflow_colors, workflow_names,
-            milestones, project_start_ts, self._granularity,
-        )
-        self.workflow_chart_view.setScene(scene)
-        self.workflow_chart_label.setText(
-            "縦軸＝稼働タスク件数（その期間に1日でも走っているタスクの本数）"
-        )
-        self.workflow_legend_label.setText(
-            self._build_legend_html(workflow_names, workflow_colors)
-        )
 
-        if self._granularity == GRANULARITY_DAY and len(periods) > _DAILY_DEFAULT_PERIODS:
-            QTimer.singleShot(
-                0, lambda: self.workflow_chart_view.fit_leading_periods(_DAILY_DEFAULT_PERIODS),
+        self._workflow_summary_periods = periods
+        self._workflow_summary_series = counts_by_workflow
+        self._workflow_summary_totals = totals
+        self._workflow_summary_colors = workflow_colors
+        self._workflow_summary_names = workflow_names
+        self._workflow_summary_chart_context = (milestones, project_start_ts)
+        self._workflow_period_count = len(periods)
+
+        # 選択を可能な限り維持する。前回選んでいた対象が今回の表にもあれば
+        # それを、無ければ（初回・ワークフローが無くなった等）「全ワークフロー」
+        # 行を選ぶ（_render_team_summaryと同じ考え方）。
+        target_row = 0
+        for row_index in range(self.workflow_table.rowCount()):
+            if (self.workflow_table.item(row_index, 0).data(Qt.UserRole)
+                    == self._selected_workflow_summary_id):
+                target_row = row_index
+                break
+        if self.workflow_table.rowCount() > 0:
+            self.workflow_table.selectRow(target_row)
+        self._render_workflow_chart()
+
+    def _on_workflow_row_selected(self):
+        selected_items = self.workflow_table.selectedItems()
+        self._selected_workflow_summary_id = (
+            selected_items[0].data(Qt.UserRole) if selected_items else None
+        )
+        self._render_workflow_chart()
+
+    def _render_workflow_chart(self):
+        """表の行選択に連動してグラフの中身を差し替える（_render_team_chartと
+        同じ考え方）。「全ワークフロー」行なら積み上げ、個別ワークフローの
+        行ならそのワークフロー単体（塗り＋折れ線、上限の概念が無いので
+        破線は無し）。いずれも _render_workflow_summary() が集計済みの系列を
+        使い回すので、行選択のたびに集計し直さない。"""
+        if self._workflow_summary_periods is None:
+            return
+        selected_items = self.workflow_table.selectedItems()
+        if not selected_items:
+            self.workflow_chart_view.setScene(None)
+            self.workflow_chart_label.setText("表の行を選択すると、稼働タスク件数の推移を表示します。")
+            self.workflow_legend_label.setText("")
+            return
+
+        selected = selected_items[0].data(Qt.UserRole)
+        periods = self._workflow_summary_periods
+        workflow_names = self._workflow_summary_names
+        workflow_colors = self._workflow_summary_colors
+        milestones, project_start_ts = self._workflow_summary_chart_context
+
+        if selected == _ALL_WORKFLOWS_KEY:
+            scene = build_workflow_stacked_scene(
+                periods, self._workflow_summary_series, self._workflow_summary_totals,
+                workflow_colors, workflow_names, milestones, project_start_ts, self._granularity,
+            )
+            self.workflow_chart_label.setText(
+                "縦軸＝稼働タスク件数（その期間に1日でも走っているタスクの本数）"
+            )
+            self.workflow_legend_label.setText(
+                self._build_legend_html(workflow_names, workflow_colors)
             )
         else:
-            QTimer.singleShot(0, self.workflow_chart_view.fit_all)
+            scene = build_workflow_detail_scene(
+                periods, self._workflow_summary_series.get(selected, []),
+                workflow_colors.get(selected, "#cbc9c2"), milestones, project_start_ts,
+                self._granularity,
+            )
+            name = workflow_names.get(selected, selected)
+            self.workflow_chart_label.setText(f"稼働タスク件数の推移: {name}")
+            self.workflow_legend_label.setText("")  # 1色なので凡例は不要
+
+        self.workflow_chart_view.setScene(scene)
+        QTimer.singleShot(0, self._fit_workflow_chart)
+
+    def _fit_workflow_chart(self):
+        """粒度に応じたフィット（_render_workflow_summary参照）を、現在
+        表示中のシーンに対してやり直す。データ更新直後だけでなく、
+        「チーム」「ワークフロー」サブタブへの切り替え直後（_on_section_tab_changed）
+        にも呼ぶ——非表示だったページはQTabWidget既定サイズのままで、その
+        状態でフィットすると実際の表示サイズに合わない。"""
+        if self.workflow_chart_view.scene() is None:
+            return
+        if self._granularity == GRANULARITY_DAY and self._workflow_period_count > _DAILY_DEFAULT_PERIODS:
+            self.workflow_chart_view.fit_leading_periods(_DAILY_DEFAULT_PERIODS)
+        else:
+            self.workflow_chart_view.fit_all()
 
     def _clear_workflow_chart(self):
         self.workflow_chart_view.setScene(None)
         self.workflow_chart_label.setText("")
         self.workflow_legend_label.setText("")
+        self._clear_workflow_summary_cache()
+
+    def _clear_workflow_summary_cache(self):
+        self._workflow_summary_periods = None
+        self._workflow_summary_series = None
+        self._workflow_summary_totals = None
+        self._workflow_summary_colors = None
+        self._workflow_summary_names = None
+        self._workflow_summary_chart_context = None
 
     def _set_workflow_item(self, row, column, text):
         item = QTableWidgetItem(text)
@@ -764,6 +917,7 @@ class AnalysisTab(QWidget):
             "selected_team_id": self._selected_team_id,
             "selected_workflow_id": self._selected_workflow_id,
             "selected_team_summary_id": self._selected_team_summary_id,
+            "selected_workflow_summary_id": self._selected_workflow_summary_id,
             # サマリーのサブタブと、ワークフロー別サマリーのグラフの粒度
             # （CLAUDE.md「内容・選択・アクティブタブを復元」）。
             "section_index": self.section_tabs.currentIndex(),
@@ -780,6 +934,7 @@ class AnalysisTab(QWidget):
         self._selected_team_id = state.get("selected_team_id")
         self._selected_workflow_id = state.get("selected_workflow_id")
         self._selected_team_summary_id = state.get("selected_team_summary_id")
+        self._selected_workflow_summary_id = state.get("selected_workflow_summary_id")
         self._breakdown_buttons[mode].setChecked(True)
         granularity = state.get("granularity")
         if granularity in self._granularity_buttons:

@@ -1636,6 +1636,56 @@ def test_analysis_tab_milestone_progress_uses_the_selected_breakdown_target_as_t
     assert tab.milestone_table.item(1, 1).text() == "100%"
 
 
+def test_analysis_tab_milestone_last_end_slack_and_overrun_use_the_selected_breakdown_target(
+    window, qapp,
+):
+    """「チーム別」「ワークフロー別」表示中は、最終終了日・スラック・超過件数も
+    「進捗」列・内訳列と同じくプロジェクト全体ではなく選択中の対象で計算する
+    こと（以前はプロジェクト全体固定だったが、対象を切り替えても値が変わらず
+    個別の状況が読めないという指摘を受けて変更した）。"""
+    db = window.db
+    db.set_project("スラック内訳テスト", "2026-01-05")
+    team_a = db.add_team("チームA", 2)
+    team_b = db.add_team("チームB", 1)
+    ms_id = db.add_milestone("マイルストーン1", "2026-01-20")
+    wf_id = db.add_workflow("WF1")
+    db.add_workflow_task(wf_id, "タスクA", team_a, 10)  # 長い方（10日）
+    db.add_workflow_task(wf_id, "タスクB", team_b, 3)   # 短い方（3日）
+    # 各ジョブは片方のタスクだけを有効にし、チームAは10日タスクのみ、
+    # チームBは3日タスクのみを持つようにする（それぞれのチームの終了日を
+    # はっきり分ける）。
+    job_a = db.add_job("ジョブA1", wf_id, ms_id, 100)
+    db.upsert_job_task_override(job_a, db.list_workflow_tasks(wf_id)[1]["id"], is_active=False)
+    job_b = db.add_job("ジョブB1", wf_id, ms_id, 100)
+    db.upsert_job_task_override(job_b, db.list_workflow_tasks(wf_id)[0]["id"], is_active=False)
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    # 「全体」表示中は、プロジェクト全体の最終終了日（=長い方のチームAの
+    # 10日タスク、締切ちょうどでスラック+0日）。
+    assert tab.milestone_table.item(0, 3).text() == "2026-01-20"
+    assert tab.milestone_table.item(0, 4).text() == "+0日"
+
+    tab._breakdown_buttons["team"].click()
+    qapp.processEvents()
+    assert tab._dimension_combo.currentText() == "チームA"
+    assert tab.milestone_table.item(0, 3).text() == "2026-01-20"
+    assert tab.milestone_table.item(0, 4).text() == "+0日"
+
+    idx_team_b = tab._dimension_combo.findText("チームB")
+    tab._dimension_combo.setCurrentIndex(idx_team_b)
+    qapp.processEvents()
+    # チームBは3日タスクのみで、全体より早く終わりスラックも大きくなる
+    # ——「全体」表示中の値のままではないこと（＝選択対象で計算し直している
+    # こと）を確認する。
+    assert tab.milestone_table.item(0, 3).text() == "2026-01-17"
+    assert tab.milestone_table.item(0, 4).text() == "+3日"
+
+
 def test_analysis_tab_milestone_table_handles_a_workflow_with_no_tasks(window, qapp):
     """ワークフロー別の絞り込み対象に「タスクを1件も持たないワークフロー」を
     選んでも、進捗・内訳が0扱いになるだけでクラッシュしないこと
@@ -1775,8 +1825,9 @@ def test_analysis_tab_splits_the_summaries_into_sub_tabs_with_the_kpi_tiles_outs
 
 
 def test_analysis_tab_workflow_table_lists_each_workflow_with_its_job_and_task_counts(window, qapp):
-    """ワークフロー別サマリーの表に、ワークフローごとのジョブ件数・タスク件数・
-    ジョブ所要期間の中央値・超過件数が並ぶこと。"""
+    """ワークフロー別サマリーの表に、先頭の「全ワークフロー」行に続けて
+    ワークフローごとのジョブ件数・タスク件数・ジョブ所要期間の中央値・
+    超過件数が並ぶこと（チーム別サマリーの「全チーム」行と同じ構成）。"""
     _build_two_team_project(window.db)
     window.tabs.setCurrentWidget(window.tab_gantt)
     _wait_for_schedule(window, qapp)
@@ -1788,12 +1839,38 @@ def test_analysis_tab_workflow_table_lists_each_workflow_with_its_job_and_task_c
     assert [
         tab.workflow_table.horizontalHeaderItem(i).text() for i in range(len(headers))
     ] == headers
-    assert tab.workflow_table.rowCount() == 2
-    assert tab.workflow_table.item(0, 0).text() == "WF1"
-    assert tab.workflow_table.item(0, 1).text() == "2"  # WF1のジョブ2件
-    assert tab.workflow_table.item(1, 1).text() == "1"  # WF2のジョブ1件
-    # 積み上げグラフと、色とワークフロー名を対応させる凡例が出ている。
+    assert tab.workflow_table.rowCount() == 3
+    assert tab.workflow_table.item(0, 0).text() == "全ワークフロー"
+    assert tab.workflow_table.item(0, 1).text() == "3"  # 全ワークフロー合算のジョブ3件
+    assert tab.workflow_table.item(1, 0).text() == "WF1"
+    assert tab.workflow_table.item(1, 1).text() == "2"  # WF1のジョブ2件
+    assert tab.workflow_table.item(2, 1).text() == "1"  # WF2のジョブ1件
+    # 既定は「全ワークフロー」行が選択され、積み上げグラフと、色とワークフロー名を
+    # 対応させる凡例が出ている。
+    assert tab.workflow_table.currentRow() == 0
     assert tab.workflow_chart_view.scene() is not None
+    assert "WF1" in tab.workflow_legend_label.text()
+
+
+def test_analysis_tab_workflow_row_selection_switches_chart_to_that_workflow_alone(window, qapp):
+    """表の行を選択すると、チーム別サマリーと同じくグラフがその1件だけの
+    表示に切り替わり、凡例（1色なので不要）は隠れること。"""
+    _build_two_team_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    tab.workflow_table.selectRow(1)  # WF1
+    qapp.processEvents()
+
+    assert tab.workflow_chart_view.scene() is not None
+    assert "WF1" in tab.workflow_chart_label.text()
+    assert tab.workflow_legend_label.text() == ""
+
+    tab.workflow_table.selectRow(0)  # 全ワークフローに戻す
+    qapp.processEvents()
     assert "WF1" in tab.workflow_legend_label.text()
 
 

@@ -23,7 +23,7 @@ gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、ホイー
 表示する。
 """
 
-from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -52,11 +52,10 @@ _NO_TAG_FILTER_KEY = None
 _NO_JOB_TAG_FILTER_LABEL = "（ジョブ タグなし）"
 _NO_TASK_TAG_FILTER_LABEL = "（タスク タグなし）"
 
-# 配置コントロール（チャート本体右下にオーバーレイ表示する小さな操作パネル）の
-# 幅・チャート右端／下端からの余白(px)。タイトル・ラベル・スライダー・
-# スピンボックスを縦に積まず1行に収めて縦方向を圧迫しないぶん、幅は広めに取る。
+# 配置コントロール（画面上部、計算結果テキストの右隣に並べる操作パネル）の幅。
+# タイトル・ラベル・スライダー・スピンボックスを縦に積まず1行に収めるぶん、
+# 幅は広めに取る。
 _PLACEMENT_CONTROL_WIDTH = 420
-_PLACEMENT_CONTROL_MARGIN = 12
 
 # ジョブ名検索は1文字入力するたびに絞り込みを走らせず、入力が止まってから
 # まとめて反映する（デバウンス）。値はキー入力の間隔として自然に感じられる
@@ -142,23 +141,21 @@ class GanttTab(QWidget):
         search_toolbar.addStretch(1)
         self.filters_section.content_layout.addLayout(search_toolbar)
 
+        # 計算結果テキスト（status_label）と配置コントロールを同じ行に並べる。
+        # 以前は配置コントロールをチャート本体（self.view）の右下にフローティング
+        # 表示していたが、チャートのバー・グリッド線が透けて見えてしまい操作
+        # 対象が見づらかったため、チャートへの重ね描画をやめて上部のテキストの
+        # 横（右揃え）に置く（幅はフローティング時代と同じ _PLACEMENT_CONTROL_WIDTH）。
+        top_row = QHBoxLayout()
+
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
+        top_row.addWidget(self.status_label, 1)
 
-        self.view = FrozenGanttPane()
-        layout.addWidget(self.view, 1)
-
-        # 配置コントロール（distribution_ratio の調整）。チャート本体（self.view）
-        # の右下に、レイアウトへは組み込まないフローティングパネルとして重ねる
-        # （self.viewのリサイズに追従させて位置合わせし直す。_reposition_placement_control
-        # /eventFilter参照）。ドラッグ中に毎回再計算すると重い上にUndoできない
-        # 中間状態が大量にできてしまうため、スライダーを離した時にだけ
-        # DBへ書き込み・再計算する（_on_placement_slider_released）。
         # QGroupBoxのネイティブタイトルは枠線をまたぐ固定位置にしか描画できない
-        # ため、タイトルは通常のQLabelとして枠内に置き、位置を自由に調整できる
-        # ようにする（QGroupBoxはタイトル無しの単なる枠として使う）。
-        self.placement_group = QGroupBox("", self.view)
+        # ため、タイトルは通常のQLabelとして枠内に置く（QGroupBoxはタイトル無しの
+        # 単なる枠として使う）。
+        self.placement_group = QGroupBox("")
         self.placement_group.setFixedWidth(_PLACEMENT_CONTROL_WIDTH)
         # ガントチャートの縦方向を圧迫しないよう、タイトル・ラベル・スライダー・
         # スピンボックスを縦に積まず1行に収める（そのぶん幅を確保する）。
@@ -191,22 +188,11 @@ class GanttTab(QWidget):
         self.placement_slider.valueChanged.connect(self._on_placement_slider_value_changed)
         self.placement_slider.sliderReleased.connect(self._on_placement_slider_released)
         self.placement_spinbox.valueChanged.connect(self._on_placement_spinbox_value_changed)
-        self.view.installEventFilter(self)
-        self.placement_group.adjustSize()
-        self.placement_group.raise_()
-        QTimer.singleShot(0, self._reposition_placement_control)
+        top_row.addWidget(self.placement_group, 0, Qt.AlignRight)
+        layout.addLayout(top_row)
 
-    def eventFilter(self, obj, event):
-        if obj is self.view and event.type() == QEvent.Resize:
-            self._reposition_placement_control()
-        return super().eventFilter(obj, event)
-
-    def _reposition_placement_control(self):
-        """配置コントロールをチャート本体（self.view）の右下に留め直す。"""
-        self.placement_group.adjustSize()
-        x = self.view.width() - self.placement_group.width() - _PLACEMENT_CONTROL_MARGIN
-        y = self.view.height() - self.placement_group.height() - _PLACEMENT_CONTROL_MARGIN
-        self.placement_group.move(max(0, x), max(0, y))
+        self.view = FrozenGanttPane()
+        layout.addWidget(self.view, 1)
 
     def _sync_placement_widgets(self, ratio):
         """配置コントロールのスライダー・スピンボックスの表示をratioに合わせる

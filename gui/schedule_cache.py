@@ -18,10 +18,19 @@
 自然と追いつく。
 """
 
+import gc
+
 from PySide6.QtCore import QObject, QThread, Signal
 
 from gui.gantt_generator import build_display, build_frames, compute_schedule_from_frames, validate_for_generation
 from project_scheduler import SchedulingError
+
+# 大規模サンプルで、_ScheduleWorker が別スレッドで大量にオブジェクトを確保して
+# CPythonの循環GCが走るタイミングが、GUIスレッドが大きな QGraphicsScene を
+# 破棄するタイミングと重なると、ほぼ確実にSegmentation faultになることを
+# faulthandlerで再現・特定した（gc.disable()で再現しなくなることも確認済み）。
+# 参照カウントによる解放は引き続き効くため、止めているのは循環参照の回収だけ。
+gc.disable()
 
 
 class _ScheduleWorker(QObject):

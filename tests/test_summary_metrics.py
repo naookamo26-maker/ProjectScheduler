@@ -22,6 +22,7 @@ from gui.summary_metrics import (  # noqa: E402
     STATUS_IN_PROGRESS,
     STATUS_NOT_STARTED,
     compute_all_teams_row,
+    compute_all_workflows_row,
     compute_kpi,
     compute_milestone_breakdown_all,
     compute_milestone_cumulative_progress_pct,
@@ -664,3 +665,38 @@ def test_compute_workflow_summary_rows_on_empty_result_df():
     rows = compute_workflow_summary_rows(EMPTY_DF, {"WF_1": "WF1"})
     assert rows[0]["jobs"] == 0 and rows[0]["tasks"] == 0
     assert rows[0]["median_duration_days"] is None and rows[0]["overrun"] == 0
+
+
+# -- compute_all_workflows_row（表の先頭「全ワークフロー」行） ---------------------------
+
+def test_all_workflows_row_totals_jobs_tasks_and_overrun_across_workflows():
+    df = _result_df([
+        ("J1", "T1", "TEAM_1", "WF_1", "MS_1", "2026-02-02", "2026-02-06", 3, ""),
+        ("J2", "T1", "TEAM_1", "WF_2", "MS_1", "2026-02-02", "2026-02-04", 0, ""),
+    ])
+    row = compute_all_workflows_row(df)
+    assert row["workflow_id"] is None       # 個別ワークフローの行と見分けるための目印
+    assert row["name"] == "全ワークフロー"
+    assert row["jobs"] == 2
+    assert row["tasks"] == 2
+    assert row["overrun"] == 1
+
+
+def test_all_workflows_row_median_duration_spans_jobs_across_all_workflows():
+    """所要期間の中央値は、ワークフローをまたいだジョブ全体から求める
+    （compute_workflow_summary_rowsの各行と同じ定義。J1は8日、J2は2日→中央値5）。"""
+    df = _result_df([
+        ("J1", "T1", "TEAM_1", "WF_1", "MS_1", "2026-02-02", "2026-02-06", 0, ""),
+        ("J1", "T2", "TEAM_1", "WF_1", "MS_1", "2026-02-06", "2026-02-10", 0, ""),
+        ("J2", "T1", "TEAM_1", "WF_2", "MS_1", "2026-03-02", "2026-03-04", 0, ""),
+    ])
+    row = compute_all_workflows_row(df)
+    assert row["median_duration_days"] == 5
+
+
+def test_all_workflows_row_on_empty_result_df():
+    row = compute_all_workflows_row(EMPTY_DF)
+    assert row["jobs"] == 0
+    assert row["tasks"] == 0
+    assert row["median_duration_days"] is None
+    assert row["overrun"] == 0

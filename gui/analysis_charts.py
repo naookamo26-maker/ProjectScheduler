@@ -475,6 +475,50 @@ def build_team_detail_scene(weeks, values, capacity_values, color,
     return scene
 
 
+def build_workflow_detail_scene(periods, values, color, milestone_markers, project_start,
+                                 granularity=GRANULARITY_WEEK):
+    """選択した1ワークフローの稼働タスク件数（塗り＋折れ線）。粒度は月次/週次/日次。
+
+    values: `active_task_counts()` の該当ワークフローぶん。ワークフローには
+    チームの同時ライン数のような上限が無いため、build_team_detail_sceneと
+    違い上限の破線は描かない。"""
+    if not periods or not values:
+        return QGraphicsScene()
+
+    max_value = max(values + [0])
+    scene, axis = _new_scene_with_axes(
+        periods, max_value, milestone_markers, project_start, granularity,
+    )
+
+    area_path = _polyline_path(axis, values)
+    area_path.lineTo(axis.x(len(values) - 1), axis.chart_bottom)
+    area_path.lineTo(axis.x(0), axis.chart_bottom)
+    area_path.closeSubpath()
+    fill_color = QColor(color)
+    fill_color.setAlpha(_DETAIL_FILL_ALPHA)
+    area_item = QGraphicsPathItem(area_path)
+    area_item.setBrush(QBrush(fill_color))
+    area_item.setPen(QPen(Qt.NoPen))
+    scene.addItem(area_item)
+
+    line_item = QGraphicsPathItem(_polyline_path(axis, values))
+    line_item.setPen(QPen(QColor(color), _LINE_WIDTH))
+    scene.addItem(line_item)
+
+    for i, period_start in enumerate(periods):
+        scene.addItem(_hit_area(
+            axis, i, f"{_fmt_period(period_start, granularity)}\n稼働タスク件数 {values[i]:,} 件",
+        ))
+
+    scene.analysis_chart_max_value = max_value
+    # 日次のときに表示範囲を絞ってフィットする（`AnalysisChartView.
+    # fit_leading_periods`）ために、build_workflow_stacked_sceneと同様に
+    # 座標変換と期間ごとの値を添えておく（1系列だけなので合計＝そのまま値）。
+    scene.analysis_chart_axis = axis
+    scene.analysis_chart_totals = values
+    return scene
+
+
 class AnalysisChartView(GanttGraphicsView):
     """`GanttGraphicsView`（ホイールズーム・中ボタンパン・A/Fキー）をそのまま
     再利用し、フィット処理だけを自己完結で追加する（旧
