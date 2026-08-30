@@ -1636,6 +1636,56 @@ def test_analysis_tab_milestone_progress_uses_the_selected_breakdown_target_as_t
     assert tab.milestone_table.item(1, 1).text() == "100%"
 
 
+def test_analysis_tab_milestone_last_end_slack_and_overrun_use_the_selected_breakdown_target(
+    window, qapp,
+):
+    """「チーム別」「ワークフロー別」表示中は、最終終了日・スラック・超過件数も
+    「進捗」列・内訳列と同じくプロジェクト全体ではなく選択中の対象で計算する
+    こと（以前はプロジェクト全体固定だったが、対象を切り替えても値が変わらず
+    個別の状況が読めないという指摘を受けて変更した）。"""
+    db = window.db
+    db.set_project("スラック内訳テスト", "2026-01-05")
+    team_a = db.add_team("チームA", 2)
+    team_b = db.add_team("チームB", 1)
+    ms_id = db.add_milestone("マイルストーン1", "2026-01-20")
+    wf_id = db.add_workflow("WF1")
+    db.add_workflow_task(wf_id, "タスクA", team_a, 10)  # 長い方（10日）
+    db.add_workflow_task(wf_id, "タスクB", team_b, 3)   # 短い方（3日）
+    # 各ジョブは片方のタスクだけを有効にし、チームAは10日タスクのみ、
+    # チームBは3日タスクのみを持つようにする（それぞれのチームの終了日を
+    # はっきり分ける）。
+    job_a = db.add_job("ジョブA1", wf_id, ms_id, 100)
+    db.upsert_job_task_override(job_a, db.list_workflow_tasks(wf_id)[1]["id"], is_active=False)
+    job_b = db.add_job("ジョブB1", wf_id, ms_id, 100)
+    db.upsert_job_task_override(job_b, db.list_workflow_tasks(wf_id)[0]["id"], is_active=False)
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    # 「全体」表示中は、プロジェクト全体の最終終了日（=長い方のチームAの
+    # 10日タスク、締切ちょうどでスラック+0日）。
+    assert tab.milestone_table.item(0, 3).text() == "2026-01-20"
+    assert tab.milestone_table.item(0, 4).text() == "+0日"
+
+    tab._breakdown_buttons["team"].click()
+    qapp.processEvents()
+    assert tab._dimension_combo.currentText() == "チームA"
+    assert tab.milestone_table.item(0, 3).text() == "2026-01-20"
+    assert tab.milestone_table.item(0, 4).text() == "+0日"
+
+    idx_team_b = tab._dimension_combo.findText("チームB")
+    tab._dimension_combo.setCurrentIndex(idx_team_b)
+    qapp.processEvents()
+    # チームBは3日タスクのみで、全体より早く終わりスラックも大きくなる
+    # ——「全体」表示中の値のままではないこと（＝選択対象で計算し直している
+    # こと）を確認する。
+    assert tab.milestone_table.item(0, 3).text() == "2026-01-17"
+    assert tab.milestone_table.item(0, 4).text() == "+3日"
+
+
 def test_analysis_tab_milestone_table_handles_a_workflow_with_no_tasks(window, qapp):
     """ワークフロー別の絞り込み対象に「タスクを1件も持たないワークフロー」を
     選んでも、進捗・内訳が0扱いになるだけでクラッシュしないこと

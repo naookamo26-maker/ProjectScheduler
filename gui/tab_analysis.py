@@ -498,21 +498,24 @@ class AnalysisTab(QWidget):
         hint = "ジョブ件数は延べ（1ジョブが複数マイルストーンにまたがりうる）"
         if mode != _BREAKDOWN_ALL and filtered_df.empty:
             # 対象が1件も無い（例: ワークフローが登録されていない、選択中の
-            # チーム/ワークフローにタスクが1件も無い）場合、内訳・進捗の列は
-            # すべて0扱いになる——テーブル自体は表示したまま、理由をここで補う。
-            hint = "選択中の対象にはタスクがありません（内訳・進捗は0になります）。" + hint
+            # チーム/ワークフローにタスクが1件も無い）場合、最終終了日・
+            # スラック・超過・内訳・進捗のすべてが0/空欄になる——テーブル自体は
+            # 表示したまま、理由をここで補う。
+            hint = "選択中の対象にはタスクがありません（締切に対する判定・内訳・進捗は空欄/0になります）。" + hint
         self.breakdown_hint_label.setText(hint)
         headers = _BASE_COLUMNS + _BREAKDOWN_EXTRA_COLUMNS
         self.milestone_table.setColumnCount(len(headers))
         self.milestone_table.setHorizontalHeaderLabels(headers)
 
-        # 基本列（締切・スラック等）は内訳モードによらず常にプロジェクト全体
-        # （全チーム・全ワークフロー）の結果から計算する——「そのマイルストーンが
-        # 間に合うか」はチーム別・ワークフロー別に絞り込んでも変わらない事実
-        # のため（設計案参照）。内訳（右側の5列）・進捗（%）は選択対象で絞り込む
-        # ——「進捗」はチーム別/ワークフロー別のときその対象の件数を基準
-        # （＝100%）にする、という利用者の要望による。
-        base_rows = compute_milestone_rows(result_df, milestones)
+        # 最終終了日・スラック・超過件数は、内訳（右側の5列）・進捗（%）と同じく
+        # 選択対象で絞り込んだ filtered_df から計算する——「チーム別」
+        # 「ワークフロー別」のときは、そのチーム/ワークフローだけのタスクで
+        # 締切に間に合うかを見る（利用者の要望による。以前はプロジェクト全体
+        # 固定だったが、対象を切り替えても値が変わらず個別の状況が読めない
+        # という指摘を受けて変更した——`docs/project_analysis_tab_design.md`
+        # §2-2参照）。マイルストーン名・締切日はタスクに依存しない値なので
+        # 絞り込みの影響を受けない。
+        base_rows = compute_milestone_rows(filtered_df, milestones)
         progress_values = compute_milestone_cumulative_progress_pct(filtered_df, milestones)
         breakdown_rows = compute_milestone_breakdown_all(filtered_df, milestones, task_status_map)
 
