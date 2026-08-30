@@ -28,8 +28,10 @@ pd = pytest.importorskip("pandas")
 # 分類: gui（PySide6 + offscreen QApplication が必要。最も重い）
 pytestmark = pytest.mark.gui
 
-from PySide6.QtCore import QDate, Qt  # noqa: E402
-from PySide6.QtWidgets import QApplication, QDialog  # noqa: E402
+from PySide6.QtCore import QDate, QPoint, Qt  # noqa: E402
+from PySide6.QtGui import QPalette  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
+from PySide6.QtWidgets import QApplication, QDialog, QWidget  # noqa: E402
 
 from gui.db import ProjectDatabase  # noqa: E402
 from gui.tab_gantt import GanttTab  # noqa: E402
@@ -2629,6 +2631,286 @@ def test_start_pin_date_column_edits_the_override_and_is_undoable(window, qapp):
     pin_edit.keyPressEvent(QKeyEvent(QEvent.KeyPress, QtCore_Qt.Key_Delete, QtCore_Qt.NoModifier))
     qapp.processEvents()
     assert pin_edit.value() is None
+
+
+def test_start_pin_date_calendar_popup_opens_near_today_not_year_2000(window, qapp):
+    """回帰テスト: 「開始固定日」が未設定（特殊値の2000-01-01）のままカレンダーを
+    開くと、表示ページが2000年になってしまい現在の年まで大きくスクロールする
+    必要があった。gui/widgets_common.py の _sync_calendar_page_to_today は
+    以前から存在したが、mousePressEvent内でsuper()を呼ぶ「前」に効かせようと
+    していたため、QDateTimeEdit自身がポップアップを開く際に自分の日付
+    （＝2000-01-01）へ表示ページを上書きし直す処理が後から効いてしまい、
+    実際には直っていなかった（QTest.mouseClickで実際にポップアップを開いて
+    確認しないと検出できない——setDate()を直接呼ぶだけのテストでは再現しない）。"""
+    from PySide6.QtCore import QPoint
+    from PySide6.QtTest import QTest
+
+    jobs_tab = window.tab_jobs
+    team_id = window.db.add_team("チームA", 1)
+    ms_id = window.db.add_milestone("MS1", "2026-06-30")
+    wf_id = window.db.add_workflow("WF1")
+    window.db.add_workflow_task(wf_id, "タスク1", team_id, 3)
+    job_id = window.db.add_job("ジョブ1", wf_id, ms_id, 1)
+
+    window.tabs.setCurrentWidget(jobs_tab)
+    jobs_tab.refresh_jobs(select_id=job_id)
+    qapp.processEvents()
+
+    pin_edit = jobs_tab.override_table.cellWidget(0, 5)
+    assert pin_edit.value() is None  # 未設定（特殊値の2000-01-01）から始める
+
+    # ドロップダウンの矢印ボタンは右端にある。ウィジェット全体へのクリックとして
+    # 実際にQtのイベントを流し、QDateTimeEdit本体のポップアップ表示処理まで
+    # 走らせる（内部実装への依存を避けるため、正確なボタン矩形は問わない）。
+    QTest.mouseClick(
+        pin_edit, Qt.LeftButton, Qt.NoModifier, QPoint(pin_edit.width() - 10, pin_edit.height() // 2),
+    )
+    qapp.processEvents()
+
+    calendar = pin_edit.calendarWidget()
+    today = QDate.currentDate()
+    assert (calendar.yearShown(), calendar.monthShown()) == (today.year(), today.month())
+    # ポップアップを開いただけでは値そのものは変えない。
+    assert pin_edit.value() is None
+
+
+def _fresh_pin_edit(window, qapp, name_suffix=""):
+    """ジョブタブのタスク上書き表を1行だけ用意し、その「開始固定日」欄を返す。"""
+    team_id = window.db.add_team(f"チームA{name_suffix}", 1)
+    ms_id = window.db.add_milestone(f"MS1{name_suffix}", "2026-06-30")
+    wf_id = window.db.add_workflow(f"WF1{name_suffix}")
+    window.db.add_workflow_task(wf_id, "タスク1", team_id, 3)
+    job_id = window.db.add_job(f"ジョブ1{name_suffix}", wf_id, ms_id, 1)
+
+    window.tabs.setCurrentWidget(window.tab_jobs)
+    window.tab_jobs.refresh_jobs(select_id=job_id)
+    qapp.processEvents()
+
+    pin_edit = window.tab_jobs.override_table.cellWidget(0, 5)
+    assert pin_edit.value() is None  # 未設定（特殊値の2000-01-01）から始める
+    return pin_edit, job_id
+
+
+def test_start_pin_date_steps_from_today_not_from_the_year_2000_sentinel(window, qapp):
+    """回帰テスト: 未設定（特殊値の2000-01-01）の開始固定日を▲キー・スピンの
+    矢印・ホイールで動かすと、Qtの既定動作では最小値の**年セクション**が1つ
+    進んで 2001-01-01 になってしまい、「日付を変えようとすると2000年代に
+    なる」という状態だった。
+
+    未設定から動かした1歩目は今日を起点にする（DefaultAwareSpinBoxが0から
+    既定値を起点に増減するのと同じ考え方。gui/widgets_common.py の
+    OptionalDateEdit.stepBy 参照）。カレンダーの表示ページだけを直した以前の
+    修正では、この経路には効いていなかった。"""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    today_iso = QDate.currentDate().toString("yyyy-MM-dd")
+
+    # 経路1: スピンの矢印ボタン相当（stepBy）。
+    pin_edit, job_id = _fresh_pin_edit(window, qapp)
+    pin_edit.stepBy(1)
+    qapp.processEvents()
+    assert pin_edit.value() == today_iso
+    assert window.db.list_job_tasks_with_overrides(job_id)[0]["start_pin_date"] == today_iso
+
+    # 経路2: ▲キー（QDateEdit内部でstepByを呼ぶ）。
+    pin_edit2, _ = _fresh_pin_edit(window, qapp, name_suffix="_b")
+    pin_edit2.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Up, Qt.NoModifier))
+    qapp.processEvents()
+    assert pin_edit2.value() == today_iso
+
+    # 2歩目以降は通常どおりカーソル位置のセクションを増減する（今日に張り付かない）。
+    pin_edit2.stepBy(1)
+    qapp.processEvents()
+    assert pin_edit2.value() != today_iso
+    assert pin_edit2.value() is not None
+
+
+def test_start_pin_date_typing_a_digit_does_not_corrupt_the_special_value_text(window, qapp):
+    """回帰テスト: 未設定の間は表示が「（固定なし）」という特殊テキストのため、
+    そこへ数字を打つとQtはセクションを更新できず、'（固定なし）0260415' の
+    ような壊れた表示になったうえ値も入らなかった。数字の打鍵で入力を
+    始めた場合は、先に今日を入れて通常の日付表示にしてから打鍵を適用する。"""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    pin_edit, _ = _fresh_pin_edit(window, qapp)
+    pin_edit.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_2, Qt.NoModifier, "2"))
+    qapp.processEvents()
+
+    # 特殊テキストが残った壊れた表示になっていないこと。
+    assert "（固定なし）" not in pin_edit.text()
+    # 値として読める日付になっていること（2000年代の番兵ではない）。
+    assert pin_edit.value() is not None
+    assert pin_edit.date().year() >= QDate.currentDate().year()
+
+
+def _collapsible_header_color(section):
+    """折りたたみセクションの見出しに指定されている文字色（'#rrggbb'）を取り出す。"""
+    import re
+
+    match = re.search(r"color:\s*(#[0-9a-fA-F]{6})", section._toggle_btn.styleSheet())
+    assert match is not None, f"見出しに文字色が指定されていない: {section._toggle_btn.styleSheet()!r}"
+    return match.group(1).lower()
+
+
+def test_collapsible_section_header_color_follows_the_palette(window, qapp):
+    """回帰テスト: 「絞り込み」の見出し（CollapsibleSection）は文字色をスタイル
+    任せにしていたため、Windows 11のライトモードで白く描かれ、背景と同化して
+    読めなくなっていた（利用者からの報告。Linuxのスタイルでは再現しないため、
+    ここでは「パレットのWindowTextを明示的に使っているか」を検証する）。
+
+    ハードコードした色にするとダークモードで逆に見えなくなるので、
+    ライト/ダークそれぞれのパレットに追従することを確認する。"""
+    from PySide6.QtGui import QColor, QPalette
+
+    from gui.widgets_common import CollapsibleSection
+
+    def palette_with_text(window_color, text_color):
+        palette = QPalette()
+        palette.setColor(QPalette.Window, QColor(window_color))
+        palette.setColor(QPalette.WindowText, QColor(text_color))
+        return palette
+
+    # ライト相当（黒文字）のパレットで作れば黒、ダーク相当なら白になる。
+    for window_color, text_color in (("#f0f0f0", "#000000"), ("#202020", "#ffffff")):
+        holder = QWidget()
+        holder.setPalette(palette_with_text(window_color, text_color))
+        section = CollapsibleSection("絞り込み", holder)
+        assert _collapsible_header_color(section) == text_color
+
+    # 起動後にOSのテーマが切り替わった場合も追従する（固定色で取り残されない）。
+    holder = QWidget()
+    holder.setPalette(palette_with_text("#f0f0f0", "#000000"))
+    section = CollapsibleSection("絞り込み", holder)
+    assert _collapsible_header_color(section) == "#000000"
+
+    holder.setPalette(palette_with_text("#202020", "#ffffff"))
+    qapp.processEvents()
+    assert _collapsible_header_color(section) == "#ffffff"
+
+
+def test_filters_section_headers_are_readable_in_jobs_and_gantt_tabs(window, qapp):
+    """利用者が報告した2箇所——ジョブ作成タブとガントチャートタブの「絞り込み」
+    ——の見出しに、実際に文字色が入っていること（両タブとも同じ
+    CollapsibleSectionを使っているので、片方だけ直り残しになっていないか）。"""
+    for tab in (window.tab_jobs, window.tab_gantt):
+        color = _collapsible_header_color(tab.filters_section)
+        assert color == window.palette().color(QPalette.WindowText).name().lower()
+
+
+def _focused_placement_spinbox(window, qapp):
+    """ガントチャートタブを開き、配置コントロールの数値入力欄にフォーカスを当てる。"""
+    _build_schedulable_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    spin = window.tab_gantt.placement_spinbox
+    spin.setFocus()
+    qapp.processEvents()
+    assert spin.hasFocus()
+    return spin
+
+
+def test_placement_spinbox_arrows_do_not_recompute_until_focus_leaves(window, qapp):
+    """回帰テスト: 配置コントロールの▲▼を押すたびにDB書き込み＋再計算が走って
+    いた（重いうえ、Undoが1押しずつ積み上がってしまう）。値の変更は表示だけに
+    留め、確定はアクティブ状態が外れた時（またはEnter）に1回だけ行う。"""
+    spin = _focused_placement_spinbox(window, qapp)
+    tab = window.tab_gantt
+
+    revision_before = window.db.revision
+    seq_before = window.schedule_cache._request_seq
+    start_value = spin.value()
+
+    for _ in range(3):
+        spin.stepBy(1)
+        qapp.processEvents()
+
+    # 表示（スピンボックスとスライダー）は追従するが、DBも再計算も動かない。
+    assert spin.value() == start_value + 3
+    assert tab.placement_slider.value() == start_value + 3
+    assert window.db.revision == revision_before
+    assert window.schedule_cache._request_seq == seq_before
+
+    # アクティブ状態が外れて初めて、1回だけ確定・再計算される。
+    spin.clearFocus()
+    qapp.processEvents()
+    assert window.db.revision != revision_before
+    assert window.schedule_cache._request_seq == seq_before + 1
+    assert window.db.get_project()["distribution_ratio"] == (start_value + 3) / 100.0
+
+
+def test_placement_spinbox_arrows_collapse_into_a_single_undo_entry(window, qapp):
+    """▲を複数回押してからフォーカスを外すまでが1つのUndo単位であること。
+
+    このUndoのまとめ自体は bind_undo_session（フォーカスの出入りで単位を
+    開閉する）が以前から担っており、確定を遅らせる変更の前後で壊れていない
+    ことを守るためのテスト。確定をフォーカスアウトへ移した際、DB書き込みが
+    Undo単位の「外」に出てしまうと（gui/widgets_common.py の
+    _UndoSessionMixin.focusOutEvent が end_undo_group を呼んだ後に書き込むと）
+    ここが壊れる。"""
+    spin = _focused_placement_spinbox(window, qapp)
+    original_ratio = window.db.get_project()["distribution_ratio"]
+
+    for _ in range(3):
+        spin.stepBy(1)
+        qapp.processEvents()
+    spin.clearFocus()
+    qapp.processEvents()
+
+    changed_ratio = window.db.get_project()["distribution_ratio"]
+    assert changed_ratio != original_ratio
+
+    # Undo1回で、3回ぶんの▲がまとめて元に戻る。
+    window.undo_manager.undo()
+    qapp.processEvents()
+    assert window.db.get_project()["distribution_ratio"] == original_ratio
+
+
+def test_placement_spinbox_enter_commits_once_and_focus_out_does_not_repeat_it(window, qapp):
+    """Enterでの確定は即座に反映してよいが、その後フォーカスが外れた際に
+    同じ内容の確定・再計算が二重に走らないこと。
+
+    確定をフォーカスアウトへ移したことで新たに生じる危険を守るためのテスト
+    ——editingFinished は Enter と フォーカスアウトの両方で飛ぶため、
+    _commit_distribution_ratio の「値が変わっていなければ何もしない」判定を
+    外すと、Enterで確定した直後にフォーカスを外しただけで同じ再計算が
+    もう一度走ってしまう。"""
+    spin = _focused_placement_spinbox(window, qapp)
+
+    spin.stepBy(1)
+    qapp.processEvents()
+
+    QTest.keyClick(spin, Qt.Key_Return)
+    qapp.processEvents()
+    revision_after_enter = window.db.revision
+    seq_after_enter = window.schedule_cache._request_seq
+    ratio_after_enter = window.db.get_project()["distribution_ratio"]
+    assert ratio_after_enter == spin.value() / 100.0
+
+    spin.clearFocus()
+    qapp.processEvents()
+    assert window.db.revision == revision_after_enter
+    assert window.schedule_cache._request_seq == seq_after_enter
+
+
+def test_placement_spinbox_loses_focus_when_clicking_elsewhere_in_the_tab(window, qapp):
+    """配置コントロールの外（状況表示テキスト・枠の余白・タブの空き領域）を
+    クリックしたら、数値入力欄のアクティブ状態が外れること。以前はこれらが
+    どれもフォーカスを受け取らないため、クリックしてもアクティブなままだった
+    （チャート本体をクリックした場合だけ外れていた）。"""
+    tab = window.tab_gantt
+    spin = _focused_placement_spinbox(window, qapp)
+
+    for target in (tab.status_label, tab.placement_group, tab):
+        spin.setFocus()
+        qapp.processEvents()
+        assert spin.hasFocus()
+
+        QTest.mouseClick(target, Qt.LeftButton, Qt.NoModifier, QPoint(3, 3))
+        qapp.processEvents()
+        assert not spin.hasFocus(), f"{type(target).__name__} のクリックでフォーカスが外れていない"
 
 
 def test_gantt_tab_reports_unsatisfiable_pin_in_the_status_line(window, qapp):

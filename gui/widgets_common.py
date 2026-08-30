@@ -9,7 +9,7 @@
   それらをまとめて畳める折りたたみセクション（ジョブ・ガントチャートタブ共通）。
 """
 
-from PySide6.QtCore import QDate, Qt, Signal
+from PySide6.QtCore import QDate, QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -230,6 +230,18 @@ class OptionalDateEdit(NoWheelDateEdit):
     Delete/Backspaceキーで直接「未設定」に戻せるようにする（値を持つ入力欄で
     Deleteが「クリア」を意味するのは一般的な操作感のため、追加のボタンを
     UIに増やさずに済む）。
+
+    逆に「未設定から日付を入れ始める」側も、素のQDateEditでは破綻する。
+    特殊値（_UNSET_DATE）は最小値でもあるため、Qtの既定動作では:
+
+    - ▲/▼キー・スピンの矢印・ホイールは、最小値の**年セクション**を1つ
+      動かして 2001-01-01 にしてしまう（実務で使う日付から20年以上離れる）。
+    - 表示が「（固定なし）」という特殊テキストなので、そこへ数字を打っても
+      Qtはセクションを更新できず、'（固定なし）0260415' のような壊れた表示に
+      なるだけで値が入らない。
+
+    どちらも「未設定から入力を始めた瞬間に今日を起点として置く」ことで解決する
+    （DefaultAwareSpinBoxが0から既定値を起点に増減するのと同じ考え方）。
     """
 
     def __init__(self, parent=None):
@@ -254,22 +266,52 @@ class OptionalDateEdit(NoWheelDateEdit):
         """未設定（_UNSET_DATE=2000-01-01）のままカレンダーを開くと表示月が
         2000年になってしまい、現在の年まで大きくスクロールする必要がある。
         実際の値（＝未設定という状態）は変えず、カレンダーの表示ページだけ
-        今日の月に合わせておく（ポップアップが開く直前のイベントで呼ぶ）。"""
+        今日の月に合わせておく。
+
+        ポップアップを開く操作（mousePressEvent/keyPressEvent）の直後に
+        呼ぶだけでは効果が無い——QDateTimeEdit側がポップアップを開く際、
+        自分自身の`date()`（＝未設定の2000-01-01）に合わせてカレンダーの
+        表示ページを自動的に上書きするため、そちらが後から効いて2000年に
+        戻ってしまう（実際に確認済み）。QDateTimeEdit自身の処理が終わった
+        「後」に上書きし直す必要があるため、呼び出し側で
+        `QTimer.singleShot(0, ...)` 経由で次のイベントループへ回してから
+        呼ぶ。"""
         if self.date() == _UNSET_DATE:
             today = QDate.currentDate()
             self.calendarWidget().setCurrentPage(today.year(), today.month())
 
+    def _seed_from_unset(self):
+        """未設定の状態から日付の入力を始める際、今日を起点として置く
+        （クラスのdocstring参照）。実際に置き換えたらTrueを返す。"""
+        if self.date() == _UNSET_DATE:
+            self.setDate(QDate.currentDate())
+            return True
+        return False
+
+    def stepBy(self, steps):
+        # 未設定から▲▼・ホイールで動かしたときの1歩目は、最小値(2000-01-01)の
+        # 年セクションを動かす既定動作ではなく「今日」にする。2歩目以降は
+        # 通常どおりカーソル位置のセクションを増減する。
+        if self._seed_from_unset():
+            return
+        super().stepBy(steps)
+
     def mousePressEvent(self, event):
-        self._sync_calendar_page_to_today()
         super().mousePressEvent(event)
+        QTimer.singleShot(0, self._sync_calendar_page_to_today)
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
             self.setDate(_UNSET_DATE)
             event.accept()
             return
-        self._sync_calendar_page_to_today()
+        # 数字の打鍵で入力を始めた場合は、先に今日を入れて通常の日付表示に
+        # してから、その打鍵をQtに渡してセクションへ適用させる（特殊テキストの
+        # ままでは打鍵がセクションに入らない）。
+        if event.text().isdigit():
+            self._seed_from_unset()
         super().keyPressEvent(event)
+        QTimer.singleShot(0, self._sync_calendar_page_to_today)
 
 
 def _to_qdate_or_unset(iso_str):
@@ -693,7 +735,7 @@ class CollapsibleSection(QWidget):
         self._toggle_btn.setText(title)
         self._toggle_btn.setCheckable(True)
         self._toggle_btn.setChecked(False)
-        self._toggle_btn.setStyleSheet("QToolButton { border: none; font-weight: bold; }")
+        self._apply_header_style()
         self._toggle_btn.clicked.connect(self._on_toggled)
         outer.addWidget(self._toggle_btn)
 
@@ -702,6 +744,34 @@ class CollapsibleSection(QWidget):
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content.setVisible(False)  # 既定は折りたたんだ状態
         outer.addWidget(self.content)
+
+    def _apply_header_style(self):
+        """見出しの文字色を、その時点のパレットのWindowTextから明示的に決める。
+
+        以前は`border: none; font-weight: bold`だけを指定し、文字色はスタイル
+        任せにしていた。Windows 11のネイティブスタイルでは、このスタイルシートを
+        当てたQToolButtonの文字が白で描かれてしまい、ライトモードでは背景と
+        同化して見えなくなる（利用者からの報告。Linux/Fusion・Windowsスタイル
+        では再現しないため、Windows 11固有のスタイルの挙動）。
+
+        文字色を明示すればスタイル側の判断に委ねずに済む。色をハードコード
+        しないのは、そうするとダークモードで逆に見えなくなるため——WindowTextは
+        ライト/ダークどちらでもウィンドウ背景とコントラストが付く役割の色なので、
+        これを使えば両方で読める。
+
+        なお、この明示指定によりボタンを無効化しても文字色が変わらなくなるが、
+        見出しは常に有効なので実害は無い。"""
+        color = self.palette().color(QPalette.WindowText)
+        self._toggle_btn.setStyleSheet(
+            f"QToolButton {{ border: none; font-weight: bold; color: {color.name()}; }}"
+        )
+
+    def changeEvent(self, event):
+        """OSのテーマ切り替え等でパレットが変わったら、見出しの文字色も追従させる
+        （起動後にライト⇄ダークを切り替えても、固定色のまま取り残されないように）。"""
+        super().changeEvent(event)
+        if event.type() in (QEvent.PaletteChange, QEvent.ApplicationPaletteChange):
+            self._apply_header_style()
 
     def _on_toggled(self, checked):
         self._toggle_btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
