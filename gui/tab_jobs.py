@@ -411,6 +411,14 @@ class JobsTab(QWidget):
             [(m["id"], m["name"]) for m in self.db.list_milestones()]
             + [(_NO_MILESTONE_FILTER_KEY, _BLANK_MILESTONE_LABEL)]
         )
+        self._rebuild_tag_filter(jobs)
+        self._rebuild_task_tag_filter(jobs, task_tag_map)
+
+    def _rebuild_tag_filter(self, jobs):
+        """「ジョブ タグ」の絞り込みチェックボックスだけを再構築する。ジョブ タグは
+        ジョブ一覧の中で自由記述のため、インライン編集のたびにこれだけを
+        呼び直して、タブを切り替えなくても絞り込みの選択肢に反映されるように
+        する（_write_job参照）。"""
         tag_keys = set()
         for job in jobs:
             tag_keys.update(self._job_tag_keys(job))
@@ -421,6 +429,9 @@ class JobsTab(QWidget):
             tag_items.append((_NO_TAG_FILTER_KEY, _NO_JOB_TAG_FILTER_LABEL))
         self.tag_filter.rebuild(tag_items)
 
+    def _rebuild_task_tag_filter(self, jobs, task_tag_map):
+        """「タスク タグ」の絞り込みチェックボックスだけを再構築する
+        （_rebuild_tag_filterと同じ理由。_on_override_changed参照）。"""
         task_tag_keys = set()
         for job in jobs:
             task_tag_keys.update(self._job_task_tag_keys(job["id"], task_tag_map))
@@ -701,6 +712,10 @@ class JobsTab(QWidget):
             QMessageBox.warning(self, "変更できません", str(e))
             self.refresh_jobs(select_id=job_id)
             return
+        # タグを変えた場合、絞り込みの選択肢（タグ一覧のチェックボックス）に
+        # タブを切り替えなくても反映されるよう、その場で作り直す。
+        if tags != job["tags"]:
+            self._rebuild_tag_filter(self.db.list_jobs())
         # ユーザーが入力したカンマ区切りの表記ゆれ（空白の有無等）を正規化した
         # 表示へ書き戻す（例外はitemChangedを再度発火させないようblockSignalsする）。
         tags_item = table.item(row, 4)
@@ -937,6 +952,10 @@ class JobsTab(QWidget):
                     table.blockSignals(True)
                     tags_item.setText(tags)
                     table.blockSignals(False)
+                # タグを変えた場合、絞り込みの選択肢（タグ一覧のチェックボックス）に
+                # タブを切り替えなくても反映されるよう、その場で作り直す
+                # （_write_job の同名の対処と同じ理由）。
+                self._rebuild_task_tag_filter(self.db.list_jobs(), self._task_tag_map())
                 if raised or changed:
                     messages = []
                     if raised:

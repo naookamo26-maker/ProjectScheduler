@@ -560,6 +560,36 @@ def compute_workflow_summary_rows(result_df, workflow_names):
     return rows
 
 
+ALL_WORKFLOWS_ROW_NAME = "全ワークフロー"
+
+
+def compute_all_workflows_row(result_df):
+    """ワークフロー別サマリーの表の先頭に置く「全ワークフロー」行。
+
+    `compute_workflow_summary_rows()` と同じ形の辞書を返す（workflow_id は
+    None）。所要期間の中央値はジョブ単位の量なので、全ワークフローを
+    まとめたジョブ集合からそのまま求める（compute_all_teams_row と同じ
+    考え方）。"""
+    durations = sorted(_job_duration_days(result_df))
+    if durations:
+        mid = len(durations) // 2
+        median = (
+            durations[mid] if len(durations) % 2
+            else (durations[mid - 1] + durations[mid]) / 2
+        )
+    else:
+        median = None
+    empty = result_df.empty
+    return {
+        "workflow_id": None,
+        "name": ALL_WORKFLOWS_ROW_NAME,
+        "jobs": 0 if empty else int(result_df["Job_ID"].nunique()),
+        "tasks": int(len(result_df)),
+        "median_duration_days": median,
+        "overrun": 0 if empty else int((result_df["Deadline_Overrun_Days"] > 0).sum()),
+    }
+
+
 def compute_milestone_breakdown_all(result_df, milestones, task_status_map):
     """マイルストーン別サマリー「全体」内訳: milestonesと同じ順で
     {jobs（延べ）, tasks, done, in_progress, not_started} の辞書のリスト。"""

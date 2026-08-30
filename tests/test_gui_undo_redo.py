@@ -1775,8 +1775,9 @@ def test_analysis_tab_splits_the_summaries_into_sub_tabs_with_the_kpi_tiles_outs
 
 
 def test_analysis_tab_workflow_table_lists_each_workflow_with_its_job_and_task_counts(window, qapp):
-    """ワークフロー別サマリーの表に、ワークフローごとのジョブ件数・タスク件数・
-    ジョブ所要期間の中央値・超過件数が並ぶこと。"""
+    """ワークフロー別サマリーの表に、先頭の「全ワークフロー」行に続けて
+    ワークフローごとのジョブ件数・タスク件数・ジョブ所要期間の中央値・
+    超過件数が並ぶこと（チーム別サマリーの「全チーム」行と同じ構成）。"""
     _build_two_team_project(window.db)
     window.tabs.setCurrentWidget(window.tab_gantt)
     _wait_for_schedule(window, qapp)
@@ -1788,12 +1789,38 @@ def test_analysis_tab_workflow_table_lists_each_workflow_with_its_job_and_task_c
     assert [
         tab.workflow_table.horizontalHeaderItem(i).text() for i in range(len(headers))
     ] == headers
-    assert tab.workflow_table.rowCount() == 2
-    assert tab.workflow_table.item(0, 0).text() == "WF1"
-    assert tab.workflow_table.item(0, 1).text() == "2"  # WF1のジョブ2件
-    assert tab.workflow_table.item(1, 1).text() == "1"  # WF2のジョブ1件
-    # 積み上げグラフと、色とワークフロー名を対応させる凡例が出ている。
+    assert tab.workflow_table.rowCount() == 3
+    assert tab.workflow_table.item(0, 0).text() == "全ワークフロー"
+    assert tab.workflow_table.item(0, 1).text() == "3"  # 全ワークフロー合算のジョブ3件
+    assert tab.workflow_table.item(1, 0).text() == "WF1"
+    assert tab.workflow_table.item(1, 1).text() == "2"  # WF1のジョブ2件
+    assert tab.workflow_table.item(2, 1).text() == "1"  # WF2のジョブ1件
+    # 既定は「全ワークフロー」行が選択され、積み上げグラフと、色とワークフロー名を
+    # 対応させる凡例が出ている。
+    assert tab.workflow_table.currentRow() == 0
     assert tab.workflow_chart_view.scene() is not None
+    assert "WF1" in tab.workflow_legend_label.text()
+
+
+def test_analysis_tab_workflow_row_selection_switches_chart_to_that_workflow_alone(window, qapp):
+    """表の行を選択すると、チーム別サマリーと同じくグラフがその1件だけの
+    表示に切り替わり、凡例（1色なので不要）は隠れること。"""
+    _build_two_team_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    tab.workflow_table.selectRow(1)  # WF1
+    qapp.processEvents()
+
+    assert tab.workflow_chart_view.scene() is not None
+    assert "WF1" in tab.workflow_chart_label.text()
+    assert tab.workflow_legend_label.text() == ""
+
+    tab.workflow_table.selectRow(0)  # 全ワークフローに戻す
+    qapp.processEvents()
     assert "WF1" in tab.workflow_legend_label.text()
 
 
