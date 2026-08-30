@@ -210,16 +210,17 @@ class BasicInfoTab(QWidget):
         )
         self.holidays_section.table.itemChanged.connect(self._on_holiday_note_changed)
 
-        # 1段目: プロジェクト概要／休業日（上下）。2段目: マイルストーン／
-        # チーム（左右5:5、`QSplitter` でユーザーがドラッグ調整可）。
+        # 1段目: プロジェクト概要。2段目: マイルストーン／チーム／休業日を
+        # 左から等間隔（1:1:1、`QSplitter` でユーザーがドラッグ調整可）で並べる。
         layout.addWidget(self._build_project_group())
-        layout.addWidget(self.holidays_section)
 
         row2 = QSplitter(Qt.Horizontal)
         row2.addWidget(self.milestones_section)
         row2.addWidget(self._build_teams_group())
-        row2.setStretchFactor(0, 5)
-        row2.setStretchFactor(1, 5)
+        row2.addWidget(self.holidays_section)
+        row2.setStretchFactor(0, 1)
+        row2.setStretchFactor(1, 1)
+        row2.setStretchFactor(2, 1)
         layout.addWidget(row2, 1)
         self._row2_splitter = row2
 
@@ -268,7 +269,8 @@ class BasicInfoTab(QWidget):
     def _apply_initial_splitter_sizes(self):
         total = self._row2_splitter.width()
         if total > 0:
-            self._row2_splitter.setSizes([total // 2, total - total // 2])
+            third = total // 3
+            self._row2_splitter.setSizes([third, third, total - 2 * third])
 
     # -- プロジェクト概要 -----------------------------------------------------
 
