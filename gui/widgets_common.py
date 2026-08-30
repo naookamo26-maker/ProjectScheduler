@@ -9,7 +9,7 @@
   それらをまとめて畳める折りたたみセクション（ジョブ・ガントチャートタブ共通）。
 """
 
-from PySide6.QtCore import QDate, Qt, QTimer, Signal
+from PySide6.QtCore import QDate, QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -735,7 +735,7 @@ class CollapsibleSection(QWidget):
         self._toggle_btn.setText(title)
         self._toggle_btn.setCheckable(True)
         self._toggle_btn.setChecked(False)
-        self._toggle_btn.setStyleSheet("QToolButton { border: none; font-weight: bold; }")
+        self._apply_header_style()
         self._toggle_btn.clicked.connect(self._on_toggled)
         outer.addWidget(self._toggle_btn)
 
@@ -744,6 +744,34 @@ class CollapsibleSection(QWidget):
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content.setVisible(False)  # 既定は折りたたんだ状態
         outer.addWidget(self.content)
+
+    def _apply_header_style(self):
+        """見出しの文字色を、その時点のパレットのWindowTextから明示的に決める。
+
+        以前は`border: none; font-weight: bold`だけを指定し、文字色はスタイル
+        任せにしていた。Windows 11のネイティブスタイルでは、このスタイルシートを
+        当てたQToolButtonの文字が白で描かれてしまい、ライトモードでは背景と
+        同化して見えなくなる（利用者からの報告。Linux/Fusion・Windowsスタイル
+        では再現しないため、Windows 11固有のスタイルの挙動）。
+
+        文字色を明示すればスタイル側の判断に委ねずに済む。色をハードコード
+        しないのは、そうするとダークモードで逆に見えなくなるため——WindowTextは
+        ライト/ダークどちらでもウィンドウ背景とコントラストが付く役割の色なので、
+        これを使えば両方で読める。
+
+        なお、この明示指定によりボタンを無効化しても文字色が変わらなくなるが、
+        見出しは常に有効なので実害は無い。"""
+        color = self.palette().color(QPalette.WindowText)
+        self._toggle_btn.setStyleSheet(
+            f"QToolButton {{ border: none; font-weight: bold; color: {color.name()}; }}"
+        )
+
+    def changeEvent(self, event):
+        """OSのテーマ切り替え等でパレットが変わったら、見出しの文字色も追従させる
+        （起動後にライト⇄ダークを切り替えても、固定色のまま取り残されないように）。"""
+        super().changeEvent(event)
+        if event.type() in (QEvent.PaletteChange, QEvent.ApplicationPaletteChange):
+            self._apply_header_style()
 
     def _on_toggled(self, checked):
         self._toggle_btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)

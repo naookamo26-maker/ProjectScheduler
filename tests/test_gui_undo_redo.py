@@ -29,8 +29,9 @@ pd = pytest.importorskip("pandas")
 pytestmark = pytest.mark.gui
 
 from PySide6.QtCore import QDate, QPoint, Qt  # noqa: E402
+from PySide6.QtGui import QPalette  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication, QDialog  # noqa: E402
+from PySide6.QtWidgets import QApplication, QDialog, QWidget  # noqa: E402
 
 from gui.db import ProjectDatabase  # noqa: E402
 from gui.tab_gantt import GanttTab  # noqa: E402
@@ -2742,6 +2743,60 @@ def test_start_pin_date_typing_a_digit_does_not_corrupt_the_special_value_text(w
     # 値として読める日付になっていること（2000年代の番兵ではない）。
     assert pin_edit.value() is not None
     assert pin_edit.date().year() >= QDate.currentDate().year()
+
+
+def _collapsible_header_color(section):
+    """折りたたみセクションの見出しに指定されている文字色（'#rrggbb'）を取り出す。"""
+    import re
+
+    match = re.search(r"color:\s*(#[0-9a-fA-F]{6})", section._toggle_btn.styleSheet())
+    assert match is not None, f"見出しに文字色が指定されていない: {section._toggle_btn.styleSheet()!r}"
+    return match.group(1).lower()
+
+
+def test_collapsible_section_header_color_follows_the_palette(window, qapp):
+    """回帰テスト: 「絞り込み」の見出し（CollapsibleSection）は文字色をスタイル
+    任せにしていたため、Windows 11のライトモードで白く描かれ、背景と同化して
+    読めなくなっていた（利用者からの報告。Linuxのスタイルでは再現しないため、
+    ここでは「パレットのWindowTextを明示的に使っているか」を検証する）。
+
+    ハードコードした色にするとダークモードで逆に見えなくなるので、
+    ライト/ダークそれぞれのパレットに追従することを確認する。"""
+    from PySide6.QtGui import QColor, QPalette
+
+    from gui.widgets_common import CollapsibleSection
+
+    def palette_with_text(window_color, text_color):
+        palette = QPalette()
+        palette.setColor(QPalette.Window, QColor(window_color))
+        palette.setColor(QPalette.WindowText, QColor(text_color))
+        return palette
+
+    # ライト相当（黒文字）のパレットで作れば黒、ダーク相当なら白になる。
+    for window_color, text_color in (("#f0f0f0", "#000000"), ("#202020", "#ffffff")):
+        holder = QWidget()
+        holder.setPalette(palette_with_text(window_color, text_color))
+        section = CollapsibleSection("絞り込み", holder)
+        assert _collapsible_header_color(section) == text_color
+
+    # 起動後にOSのテーマが切り替わった場合も追従する（固定色で取り残されない）。
+    holder = QWidget()
+    holder.setPalette(palette_with_text("#f0f0f0", "#000000"))
+    section = CollapsibleSection("絞り込み", holder)
+    assert _collapsible_header_color(section) == "#000000"
+
+    holder.setPalette(palette_with_text("#202020", "#ffffff"))
+    qapp.processEvents()
+    assert _collapsible_header_color(section) == "#ffffff"
+
+
+def test_filters_section_headers_are_readable_in_jobs_and_gantt_tabs(window, qapp):
+    """利用者が報告した2箇所——ジョブ作成タブとガントチャートタブの「絞り込み」
+    ——の見出しに、実際に文字色が入っていること（両タブとも同じ
+    CollapsibleSectionを使っているので、片方だけ直り残しになっていないか）。"""
+    for tab in (window.tab_jobs, window.tab_gantt):
+        color = _collapsible_header_color(tab.filters_section)
+        assert color == window.palette().color(QPalette.WindowText).name().lower()
 
 
 def _focused_placement_spinbox(window, qapp):
