@@ -179,6 +179,30 @@ class DefaultAwareSpinBox(NoWheelSpinBox):
         return QAbstractSpinBox.StepUpEnabled | QAbstractSpinBox.StepDownEnabled
 
 
+class OptionalSpinBox(NoWheelSpinBox):
+    """最小値の1つ下を「指定なし」（NULL）として扱うQSpinBox。
+
+    DefaultAwareSpinBoxと違い、実際の最小値（例: チームの同時ライン数の0＝
+    「その期間は稼働なし」）自体に固有の意味がある場面で使うため、その値への
+    自動畳み込みはしない——「指定なし」と「0」は別の値として明示的に区別する。
+
+    QSpinBoxのvalue()/setValue()はQtの内部のスピン制御が使う実際の整数
+    （最小値＝指定なし）のまま変えず、NULLとの変換は optional_value()/
+    set_optional_value() で明示的に行う。"""
+
+    def __init__(self, maximum, special_value_text, parent=None):
+        super().__init__(parent)
+        self.setRange(-1, maximum)
+        self.setSpecialValueText(special_value_text)
+
+    def optional_value(self):
+        value = self.value()
+        return None if value == self.minimum() else value
+
+    def set_optional_value(self, value):
+        self.setValue(self.minimum() if value is None else value)
+
+
 class NoWheelDateEdit(_UndoSessionMixin, QDateEdit):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

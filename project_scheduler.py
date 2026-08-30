@@ -1202,20 +1202,28 @@ def _build_team_capacity_schedule(df_teams, df_team_capacity):
     先頭要素は常に Teams シートの Max_Lines を「いつまでも遡って適用される
     既定値」として含む（pd.Timestamp.min始まり）ため、開発開始日を含む
     どの日付を問い合わせても必ず何らかの値が見つかる。Team_Capacity_Changes
-    （任意）に登録された変更点があれば、その後ろに開始日昇順で追加する。"""
+    （任意）に登録された変更点があれば、その後ろに開始日昇順で追加する。
+
+    Max_Lines / Lines が欠損（NULL＝「指定なし」）の場合は _UNLIMITED_LINES
+    を使う。build_capacity() が「Teams シートに未定義のチーム」に使っているのと
+    同じ「制限なし」の意味づけで、GUI側で新規チームの既定にしている値
+    （docs/project_analysis_tab_design.md参照）。"""
+    def _lines_or_unlimited(value):
+        return _UNLIMITED_LINES if pd.isna(value) else int(value)
+
     schedule = {}
     for team_id, row in df_teams.set_index("Team_ID").iterrows():
-        schedule[team_id] = [(pd.Timestamp.min, int(row["Max_Lines"]))]
+        schedule[team_id] = [(pd.Timestamp.min, _lines_or_unlimited(row["Max_Lines"]))]
 
     for _, row in df_team_capacity.iterrows():
         team_id = row.get("Team_ID")
         start = pd.to_datetime(row.get("Start_Date"))
-        lines = row.get("Lines")
-        if not pd.notna(team_id) or pd.isna(start) or not pd.notna(lines):
+        if not pd.notna(team_id) or pd.isna(start):
             logger.warning(f"Team_Capacity_Changes に不完全な行があります（スキップ）: {row.to_dict()}")
             continue
-        schedule.setdefault(team_id, [(pd.Timestamp.min, int(lines))])
-        schedule[team_id].append((start, int(lines)))
+        lines = _lines_or_unlimited(row.get("Lines"))
+        schedule.setdefault(team_id, [(pd.Timestamp.min, lines)])
+        schedule[team_id].append((start, lines))
 
     for team_id in schedule:
         schedule[team_id].sort(key=lambda period: period[0])

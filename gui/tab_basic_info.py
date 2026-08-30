@@ -20,11 +20,9 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
-    QGraphicsScene,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
-    QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
@@ -38,17 +36,10 @@ from PySide6.QtWidgets import (
 )
 
 from gui.db import DuplicateNameError, ReferencedEntityError
-from gui.node_canvas import team_color_map
-from gui.resource_histogram import (
-    ResourceHistogramView,
-    build_histogram_scene,
-    histogram_axis_range,
-    team_capacity_breakpoints,
-)
 from gui.widgets_common import (
     CrudSection,
     NoWheelDateEdit,
-    NoWheelSpinBox,
+    OptionalSpinBox,
     auto_size_columns,
     bind_undo_session,
     capture_table_state,
@@ -63,6 +54,10 @@ from gui.widgets_common import (
     set_row_id,
     unique_default_name,
 )
+
+# チームの同時ライン数入力欄の上限（gui/tab_basic_info.py 全体で共通）。
+_MAX_LINES = 999
+_LINES_UNSET_TEXT = "指定なし"
 
 
 def _to_qdate(iso_str):
@@ -112,9 +107,8 @@ class AddTeamDialog(QDialog):
         self.name_edit = QLineEdit(default_name)
         form.addRow("チーム名", self.name_edit)
 
-        self.lines_spin = NoWheelSpinBox()
-        self.lines_spin.setRange(0, 999)
-        self.lines_spin.setValue(1)
+        self.lines_spin = OptionalSpinBox(_MAX_LINES, _LINES_UNSET_TEXT)
+        self.lines_spin.set_optional_value(None)  # 新規チームの既定は「指定なし」
         form.addRow("同時ライン数（開発開始日からの既定値）", self.lines_spin)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -123,7 +117,7 @@ class AddTeamDialog(QDialog):
         form.addRow(buttons)
 
     def values(self):
-        return self.name_edit.text(), self.lines_spin.value()
+        return self.name_edit.text(), self.lines_spin.optional_value()
 
 
 class AddCapacityChangeDialog(QDialog):
@@ -142,9 +136,8 @@ class AddCapacityChangeDialog(QDialog):
         self.date_edit.setDisplayFormat("yyyy-MM-dd")
         form.addRow("適用開始日", self.date_edit)
 
-        self.lines_spin = NoWheelSpinBox()
-        self.lines_spin.setRange(0, 999)
-        self.lines_spin.setValue(default_lines)
+        self.lines_spin = OptionalSpinBox(_MAX_LINES, _LINES_UNSET_TEXT)
+        self.lines_spin.set_optional_value(default_lines)
         form.addRow("同時ライン数", self.lines_spin)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -153,7 +146,7 @@ class AddCapacityChangeDialog(QDialog):
         form.addRow(buttons)
 
     def values(self):
-        return _to_iso(self.date_edit.date()), self.lines_spin.value()
+        return _to_iso(self.date_edit.date()), self.lines_spin.optional_value()
 
 
 class AddHolidayDialog(QDialog):
@@ -205,8 +198,6 @@ class BasicInfoTab(QWidget):
         scroll.setWidget(content)
         layout = QVBoxLayout(content)
 
-        layout.addWidget(self._build_project_group())
-
         self.milestones_section = CrudSection(
             "マイルストーン", ["マイルストーン名", "締切日", "備考"],
             on_add=self._add_milestone, on_delete=self._delete_milestone,
@@ -219,15 +210,18 @@ class BasicInfoTab(QWidget):
         )
         self.holidays_section.table.itemChanged.connect(self._on_holiday_note_changed)
 
+        # 1段目: プロジェクト概要／休業日（上下）。2段目: マイルストーン／
+        # チーム（左右5:5、`QSplitter` でユーザーがドラッグ調整可）。
+        layout.addWidget(self._build_project_group())
+        layout.addWidget(self.holidays_section)
+
         row2 = QSplitter(Qt.Horizontal)
         row2.addWidget(self.milestones_section)
-        row2.addWidget(self.holidays_section)
-        row2.setStretchFactor(0, 1)
-        row2.setStretchFactor(1, 1)
-        layout.addWidget(row2)
+        row2.addWidget(self._build_teams_group())
+        row2.setStretchFactor(0, 5)
+        row2.setStretchFactor(1, 5)
+        layout.addWidget(row2, 1)
         self._row2_splitter = row2
-
-        layout.addWidget(self._build_team_and_histogram_group(), 1)
 
         # コンストラクタ時点（実際のウィジェット幅が確定する前）にsetSizes()を
         # 呼んでも比率が反映されない（表示後の最初のレイアウトで上書きされる）
@@ -238,8 +232,8 @@ class BasicInfoTab(QWidget):
         self.refresh_all()
 
     # チームを選択した後、チーム欄（ツリー＋ツールバー）の外をクリックしたら
-    # 選択を解除し、ヒストグラムを全チーム表示に戻す。アプリ全体のマウス
-    # クリックを監視する必要があるためQApplication単位のイベントフィルタで
+    # 選択を解除する。アプリ全体のマウスクリックを監視する必要があるため
+    # QApplication単位のイベントフィルタで
     # 実装するが、これはアプリ内で発生する *すべての* イベントを一度Python側へ
     # 通すことになる。このタブが表示されている間だけ仕掛け、他のタブへ移ったら
     # 外す（例えばジョブ一覧を1,900行組み立てる間だけで55万回以上呼ばれ、
@@ -272,13 +266,9 @@ class BasicInfoTab(QWidget):
         return False
 
     def _apply_initial_splitter_sizes(self):
-        total2 = self._row2_splitter.width()
-        if total2 > 0:
-            self._row2_splitter.setSizes([total2 // 2, total2 - total2 // 2])
-        total3 = self._team_histogram_splitter.width()
-        if total3 > 0:
-            left = round(total3 * 3 / 10)
-            self._team_histogram_splitter.setSizes([left, total3 - left])
+        total = self._row2_splitter.width()
+        if total > 0:
+            self._row2_splitter.setSizes([total // 2, total - total // 2])
 
     # -- プロジェクト概要 -----------------------------------------------------
 
@@ -301,7 +291,6 @@ class BasicInfoTab(QWidget):
 
     def _on_project_changed(self):
         self.db.set_project(self.project_name_edit.text(), _to_iso(self.start_date_edit.date()))
-        self._refresh_histogram()
 
     def refresh_project(self):
         proj = self.db.get_project()
@@ -359,7 +348,6 @@ class BasicInfoTab(QWidget):
             break
         self.refresh_milestones()
         select_row_by_id(self.milestones_section.table, new_id)
-        self._refresh_histogram()
 
     def _delete_milestone(self, row):
         table = self.milestones_section.table
@@ -369,7 +357,6 @@ class BasicInfoTab(QWidget):
             return
         self.db.delete_milestone(ms_id)
         self.refresh_milestones()
-        self._refresh_histogram()
 
     def _on_milestone_cell_changed(self, item):
         if item.column() not in (0, 2):
@@ -393,14 +380,12 @@ class BasicInfoTab(QWidget):
             # 締切日順に合わせ直す（このメソッド自体がitemChangedシグナル内から
             # 呼ばれているため、ウィジェットの再構築は次のイベントループへ遅延させる）。
             QTimer.singleShot(0, self.refresh_milestones)
-        self._refresh_histogram()
 
     def _resort_milestones_later(self):
         """締切日順の表示を保つよう並べ直す。日付欄の編集が終わった時点で呼ぶ
         （このメソッド自体がフォーカス喪失の処理中から呼ばれるため、ウィジェットの
         再構築は次のイベントループへ遅延させる）。"""
         QTimer.singleShot(0, self.refresh_milestones)
-        self._refresh_histogram()
 
     def _on_milestone_date_changed(self, milestone_id, qdate):
         table = self.milestones_section.table
@@ -416,7 +401,6 @@ class BasicInfoTab(QWidget):
                 # 編集で何度も値が変わるので、検査・確認ダイアログは毎回は出さない）。
                 if self._milestone_date_before_edit is None:
                     self._milestone_date_before_edit = (milestone_id, previous)
-                self._refresh_histogram()
                 return
 
     def _repair_milestone_consistency_before_commit(self):
@@ -441,7 +425,6 @@ class BasicInfoTab(QWidget):
                 milestone_id, previous["name"], previous["end_date"], previous["note"],
             )
         QTimer.singleShot(0, self.refresh_milestones)
-        self._refresh_histogram()
 
     def _notify_jobs_changed(self):
         """ジョブ側のデータを書き換えたことを他タブへ伝える（タブ3が開いた
@@ -482,7 +465,6 @@ class BasicInfoTab(QWidget):
         teams_header.setSectionResizeMode(1, QHeaderView.Stretch)
         self.teams_tree.setSelectionMode(QTreeWidget.SingleSelection)
         self.teams_tree.itemChanged.connect(self._on_team_name_changed)
-        self.teams_tree.itemSelectionChanged.connect(self._refresh_histogram)
         keep_selection_visible(self.teams_tree)
         panel_layout.addWidget(self.teams_tree)
 
@@ -508,11 +490,11 @@ class BasicInfoTab(QWidget):
             default_child.setData(0, Qt.UserRole, {"kind": "default_capacity", "team_id": team["id"]})
             top.addChild(default_child)
 
-            default_spin = NoWheelSpinBox()
-            default_spin.setRange(0, 999)
-            default_spin.setValue(team["max_lines"])
+            default_spin = OptionalSpinBox(_MAX_LINES, _LINES_UNSET_TEXT)
+            default_spin.set_optional_value(team["max_lines"])
             default_spin.valueChanged.connect(
-                lambda value, eid=team["id"]: self._on_team_lines_changed(eid, value)
+                lambda _val, eid=team["id"], spin=default_spin:
+                    self._on_team_lines_changed(eid, spin.optional_value())
             )
             bind_undo_session(default_spin, self.db, "チームの同時ライン数を変更")
             tree.setItemWidget(default_child, 1, default_spin)
@@ -537,9 +519,8 @@ class BasicInfoTab(QWidget):
                 )
                 tree.setItemWidget(child, 0, date_edit)
 
-                lines_spin = NoWheelSpinBox()
-                lines_spin.setRange(0, 999)
-                lines_spin.setValue(c["lines"])
+                lines_spin = OptionalSpinBox(_MAX_LINES, _LINES_UNSET_TEXT)
+                lines_spin.set_optional_value(c["lines"])
                 lines_spin.valueChanged.connect(
                     lambda _val, cid=c["id"], it=child: self._on_team_capacity_change_edited(cid, it)
                 )
@@ -550,9 +531,8 @@ class BasicInfoTab(QWidget):
 
     def _selected_team_tree_item(self):
         """teams_tree の実際の選択状態（ハイライト）を返す。currentItem()は
-        空欄部分クリックで選択が解除されても値が残り続けてしまい、「チームを
-        選んだ後、選択を解除しても全チーム表示のヒストグラムに戻れない」
-        原因になるため使わない（SingleSelectionのため高々1件）。"""
+        空欄部分クリックで選択が解除されても値が残り続けてしまうため使わない
+        （SingleSelectionのため高々1件）。"""
         selected = self.teams_tree.selectedItems()
         return selected[0] if selected else None
 
@@ -616,7 +596,6 @@ class BasicInfoTab(QWidget):
             break
         self.refresh_teams()
         self._select_capacity_change_item(team_id, new_id)
-        self._refresh_histogram()
 
     def _delete_capacity_change_selected(self):
         item = self._selected_team_tree_item()
@@ -630,7 +609,6 @@ class BasicInfoTab(QWidget):
         self.db.delete_team_capacity_change(data["change_id"])
         self.refresh_teams()
         self._select_team_tree_item(team_id)
-        self._refresh_histogram()
 
     def _select_capacity_change_item(self, team_id, change_id):
         top = self._find_team_tree_item(team_id)
@@ -649,12 +627,13 @@ class BasicInfoTab(QWidget):
         if date_edit is None or lines_spin is None:
             return
         try:
-            self.db.update_team_capacity_change(change_id, _to_iso(date_edit.date()), lines_spin.value())
+            self.db.update_team_capacity_change(
+                change_id, _to_iso(date_edit.date()), lines_spin.optional_value()
+            )
         except DuplicateNameError as e:
             QMessageBox.warning(self, "変更できません", str(e))
             self.refresh_teams()
             return
-        self._refresh_histogram()
 
     def _resort_team_capacity_changes_later(self):
         """適用開始日を変更すると並び順が変わりうるため、編集セッション
@@ -694,7 +673,6 @@ class BasicInfoTab(QWidget):
         self.refresh_teams()
         self._select_team_tree_item(new_id)
         self._notify_teams_changed()
-        self._refresh_histogram()
 
     def _delete_team_selected(self):
         _item, data = self._resolve_team_item(self._selected_team_tree_item())
@@ -712,7 +690,6 @@ class BasicInfoTab(QWidget):
             return
         self.refresh_teams()
         self._notify_teams_changed()
-        self._refresh_histogram()
 
     def _on_team_name_changed(self, item, column):
         if column != 0:
@@ -737,101 +714,19 @@ class BasicInfoTab(QWidget):
         if top is None:
             return
         self.db.update_team(team_id, top.text(0), value)
-        self._refresh_histogram()
 
     def _notify_teams_changed(self):
         if self.on_teams_changed:
             self.on_teams_changed()
 
-    # -- チーム＋リソースヒストグラム（1つの枠にまとめる） -------------------------------
+    # -- チーム（枠） ---------------------------------------------------------------
 
-    def _build_team_and_histogram_group(self):
+    def _build_teams_group(self):
         group = QGroupBox("チーム")
         group_layout = QVBoxLayout(group)
-
-        splitter = QSplitter(Qt.Horizontal)
         self._teams_panel = self._build_teams_panel()
-        splitter.addWidget(self._teams_panel)
-        splitter.addWidget(self._build_histogram_panel())
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 7)
-        group_layout.addWidget(splitter)
-        self._team_histogram_splitter = splitter
-
+        group_layout.addWidget(self._teams_panel)
         return group
-
-    def _build_histogram_panel(self):
-        panel = QWidget()
-        panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(0, 0, 0, 0)
-
-        title = QLabel("リソースヒストグラム")
-        title_font = title.font()
-        title_font.setBold(True)
-        title.setFont(title_font)
-        panel_layout.addWidget(title)
-
-        self.histogram_status_label = QLabel("")
-        self.histogram_status_label.setWordWrap(True)
-        panel_layout.addWidget(self.histogram_status_label)
-
-        self.histogram_view = ResourceHistogramView()
-        panel_layout.addWidget(self.histogram_view, 1)
-
-        return panel
-
-    def _refresh_histogram(self):
-        """チーム・マイルストーン・開発開始日のいずれかが変わるたび、また
-        チームツリーの選択が変わるたびに呼ぶ。ツリーで1件のチーム（または
-        その変動点の子）が選択されていればそのチーム単独の推移を、未選択
-        なら全チーム合計を積み上げ（人数比が分かる）で表示する（表示する
-        のはあくまで計画上の同時ライン数の上限であり、実際のタスク使用状況
-        ではない——詳細はdocs/architecture.md参照）。"""
-        proj = self.db.get_project()
-        teams = self.db.list_teams()
-        if not proj["start_date"] or not teams:
-            self.histogram_status_label.setStyleSheet("color: #b3261e;")
-            self.histogram_status_label.setText(
-                "開発開始日とチームを設定すると、リソースヒストグラムを表示します。"
-            )
-            self.histogram_view.setScene(QGraphicsScene())
-            return
-        self.histogram_status_label.setStyleSheet("")
-        self.histogram_status_label.setText("")
-
-        milestones = self.db.list_milestones()
-        changes_by_team = {t["id"]: self.db.list_team_capacity_changes(t["id"]) for t in teams}
-        all_changes = [c for changes in changes_by_team.values() for c in changes]
-        range_start, range_end = histogram_axis_range(proj["start_date"], milestones, all_changes)
-
-        _item, data = self._resolve_team_item(self._selected_team_tree_item())
-        colors = team_color_map(teams)
-        labels = {t["id"]: t["name"] for t in teams}
-        milestone_markers = [
-            (m["id"], m["name"], date.fromisoformat(m["end_date"])) for m in milestones
-        ]
-        project_start = date.fromisoformat(proj["start_date"])
-
-        if data is not None:
-            team_id = data["team_id"]
-            team = next(t for t in teams if t["id"] == team_id)
-            segments_by_key = {team_id: team_capacity_breakpoints(
-                team, changes_by_team[team_id], proj["start_date"]
-            )}
-            mode = "single"
-        else:
-            segments_by_key = {
-                t["id"]: team_capacity_breakpoints(t, changes_by_team[t["id"]], proj["start_date"])
-                for t in teams
-            }
-            mode = "stacked"
-
-        scene = build_histogram_scene(
-            segments_by_key, mode, colors, labels, milestone_markers,
-            project_start, range_start, range_end,
-        )
-        self.histogram_view.setScene(scene)
-        self.histogram_view.fit_all()
 
     # -- 休業日 -------------------------------------------------------------------
 
@@ -930,7 +825,6 @@ class BasicInfoTab(QWidget):
         self.refresh_milestones()
         self.refresh_teams()
         self.refresh_holidays()
-        self._refresh_histogram()
 
     def refresh_choices(self):
         """他タブの変更（現状なし）に合わせて表示を更新する共通インターフェース。

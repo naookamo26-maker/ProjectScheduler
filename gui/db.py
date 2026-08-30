@@ -150,6 +150,28 @@ def parse_tags(tags):
     return [t.strip() for t in (tags or "").split(",") if t.strip()]
 
 
+#: job_task_overrides.status に許される値（NULL＝未着手は別途Noneで表す）。
+TASK_STATUSES = ("in_progress", "done")
+
+
+def normalize_task_status(status):
+    """タスクの進捗状態を検証し、None（未着手）/ "in_progress"（進行中）/
+    "done"（完了）のいずれかに正規化する。
+
+    ALTER TABLE で後から足した列にはCHECK制約を付けられないため、他の
+    後付け列（normalize_dependency_kind 等）と同様に書き込み経路で守る。
+    """
+    if status is None or status == "":
+        return None
+    status = str(status).strip()
+    if status not in TASK_STATUSES:
+        raise ProjectDatabaseError(
+            f"タスクの状態 '{status}' は不正です（{' / '.join(TASK_STATUSES)} のいずれか、"
+            "または未着手はNone）"
+        )
+    return status
+
+
 def undoable(label):
     """ProjectDatabaseの変更系メソッドに付け、Undo/Redoの記録対象にするデコレータ。
 
@@ -1189,7 +1211,7 @@ class ProjectDatabase:
             "o.milestone_id AS override_milestone_id, "
             "om.name AS override_milestone_name, "
             "o.team_id AS override_team_id, ot.name AS override_team_name, "
-            "o.start_pin_date, COALESCE(o.tags, '') AS tags "
+            "o.start_pin_date, COALESCE(o.tags, '') AS tags, o.status "
             "FROM jobs j "
             "JOIN workflow_tasks wt ON wt.workflow_id = j.workflow_id "
             "JOIN teams t ON t.id = wt.team_id "
@@ -1214,7 +1236,7 @@ class ProjectDatabase:
         rows = self._conn.execute(
             "SELECT o.job_id, o.workflow_task_id, o.is_active, o.override_days, "
             "o.milestone_id AS override_milestone_id, o.team_id AS override_team_id, "
-            "o.start_pin_date, o.tags "
+            "o.start_pin_date, o.tags, o.status "
             "FROM job_task_overrides o "
             "JOIN jobs j ON j.id = o.job_id "
             "JOIN workflow_tasks wt ON wt.id = o.workflow_task_id "
@@ -1225,9 +1247,10 @@ class ProjectDatabase:
     @undoable("タスク上書きを変更")
     def upsert_job_task_override(self, job_id, workflow_task_id, is_active=True,
                                   override_days=None, milestone_id=None, team_id=None,
-                                  start_pin_date=None, tags=""):
+                                  start_pin_date=None, tags="", status=None):
         start_pin_date = _validate_start_pin_date(start_pin_date)
         tags = normalize_tags(tags)
+        status = normalize_task_status(status)
         existing = self._conn.execute(
             "SELECT id FROM job_task_overrides WHERE job_id = ? AND workflow_task_id = ?",
             (job_id, workflow_task_id),
@@ -1235,17 +1258,18 @@ class ProjectDatabase:
         if existing:
             self._conn.execute(
                 "UPDATE job_task_overrides SET is_active = ?, override_days = ?, "
-                "milestone_id = ?, team_id = ?, start_pin_date = ?, tags = ? WHERE id = ?",
+                "milestone_id = ?, team_id = ?, start_pin_date = ?, tags = ?, status = ? "
+                "WHERE id = ?",
                 (int(is_active), override_days, milestone_id, team_id, start_pin_date,
-                 tags, existing["id"]),
+                 tags, status, existing["id"]),
             )
         else:
             self._conn.execute(
                 "INSERT INTO job_task_overrides(job_id, workflow_task_id, is_active, "
-                "override_days, milestone_id, team_id, start_pin_date, tags) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "override_days, milestone_id, team_id, start_pin_date, tags, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (job_id, workflow_task_id, int(is_active), override_days, milestone_id,
-                 team_id, start_pin_date, tags),
+                 team_id, start_pin_date, tags, status),
             )
         self._commit()
 

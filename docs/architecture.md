@@ -19,11 +19,11 @@ gui/ ─────────────────────────
   ├ db.py            CRUD（Qt非依存）+ Undo記録の仕組み・明示的な保存
   ├ db_schema.py      SQLiteスキーマ定義 + 旧バージョンからのマイグレーション
   ├ undo_manager.py   Undo/Redoスタック（Qt非依存）
-  ├ main.py           MainWindow・4タブ組み立て・File/Editメニュー・D&Dで開く
-  ├ tab_basic_info.py  タブ1「基本情報設定」（チームはresource_histogram.pyの
-  │                      リソースヒストグラムと連動するツリー表示）
-  ├ resource_histogram.py  リソースヒストグラムの計算（純粋関数）・描画
-  │                          （gui/gantt_view.pyのQGraphicsView描画方式を踏襲）
+  ├ main.py           MainWindow・5タブ組み立て・File/Editメニュー・D&Dで開く
+  ├ tab_basic_info.py  タブ1「基本情報設定」（チームは変動点付きのツリー表示）
+  ├ resource_histogram.py  階段関数の区間化（純粋関数。旧リソース
+  │                          ヒストグラム機能の名残で、プロジェクト分析
+  │                          タブの「上限に張り付いた日数」の集計に使う）
   ├ tab_workflows.py    タブ2「ワークフロー設計」（node_canvas.pyのノードビューと、
   │                       タスク表・依存テンプレート表のテーブルビューを切り替える）
   ├ node_canvas.py       ノードグラフエディタ（タスク依存関係の視覚編集、
@@ -31,8 +31,29 @@ gui/ ─────────────────────────
   │                       フィット表示、ダイアログ開閉の共通ロジック）
   ├ tab_jobs.py            タブ3「ジョブ」（ワークフロー絞り込み、依存ジョブ
   │                          セクションを含む。旧タブ4はここに統合済み）
-  ├ widgets_common.py        タブ横断の共通UI部品（列幅自動調整含む）
-  └ gantt_generator.py        DB → project_scheduler.py 呼び出し → ガントチャート出力
+  ├ gantt_generator.py       DB → project_scheduler.py 呼び出し → ガントチャート出力
+  ├ schedule_cache.py          スケジューリング結果のキャッシュ（ワーカー
+  │                              スレッド管理・revision判定）。tab_gantt.pyと
+  │                              tab_analysis.pyが共有する（MainWindowが1つ
+  │                              保持）——詳細はdocs/project_analysis_tab_design.md §5
+  ├ tab_gantt.py              タブ4「ガントチャート」（schedule_cache.pyへ
+  │                            計算を要求し、結果をgantt_view.pyで描画）
+  ├ gantt_view.py              QGraphicsScene直接描画のガントチャート本体
+  ├ summary_metrics.py          タブ5の集計（Qt非依存の純粋関数。
+  │                              gantt_generator.build_frames()が組み立てた
+  │                              result_dfを受け取って集計するだけで、自分では
+  │                              スケジューリングしない）
+  ├ tab_analysis.py             タブ5「プロジェクト分析」（schedule_cache.py
+  │                              経由で結果を集計する表示専用タブ。自分では
+  │                              スケジューリングを起こさない。サマリーは
+  │                              QTabWidgetのサブタブに分ける）
+  ├ analysis_charts.py         タブ5のグラフ描画（チーム別＝同時タスク数、
+  │                              ワークフロー別＝稼働タスク件数）。共通の
+  │                              期間X軸の上に積み上げ面・折れ線を描く
+  │                              （粒度は月次/週次/日次。gantt_view.pyと同じ
+  │                              QGraphicsScene直接描画・GanttGraphicsView
+  │                              再利用パターン）
+  └ widgets_common.py        タブ横断の共通UI部品（列幅自動調整含む）
 ```
 
 ## project_scheduler.py との連携方式
@@ -481,7 +502,7 @@ GUIのガントチャートタブは件数と最大超過日数を画面上部�
   というシンプルな仕様のため、専用ウィジェットを持たずジョブ名列（列0）と
   同様に常時editableなitemとして扱う。
 
-## ガントチャートタブのバックグラウンド計算
+## スケジューリング結果の共有キャッシュ（`gui/schedule_cache.py`）
 
 スケジューリングは規模によっては数秒かかるため、そのままGUIスレッドで実行すると
 タブを開くたびにウィンドウ全体が固まる。次の2つで回避している。
@@ -489,34 +510,48 @@ GUIのガントチャートタブは件数と最大超過日数を画面上部�
 1. **結果のキャッシュ**: `ProjectDatabase.revision`（内容が変わるたびに増える
    通し番号）を結果と一緒に覚えておき、一致している間は再計算せず表示だけ
    作り直す。タブを行き来しただけで計算し直さない。
-2. **ワーカースレッド**: 計算本体を `_ScheduleWorker`（`gui/tab_gantt.py`）で
+2. **ワーカースレッド**: 計算本体を `_ScheduleWorker`（`gui/schedule_cache.py`）で
    実行する。分割の境界は「DBを読むのはGUIスレッド、計算だけ別スレッド」。
    sqlite3の接続はスレッドをまたげず、計算中にGUI側がDBを書き換えると結果が
    壊れるため、`build_frames()` / `build_display()` はGUIスレッドで先に済ませ、
    ワーカーへはDataFrameだけを渡す（`compute_schedule_from_frames`）。
 
+タブ4「ガントチャート」（`gui/tab_gantt.py`）とタブ5「プロジェクト分析」
+（`gui/tab_analysis.py`）はこのキャッシュを共有する（`MainWindow`が
+プロジェクトを開くたびに1つ作り、両タブへ渡す）。どちらのタブも
+`refresh_choices()`（タブに切り替わるたびに呼ばれる）の中で
+`ScheduleCache.ensure_fresh()`を呼んで最新化を要求できるため、
+ガントチャートタブを一度も開いていなくても、プロジェクト分析タブを開けば
+それだけで計算が起動する。計算が非同期に完了した際は`ScheduleCache.updated`
+シグナルで両タブへ通知するが、実際に画面を作り直すのは**自分が表示中の
+タブだけ**（`isVisible()`で判定）——非表示のタブは、次に実際に切り替えられた
+時点で`refresh_choices()`が同期的に最新の内容を反映すればよく、見えていない
+間の再描画は無駄なため。
+
 計算中に内容を変えた場合は、新しい要求が古い要求を追い越す。ワーカーは強制終了
 させず、要求ごとの通し番号で「最後に出した要求の結果か」を判定し、古い結果は
 捨てる（スケジューリングはDBに触れない純粋な計算なので、走らせたままにしても
-害がない）。ウィンドウを閉じる/プロジェクトを開き直す際は、
-`MainWindow._shutdown_gantt_tab()` がスレッドの終了を待ち合わせる。
+害がない）。同じrevisionに対して2つのタブがほぼ同時に`ensure_fresh()`を
+呼んでも、`_computing_revision`で「既に同じ内容の計算が進行中か」を判定し、
+二重にワーカーを起動しない。ウィンドウを閉じる/プロジェクトを開き直す際は、
+`MainWindow._shutdown_schedule_cache()` がスレッドの終了を待ち合わせる。
 
 ### revisionは「要求時点」の値を刻む
 
 結果のキャッシュ判定（`self._computed_revision == self.db.revision`）に使う
 `_computed_revision`は、計算が**完了した時点**の`db.revision`ではなく、
-`build_frames()`を呼んだ**要求時点**の`db.revision`（`refresh_choices()`が
+`build_frames()`を呼んだ**要求時点**の`db.revision`（`ensure_fresh()`が
 `request_revision`として控え、`_pending_revision`経由で`_on_schedule_finished`
 に渡す）を刻む。
 
 計算は非同期のため、ワーカーが走っている間に他タブでDBが編集されて
 `db.revision`が先に進むことがある。完了時点の値を刻んでいると、この
 「計算中の編集」を誤って「結果に反映済み」とみなしてしまい——結果は
-編集前の古いDB内容のままなのに、以降`refresh_choices()`が
+編集前の古いDB内容のままなのに、以降`ensure_fresh()`が
 `_computed_revision == db.revision`の一致を見て再計算をスキップし続け、
 編集がガントチャートに反映されないまま「最新」として画面に残ってしまう。
 要求時点の値を刻めば、計算中の編集で`db.revision`との食い違いが必ず残るため、
-次の`refresh_choices()`が正しく再計算を走らせる。
+次の`ensure_fresh()`が正しく再計算を走らせる。
 
 ### `sync_dependency_templates()`が無変更でrevisionを進めないこと
 
@@ -533,7 +568,7 @@ GUIのガントチャートタブは件数と最大超過日数を画面上部�
 
 `_start_worker()`は、実行中の古いワーカーを止めずに放置する方針（上記）
 のため、タブを連続して切り替えたり配置スライダーを繰り返し操作したりすると、
-複数本のスレッドが同時に実行中の状態になり得る。`GanttTab._threads`は
+複数本のスレッドが同時に実行中の状態になり得る。`ScheduleCache._threads`は
 `(QThread, _ScheduleWorker)`の**一覧**として全件を保持し、`shutdown()`は
 その全件を待ち合わせる。「最後の1本」だけを`self._thread`に保持していた
 頃は、それより前に始まった実行中のスレッドを待たずにウィンドウが閉じてしまい、
@@ -553,7 +588,8 @@ PySide側が接続をキュー接続だと判定できず、ワーカースレ�
 回帰テストは`tests/test_gui_undo_redo.py`
 （`test_schedule_completing_after_a_concurrent_edit_does_not_mask_it` /
 `test_switching_to_jobs_tab_and_back_does_not_force_a_recomputation` /
-`test_shutdown_waits_for_every_in_flight_worker_thread`）。
+`test_shutdown_waits_for_every_in_flight_worker_thread` /
+`test_analysis_tab_computes_its_own_result_without_opening_gantt_tab`）。
 
 ## ノードグラフの循環依存検出
 
@@ -990,89 +1026,26 @@ GUIで編集できる項目はすべてUndo/Redoで元に戻せる。個々の�
   エントリが捨てられた場合は、以降「保存時と同じ内容か」を判定できなくなるため
   未保存扱いに倒す。
 
-## リソースヒストグラム（`gui/resource_histogram.py`）
+## 階段関数の区間化（`gui/resource_histogram.py`）
 
-タブ1「基本情報設定」のチーム欄（ツリー表示）と連動する、チームの
-同時ライン数の推移グラフ。計算部分を2段階に分けているのは、将来ガント
-チャートタブで「実際のタスクスケジューリング結果（リソース使用状況）」を
-表示する機能を追加する際に、描画ロジックをそのまま使い回せるようにするため
-——現時点ではそちらは未実装。
+`compute_step_segments(breakpoints, range_start, range_end)` は、
+「日付→値」の変化点リストから階段関数の区間を作るだけの、特定の用途に
+依存しない汎用関数（Qt非依存）。
 
-- `compute_step_segments(breakpoints, range_start, range_end)` は、
-  「日付→値」の変化点リストから階段関数の区間を作るだけの汎用関数で、
-  チームの計画容量固有の知識を一切持たない。`team_capacity_breakpoints`
-  （`teams.max_lines` + `team_capacity_changes`から変化点を作る、チーム容量
-  専用の関数）とは意図的に分離してあり、将来「日ごとの実タスク稼働数」から
-  同じ形の変化点リストを作る関数を追加すれば、`compute_step_segments`と
-  `build_histogram_scene`（描画）はそのまま流用できる想定。
-- 描画は`gui/gantt_view.py`と同じ、素のQGraphicsScene直接描画方式を踏襲する
-  （プロット用ライブラリを新たに導入しない——`plotly`は`project_scheduler.py`の
-  静的HTML書き出し専用で、アプリ内描画では使っていないという既存方針に合わせる）。
-  ズーム・パン・A/Fキーは`gui/gantt_view.py`の`GanttGraphicsView`をそのまま
-  継承し（`ResourceHistogramView`）、フィット処理だけ`gui/node_canvas.py`の
-  `WorkflowGraphView.fit_all`と同じ自己完結パターンで追加する
-  （ヒストグラムのバーは個別選択できない仕様のため、`fit_selected`は
-  `fit_all`と同じ挙動にしている）。ヘッダー・左列を固定表示する
-  `FrozenGanttPane`相当の仕組みは導入していない（表示期間・行数がガント
-  チャートほど大きくならないため、v1では単一シーンで十分と判断した）。
-- **表示期間の割り切り**: X軸の範囲は開発開始日から、既知のマイルストーン
-  締切日・チームの容量変更点のうち最も遅い日付までとする
-  （`histogram_axis_range`）。どちらも無いプロジェクトでは、期間の長さを
-  決める材料が無いため開発開始日+90日をフォールバックとして使う。
-  ユーザーが調整できる設定にはしていない。
-- **未保存の座標を持たない**: ノードグラフの疑似ノード（`docs/architecture.md`
-  「ノードビュー／テーブルビューの切り替えと依存テンプレートの疑似ノード」参照）
-  と同様、ヒストグラムの見た目上の座標はDBに保存せず、表示のたびに計算し直す
-  （保存すべき状態はチームの容量設定そのものであり、グラフの座標はその都度の
-  派生表示でしかないため）。
-- **チーム名ラベル**: `build_histogram_scene`は、系列（チーム）ごとに
-  最も横幅が広い区間を選び、その中央にチーム名を1つだけ描画する（短い
-  区間が並ぶ場合に文字が重なって読めなくなるのを避けるため）。位置合わせは
-  `gui/gantt_view.py`の年ラベル（`_add_fixed_size_label` + `QFontMetrics`で
-  幅を測って中央寄せ）と同じ、シーン座標に対する簡易な近似であり、ズーム後に
-  再センタリングするような追従処理は行っていない（表示期間・行数の規模的に
-  ガントチャート本体ほどの精度は不要と判断）。
-- **タブ1側のレイアウト**: チームツリーとヒストグラムは、`gui/tab_basic_info.py`
-  側で1つの`QGroupBox("チーム")`の中に`QSplitter`（既定比率3:7）で並べており、
-  `resource_histogram.py`自体はどちらの枠に置かれるかを知らない（描画・計算
-  ロジックとレイアウトを分離するという、このモジュールの既存方針のまま）。
-- **上方向の余白**: 最も高いバーの上端が目盛りエリアの上端に接して窮屈に
-  見えないよう、Y軸のスケールには`TOP_PADDING_ROWS`（既定1行分）を常に
-  上乗せする（Y軸の目盛り自体は実際の最大値までしか描かないため、この余白に
-  目盛り線は増えない）。
-- **上余白はデータ量に応じて拡大し、ラベルはシーン最上部に固定する**
-  （`_compute_top_margin`、`_LABEL_TOP`）: マイルストーンラベルは
-  `ItemIgnoresTransformations`で常に一定ピクセル数のまま描かれるが、上余白
-  （`TOP_MARGIN`）が固定値のままだと、全チーム積み上げの合計値が大きい
-  （バーの縦幅が大きい）プロジェクトでは`fit_all()`が縦方向を大きく縮小する
-  ため、縮小されないラベルに対し余白だけが縮み、実際の画面上でラベルが
-  バーと重なって見えてしまう（回帰バグ）。上余白をバー全体の高さ
-  （`TOP_PADDING_ROWS`込み）に対する一定割合（`TOP_MARGIN_MIN_FRACTION`、
-  既定12%）を下限として確保することで、`fit_all()`後の表示倍率によらず、
-  実際の画面上の余白がビューポート高さに対して概ね一定の割合を保つように
-  している（縮小前のシーン座標での比率を保てば、縮小後の実ピクセルでの
-  比率も保たれるため）。
+元はタブ1「基本情報設定」のチーム欄と連動する「リソースヒストグラム」
+（チームの計画上の同時ライン数の推移を表示する機能）の一部だったが、
+その機能自体はプロジェクト分析タブへ移管して廃止した
+（`docs/project_analysis_tab_design.md`参照）。この関数は、プロジェクト
+分析タブの**「上限に張り付いた日数」列の集計**
+（`gui/summary_metrics._team_pinned_days`）が使い回しているため残している
+——同時タスク数と設定上限という2つの階段関数を共通の区切りへ揃えて
+突き合わせ、「同時タスク数＝上限」だった日数を数える処理で、まさにこの
+関数が想定していた用途にあたる。
 
-  **ここで重要なのが、ラベル自体の位置**: 当初はラベルを`top_margin`の
-  下端からの固定オフセット（例: `top_margin - 14`）に置いていたが、これでは
-  `top_margin`をいくら大きくしても、ラベルからバーまでのシーン座標上の
-  間隔は常に一定（`TOP_PADDING_ROWS * ROW_UNIT_HEIGHT`のみ）のままで、
-  拡大した余白が全く活用されず、実際には何も改善しないという不具合があった
-  （`top_margin`が動くとラベルの位置も一緒に追従してしまうため）。正しくは、
-  ラベルをシーンの最上部近くの固定位置（`_LABEL_TOP`）に置くことで、
-  `top_margin`が拡大するほどラベル・バー間の間隔（＝ほぼ`top_margin`
-  そのもの）も連動して広がるようにする。マイルストーン・開発開始日の
-  縦線も、ラベルと視覚的につながって見えるよう同じ`_LABEL_TOP`から
-  描き始める。合計値が小さい既存のプロジェクトでは、この下限が既定値
-  （`TOP_MARGIN`）を下回るため見た目は変わらない。
-- **マイルストーンの縦線はバーより前面**: `gui/gantt_view.py`と同じ幅2の
-  破線で描画し、`_grid_line`にzValue（`_MILESTONE_LINE_Z`）を渡してバー
-  （既定のzValue=0）より手前に重ねる。バーの内側を横切っても線が隠れず、
-  常にどのバーがどのマイルストーン日をまたぐか視認できるようにするため。
-- **チーム選択の解除**: チームツリーで1件選択すると単独表示になるが、
-  `QTreeWidget`は空欄クリックで選択（ハイライト）は解除されても
-  `currentItem()`は古い項目を指したまま残る。ヒストグラムの表示切り替えは
-  `currentItem()`ではなく実際の選択状態（`selectedItems()`）を見るように
-  している。また、チーム欄（ツリー＋ツールバー、`BasicInfoTab._teams_panel`）
-  の外をクリックした場合も選択を解除し、全チーム表示に戻す
-  （`QApplication`単位のイベントフィルタ、`BasicInfoTab.eventFilter`）。
+**描画側では使っていない**。チーム別サマリーのグラフ
+（`gui/analysis_charts.py`）は日次の階段ではなく週次の折れ線・面で描くため
+（`docs/screens.md`のタブ5節参照——日次の変化点をそのまま描くと営業日数ぶんの
+ギザギザになって形が読めず、月次まで丸めると短いプロジェクトで点が数個しか
+並ばない）、集計は `gui/summary_metrics` の
+`weekly_concurrency_by_team` / `weekly_peak_breakdown_by_team` / `weekly_capacity`
+が週単位で行う。

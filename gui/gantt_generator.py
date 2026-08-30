@@ -13,6 +13,7 @@ import pandas as pd
 from gui.db import parse_tags
 from project_scheduler import (
     _TEAM_COLOR_OVERFLOW,
+    _build_team_capacity_schedule,
     _build_team_color_map,
     format_dependency_ref,
     run_resource_constrained_scheduler_from_frames,
@@ -190,6 +191,16 @@ def build_display(db):
           タスク タグを1つの集合にまとめたもの——job_tagsと違い、個々の
           タスクどのタグを持つかまでは表現しない。ジョブ単位で「いずれかの
           タスクがそのタグを持つか」だけを見る絞り込みのため十分）
+        - task_status: {(Job_ID(文字列), Task_ID(文字列)): "in_progress"/"done"}
+          （プロジェクト分析タブの「タスクの状態」集計用。job_task_overrides.status
+          にユーザーが記録した実際の進捗——result_dfにはこの情報を持たせて
+          いないため、job_tags/job_task_tagsと同じ理由でここに含める。
+          エントリの無いタスクは未着手を表す）
+        - team_capacity_schedule: {Team_ID(文字列): [(適用開始日, ライン数), ...]}
+          （プロジェクト分析タブの「チーム別サマリー」用。project_scheduler.py の
+          `_build_team_capacity_schedule` をそのまま呼ぶ——スケジューリング本体が
+          実際に使ったのと同じ区分定数関数を、結果を作り直さずに読めるように
+          するため。ライン数「指定なし」は `project_scheduler._UNLIMITED_LINES`）
     """
     teams = db.list_teams()
     team_str = {t["id"]: _fmt("TEAM", t["id"]) for t in teams}
@@ -246,12 +257,40 @@ def build_display(db):
         for j in db.list_jobs()
     }
 
+    # 実際の進捗（ユーザーが手動で記録した状態）。result_dfには持たせていない
+    # ため、job_tags/job_task_tagsと同じ理由でここに含める。エントリの無い
+    # タスクは未着手を表す（job_task_overrides.statusのNULLと同じ既定）。
+    task_status = {
+        (_fmt("JOB", o["job_id"]), _fmt("T", o["workflow_task_id"])): o["status"]
+        for o in db.list_all_job_task_overrides()
+        if o["status"] is not None
+    }
+
+    # チーム別サマリーの「上限に張り付いた日数」・上限の破線に使う区分定数関数。
+    # build_frames() の df_teams/df_team_capacity と同じ組み立て方（team_str
+    # による文字列ID変換）をここでも独立に行う——build_frames()側の結果
+    # （frames）はワーカースレッドへ渡した後は保持されないため。
+    df_teams_for_capacity = pd.DataFrame(
+        [{"Team_ID": team_str[t["id"]], "Max_Lines": t["max_lines"]} for t in teams]
+    )
+    capacity_change_rows = [
+        {"Team_ID": team_str[t["id"]], "Start_Date": c["start_date"], "Lines": c["lines"]}
+        for t in teams for c in db.list_team_capacity_changes(t["id"])
+    ]
+    df_team_capacity_for_schedule = pd.DataFrame(
+        capacity_change_rows, columns=["Team_ID", "Start_Date", "Lines"]
+    )
+    team_capacity_schedule = _build_team_capacity_schedule(
+        df_teams_for_capacity, df_team_capacity_for_schedule
+    )
+
     return {
         "team_names": team_names, "team_colors": team_colors,
         "workflow_names": workflow_names, "workflow_colors": workflow_colors,
         "milestone_markers": milestone_markers,
         "common_holiday_dates": common_holiday_dates, "holidays_by_team": holidays_by_team,
-        "job_tags": job_tags, "job_task_tags": job_task_tags,
+        "job_tags": job_tags, "job_task_tags": job_task_tags, "task_status": task_status,
+        "team_capacity_schedule": team_capacity_schedule,
     }
 
 

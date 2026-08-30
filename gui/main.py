@@ -1,7 +1,7 @@
 """
 GUIエントリポイント（MainWindow）。
 
-4タブ（基本情報設定・ワークフロー設計・ジョブ・ガントチャート）を束ね、
+5タブ（基本情報設定・ワークフロー設計・ジョブ・ガントチャート・プロジェクト分析）を束ね、
 File メニューでプロジェクトファイル（.pschedule）の新規作成/オープンを行う。
 プロジェクトファイルをウィンドウにドラッグ&ドロップして開くこともできる。
 """
@@ -24,6 +24,8 @@ from PySide6.QtWidgets import (
 
 from gui.db import ProjectDatabase
 from gui.gantt_generator import generate_gantt, validate_for_generation
+from gui.schedule_cache import ScheduleCache
+from gui.tab_analysis import AnalysisTab
 from gui.tab_basic_info import BasicInfoTab
 from gui.tab_gantt import GanttTab
 from gui.tab_jobs import JobsTab
@@ -42,6 +44,9 @@ class MainWindow(QMainWindow):
         # プロジェクトファイルを開くたびに作り直す（ファイルをまたいだUndoは
         # 行わない）。詳細は gui/undo_manager.py 参照。
         self.undo_manager: UndoManager | None = None
+        # ガントチャートタブ・プロジェクト分析タブが共有するスケジューリング
+        # 結果のキャッシュ（gui/schedule_cache.py）。DBを開くたびに作り直す。
+        self.schedule_cache: ScheduleCache | None = None
 
         self.setWindowTitle("プロジェクトスケジューラー")
         self.resize(1500, 900)
@@ -120,22 +125,29 @@ class MainWindow(QMainWindow):
             ),
             "ガントチャート",
         )
+        self.tabs.addTab(
+            self._placeholder_tab(
+                "ガントチャートタブの計算結果を、KPI・マイルストーン別サマリーとして集計表示します。"
+            ),
+            "プロジェクト分析",
+        )
         self.tabs.setEnabled(False)
 
-    def _shutdown_gantt_tab(self):
-        """タブを差し替える/閉じる前に、ガントチャートタブが走らせている
-        スケジューリングの終了を待つ（gui/tab_gantt.py の shutdown を参照）。"""
-        tab = getattr(self, "tab_gantt", None)
-        if tab is not None:
+    def _shutdown_schedule_cache(self):
+        """タブを差し替える/閉じる前に、ScheduleCache が走らせている
+        スケジューリングの終了を待つ（gui/schedule_cache.py の shutdown を参照）。"""
+        cache = self.schedule_cache
+        if cache is not None:
             try:
-                tab.shutdown()
+                cache.shutdown()
             except RuntimeError:
                 pass  # 既にQt側で破棄済み
-            self.tab_gantt = None
+            self.schedule_cache = None
+        self.tab_gantt = None
 
     def _rebuild_tabs(self):
         """DBオープン後、実際に機能するタブへ差し替える。"""
-        self._shutdown_gantt_tab()
+        self._shutdown_schedule_cache()
         self.tabs.clear()
 
         self.tab_basic_info = BasicInfoTab(
@@ -150,8 +162,15 @@ class MainWindow(QMainWindow):
         self.tab_jobs = JobsTab(self.db)
         self.tabs.addTab(self.tab_jobs, "ジョブ作成")
 
-        self.tab_gantt = GanttTab(self.db)
+        # ガントチャートタブ・プロジェクト分析タブはこのキャッシュ経由で
+        # スケジューリング結果を共有する（どちらのタブからでも計算を起動できる）。
+        self.schedule_cache = ScheduleCache(self.db, parent=self)
+
+        self.tab_gantt = GanttTab(self.db, self.schedule_cache)
         self.tabs.addTab(self.tab_gantt, "ガントチャート")
+
+        self.tab_analysis = AnalysisTab(self.db, self.schedule_cache)
+        self.tabs.addTab(self.tab_analysis, "プロジェクト分析")
 
         self.tabs.setEnabled(True)
         self.generate_action.setEnabled(True)
@@ -498,7 +517,7 @@ class MainWindow(QMainWindow):
             # （フォーカスが外れた入力欄が、閉じたDBへ書き込もうとするのを防ぐ）。
             self.db.on_change = None
             self.db.undo_manager = None
-            self._shutdown_gantt_tab()
+            self._shutdown_schedule_cache()
             self._build_empty_state_tabs()
             self.db.close()
         super().closeEvent(event)

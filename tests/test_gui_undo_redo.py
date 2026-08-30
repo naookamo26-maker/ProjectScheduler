@@ -58,7 +58,7 @@ def window(qapp):
     # （gui/main.py の _confirm_discard_unsaved）。テストではダイアログを
     # 操作できず無限にブロックしてしまうため、後片付けはダイアログを経由
     # しない形で行う。
-    w._shutdown_gantt_tab()
+    w._shutdown_schedule_cache()
     w.db.on_change = None
     w.db.undo_manager = None
     w.db.close()
@@ -160,7 +160,7 @@ def test_focus_is_never_moved_into_cell_widgets_by_undo(window, qapp):
 def test_teams_tree_shows_default_capacity_as_first_undeletable_child(window, qapp):
     """開発開始日からの既定値（teams.max_lines）は、他の変動点と同じ見た目の
     最初の子行として表示され、日付は開発開始日で固定（編集不可）・ライン数は
-    インライン編集可能（NoWheelSpinBox）で、削除ボタンでは削除できないこと。"""
+    インライン編集可能（OptionalSpinBox）で、削除ボタンでは削除できないこと。"""
     bi = window.tab_basic_info
     window.tabs.setCurrentWidget(bi)
     window.db.set_project("P", "2026-01-01")
@@ -184,6 +184,36 @@ def test_teams_tree_shows_default_capacity_as_first_undeletable_child(window, qa
     with patch.object(QMessageBox, "information", return_value=QMessageBox.Ok):
         bi._delete_capacity_change_selected()
     assert bi.teams_tree.topLevelItem(0).childCount() == 1  # 既定値は削除されない
+
+
+def test_teams_tree_shows_unspecified_lines_as_special_value(window, qapp):
+    """ライン数「指定なし」（max_lines=None）のチームは、ツリー上のスピン
+    ボックスが特殊値表示（specialValueText）になり、optional_value()が
+    Noneを返すこと。"""
+    bi = window.tab_basic_info
+    window.tabs.setCurrentWidget(bi)
+    window.db.set_project("P", "2026-01-01")
+    window.db.add_team("チームA", None)
+    bi.refresh_all()
+    qapp.processEvents()
+
+    top = bi.teams_tree.topLevelItem(0)
+    default_child = top.child(0)
+    spin = bi.teams_tree.itemWidget(default_child, 1)
+    assert spin.value() == spin.minimum()
+    assert spin.optional_value() is None
+    assert spin.text() == "指定なし"
+
+
+def test_add_team_dialog_defaults_lines_to_unspecified(window, qapp):
+    """「＋チーム」ダイアログの既定ライン数は「指定なし」（NULL）であること
+    （docs/project_analysis_tab_design.md「新規チームの既定を『指定なし』に」）。"""
+    from gui.tab_basic_info import AddTeamDialog
+
+    dialog = AddTeamDialog("新しいチーム", window)
+    assert dialog.values() == ("新しいチーム", None)
+    dialog.deleteLater()
+    qapp.processEvents()
 
 
 def test_teams_tree_capacity_changes_are_inline_editable_children(window, qapp):
@@ -380,45 +410,6 @@ def test_selecting_a_capacity_change_child_resolves_to_its_parent_team(window, q
     # 明示的にフォーカスを外して確定させる（他のテストと同じ後始末）。
     bi.project_name_edit.setFocus()
     qapp.processEvents()
-
-
-def test_histogram_shows_placeholder_when_project_incomplete(window, qapp):
-    """開発開始日・チームが揃っていない間は、モーダルではなくパネル内の
-    赤字ラベルで案内し、グラフは空のままであること
-    （gui/tab_gantt.py のエラー表示方針と同じ考え方）。"""
-    bi = window.tab_basic_info
-    window.tabs.setCurrentWidget(bi)
-    qapp.processEvents()
-
-    assert bi.histogram_status_label.text() != ""
-    assert bi.histogram_view.scene() is None or bi.histogram_view.scene().items() == []
-
-
-def test_histogram_switches_between_stacked_and_single_team_on_selection(window, qapp):
-    """チームツリーで何も選択していなければ全チーム積み上げ、1件選択すれば
-    そのチーム単独の表示に切り替わること。"""
-    bi = window.tab_basic_info
-    window.tabs.setCurrentWidget(bi)
-    window.db.set_project("P", "2026-01-01")
-    team_a = window.db.add_team("チームA", 2)
-    window.db.add_team("チームB", 3)
-    bi.refresh_all()
-    qapp.processEvents()
-
-    assert bi.histogram_status_label.text() == ""
-    scene = bi.histogram_view.scene()
-    assert scene is not None
-    assert scene.histogram_mode == "stacked"
-
-    bi._select_team_tree_item(team_a)
-    qapp.processEvents()
-    scene = bi.histogram_view.scene()
-    assert scene.histogram_mode == "single"
-
-    bi.teams_tree.setCurrentItem(None)
-    qapp.processEvents()
-    scene = bi.histogram_view.scene()
-    assert scene.histogram_mode == "stacked"
 
 
 def test_workflow_task_add_is_single_undo_step_and_restores_canvas_selection(window, qapp):
@@ -851,7 +842,7 @@ def test_override_days_edit_keeps_its_spinbox_alive(window, qapp):
 
 
 def test_task_tag_edit_persists_and_filters_jobs(window, qapp):
-    """タスク上書き表の「タグ」列（7列目、タスク タグ）を編集すると
+    """タスク上書き表の「タグ」列（8列目、タスク タグ）を編集すると
     job_task_overrides.tags に保存され、ジョブ タグと同じ正規化（前後の
     空白除去・重複排除・「, 」区切り）を経て表示に書き戻ること。また、
     「絞り込み」のタスク タグフィルタで、そのタグを持つタスクを含む
@@ -867,13 +858,13 @@ def test_task_tag_edit_persists_and_filters_jobs(window, qapp):
     qapp.processEvents()
 
     table = window.tab_jobs.override_table
-    assert table.horizontalHeaderItem(6).text() == "タグ"
-    table.item(0, 6).setText(" 確認 ,レビュー,, 確認")
+    assert table.horizontalHeaderItem(7).text() == "タグ"
+    table.item(0, 7).setText(" 確認 ,レビュー,, 確認")
     qapp.processEvents()
 
     rows = window.db.list_job_tasks_with_overrides(job1)
     assert rows[0]["tags"] == "確認, レビュー"
-    assert table.item(0, 6).text() == "確認, レビュー"  # 正規化した表記へ書き戻る
+    assert table.item(0, 7).text() == "確認, レビュー"  # 正規化した表記へ書き戻る
 
     # 絞り込みの選択肢は（ジョブ タグと同様）refresh_jobs() 時にDBから
     # 作り直される。タグ編集直後は即座には反映されないため、タブの
@@ -1101,15 +1092,15 @@ def test_gantt_tab_reuses_result_until_the_db_changes(window, qapp):
     window.tabs.setCurrentWidget(window.tab_gantt)
     _wait_for_schedule(window, qapp)
 
-    seq_before = window.tab_gantt._request_seq
+    seq_before = window.schedule_cache._request_seq
     window.tab_gantt.refresh_choices()
     qapp.processEvents()
-    assert window.tab_gantt._request_seq == seq_before  # 再計算していない
+    assert window.schedule_cache._request_seq == seq_before  # 再計算していない
     assert window.tab_gantt._result_df is not None
 
     window.db.add_team("チームB", 1)  # 内容が変わったら計算し直す
     window.tab_gantt.refresh_choices()
-    assert window.tab_gantt._request_seq == seq_before + 1
+    assert window.schedule_cache._request_seq == seq_before + 1
     _wait_for_schedule(window, qapp)
     assert window.tab_gantt._result_df is not None
 
@@ -1126,7 +1117,7 @@ def test_switching_to_jobs_tab_and_back_does_not_force_a_recomputation(window, q
     window.tabs.setCurrentWidget(window.tab_gantt)
     _wait_for_schedule(window, qapp)
 
-    seq_before = window.tab_gantt._request_seq
+    seq_before = window.schedule_cache._request_seq
     revision_before = window.db.revision
 
     window.tabs.setCurrentWidget(window.tab_jobs)
@@ -1135,7 +1126,7 @@ def test_switching_to_jobs_tab_and_back_does_not_force_a_recomputation(window, q
 
     window.tabs.setCurrentWidget(window.tab_gantt)
     qapp.processEvents()
-    assert window.tab_gantt._request_seq == seq_before  # 再計算していない
+    assert window.schedule_cache._request_seq == seq_before  # 再計算していない
     assert window.tab_gantt._result_df is not None
 
 
@@ -1153,7 +1144,7 @@ def test_schedule_completing_after_a_concurrent_edit_does_not_mask_it(window, qa
     # 起動しただけで、Pythonコードとしてはまだ何も実行していない）ため、
     # 次の編集は確実に「要求後・完了前」に割り込む。
     assert window.tab_gantt._result_df is None
-    requested_revision = window.tab_gantt._pending_revision
+    requested_revision = window.schedule_cache._pending_revision
     assert requested_revision == window.db.revision
 
     window.db.add_team("後から追加したチーム", 1)
@@ -1161,15 +1152,15 @@ def test_schedule_completing_after_a_concurrent_edit_does_not_mask_it(window, qa
 
     _wait_for_schedule(window, qapp)
     # 結果には要求時点のrevisionが刻まれ、完了時点（編集後）の値ではないこと。
-    assert window.tab_gantt._computed_revision == requested_revision
-    assert window.tab_gantt._computed_revision != window.db.revision
+    assert window.schedule_cache._computed_revision == requested_revision
+    assert window.schedule_cache._computed_revision != window.db.revision
 
     # 食い違いが検知され、次に切り替えたときは再計算されること。
-    seq_before = window.tab_gantt._request_seq
+    seq_before = window.schedule_cache._request_seq
     window.tab_gantt.refresh_choices()
-    assert window.tab_gantt._request_seq == seq_before + 1
+    assert window.schedule_cache._request_seq == seq_before + 1
     _wait_for_schedule(window, qapp)
-    assert window.tab_gantt._computed_revision == window.db.revision
+    assert window.schedule_cache._computed_revision == window.db.revision
 
 
 def test_shutdown_waits_for_every_in_flight_worker_thread(window, qapp):
@@ -1180,19 +1171,21 @@ def test_shutdown_waits_for_every_in_flight_worker_thread(window, qapp):
     以前は self._thread に最後の1本しか保持していなかったため、shutdown()
     （ウィンドウを閉じる際に呼ばれる）がそれより前の実行中スレッドを待たずに
     戻ってしまい、"QThread: Destroyed while thread is still running" という
-    形でクラッシュしうる状態だった。"""
+    形でクラッシュしうる状態だった。このワーカー管理は ScheduleCache
+    （gui/schedule_cache.py）へ移した。"""
     _build_schedulable_project(window.db)
     tab = window.tab_gantt
+    cache = window.schedule_cache
 
     # イベントを一度も回さずに複数回 refresh_choices() を呼び、前の要求が
     # 完了する前に次の要求を出す（DBを毎回変えて再計算の対象にする）。
     for i in range(3):
         window.db.add_team(f"チーム{i}", 1)
         tab.refresh_choices()
-    assert len(tab._threads) == 3  # 3本とも実行中（または実行待ち）として追跡されている
+    assert len(cache._threads) == 3  # 3本とも実行中（または実行待ち）として追跡されている
 
-    tab.shutdown()
-    assert tab._threads == []
+    cache.shutdown()
+    assert cache._threads == []
 
 
 def test_gantt_chart_draws_overrun_tasks_with_a_red_border(window, qapp):
@@ -1403,6 +1396,450 @@ def test_gantt_column_shows_workflow_color_swatch_next_to_job_name(window, qapp)
     assert "ワークフロー: WF1" in swatches
     assert "ワークフロー: WF2" in swatches
     assert swatches["ワークフロー: WF1"] != swatches["ワークフロー: WF2"]
+
+
+# -- プロジェクト分析タブ（gui/tab_analysis.py） ---------------------------------------
+
+def test_analysis_tab_shows_reason_instead_of_a_dialog_when_no_schedule_result(window, qapp):
+    """ガントチャートタブで一度も計算していなくても、プロジェクト分析タブ自身が
+    ScheduleCache に計算を要求する（gui/schedule_cache.py）。プロジェクトが
+    未完成で検証エラーになる場合、モーダルダイアログではなくタブ内に赤字で
+    理由を表示すること（ガントチャートタブと同じ方針）。"""
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    assert "解決してください" in window.tab_analysis.status_label.text()
+    assert window.tab_analysis.kpi_scale.value_label.text() == "—"
+    assert window.tab_analysis.milestone_table.rowCount() == 0
+
+
+def test_analysis_tab_computes_its_own_result_without_opening_gantt_tab(window, qapp):
+    """ガントチャートタブを一度も開かなくても、プロジェクト分析タブを開けば
+    共有の ScheduleCache 経由で自分から計算を起動できること
+    （docs/project_analysis_tab_design.md §5）。"""
+    _build_schedulable_project(window.db)
+    assert not hasattr(window, "tab_gantt") or window.tab_gantt._result_df is None
+
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    # まだイベントを回していないので、この時点では計算中の表示のはず。
+    assert "計算中" in window.tab_analysis.status_label.text()
+
+    deadline = time.monotonic() + 15.0
+    while window.tab_analysis.kpi_scale.value_label.text() == "—" and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    qapp.processEvents()
+
+    assert window.tab_analysis.kpi_scale.value_label.text() == "1 ジョブ"
+    assert window.tab_analysis.milestone_table.rowCount() == 1
+    # ガントチャートタブも同じキャッシュを見るので、後から開いても再計算しない。
+    seq_before = window.schedule_cache._request_seq
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    qapp.processEvents()
+    assert window.schedule_cache._request_seq == seq_before
+    assert window.tab_gantt._result_df is not None
+
+
+def test_analysis_tab_renders_kpi_and_milestone_table_from_gantt_result(window, qapp):
+    """ガントチャートタブの計算結果をもとに、KPIタイルとマイルストーン別表の
+    基本列が埋まること。自分では計算を起こさない（共有の ScheduleCache が
+    持つ結果をそのまま集計する）。"""
+    _build_schedulable_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    assert window.tab_analysis.kpi_scale.value_label.text() == "1 ジョブ"
+    assert window.tab_analysis.milestone_table.rowCount() == 1
+    assert window.tab_analysis.milestone_table.item(0, 0).text() == "マイルストーン1"
+    # マイルストーンが1件だけなので、全タスクがそこに属し進捗は必ず100%。
+    assert window.tab_analysis.milestone_table.item(0, 1).text() == "100%"
+
+
+def test_analysis_tab_milestone_progress_column_is_cumulative_across_milestones(window, qapp):
+    """「進捗」列はタスクの完了状態と無関係の計画上の指標で、締切順に
+    マイルストーンをまたいで累積し、最後のマイルストーンで必ず100%になる
+    こと（gui/summary_metrics.compute_milestone_rows参照）。"""
+    db = window.db
+    db.set_project("進捗列テスト", "2026-01-05")
+    team_id = db.add_team("チームA", 2)
+    ms1 = db.add_milestone("マイルストーン1", "2026-03-01")
+    ms2 = db.add_milestone("マイルストーン2", "2026-06-01")
+    wf_id = db.add_workflow("WF1")
+    db.add_workflow_task(wf_id, "タスク", team_id, 3)
+    db.add_job("ジョブA", wf_id, ms1, 100)  # MS1に1タスク
+    db.add_job("ジョブB", wf_id, ms2, 100)  # MS2に1タスク
+    db.add_job("ジョブC", wf_id, ms2, 100)  # MS2に1タスク（MS2は計2タスク）
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    table = window.tab_analysis.milestone_table
+    assert table.rowCount() == 2
+    # 全体3タスク中、MS1に1件・MS2に2件 -> 累積は 1/3=33%, 3/3=100%。
+    assert table.item(0, 1).text() == "33%"
+    assert table.item(1, 1).text() == "100%"
+
+
+def test_analysis_tab_status_kpi_reflects_recorded_status_not_a_date_guess(window, qapp):
+    """「タスクの状態」は日付からの推測ではなく、job_task_overrides.statusに
+    実際に記録された値を使うこと。今日を挟む長い所要日数のタスクでも、
+    statusを記録していなければ（日付上は「進行中」に見えても）未着手のまま
+    集計され、記録して初めて反映されることを確認する。"""
+    window.db.set_project("状態テスト", "2020-01-01")
+    team_id = window.db.add_team("チームA", 2)
+    ms_id = window.db.add_milestone("マイルストーン1", "2040-06-30")
+    wf_id = window.db.add_workflow("WF1")
+    # 2020年から約20年（5000営業日）と、今日をまたぐ長い所要日数にする——
+    # 日付だけで判定していれば「進行中」に見えるはずの状況を作る。
+    task_id = window.db.add_workflow_task(wf_id, "タスク", team_id, 5000)
+    job_id = window.db.add_job("ジョブ1", wf_id, ms_id, 100)
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    # statusを記録していないので、日付上は今日を挟んでいても「未着手」のまま。
+    assert window.tab_analysis.kpi_status.value_label.text() == "0 完了"
+    assert "未着手 1" in window.tab_analysis.kpi_status.sub_label.text()
+
+    window.db.upsert_job_task_override(job_id, task_id, status="in_progress")
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    qapp.processEvents()
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    assert "進行中 1" in window.tab_analysis.kpi_status.sub_label.text()
+    assert "未着手 0" in window.tab_analysis.kpi_status.sub_label.text()
+
+
+def test_task_status_combo_in_override_table_persists_to_db(window, qapp):
+    """タスク上書き表の「状態」列（7列目）でコンボを選ぶと
+    job_task_overrides.status に保存されること。"""
+    team_id = window.db.add_team("チームA", 1)
+    wf_id = window.db.add_workflow("WF1")
+    window.db.add_workflow_task(wf_id, "タスク1", team_id, 3)
+    job_id = window.db.add_job("J1", wf_id, None, 100)
+    window.tabs.setCurrentWidget(window.tab_jobs)
+    window.tab_jobs.refresh_jobs(select_id=job_id)
+    qapp.processEvents()
+
+    table = window.tab_jobs.override_table
+    assert table.horizontalHeaderItem(6).text() == "状態"
+    status_combo = table.cellWidget(0, 6)
+    assert status_combo.currentData() is None  # 既定は未着手
+
+    idx = status_combo.findData("done")
+    status_combo.setCurrentIndex(idx)
+    qapp.processEvents()
+
+    rows = window.db.list_job_tasks_with_overrides(job_id)
+    assert rows[0]["status"] == "done"
+
+
+def _build_two_team_project(db):
+    """チームAに2タスク・チームBに1タスクが乗る、同一マイルストーンの
+    プロジェクト（「チーム別」内訳の選択切り替えを件数で見分けるため、
+    チームごとの件数をわざと変えてある）。"""
+    db.set_project("チーム別テスト", "2026-01-05")
+    team_a = db.add_team("チームA", 2)
+    team_b = db.add_team("チームB", 1)
+    ms_id = db.add_milestone("マイルストーン1", "2026-06-30")
+    wf1 = db.add_workflow("WF1")
+    db.add_workflow_task(wf1, "タスク", team_a, 3)
+    wf2 = db.add_workflow("WF2")
+    db.add_workflow_task(wf2, "タスク", team_b, 3)
+    db.add_job("ジョブA1", wf1, ms_id, 100)
+    db.add_job("ジョブA2", wf1, ms_id, 100)
+    db.add_job("ジョブB1", wf2, ms_id, 100)
+    return team_a, team_b, wf1, wf2
+
+
+def test_analysis_tab_breakdown_dimension_selector_filters_to_one_team_at_a_time(window, qapp):
+    """「チーム別」「ワークフロー別」は全チーム/全ワークフローを列に並べるの
+    ではなく、コンボで選んだ1件だけを「全体」と同じ列構成（ジョブ/タスク/
+    完了/進行中/未着手）で表示すること。"""
+    _build_two_team_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    headers = ["マイルストーン", "進捗", "締切日", "最終終了日", "スラック", "超過",
+               "ジョブ", "タスク", "完了", "進行中", "未着手"]
+    assert [tab.milestone_table.horizontalHeaderItem(i).text() for i in range(len(headers))] == headers
+    assert not tab._dimension_combo.isVisible()
+
+    tab._breakdown_buttons["team"].click()
+    qapp.processEvents()
+    assert tab._dimension_combo.isVisible()
+    assert tab._dimension_combo.currentText() == "チームA"
+    assert tab.milestone_table.item(0, 7).text() == "2"  # タスク: チームAの2件
+
+    idx_team_b = tab._dimension_combo.findText("チームB")
+    tab._dimension_combo.setCurrentIndex(idx_team_b)
+    qapp.processEvents()
+    assert tab.milestone_table.item(0, 7).text() == "1"  # タスク: チームBの1件
+
+    tab._breakdown_buttons["workflow"].click()
+    qapp.processEvents()
+    assert tab._dimension_combo.currentText() == "WF1"
+    assert tab.milestone_table.item(0, 7).text() == "2"  # タスク: WF1の2件
+
+
+def test_analysis_tab_milestone_progress_uses_the_selected_breakdown_target_as_the_denominator(
+    window, qapp,
+):
+    """「チーム別」「ワークフロー別」表示中は、「進捗」列の基準（分母）が
+    プロジェクト全体ではなく選択中の対象の件数になること。"""
+    db = window.db
+    db.set_project("進捗内訳テスト", "2026-01-05")
+    team_a = db.add_team("チームA", 2)
+    team_b = db.add_team("チームB", 1)
+    ms1 = db.add_milestone("マイルストーン1", "2026-03-01")
+    ms2 = db.add_milestone("マイルストーン2", "2026-06-01")
+    wf_id = db.add_workflow("WF1")
+    db.add_workflow_task(wf_id, "タスク", team_a, 3)
+    db.add_workflow_task(wf_id, "タスク2", team_b, 3)
+    # チームAはMS1に1件・MS2に1件（計2件）。チームBはMS1に1件のみ（計1件）。
+    job1 = db.add_job("ジョブA1", wf_id, ms1, 100)
+    db.upsert_job_task_override(job1, db.list_workflow_tasks(wf_id)[1]["id"], is_active=False)
+    job2 = db.add_job("ジョブA2", wf_id, ms2, 100)
+    db.upsert_job_task_override(job2, db.list_workflow_tasks(wf_id)[1]["id"], is_active=False)
+    job3 = db.add_job("ジョブB1", wf_id, ms1, 100)
+    db.upsert_job_task_override(job3, db.list_workflow_tasks(wf_id)[0]["id"], is_active=False)
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    tab._breakdown_buttons["team"].click()
+    qapp.processEvents()
+    assert tab._dimension_combo.currentText() == "チームA"
+    # チームAはMS1・MS2に1件ずつ（計2件）なので累積は 1/2=50%, 2/2=100%。
+    assert tab.milestone_table.item(0, 1).text() == "50%"
+    assert tab.milestone_table.item(1, 1).text() == "100%"
+
+    idx_team_b = tab._dimension_combo.findText("チームB")
+    tab._dimension_combo.setCurrentIndex(idx_team_b)
+    qapp.processEvents()
+    # チームBはMS1に1件のみ（計1件）なので、MS1時点で既に100%。
+    assert tab.milestone_table.item(0, 1).text() == "100%"
+    assert tab.milestone_table.item(1, 1).text() == "100%"
+
+
+def test_analysis_tab_milestone_table_handles_a_workflow_with_no_tasks(window, qapp):
+    """ワークフロー別の絞り込み対象に「タスクを1件も持たないワークフロー」を
+    選んでも、進捗・内訳が0扱いになるだけでクラッシュしないこと
+    （プロジェクト全体としては別のワークフローにタスクがあるため、
+    スケジューリング自体は成立する）。"""
+    db = window.db
+    db.set_project("空ワークフローテスト", "2026-01-05")
+    team_id = db.add_team("チームA", 2)
+    ms_id = db.add_milestone("マイルストーン1", "2026-06-30")
+    wf_used = db.add_workflow("使用中WF")
+    db.add_workflow_task(wf_used, "タスク", team_id, 3)
+    db.add_job("ジョブ1", wf_used, ms_id, 100)
+    db.add_workflow("未使用WF")  # タスクを1件も持たない
+
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    tab._breakdown_buttons["workflow"].click()
+    qapp.processEvents()
+    idx_unused = tab._dimension_combo.findText("未使用WF")
+    assert idx_unused >= 0
+    tab._dimension_combo.setCurrentIndex(idx_unused)
+    qapp.processEvents()
+
+    assert tab.milestone_table.item(0, 1).text() == "0%"
+    assert tab.milestone_table.item(0, 7).text() == "0"  # タスク
+    assert "タスクがありません" in tab.breakdown_hint_label.text()
+
+
+def test_analysis_tab_capture_and_restore_breakdown_mode(window, qapp):
+    _build_two_team_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    window.tab_analysis._breakdown_buttons["team"].click()
+    qapp.processEvents()
+    idx_team_b = window.tab_analysis._dimension_combo.findText("チームB")
+    window.tab_analysis._dimension_combo.setCurrentIndex(idx_team_b)
+    qapp.processEvents()
+
+    state = window.tab_analysis.capture_ui_state()
+    assert state["breakdown_mode"] == "team"
+    assert state["selected_team_id"] is not None
+
+    window.tab_analysis._breakdown_buttons["all"].click()
+    qapp.processEvents()
+    window.tab_analysis.restore_ui_state(state)
+    qapp.processEvents()
+    assert window.tab_analysis._breakdown_mode == "team"
+    assert window.tab_analysis._breakdown_buttons["team"].isChecked()
+    assert window.tab_analysis._dimension_combo.currentText() == "チームB"
+
+
+# -- チーム別サマリー（gui/analysis_charts.py） ---------------------------------------
+
+def test_team_summary_table_starts_with_an_all_teams_row_driving_the_stacked_chart(window, qapp):
+    """表の先頭は「全チーム」行で、既定でそれが選択されていること。グラフは
+    1枚に統合してあり、この行のときは積み上げ（凡例あり）になる。"""
+    from gui.tab_analysis import _ALL_TEAMS_KEY
+
+    _build_two_team_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    table = tab.team_table
+    assert table.item(0, 0).text() == "全チーム"
+    assert table.item(0, 0).data(Qt.UserRole) == _ALL_TEAMS_KEY
+    assert table.rowCount() == 3  # 全チーム + チームA + チームB
+    assert tab._selected_team_summary_id == _ALL_TEAMS_KEY
+    assert "積み上げ" in tab.team_chart_label.text()
+    assert tab.team_legend_label.text()  # 積み上げのときだけ凡例を出す
+
+
+def test_team_summary_chart_switches_to_the_selected_teams_detail(window, qapp):
+    """個別チームの行を選ぶと、同じ1枚のグラフがそのチームの詳細に切り替わり、
+    凡例（1色なので不要）が消えること。"""
+    _build_two_team_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    tab.team_table.selectRow(1)  # 「全チーム」の次＝最初の個別チーム
+    qapp.processEvents()
+
+    assert tab._selected_team_summary_id is not None
+    assert "チームA" in tab.team_chart_label.text()
+    assert "破線＝設定上限" in tab.team_chart_label.text()
+    assert tab.team_legend_label.text() == ""
+
+
+def test_capacity_line_merges_consecutive_weeks_so_the_dash_pattern_is_visible():
+    """回帰テスト: 設定上限の破線は、同じ値が続く週をまとめて1本にすること。
+
+    週ごと（9px）の細切れで描くと、QtのDashLineはダッシュ長を線幅の倍数で
+    決めるため1ダッシュも入りきらず、実線にしか見えなくなっていた。"""
+    from gui.analysis_charts import _merge_runs
+
+    # 同じ値が続く区間は1本にまとまる。
+    assert _merge_runs([2, 2, 2]) == [(0, 2, 2)]
+    # 値が変わったところで切れる（階段になる）。
+    assert _merge_runs([1, 1, 3, 3]) == [(0, 1, 1), (2, 3, 3)]
+    # None（＝上限「指定なし」）は区間を作らず、そこで切る。
+    assert _merge_runs([1, 1, None, 1]) == [(0, 1, 1), (3, 3, 1)]
+    assert _merge_runs([None, None]) == []
+    assert _merge_runs([]) == []
+
+
+# -- サマリーのサブタブ・ワークフロー別サマリー ------------------------------------------
+
+def test_analysis_tab_splits_the_summaries_into_sub_tabs_with_the_kpi_tiles_outside(window, qapp):
+    """サマリーはサブタブに分け、KPIタイルはその外に常時表示すること
+    （全部を縦積みにするとウインドウの高さが足りないときに窮屈になるため）。"""
+    _build_two_team_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    labels = [tab.section_tabs.tabText(i) for i in range(tab.section_tabs.count())]
+    assert labels == ["マイルストーン", "チーム", "ワークフロー"]
+    # KPIタイルはサブタブの中ではなく、タブの外（＝どのサブタブでも見える）。
+    assert tab.kpi_scale.parent() is tab
+    assert not tab.section_tabs.isAncestorOf(tab.kpi_scale)
+    assert tab.section_tabs.isAncestorOf(tab.milestone_table)
+    assert tab.section_tabs.isAncestorOf(tab.workflow_table)
+
+
+def test_analysis_tab_workflow_table_lists_each_workflow_with_its_job_and_task_counts(window, qapp):
+    """ワークフロー別サマリーの表に、ワークフローごとのジョブ件数・タスク件数・
+    ジョブ所要期間の中央値・超過件数が並ぶこと。"""
+    _build_two_team_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    headers = ["ワークフロー", "ジョブ件数", "タスク件数", "ジョブ所要期間の中央値", "超過件数"]
+    assert [
+        tab.workflow_table.horizontalHeaderItem(i).text() for i in range(len(headers))
+    ] == headers
+    assert tab.workflow_table.rowCount() == 2
+    assert tab.workflow_table.item(0, 0).text() == "WF1"
+    assert tab.workflow_table.item(0, 1).text() == "2"  # WF1のジョブ2件
+    assert tab.workflow_table.item(1, 1).text() == "1"  # WF2のジョブ1件
+    # 積み上げグラフと、色とワークフロー名を対応させる凡例が出ている。
+    assert tab.workflow_chart_view.scene() is not None
+    assert "WF1" in tab.workflow_legend_label.text()
+
+
+def test_analysis_tab_workflow_chart_granularity_switch_changes_the_number_of_points(window, qapp):
+    """粒度（月次/週次/日次）を切り替えるとグラフを引き直すこと。粒度が細かい
+    ほど点が増えるので、シーンの横幅で見分けられる。"""
+    _build_two_team_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    widths = {}
+    for key in ("month", "week", "day"):
+        tab._granularity_buttons[key].click()
+        qapp.processEvents()
+        assert tab._granularity == key
+        widths[key] = tab.workflow_chart_view.scene().itemsBoundingRect().width()
+    assert widths["month"] < widths["week"] < widths["day"]
+
+
+def test_analysis_tab_restores_the_active_sub_tab_and_granularity(window, qapp):
+    """Undo/Redoでの復元対象に、サマリーのサブタブと粒度も含まれること
+    （CLAUDE.md「内容・選択・アクティブタブを復元」）。"""
+    _build_two_team_project(window.db)
+    window.tabs.setCurrentWidget(window.tab_gantt)
+    _wait_for_schedule(window, qapp)
+    window.tabs.setCurrentWidget(window.tab_analysis)
+    qapp.processEvents()
+
+    tab = window.tab_analysis
+    tab.section_tabs.setCurrentIndex(2)  # ワークフロー
+    tab._granularity_buttons["month"].click()
+    qapp.processEvents()
+    state = tab.capture_ui_state()
+
+    tab.section_tabs.setCurrentIndex(0)
+    tab._granularity_buttons["day"].click()
+    qapp.processEvents()
+
+    tab.restore_ui_state(state)
+    qapp.processEvents()
+    assert tab.section_tabs.currentIndex() == 2
+    assert tab._granularity == "month"
+    assert tab._granularity_buttons["month"].isChecked()
 
 
 # -- ガントチャート描画（gui/gantt_view.py）: 「今日」の縦線・1行飛ばしの行背景 ------------

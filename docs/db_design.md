@@ -25,14 +25,14 @@ PySide6（Qt）に一切依存しないため、GUIを起動せずに単体で�
 | `schema_meta` | スキーマバージョン管理用。`ProjectDatabase.open_existing`が旧バージョンの`.pschedule`を検出すると`_migrate_schema`で自動的に不足カラム等を追加する（例: v1→v2で`workflows.sort_order`を追加）。`open_existing`はマイグレーションの前に`check_openable`（`gui/db_schema.py`）でこのテーブル・行の有無と`schema_version`がこのアプリの対応範囲内かを検証し、ProjectSchedulerのファイルとして扱えない場合は`ProjectDatabaseError`にして拒否する（詳細は`docs/architecture.md`「ファイルを開く際の検証」参照） |
 | `project` | プロジェクト名・開始日・`distribution_ratio`（ガントチャートタブの「配置コントロール」で調整する配置基準点、既定0.7。`project_scheduler.py`参照）（常に1行、`id=1`固定） |
 | `milestones` | マイルストーン（名前・締切日・備考） |
-| `teams` | チーム（名前・開発開始日からの既定の同時ライン数）。ライン数は0以上（0＝その期間は稼働なし。遅く合流する・早めに引き上げるチームの表現に使う） |
-| `team_capacity_changes` | チームの同時ライン数が期間の途中で変わる場合の変更点（適用開始日・その日以降のライン数、こちらも0以上）。`teams.max_lines`はいつまでも「最初の期間」の値として残る |
+| `teams` | チーム（名前・開発開始日からの既定の同時ライン数）。ライン数は3状態: NULL＝指定なし（上限を設けない。新規チームの既定）、0＝その期間は稼働なし、N＝N本 |
+| `team_capacity_changes` | チームの同時ライン数が期間の途中で変わる場合の変更点（適用開始日・その日以降のライン数、こちらも同じ3状態）。`teams.max_lines`はいつまでも「最初の期間」の値として残る |
 | `holidays` | 休業日（日付、任意でチームを指定。未指定は全チーム共通。備考あり） |
 | `workflows` | ワークフロー（テンプレートの名前と、一覧での表示順`sort_order`） |
 | `workflow_tasks` | ワークフロー内のタスク（名前・担当チーム・所要日数）。ノードグラフ上の座標は保持しない——依存の深さから毎回計算し直す（下記「座標は保存しない」参照） |
 | `task_dependencies` | ワークフロー内のタスク依存（Internal_Depends相当、predecessor→successor）。`dep_type`が種別（`FS`=完了→開始 / `SS`=開始→開始）、`lag_days`が間に空ける営業日数（負ならリード＝先行の完了前に着手可）。既定は`FS`・`0` |
 | `jobs` | ジョブ（ワークフローの実体化。名前・使用ワークフロー・既定マイルストーン・優先度・タグ）。`priority`はNULL可（未指定）——未指定は`project_scheduler.py`側で自動的に最低優先として扱う。`tags`はカンマ区切りの1文字列（例:「緊急, 顧客A」）で、書き込み経路（`gui/db.py`の`normalize_tags`）で正規化する |
-| `job_task_overrides` | ジョブ単位でのタスク上書き（有効/無効・日数・マイルストーン・チームの差分のみ保持）。`start_pin_date`が開始固定日（実績確定・外部都合のピン留め）。**日付を「入力」として持つ唯一の場所**。`tags`がタスク タグ（`jobs.tags`＝ジョブ タグと同じ仕様のカンマ区切り文字列） |
+| `job_task_overrides` | ジョブ単位でのタスク上書き（有効/無効・日数・マイルストーン・チームの差分のみ保持）。`start_pin_date`が開始固定日（実績確定・外部都合のピン留め）。**日付を「入力」として持つ唯一の場所**。`tags`がタスク タグ（`jobs.tags`＝ジョブ タグと同じ仕様のカンマ区切り文字列）。`status`が実際の進捗（NULL＝未着手／`in_progress`＝進行中／`done`＝完了。ユーザーが手動で記録する値で、日付からの推測ではない。プロジェクト分析タブの「タスクの状態」集計に使う） |
 | `job_dependency_links` | ジョブ単位の依存リンク（「このジョブは、あのジョブに依存する」）。追加時に`workflow_dependency_templates`を参照し、タスク単位の依存を自動展開する |
 | `job_external_dependencies` | ジョブをまたぐタスク依存（External_Dependencies相当）。`source_link_id`で`job_dependency_links`からの自動生成分か手動追加分かを区別する。`is_active`で（自動生成分も含め）削除せず一時的に無効化できる |
 | `workflow_dependency_templates` | ワークフローペア単位の既定タスク対応（例: ワークフローAがワークフローBに依存する場合、Aのどのタスクが、Bのどのタスクの完了を待つか） |

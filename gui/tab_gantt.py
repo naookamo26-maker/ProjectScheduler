@@ -23,7 +23,7 @@ gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、ホイー
 表示する。
 """
 
-from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -36,12 +36,6 @@ from PySide6.QtWidgets import (
 )
 
 from gui.db import parse_tags
-from gui.gantt_generator import (
-    build_display,
-    build_frames,
-    compute_schedule_from_frames,
-    validate_for_generation,
-)
 from gui.gantt_view import FrozenGanttPane, build_gantt_scenes
 from gui.widgets_common import (
     ChoiceFilterGroup,
@@ -50,7 +44,6 @@ from gui.widgets_common import (
     NoWheelSpinBox,
     bind_undo_session,
 )
-from project_scheduler import SchedulingError
 
 # ジョブ タグ／タスク タグを1つも持たない場合にまとめる擬似キー
 # （gui/tab_jobs.py と同じ考え方。2つの絞り込みは別々のChoiceFilterGroupの
@@ -71,71 +64,26 @@ _PLACEMENT_CONTROL_MARGIN = 12
 _SEARCH_DEBOUNCE_MS = 300
 
 
-class _ScheduleWorker(QObject):
-    """スケジューリングをGUIスレッドの外で実行するためのワーカー。
-
-    受け取るのは build_frames() が作ったDataFrame群だけで、DB接続は持たない
-    （sqlite3の接続はスレッドをまたげないうえ、計算中にGUI側がDBを書き換えると
-    結果が壊れるため。gui/gantt_generator.py の compute_schedule_from_frames
-    を参照）。
-
-    完了したら結果を、失敗したら例外メッセージを、いずれも要求時の通し番号
-    （seq）付きでシグナルとして返す。呼び出し側は自分が最後に出した要求の
-    番号と照合し、古い要求の結果を捨てる。
-    """
-
-    finished = Signal(int, object)   # (seq, result_df)
-    failed = Signal(int, str)        # (seq, エラーメッセージ)
-
-    def __init__(self, seq, frames, distribution_ratio):
-        super().__init__()
-        self._seq = seq
-        self._frames = frames
-        self._distribution_ratio = distribution_ratio
-
-    def run(self):
-        try:
-            result_df = compute_schedule_from_frames(
-                self._frames, verbose=False, distribution_ratio=self._distribution_ratio,
-            )
-        except SchedulingError as e:
-            self.failed.emit(self._seq, str(e))
-        except Exception as e:  # noqa: BLE001 - ワーカースレッドで例外を握り潰さない
-            self.failed.emit(self._seq, f"予期しないエラー: {e}")
-        else:
-            self.finished.emit(self._seq, result_df)
-
-
 class GanttTab(QWidget):
-    def __init__(self, db, parent=None):
+    def __init__(self, db, schedule_cache, parent=None):
         super().__init__(parent)
         self.db = db
+        # 結果（_result_df/_display）は ScheduleCache が一元管理する
+        # （gui/schedule_cache.py 参照。プロジェクト分析タブと共有する）。
+        # ここに持つ同名の属性は、cache の現在の内容を写した「表示用の
+        # スナップショット」——このタブ自身の絞り込み・チャート描画ロジックは
+        # 従来どおりこの2つを読むだけで済ませ、cache参照への書き換えを
+        # 最小限にする。_sync_from_cache() でcacheの内容と合わせる。
         self._result_df = None
         self._display = None
+        self.cache = schedule_cache
+        self.cache.updated.connect(self._on_cache_updated)
         # 「配置コントロール」で調整する distribution_ratio（project_scheduler.py
         # 参照。各タスクを[ASAP, ALAP]のどのあたりに配置するかの基準点）。
         # プロジェクト設定としてDB（project.distribution_ratio）に保存する。
         # ここに持つのは表示用のキャッシュで、DB側が正——Undo/Redo等でDBの値が
         # 変わった場合は refresh_choices() の先頭で読み直して同期する。
         self._distribution_ratio = self.db.get_project()["distribution_ratio"]
-        # 直近の計算結果がどの時点のDB内容に対応するか（db.revision の値）。
-        # 一致している間は再計算しない（タブを行き来するたびに数秒かかる
-        # スケジューリングを走らせないため）。distribution_ratioの変更もDBへの
-        # 書き込みを伴う＝db.revisionが進むため、これだけで両方カバーできる。
-        self._computed_revision = None
-        # 実行中のスケジューリング要求の通し番号。結果が返ってきたときに
-        # 「最後に出した要求のものか」を判定し、古い結果は捨てる。
-        self._request_seq = 0
-        # 実行中（または終了直後の後始末待ち）の (QThread, _ScheduleWorker) の
-        # 一覧。タブを連続して切り替える等で複数本が同時に走ることがあるため、
-        # 「最後の1本」ではなく全件を保持する（shutdown() 参照）。
-        self._threads = []
-        # 計算中の要求に対応する表示用補助情報（結果が返ってきたら _display へ移す）
-        self._pending_display = None
-        # 計算中の要求が「どの時点のDB内容」を元にしたものか（frames を組み立てた
-        # 瞬間の db.revision）。結果が返ってきた時点の db.revision ではなく、
-        # 要求時点のこの値を _computed_revision に刻む（_on_schedule_finished 参照）。
-        self._pending_revision = None
 
         layout = QVBoxLayout(self)
 
@@ -275,17 +223,18 @@ class GanttTab(QWidget):
         """このタブに切り替わるたびに gui/main.py の _on_tab_changed から呼ばれ、
         現在のDB内容でスケジューリングを実行し直す。
 
-        タスク数が増えるとスケジューリングは数秒かかるため、次の2つでUIが
-        固まらないようにしている。
+        計算そのものは共有の ScheduleCache（gui/schedule_cache.py）に任せる。
+        タスク数が増えるとスケジューリングは数秒かかるため、cache側で次の2つに
+        よりUIが固まらないようにしている。
 
         1. 前回計算した時点からDBの内容が変わっていなければ再計算しない
            （db.revision で判定）。タブを行き来しただけで毎回計算し直すのを防ぐ。
            distribution_ratioの変更もDBへの書き込みを伴う（db.set_distribution_ratio）
            ためdb.revisionが進み、これだけで両方カバーできる。
-        2. 計算本体はワーカースレッドで実行する（_ScheduleWorker）。DBを読むのは
-           GUIスレッド（build_frames）、計算だけ別スレッド、という分割にしている。
-           計算中も画面は操作でき、途中で内容を変えれば新しい要求が古い要求を
-           追い越す（古い結果は通し番号で判定して捨てる）。
+        2. 計算本体はワーカースレッドで実行する。DBを読むのはGUIスレッド
+           （build_frames）、計算だけ別スレッド、という分割にしている。計算中も
+           画面は操作でき、途中で内容を変えれば新しい要求が古い要求を追い越す
+           （古い結果は通し番号で判定して捨てる）。
 
         失敗した場合はダイアログを出さず、タブ内の status_label に表示するだけに
         留める。このメソッドはユーザーの明示的な操作ではなく「タブが表示される
@@ -303,40 +252,31 @@ class GanttTab(QWidget):
             self._distribution_ratio = db_ratio
             self._sync_placement_widgets(db_ratio)
 
-        errors = validate_for_generation(self.db)
-        if errors:
-            self._cancel_pending_request()
-            self._clear_chart_state(
-                "ガントチャートを表示できません。以下を解決してください:\n- " + "\n- ".join(errors),
-                is_error=True,
-            )
-            return
+        self.cache.ensure_fresh()
+        self._sync_from_cache()
 
-        if self._result_df is not None and self._computed_revision == self.db.revision:
-            # 前回計算した時点から内容が変わっていないので、表示だけ作り直す。
-            self._apply_result()
-            return
+    def _on_cache_updated(self):
+        """ScheduleCache の結果・エラーが更新されるたびに呼ばれる。
 
-        # DBの読み出しはGUIスレッドで行い、DataFrameだけをワーカーへ渡す。
-        # revisionは、渡すDataFrame群が実際に対応する時点の値として、
-        # build_frames() の直前で読む（計算中に他タブが編集して revision が
-        # 進んでも、この要求の結果には要求時点の値を使う。
-        # _on_schedule_finished 参照）。
-        request_revision = self.db.revision
-        try:
-            frames = build_frames(self.db)
-            display = build_display(self.db)
-        except Exception as e:  # noqa: BLE001 - 未完成なデータでも落とさない
-            self._cancel_pending_request()
-            self._clear_chart_state(f"スケジューリングに失敗しました: {e}", is_error=True)
+        自分が非表示の間は反映を後回しにする——次にこのタブへ切り替わった際、
+        refresh_choices() の中で _sync_from_cache() が同期的に最新の内容を
+        反映するため、ここで無駄にチャートを再構築する必要がない。"""
+        if not self.isVisible():
             return
+        self._sync_from_cache()
 
-        self._pending_display = display
-        self._pending_revision = request_revision
-        self._request_seq += 1
-        seq = self._request_seq
-        self._start_worker(seq, frames)
-        self._set_status("スケジューリングを計算中です...")
+    def _sync_from_cache(self):
+        """ScheduleCache の現在の状態（エラー／計算中／最新の結果）を
+        このタブの表示へ反映する。"""
+        if self.cache.error_message is not None:
+            self._clear_chart_state(self.cache.error_message, is_error=True)
+            return
+        if not self.cache.is_fresh():
+            self._set_status("スケジューリングを計算中です...")
+            return
+        self._result_df = self.cache.result_df
+        self._display = self.cache.display
+        self._apply_result()
 
     def _on_placement_slider_value_changed(self, value):
         """ドラッグ中は毎回ここが呼ばれる。スピンボックスの表示だけ追従させ、
@@ -361,85 +301,6 @@ class GanttTab(QWidget):
         self._distribution_ratio = ratio
         self.db.set_distribution_ratio(ratio)
         self.refresh_choices()
-
-    def _start_worker(self, seq, frames):
-        """ワーカースレッドを起こしてスケジューリングを走らせる。
-
-        実行中の古いスレッドは、結果を捨てる（通し番号で判定）だけで止めずに
-        放置する。スケジューリングはDBに触れない純粋な計算なので、放置しても
-        害はなく、途中で強制終了させるより安全なため（終了は quit()/wait() を
-        shutdown() でまとめて待つ）。
-
-        タブを連続して切り替える・配置スライダーを繰り返し操作する等で、
-        複数本が同時に走っている状態になり得る。self._threads に全件を
-        保持しておかないと、shutdown() が最後の1本しか待たずに終了し、
-        それより前に始まった実行中のスレッドを残したままウィンドウが
-        閉じてしまう（"QThread: Destroyed while thread is still running"）。"""
-        thread = QThread(self)
-        worker = _ScheduleWorker(seq, frames, self._distribution_ratio)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_schedule_finished)
-        worker.failed.connect(self._on_schedule_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        # deleteLater() によるQt側の破棄後、追跡リストからも手放す
-        # （self._threads がPython側の唯一の参照であり続けないよう、
-        # 終わったスレッドをいつまでも溜め込まない）。self（GUIスレッドに
-        # 属するQObject）の束縛メソッドを繋ぐことで、PySide側が自動的に
-        # キュー接続にしてくれる——ラムダ等の素のcallableを直接繋ぐと
-        # ワーカースレッド側で実行されてしまい、GUIスレッドの self._threads を
-        # ロック無しで書き換えることになる（sender()で「どのスレッドが
-        # 終わったか」をGUIスレッド側から安全に判定する）。
-        thread.finished.connect(self._on_worker_thread_finished)
-        self._threads.append((thread, worker))
-        thread.start()
-
-    def _on_worker_thread_finished(self):
-        thread = self.sender()
-        self._threads = [(t, w) for t, w in self._threads if t is not thread]
-
-    def _cancel_pending_request(self):
-        """実行中の要求の結果を無視する（通し番号を進めるだけ）。"""
-        self._request_seq += 1
-
-    def shutdown(self):
-        """ウィンドウを閉じる際に、走っているスケジューリングすべての終了を待つ。
-
-        ワーカーはDBに触れないため放置しても壊れないが、QThreadが動いたまま
-        プロセスを終えるとQt側が警告を出すため、明示的に待ち合わせる
-        （_start_worker のコメント参照——「最後の1本」だけでなく、
-        追跡している全スレッドを待つ）。"""
-        self._cancel_pending_request()
-        threads, self._threads = self._threads, []
-        for thread, _worker in threads:
-            try:
-                if thread.isRunning():
-                    thread.quit()
-                    thread.wait(5000)
-            except RuntimeError:
-                # 既にdeleteLater()で破棄済み（＝計算は完了している）
-                pass
-
-    def _on_schedule_finished(self, seq, result_df):
-        if seq != self._request_seq:
-            return  # 追い越された古い要求の結果なので捨てる
-        self._result_df = result_df
-        self._display = self._pending_display
-        # 計算完了時点ではなく、要求時点（frames を組み立てた瞬間）の revision を
-        # 刻む。計算は非同期のため、計算中に他タブの編集で revision が進むことが
-        # あり、ここで self.db.revision を読むとその新しいrevisionが刻まれて
-        # しまう——結果は古いDB内容のままなのに「最新」として扱われ、以降の
-        # refresh_choices() が再計算をスキップして編集が反映されないままになる。
-        self._computed_revision = self._pending_revision
-        self._apply_result()
-
-    def _on_schedule_failed(self, seq, message):
-        if seq != self._request_seq:
-            return
-        self._clear_chart_state(f"スケジューリングに失敗しました: {message}", is_error=True)
 
     def _apply_result(self):
         """計算済みの結果でタブ内の表示（絞り込み選択肢・チャート）を作り直す。"""
@@ -490,7 +351,6 @@ class GanttTab(QWidget):
         ように誤解させてしまうため。"""
         self._result_df = None
         self._display = None
-        self._computed_revision = None
         self.view.setScene(None)
         self._rebuild_filters()
         self._set_status(status_message, is_error=is_error)

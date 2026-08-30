@@ -22,7 +22,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from gui.db import ProjectDatabase  # noqa: E402
+from gui.db import ProjectDatabase, ProjectDatabaseError  # noqa: E402
 
 pytestmark = pytest.mark.core
 
@@ -55,6 +55,7 @@ def _assert_untouched_columns_survived(db, ids):
     assert row["tags"] == "確定, 外注"
     assert row["override_days"] == 9
     assert row["override_team_id"] == ids["team"]
+    assert row["status"] == "in_progress"
     # 目的であるマイルストーンの引き上げ自体は起きていること
     assert db.effective_milestone(ids["job"], ids["t2"])["milestone_id"] == ids["ms_late"]
 
@@ -64,7 +65,7 @@ def _pin_successor(db, ids):
     db.upsert_job_task_override(
         ids["job"], ids["t2"], is_active=True, override_days=9,
         milestone_id=ids["ms_early"], team_id=ids["team"],
-        start_pin_date="2026-05-01", tags="確定, 外注",
+        start_pin_date="2026-05-01", tags="確定, 外注", status="in_progress",
     )
 
 
@@ -124,6 +125,7 @@ def test_milestone_adjustment_creates_a_minimal_row_when_none_exists(tmp_path):
     assert row["tags"] == ""
     assert row["override_days"] is None
     assert row["override_team_id"] is None
+    assert row["status"] is None
     assert bool(row["is_active"]) is True
     assert db.effective_milestone(ids["job"], ids["t2"])["milestone_id"] == ids["ms_late"]
     db.close()
@@ -140,4 +142,46 @@ def test_milestone_adjustment_does_not_reactivate_a_disabled_task(tmp_path):
 
     db.enforce_milestone_floor(ids["job"], ids["t2"])
     assert bool(_override(db, ids["job"], ids["t2"])["is_active"]) is False
+
+
+# -- status（実際の進捗。docs/project_analysis_tab_design.md参照） ---------------------
+
+def test_task_status_round_trips_through_upsert(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    ids = _build_chain_job(db)
+
+    db.upsert_job_task_override(ids["job"], ids["t1"], status="in_progress")
+    assert _override(db, ids["job"], ids["t1"])["status"] == "in_progress"
+
+    db.upsert_job_task_override(ids["job"], ids["t1"], status="done")
+    assert _override(db, ids["job"], ids["t1"])["status"] == "done"
+
+    # Noneに戻すと「未着手」——他の列がすべて既定のままなら行自体も消える
+    # （差分のみ保持、clear_job_task_override と同じ挙動をgui/tab_jobs.py側で辿る）。
+    db.upsert_job_task_override(ids["job"], ids["t1"], status=None)
+    assert _override(db, ids["job"], ids["t1"])["status"] is None
+    db.close()
+
+
+def test_task_status_rejects_unknown_values(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    ids = _build_chain_job(db)
+
+    with pytest.raises(ProjectDatabaseError):
+        db.upsert_job_task_override(ids["job"], ids["t1"], status="完了")
+    db.close()
+
+
+def test_task_status_survives_a_milestone_only_adjustment_when_other_columns_are_default(tmp_path):
+    """statusだけを設定したタスクにマイルストーンの自動調整
+    （_set_override_milestoneのマイルストーン列だけのUPDATE経路）が走っても、
+    statusが消えないこと。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    ids = _build_chain_job(db)
+    db.upsert_job_task_override(ids["job"], ids["t2"], status="done")
+    db.upsert_job_task_override(ids["job"], ids["t1"], milestone_id=ids["ms_late"])
+
+    assert db.enforce_milestone_floor(ids["job"], ids["t2"]) is True
+    assert _override(db, ids["job"], ids["t2"])["status"] == "done"
+    db.close()
     db.close()

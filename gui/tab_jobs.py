@@ -306,9 +306,9 @@ class JobsTab(QWidget):
         override_group = QGroupBox("タスク上書き（選択中のジョブ）")
         override_layout = QVBoxLayout(override_group)
 
-        self.override_table = QTableWidget(0, 7)
+        self.override_table = QTableWidget(0, 8)
         self.override_table.setHorizontalHeaderLabels(
-            ["タスク名", "有効", "日数", "マイルストーン", "チーム", "開始固定日", "タグ"]
+            ["タスク名", "有効", "日数", "マイルストーン", "チーム", "開始固定日", "状態", "タグ"]
         )
         self.override_table.verticalHeader().setVisible(False)
         self.override_table.setSelectionMode(QTableWidget.NoSelection)
@@ -836,10 +836,22 @@ class JobsTab(QWidget):
             bind_undo_session(pin_edit, self.db, "タスクの開始固定日を変更")
             table.setCellWidget(row, 5, pin_edit)
 
+            # 実際の進捗（ユーザーが手動で記録する。日付からの推測ではない
+            # ——プロジェクト分析タブの「タスクの状態」はこの値を集計する。
+            # gui/db.py の job_task_overrides.status: NULL＝未着手）。
+            status_combo = make_fk_combo(
+                [("in_progress", "進行中"), ("done", "完了")], r["status"],
+                allow_blank=True, blank_label="未着手",
+            )
+            status_combo.currentIndexChanged.connect(
+                lambda _idx, tid=r["workflow_task_id"]: self._on_override_changed(tid)
+            )
+            table.setCellWidget(row, 6, status_combo)
+
             # タスク タグ。ジョブ タグ列（ジョブ一覧）と同様、専用ウィジェットを
             # 持たない常に編集可能なitemとして表示する（itemChangedは
             # __init__で_on_override_tag_text_changedに一括で繋いである）。
-            table.setItem(row, 6, QTableWidgetItem(r["tags"]))
+            table.setItem(row, 7, QTableWidgetItem(r["tags"]))
         table.blockSignals(False)
         # 「タグ」列（最後の列）はジョブ一覧と同様、内容幅に関わらず表の
         # 右側に残る余白をすべて使う。
@@ -865,13 +877,13 @@ class JobsTab(QWidget):
                 return
 
     def _on_override_tag_text_changed(self, item):
-        """タスク上書き表の「タグ」列（6列目、タスク タグ）の編集完了時に
+        """タスク上書き表の「タグ」列（7列目、タスク タグ）の編集完了時に
         呼ばれる。他の列（チェックボックス・コンボ・スピンボックス等）は
         セルウィジェットのシグナルで直接 _on_override_changed に繋いでいるが、
         タスク タグ列はジョブ一覧の「タグ」列と同じくウィジェットを持たない
         常時編集可能なitemのため、テーブル全体のitemChangedを購読してここで
         列を判定する。"""
-        if item.column() != 6:
+        if item.column() != 7:
             return
         workflow_task_id = row_id(self.override_table, item.row())
         if workflow_task_id is None:
@@ -888,18 +900,20 @@ class JobsTab(QWidget):
                 milestone_id = table.cellWidget(row, 3).currentData()
                 team_id = table.cellWidget(row, 4).currentData()
                 start_pin_date = table.cellWidget(row, 5).value()
+                status = table.cellWidget(row, 6).currentData()
                 # タスク タグ列はジョブ タグ列と同様にウィジェットを持たない
                 # ため、名前列と同じくitemのテキストをそのまま読む。
-                tags_item = table.item(row, 6)
+                tags_item = table.item(row, 7)
                 tags = normalize_tags(tags_item.text() if tags_item is not None else "")
 
                 with self.db.undo_group("タスク上書きを変更"):
                     if (not is_active or override_days is not None or milestone_id is not None
-                            or team_id is not None or start_pin_date is not None or tags):
+                            or team_id is not None or start_pin_date is not None or tags
+                            or status is not None):
                         self.db.upsert_job_task_override(
                             self.current_job_id, workflow_task_id, is_active=is_active,
                             override_days=override_days, milestone_id=milestone_id, team_id=team_id,
-                            start_pin_date=start_pin_date, tags=tags,
+                            start_pin_date=start_pin_date, tags=tags, status=status,
                         )
                     else:
                         self.db.clear_job_task_override(self.current_job_id, workflow_task_id)
