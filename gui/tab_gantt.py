@@ -32,7 +32,7 @@ gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、ホイー
 
 from datetime import date, timedelta
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -51,7 +51,7 @@ from gui.db import ProjectDatabaseError, parse_tags
 from gui.gantt_edit import WorkDayCalendar, format_entity_id, parse_entity_id
 from gui.gantt_task_editor import TaskEditWindow
 from gui.gantt_view import FrozenGanttPane, build_gantt_scenes, set_bar_baseline
-from gui.plan_actions import confirm_all, confirm_selected
+from gui.plan_actions import confirm_all, confirm_selected, selected_targets
 from gui.plan_confirmation import CONFIRMED, DRAFT, UNCONFIRMED, PlanState, successor_map
 from gui.widgets_common import (
     ChoiceFilterGroup,
@@ -84,6 +84,8 @@ _DRAG_MODIFIER_KEYS = {"shift": Qt.ShiftModifier, "alt": Qt.AltModifier}
 
 
 class GanttTab(QWidget):
+    # 選択が変わった（状態帯の「選択した変更を確定」を押せるかが変わりうる）
+    planSelectionChanged = Signal()
     def __init__(self, db, schedule_cache, app_settings=None, parent=None):
         super().__init__(parent)
         self.db = db
@@ -805,6 +807,7 @@ class GanttTab(QWidget):
         self._editor.raise_()
 
     def _on_selection_changed(self):
+        self.planSelectionChanged.emit()
         if self._editor is not None and self._editor.isVisible():
             self._editor.set_keys(self.view.selected_keys())
 
@@ -936,6 +939,15 @@ class GanttTab(QWidget):
             if abs(shift) > abs(worst):
                 worst = shift
         return moved, worst
+
+    def can_confirm_selected(self):
+        """選んでいるタスクに、確定していない変更（またはその影響）があるか。"""
+        state = self.cache.plan_state
+        keys = self.view.selected_keys() if self.view.scene() is not None else []
+        if state is None or state.status != DRAFT or not keys:
+            return False
+        ids = {self._job_and_task_ids(k) for k in keys}
+        return bool(selected_targets(state, ids, successor_map(self.db)))
 
     def run_plan_action(self, action):
         """状態帯のボタンの処理。いずれも1回のUndoで戻せる。"""

@@ -71,17 +71,27 @@ def confirm_all(db, result_df):
     )
 
 
-def confirm_selected(db, result_df, keys, successors):
-    """選んだタスク（(job_id, workflow_task_id) の集合）の変更と、その影響で動いた
-    後続を確定する。確定したタスクの数を返す。
+def selected_targets(state, keys, successors):
+    """「選択した変更を確定」で確定するタスク: 選んだタスク（(job_id,
+    workflow_task_id) の集合）のうち変更のあるものと、その影響で動いた後続。
+    空なら、選んだタスクには確定していない変更が無い。"""
+    from gui.plan_confirmation import downstream
 
-    successors は gui/plan_confirmation.successor_map(db) の戻り値。"""
-    from gui.plan_confirmation import PlanState, downstream
-
-    state = PlanState(db)
     changed_or_affected = downstream(state.changed, successors)
     targets = {k for k in downstream(set(keys), successors) if k in changed_or_affected}
     targets |= {k for k in keys if k in state.changed}
+    return targets
+
+
+def confirm_selected(db, result_df, keys, successors):
+    """選んだタスクの変更と、その影響で動いた後続を確定する（selected_targets）。
+    確定したタスクの数を返す。
+
+    successors は gui/plan_confirmation.successor_map(db) の戻り値。"""
+    from gui.plan_confirmation import PlanState
+
+    state = PlanState(db)
+    targets = selected_targets(state, keys, successors)
     if not targets:
         return 0
     rows = confirmed_rows_from_result(db, result_df, only_keys=targets)

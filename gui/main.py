@@ -196,6 +196,7 @@ class MainWindow(QMainWindow):
 
         self.tab_gantt = GanttTab(self.db, self.schedule_cache, self.app_settings)
         self.tabs.addTab(self.tab_gantt, "ガントチャート")
+        self.tab_gantt.planSelectionChanged.connect(self._plan_band_timer.start)
 
         self.tab_analysis = AnalysisTab(self.db, self.schedule_cache)
         self.tabs.addTab(self.tab_analysis, "プロジェクト分析")
@@ -562,7 +563,10 @@ class MainWindow(QMainWindow):
             return
         status, detail, ready = self.tab_gantt.plan_band_summary()
         on_gantt = self.tabs.currentWidget() is self.tab_gantt
-        self.plan_band.set_state(status, detail, show_buttons=on_gantt, buttons_enabled=ready)
+        self.plan_band.set_state(
+            status, detail, show_buttons=on_gantt, buttons_enabled=ready,
+            selected_enabled=on_gantt and self.tab_gantt.can_confirm_selected(),
+        )
         self.plan_band.setVisible(True)
 
     def _run_plan_action(self, action):

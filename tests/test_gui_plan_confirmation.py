@@ -128,22 +128,24 @@ def test_new_job_after_confirming_is_drawn_unconfirmed(qapp, gantt):
     assert not bars[_key(ids, "job1", "t1")].unconfirmed
 
 
-def test_confirm_selected_without_a_selection_explains_and_writes_nothing(qapp, gantt):
+def test_confirm_selected_is_grayed_out_unless_a_changed_task_is_selected(qapp, gantt):
     w, tab, ids = gantt
     _confirm(qapp, w)
     w.db.update_job_task_override_fields(ids["job1"], ids["t1"], override_days=8)
     tab.refresh_choices()  # 他のタブでの編集の後にガントタブを開いたときと同じ
     assert _band_settled(qapp, w, DRAFT)
     _wait_recomputed(qapp, tab)
+    button = w.plan_band.confirm_selected_button
+
     tab.view.select_keys([])
-    label = w.undo_manager.undo_label()
-    with patch.object(QMessageBox, "information") as info:
-        w.plan_band.confirm_selected_button.click()
-    assert info.called
-    assert w.undo_manager.undo_label() == label
+    assert _wait(qapp, lambda: not button.isEnabled())
+    # 変更も、変更の影響も無いタスクだけを選んでいる
+    tab.view.select_keys([_key(ids, "job2", "t1")])
+    assert _wait(qapp, lambda: not button.isEnabled())
 
     tab.view.select_keys([_key(ids, "job1", "t1")])
-    w.plan_band.confirm_selected_button.click()
+    assert _wait(qapp, button.isEnabled)
+    button.click()
     assert _band_settled(qapp, w, CONFIRMED)
     assert w.undo_manager.undo_label() == "選択した変更を確定"
 

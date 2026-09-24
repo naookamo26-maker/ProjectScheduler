@@ -63,8 +63,10 @@ class PlanStatusBand(QFrame):
         self.status = None
         self.set_state(UNCONFIRMED, "", show_buttons=False, buttons_enabled=False)
 
-    def set_state(self, status, detail, show_buttons, buttons_enabled):
-        """status: UNCONFIRMED/CONFIRMED/DRAFT。detail: 状態名の右に出す事実（HTML可）。"""
+    def set_state(self, status, detail, show_buttons, buttons_enabled, selected_enabled=True):
+        """status: UNCONFIRMED/CONFIRMED/DRAFT。detail: 状態名の右に出す事実（HTML可）。
+        selected_enabled: 「選択した変更を確定」を押せるか（ガントで、確定していない
+        変更のあるタスクを選んでいるときだけ）。"""
         self.status = status
         background, border, text = _COLORS[status]
         self.setStyleSheet(
@@ -78,3 +80,4 @@ class PlanStatusBand(QFrame):
             for button in buttons:
                 button.setVisible(button in visible)
                 button.setEnabled(buttons_enabled)
+        self.confirm_selected_button.setEnabled(buttons_enabled and selected_enabled)
