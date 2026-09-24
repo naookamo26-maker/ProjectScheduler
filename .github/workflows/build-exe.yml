@@ -6,17 +6,8 @@ name: Build Windows exe
 # 詳細は docs/packaging.md を参照。
 
 on:
-  push:
-    # このリポジトリはまだ main/master ブランチを持たないため、現在の開発
-    # ブランチも明示しておく（今後 main へ統合した場合もそのまま動作する）。
-    branches: [main, master, claude/dev-continuation-uudn2p]
-    paths:
-      - "gui/**"
-      - "project_scheduler.py"
-      - "run_gui.py"
-      - "requirements.txt"
-      - "packaging/**"
-      - ".github/workflows/build-exe.yml"
+  # 無料プランではArtifactの保存容量に上限があるため、pushのたびに自動で
+  # ビルドするのはやめ、必要なときにActionsタブから手動で実行する。
   workflow_dispatch: {}
 
 jobs:
@@ -44,3 +35,6 @@ jobs:
           # --onefile構成のため、生成物は dist/ProjectSchedulerGUI.exe の1ファイルのみ。
           path: dist/ProjectSchedulerGUI.exe
           if-no-files-found: error
+          # 保存容量を圧迫しないよう、既定の90日ではなく短期間で自動削除する。
+          # 必要な.exeはこの期間内にダウンロードしておく。
+          retention-days: 7

@@ -11,20 +11,23 @@ PyInstallerは**クロスコンパイルに対応していない**——ビル�
 
 このため、以下2つの方法を用意している。
 
-## 方法1: GitHub Actionsで自動ビルド（推奨、手元にWindows機が無くても可）
+## 方法1: GitHub Actionsでビルド（推奨、手元にWindows機が無くても可）
 
 `.github/workflows/build-exe.yml` が `windows-latest` ランナー上でビルドを
-自動実行する。トリガー:
+実行する。**実行は手動のみ**（`workflow_dispatch`）。GitHubの無料プランでは
+Artifactの保存容量に上限があり、pushのたびに自動ビルドすると上限に達したため、
+自動実行はやめた。
 
-- `gui/`, `project_scheduler.py`, `run_gui.py`, `requirements.txt`,
-  `packaging/` のいずれかを変更して `main`/`master` ブランチにpushしたとき
-- Actionsタブから手動実行（`workflow_dispatch`）
+実行手順: GitHubのリポジトリ画面 → Actionsタブ → 左の一覧から
+「Build Windows exe」→「Run workflow」→ ビルドしたいブランチを選んで実行。
 
 ビルドが成功すると、ワークフローの実行結果ページから
 `ProjectSchedulerGUI-windows` という名前のArtifact（zip）をダウンロードできる。
 展開すると `ProjectSchedulerGUI.exe` の単一ファイルが得られる
 （依存ライブラリ・plotly.min.js等はすべて実行ファイル内に埋め込まれており、
 他に配布するファイルは無い）。
+Artifactは**7日で自動削除**される（`retention-days: 7`）ので、必要な`.exe`は
+それまでにダウンロードしておく。
 
 ## 方法2: 手元のWindows環境でビルド
 
