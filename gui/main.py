@@ -65,7 +65,7 @@ class MainWindow(QMainWindow):
         self.schedule_cache: ScheduleCache | None = None
         self.tab_gantt: GanttTab | None = None
 
-        self.setWindowTitle("プロジェクトスケジューラー")
+        self.setWindowTitle(tr("プロジェクトスケジューラー"))
         self.resize(1500, 900)
         self.setAcceptDrops(True)
 
@@ -99,7 +99,7 @@ class MainWindow(QMainWindow):
         self._build_empty_state_tabs()
 
         self._build_menu()
-        self.statusBar().showMessage("プロジェクトファイルを新規作成するか、開いてください")
+        self.statusBar().showMessage(tr("プロジェクトファイルを新規作成するか、開いてください"))
 
     def dragEnterEvent(self, event):
         if self._pschedule_path_from_mime(event.mimeData()) is not None:
@@ -115,7 +115,7 @@ class MainWindow(QMainWindow):
         try:
             self._open_database(ProjectDatabase.open_existing(path))
         except Exception as e:
-            QMessageBox.critical(self, "エラー", f"プロジェクトを開けませんでした:\n{e}")
+            QMessageBox.critical(self, tr("エラー"), tr("プロジェクトを開けませんでした:\n{e}", e=e))
         event.acceptProposedAction()
 
     def _pschedule_path_from_mime(self, mime_data):
@@ -141,32 +141,32 @@ class MainWindow(QMainWindow):
         self.tabs.clear()
         self.plan_band.setVisible(False)
         self.tabs.addTab(
-            self._placeholder_tab("プロジェクト名・開始日・マイルストーン・チーム・休業日をここで設定します。"),
-            "基本情報設定",
+            self._placeholder_tab(tr("プロジェクト名・開始日・マイルストーン・チーム・休業日をここで設定します。")),
+            tr("基本情報設定"),
         )
         self.tabs.addTab(
             self._placeholder_tab(
-                "ワークフローとタスクの依存関係、およびワークフロー間の依存テンプレートをここで設計します。"
+                tr("ワークフローとタスクの依存関係、およびワークフロー間の依存テンプレートをここで設計します。")
             ),
-            "ワークフロー設計",
+            tr("ワークフロー設計"),
         )
         self.tabs.addTab(
             self._placeholder_tab(
-                "ジョブ（ワークフローの実体化）と、ジョブをまたぐ依存関係をここで作成します。"
+                tr("ジョブ（ワークフローの実体化）と、ジョブをまたぐ依存関係をここで作成します。")
             ),
-            "ジョブ作成",
+            tr("ジョブ作成"),
         )
         self.tabs.addTab(
             self._placeholder_tab(
-                "現在の設定でのスケジューリング結果を、ファイル出力せずにその場で確認できます。"
+                tr("現在の設定でのスケジューリング結果を、ファイル出力せずにその場で確認できます。")
             ),
-            "ガントチャート",
+            tr("ガントチャート"),
         )
         self.tabs.addTab(
             self._placeholder_tab(
-                "ガントチャートタブの計算結果を、KPI・マイルストーン別サマリーとして集計表示します。"
+                tr("ガントチャートタブの計算結果を、KPI・マイルストーン別サマリーとして集計表示します。")
             ),
-            "プロジェクト分析",
+            tr("プロジェクト分析"),
         )
         self.tabs.setEnabled(False)
 
@@ -191,13 +191,13 @@ class MainWindow(QMainWindow):
             self.db, on_teams_changed=self._on_teams_changed,
             on_jobs_changed=self._on_jobs_changed,
         )
-        self.tabs.addTab(self.tab_basic_info, "基本情報設定")
+        self.tabs.addTab(self.tab_basic_info, tr("基本情報設定"))
 
         self.tab_workflows = WorkflowsTab(self.db)
-        self.tabs.addTab(self.tab_workflows, "ワークフロー設計")
+        self.tabs.addTab(self.tab_workflows, tr("ワークフロー設計"))
 
         self.tab_jobs = JobsTab(self.db)
-        self.tabs.addTab(self.tab_jobs, "ジョブ作成")
+        self.tabs.addTab(self.tab_jobs, tr("ジョブ作成"))
 
         # ガントチャートタブ・プロジェクト分析タブはこのキャッシュ経由で
         # スケジューリング結果を共有する（どちらのタブからでも計算を起動できる）。
@@ -205,11 +205,11 @@ class MainWindow(QMainWindow):
         self.schedule_cache.updated.connect(self._plan_band_timer.start)
 
         self.tab_gantt = GanttTab(self.db, self.schedule_cache, self.app_settings)
-        self.tabs.addTab(self.tab_gantt, "ガントチャート")
+        self.tabs.addTab(self.tab_gantt, tr("ガントチャート"))
         self.tab_gantt.planSelectionChanged.connect(self._plan_band_timer.start)
 
         self.tab_analysis = AnalysisTab(self.db, self.schedule_cache)
-        self.tabs.addTab(self.tab_analysis, "プロジェクト分析")
+        self.tabs.addTab(self.tab_analysis, tr("プロジェクト分析"))
 
         self.tabs.setEnabled(True)
         self._plan_band_timer.start()
@@ -239,25 +239,25 @@ class MainWindow(QMainWindow):
             self.tab_jobs.refresh_choices()
 
     def _build_menu(self):
-        file_menu = self.menuBar().addMenu("ファイル(&F)")
+        file_menu = self.menuBar().addMenu(tr("ファイル(&F)"))
 
-        new_action = QAction("新規プロジェクト(&N)...", self)
+        new_action = QAction(tr("新規プロジェクト(&N)..."), self)
         new_action.triggered.connect(self.on_new_project)
         file_menu.addAction(new_action)
 
-        open_action = QAction("プロジェクトを開く(&O)...", self)
+        open_action = QAction(tr("プロジェクトを開く(&O)..."), self)
         open_action.triggered.connect(self.on_open_project)
         file_menu.addAction(open_action)
 
         file_menu.addSeparator()
 
-        self.save_action = QAction("保存(&S)", self)
+        self.save_action = QAction(tr("保存(&S)"), self)
         self.save_action.setShortcut(QKeySequence.Save)  # 標準的にCtrl+S
         self.save_action.triggered.connect(self.on_save)
         self.save_action.setEnabled(False)
         file_menu.addAction(self.save_action)
 
-        self.save_as_action = QAction("名前を付けて保存(&A)...", self)
+        self.save_as_action = QAction(tr("名前を付けて保存(&A)..."), self)
         self.save_as_action.setShortcut(QKeySequence.SaveAs)  # 標準的にCtrl+Shift+S
         self.save_as_action.triggered.connect(self.on_save_as)
         self.save_as_action.setEnabled(False)
@@ -265,26 +265,26 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        self.generate_action = QAction("ガントチャートを生成(&G)...", self)
+        self.generate_action = QAction(tr("ガントチャートを生成(&G)..."), self)
         self.generate_action.triggered.connect(self.on_generate_gantt)
         self.generate_action.setEnabled(False)
         file_menu.addAction(self.generate_action)
 
         file_menu.addSeparator()
 
-        exit_action = QAction("終了(&X)", self)
+        exit_action = QAction(tr("終了(&X)"), self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
-        edit_menu = self.menuBar().addMenu("編集(&E)")
+        edit_menu = self.menuBar().addMenu(tr("編集(&E)"))
 
-        self.undo_action = QAction("元に戻す", self)
+        self.undo_action = QAction(tr("元に戻す"), self)
         self.undo_action.setShortcut(QKeySequence.Undo)
         self.undo_action.triggered.connect(self.on_undo)
         self.undo_action.setEnabled(False)
         edit_menu.addAction(self.undo_action)
 
-        self.redo_action = QAction("やり直す", self)
+        self.redo_action = QAction(tr("やり直す"), self)
         self.redo_action.setShortcut(QKeySequence.Redo)
         self.redo_action.triggered.connect(self.on_redo)
         self.redo_action.setEnabled(False)
@@ -293,7 +293,7 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
 
         # プロジェクトを開いていなくても使える（利用者ごとの設定のため）。
-        options_action = QAction("オプション(&O)...", self)
+        options_action = QAction(tr("オプション(&O)..."), self)
         options_action.triggered.connect(self.on_options)
         edit_menu.addAction(options_action)
 
@@ -320,20 +320,20 @@ class MainWindow(QMainWindow):
         try:
             self._open_database(ProjectDatabase.create_new())
         except Exception as e:
-            QMessageBox.critical(self, "エラー", f"プロジェクトを作成できませんでした:\n{e}")
+            QMessageBox.critical(self, tr("エラー"), tr("プロジェクトを作成できませんでした:\n{e}", e=e))
 
     def on_open_project(self):
         if not self._confirm_discard_unsaved():
             return
         path, _ = QFileDialog.getOpenFileName(
-            self, "プロジェクトファイルを開く", "", FILE_FILTER
+            self, tr("プロジェクトファイルを開く"), "", FILE_FILTER
         )
         if not path:
             return
         try:
             self._open_database(ProjectDatabase.open_existing(path))
         except Exception as e:
-            QMessageBox.critical(self, "エラー", f"プロジェクトを開けませんでした:\n{e}")
+            QMessageBox.critical(self, tr("エラー"), tr("プロジェクトを開けませんでした:\n{e}", e=e))
 
     def on_save(self):
         """保存（Ctrl+S）。ファイルへの書き込みはここで明示的に行うまで発生しない。
@@ -346,10 +346,10 @@ class MainWindow(QMainWindow):
         try:
             self.db.save()
         except Exception as e:
-            QMessageBox.critical(self, "エラー", f"保存できませんでした:\n{e}")
+            QMessageBox.critical(self, tr("エラー"), tr("保存できませんでした:\n{e}", e=e))
             return False
         self._update_title()
-        self.statusBar().showMessage(f"保存しました: {self.db.path}", 5000)
+        self.statusBar().showMessage(tr("保存しました: {path}", path=self.db.path), 5000)
         return True
 
     def on_save_as(self):
@@ -358,7 +358,7 @@ class MainWindow(QMainWindow):
             return False
         default_path = self.db.path or ""
         path, _ = QFileDialog.getSaveFileName(
-            self, "名前を付けて保存", default_path, FILE_FILTER
+            self, tr("名前を付けて保存"), default_path, FILE_FILTER
         )
         if not path:
             return False
@@ -370,8 +370,8 @@ class MainWindow(QMainWindow):
             path = f"{path}.{DEFAULT_SUFFIX}"
             if Path(path).exists():
                 reply = QMessageBox.question(
-                    self, "上書きの確認",
-                    f"'{Path(path).name}' は既に存在します。上書きしますか？",
+                    self, tr("上書きの確認"),
+                    tr("'{name}' は既に存在します。上書きしますか？", name=Path(path).name),
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
                 )
                 if reply != QMessageBox.Yes:
@@ -379,10 +379,10 @@ class MainWindow(QMainWindow):
         try:
             self.db.save_as(path)
         except Exception as e:
-            QMessageBox.critical(self, "エラー", f"保存できませんでした:\n{e}")
+            QMessageBox.critical(self, tr("エラー"), tr("保存できませんでした:\n{e}", e=e))
             return False
         self._update_title()
-        self.statusBar().showMessage(f"保存しました: {self.db.path}", 5000)
+        self.statusBar().showMessage(tr("保存しました: {path}", path=self.db.path), 5000)
         return True
 
     def _confirm_discard_unsaved(self):
@@ -391,8 +391,8 @@ class MainWindow(QMainWindow):
         if self.db is None or not self.db.is_dirty():
             return True
         reply = QMessageBox.question(
-            self, "未保存の変更",
-            "現在のプロジェクトに未保存の変更があります。保存しますか？",
+            self, tr("未保存の変更"),
+            tr("現在のプロジェクトに未保存の変更があります。保存しますか？"),
             QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
             QMessageBox.Save,
         )
@@ -408,8 +408,8 @@ class MainWindow(QMainWindow):
         errors = validate_for_generation(self.db)
         if errors:
             QMessageBox.warning(
-                self, "生成できません",
-                "以下を解決してから再度お試しください:\n\n- " + "\n- ".join(errors),
+                self, tr("生成できません"),
+                tr("以下を解決してから再度お試しください:\n\n- ") + "\n- ".join(errors),
             )
             return
 
@@ -431,39 +431,39 @@ class MainWindow(QMainWindow):
                 self.db, plotly_output_path=html_path, plan_output=plan_output, verbose=False,
             )
         except SchedulingError as e:
-            QMessageBox.critical(self, "生成に失敗しました", str(e))
+            QMessageBox.critical(self, tr("生成に失敗しました"), str(e))
             return
 
-        message = f"ガントチャートを書き出しました:\n\n{html_path}"
+        message = tr("ガントチャートを書き出しました:\n\n{html_path}", html_path=html_path)
         overruns = result_df[result_df["Deadline_Overrun_Days"] > 0]
         if not overruns.empty:
             # 締切超過は例外ではなく結果として返るため、ここで明示しないと
             # 「生成完了」だけを見て見過ごされてしまう。
             worst = int(overruns["Deadline_Overrun_Days"].max())
-            message += (
-                f"\n\n※ マイルストーンの締切に間に合わないタスクが{len(overruns)}件あります"
-                f"（最大{worst}日超過）。該当タスクはチャート上で赤く太い枠線で"
-                f"表示しています。"
+            message += tr(
+                "\n\n※ マイルストーンの締切に間に合わないタスクが{n}件あります（最大{worst}日超過）。"
+                "該当タスクはチャート上で赤く太い枠線で表示しています。",
+                n=len(overruns), worst=worst,
             )
         broken = result_df[result_df["Constraint_Violation"] != ""]
         if not broken.empty:
             # 開始固定日の矛盾も締切超過と同じく結果として返る（例外にしない）。
-            message += (
-                f"\n\n※ 開始固定日どおりに配置できないタスクが{len(broken)}件あります"
-                f"（例: {broken.iloc[0]['Task_Name']} — "
-                f"{broken.iloc[0]['Constraint_Violation']}）。"
+            message += tr(
+                "\n\n※ 開始固定日どおりに配置できないタスクが{n}件あります（例: {task} — {violation}）。",
+                n=len(broken), task=broken.iloc[0]["Task_Name"],
+                violation=broken.iloc[0]["Constraint_Violation"],
             )
-        QMessageBox.information(self, "生成完了", message)
+        QMessageBox.information(self, tr("生成完了"), message)
 
     def _ask_plan_output(self):
         """変更案の最中にHTMLを出力するとき、確定した日程と変更案のどちらを出すかを
         尋ねる（キャンセルなら None。テストで差し替える）。"""
-        box = QMessageBox(QMessageBox.Question, "ガントチャートを生成",
-                          "どちらの日程を出力しますか？", parent=self)
-        box.setInformativeText("出力したファイルの見出しに、どちらの日程かを書き添えます。")
-        draft = box.addButton("変更案", QMessageBox.AcceptRole)
-        confirmed = box.addButton("確定した日程", QMessageBox.AcceptRole)
-        box.addButton("キャンセル", QMessageBox.RejectRole)
+        box = QMessageBox(QMessageBox.Question, tr("ガントチャートを生成"),
+                          tr("どちらの日程を出力しますか？"), parent=self)
+        box.setInformativeText(tr("出力したファイルの見出しに、どちらの日程かを書き添えます。"))
+        draft = box.addButton(tr("変更案"), QMessageBox.AcceptRole)
+        confirmed = box.addButton(tr("確定した日程"), QMessageBox.AcceptRole)
+        box.addButton(tr("キャンセル"), QMessageBox.RejectRole)
         box.setDefaultButton(draft)
         # QMessageBox は幅が狭く、説明文が途中で折り返されるので広げる
         layout = box.layout()
@@ -479,7 +479,7 @@ class MainWindow(QMainWindow):
 
     def _ask_output_dir(self, default_dir):
         """出力先フォルダを選ばせる（テストで差し替える）。"""
-        return QFileDialog.getExistingDirectory(self, "ガントチャートの出力先フォルダ", default_dir)
+        return QFileDialog.getExistingDirectory(self, tr("ガントチャートの出力先フォルダ"), default_dir)
 
     def _open_database(self, db):
         # 旧DBを閉じるのは、旧タブを差し替え終えた後にする。タブの差し替えでは
@@ -524,7 +524,7 @@ class MainWindow(QMainWindow):
         if opened_clean:
             self.undo_manager.mark_clean()
         self._update_undo_redo_actions()
-        self.statusBar().showMessage(f"開いているプロジェクト: {db.path or '無題（未保存）'}")
+        self.statusBar().showMessage(tr("開いているプロジェクト: {path}", path=db.path or tr("無題（未保存）")))
         self._update_title()
 
     # -- Undo/Redo -----------------------------------------------------------
@@ -548,9 +548,9 @@ class MainWindow(QMainWindow):
         can_undo = self.undo_manager is not None and self.undo_manager.can_undo()
         can_redo = self.undo_manager is not None and self.undo_manager.can_redo()
         self.undo_action.setEnabled(can_undo)
-        self.undo_action.setText(f"元に戻す: {self.undo_manager.undo_label()}" if can_undo else "元に戻す")
+        self.undo_action.setText(tr("元に戻す: {label}", label=self.undo_manager.undo_label()) if can_undo else tr("元に戻す"))
         self.redo_action.setEnabled(can_redo)
-        self.redo_action.setText(f"やり直す: {self.undo_manager.redo_label()}" if can_redo else "やり直す")
+        self.redo_action.setText(tr("やり直す: {label}", label=self.undo_manager.redo_label()) if can_redo else tr("やり直す"))
 
     def _iter_tab_widgets(self):
         return [(i, self.tabs.widget(i)) for i in range(self.tabs.count())]
@@ -628,10 +628,10 @@ class MainWindow(QMainWindow):
 
     def _update_title(self):
         if self.db is None:
-            self.setWindowTitle("プロジェクトスケジューラー")
+            self.setWindowTitle(tr("プロジェクトスケジューラー"))
             return
         mark = "*" if self.db.is_dirty() else ""
-        self.setWindowTitle(f"プロジェクトスケジューラー — {mark}{self.db.path or '無題（未保存）'}")
+        self.setWindowTitle(tr("プロジェクトスケジューラー — {mark}{path}", mark=mark, path=self.db.path or tr("無題（未保存）")))
 
     def closeEvent(self, event):
         if self.db is not None and not self._confirm_discard_unsaved():

@@ -35,6 +35,7 @@ TRANSLATED_LANGUAGES = [code for code, _label in i18n.LANGUAGES if code != i18n.
 MIGRATED_FILES = {
     "i18n.py",
     "gui/app_settings.py",
+    "gui/main.py",
     "gui/options_dialog.py",
     "gui/plan_band.py",
     "gui/replan_dialog.py",
@@ -44,8 +45,10 @@ MIGRATED_FILES = {
 _MARKERS = {
     "tr": 0, "N_": 0, "undoable": 0, "undo_group": 0, "begin_undo_group": 0, "bind_undo_session": 2,
 }
-# 翻訳しない呼び出し（ログ・コンソール出力。GUI には出ない）
-_EXEMPT_CALLS = {"print", "debug", "info", "warning", "error", "exception", "critical"}
+# 翻訳しない呼び出し（ログ・コンソール出力。GUI には出ない）。ログは logger.warning(…)
+# のようにロガーのメソッドとして呼んだものだけ（QMessageBox.warning(…) は画面に出るので対象）
+_LOG_METHODS = {"debug", "info", "warning", "error", "exception", "critical"}
+_LOGGERS = {"logger", "logging", "log", "_logger"}
 # 翻訳しない定数（言語の選択肢は、それぞれの言語での呼び名のまま出す）
 _EXEMPT_ASSIGNMENTS = {"LANGUAGES"}
 _JA = re.compile(r"[぀-ヿ㐀-鿿＀-￯]")
@@ -84,7 +87,12 @@ def _scan(path):
             if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                 marked.add(arg.value)
                 marked_ids.add(id(arg))
-        if name in _EXEMPT_CALLS:
+        func = node.func
+        is_log = (isinstance(func, ast.Name) and func.id == "print") or (
+            isinstance(func, ast.Attribute) and func.attr in _LOG_METHODS
+            and isinstance(func.value, ast.Name) and func.value.id in _LOGGERS
+        )
+        if is_log:
             for sub in ast.walk(node):
                 exempt_ids.add(id(sub))
     for node in ast.walk(tree):
