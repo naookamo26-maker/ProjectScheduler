@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.gantt_edit import to_date
+from i18n import tr
 
 DAY_WIDTH = 10
 ROW_HEIGHT = 26
@@ -530,7 +531,7 @@ class GanttGraphicsView(QGraphicsView):
             drag["new_days"] = new_days
             new_end = cal.end_exclusive(anchor.start, new_days, anchor.team_key)
             self._place_ghost(drag["ghosts"][anchor.key], anchor, anchor.start, new_end)
-            text = f"{new_days}営業日（{new_end - timedelta(days=1):%m/%d} まで）"
+            text = tr("{new_days}営業日（{end:%m/%d} まで）", new_days=new_days, end=new_end - timedelta(days=1))
         else:
             shift = cal.diff(anchor.start, anchor.start + timedelta(days=dx_days), anchor.team_key)
             drag["shift"] = shift
@@ -543,13 +544,16 @@ class GanttGraphicsView(QGraphicsView):
             drag["targets"] = targets
             sign = "+" if shift >= 0 else "−"
             if len(drag["bars"]) == 1:
-                text = f"{anchor.start:%m/%d} → {targets[anchor.key]:%m/%d}（{sign}{abs(shift)}営業日）"
+                text = tr(
+                    "{start:%m/%d} → {new_start:%m/%d}（{sign}{days}営業日）",
+                    start=anchor.start, new_start=targets[anchor.key], sign=sign, days=abs(shift),
+                )
             else:
-                text = f"{len(drag['bars'])}件を {sign}{abs(shift)}営業日"
+                text = tr("{n}件を {sign}{days}営業日", n=len(drag["bars"]), sign=sign, days=abs(shift))
             if self.move_hint_provider is not None:
                 hints = [h for h in (self.move_hint_provider(k, d) for k, d in targets.items()) if h]
                 if hints:
-                    text += "\n⚠ " + hints[0] + (f"（ほか{len(hints) - 1}件）" if len(hints) > 1 else "")
+                    text += "\n⚠ " + hints[0] + (tr("（ほか{n}件）", n=len(hints) - 1) if len(hints) > 1 else "")
         QToolTip.showText(event.globalPosition().toPoint(), text, self)
         scene.update()
 
@@ -1194,7 +1198,7 @@ def build_gantt_scenes(df, display, color_by="team"):
         span_start = max(axis_start, year_cursor)
         span_end = min(axis_end, year_end)
         center_x = (x_of(span_start) + x_of(span_end)) / 2
-        text = f"{year_cursor.year}年"
+        text = tr("{year}年", year=year_cursor.year)
         text_width = year_metrics.horizontalAdvance(text)
         _add_fixed_size_label(
             header_scene, text, year_font,
@@ -1258,7 +1262,7 @@ def build_gantt_scenes(df, display, color_by="team"):
         body_line = body_scene.addLine(x, TOP_MARGIN, x, chart_bottom, pen)
         body_line.setZValue(-1)
         label = _add_fixed_size_label(
-            header_scene, "今日", job_font,
+            header_scene, tr("今日"), job_font,
             (x, TOP_MARGIN - _MILESTONE_LABEL_OFFSET),
             brush=QBrush(_TODAY_LINE_COLOR), z_value=2,
         )
@@ -1313,7 +1317,7 @@ def build_gantt_scenes(df, display, color_by="team"):
         )
         swatch.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
         swatch.setPos(4, (y_top + y_bottom) / 2 - swatch_height / 2)
-        swatch.setToolTip(f"ワークフロー: {workflow_names.get(job_workflow_id, job_workflow_id)}")
+        swatch.setToolTip(tr("ワークフロー: {workflow}", workflow=workflow_names.get(job_workflow_id, job_workflow_id)))
 
         _add_fixed_size_label(
             column_scene,
@@ -1379,14 +1383,15 @@ def build_gantt_scenes(df, display, color_by="team"):
             team_name = team_names.get(r["Team_ID"], str(r["Team_ID"]))
             workflow_name = workflow_names.get(r["Workflow_ID"], str(r["Workflow_ID"]))
             rect.setToolTip(
-                f'{job_name} / {r["Task_Name"]}\n'
-                f'ワークフロー: {workflow_name}\n'
-                f'チーム: {team_name}\n'
-                f'{r["Start_Date"].strftime("%Y-%m-%d")} 〜 {r["End_Date"].strftime("%Y-%m-%d")}'
-                + (f'\n⚠ マイルストーンの締切を{overrun_days}日超過' if overrun_days > 0 else "")
+                tr(
+                    "{job} / {task}\nワークフロー: {workflow}\nチーム: {team}\n{start} 〜 {end}",
+                    job=job_name, task=r["Task_Name"], workflow=workflow_name, team=team_name,
+                    start=r["Start_Date"].strftime("%Y-%m-%d"), end=r["End_Date"].strftime("%Y-%m-%d"),
+                )
+                + (tr("\n⚠ マイルストーンの締切を{overrun_days}日超過", overrun_days=overrun_days) if overrun_days > 0 else "")
                 + (f'\n⚠ {constraint_violation}' if constraint_violation else "")
-                + ("\n※リソース制約により前倒し" if r["Resource_Adjusted"] else "")
-                + (f'\n📍 開始固定日: {start_pins[key]:%Y-%m-%d}' if key in start_pins else "")
+                + (tr("\n※リソース制約により前倒し") if r["Resource_Adjusted"] else "")
+                + (tr("\n📍 開始固定日: {date:%Y-%m-%d}", date=start_pins[key]) if key in start_pins else "")
             )
             body_scene.addItem(rect)
 

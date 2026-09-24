@@ -64,13 +64,14 @@ from gui.widgets_common import (
     NoWheelSpinBox,
     bind_undo_session,
 )
+from i18n import N_, tr
 
 # ジョブ タグ／タスク タグを1つも持たない場合にまとめる擬似キー
 # （gui/tab_jobs.py と同じ考え方。2つの絞り込みは別々のChoiceFilterGroupの
 # ため、同じ値を使ってもキー空間は混ざらない）。
 _NO_TAG_FILTER_KEY = None
-_NO_JOB_TAG_FILTER_LABEL = "（ジョブ タグなし）"
-_NO_TASK_TAG_FILTER_LABEL = "（タスク タグなし）"
+_NO_JOB_TAG_FILTER_LABEL = N_("（ジョブ タグなし）")
+_NO_TASK_TAG_FILTER_LABEL = N_("（タスク タグなし）")
 
 # 配置コントロール（画面上部、計算結果テキストの右隣に並べる操作パネル）の幅。
 # タイトル・ラベル・スライダー・スピンボックスを縦に積まず1行に収めるぶん、
@@ -132,18 +133,18 @@ class GanttTab(QWidget):
         # ワークフロー／チーム／ジョブ タグ／タスク タグの4つの絞り込み
         # （いずれもOR条件のチェックボックス一覧で、4つの間はAND条件で
         # 組み合わせる。gui/tab_jobs.py の絞り込みと同じ構造・見た目）。
-        self.filters_section = CollapsibleSection("絞り込み")
+        self.filters_section = CollapsibleSection(tr("絞り込み"))
         layout.addWidget(self.filters_section)
 
-        self.workflow_filter = ChoiceFilterGroup("ワークフロー")
+        self.workflow_filter = ChoiceFilterGroup(tr("ワークフロー"))
         self.workflow_filter.changed.connect(self._refresh_chart)
         self.filters_section.content_layout.addWidget(self.workflow_filter)
 
-        self.team_filter = ChoiceFilterGroup("チーム")
+        self.team_filter = ChoiceFilterGroup(tr("チーム"))
         self.team_filter.changed.connect(self._refresh_chart)
         self.filters_section.content_layout.addWidget(self.team_filter)
 
-        self.tag_filter = ChoiceFilterGroup("ジョブ タグ")
+        self.tag_filter = ChoiceFilterGroup(tr("ジョブ タグ"))
         self.tag_filter.changed.connect(self._refresh_chart)
         self.filters_section.content_layout.addWidget(self.tag_filter)
 
@@ -151,17 +152,17 @@ class GanttTab(QWidget):
         # タスクを1つでも含むジョブを表示する（gui/tab_jobs.py の
         # task_tag_filter と同じ考え方。display["job_task_tags"] は
         # gantt_generator.build_display() が組み立てる）。
-        self.task_tag_filter = ChoiceFilterGroup("タスク タグ")
+        self.task_tag_filter = ChoiceFilterGroup(tr("タスク タグ"))
         self.task_tag_filter.changed.connect(self._refresh_chart)
         self.filters_section.content_layout.addWidget(self.task_tag_filter)
 
         # ジョブ名の文字列検索・「間に合わないジョブのみ表示」も、ワークフロー
         # ／チーム／ジョブ タグ／タスク タグと同じ「絞り込み」セクションにまとめる。
         search_toolbar = QHBoxLayout()
-        search_toolbar.addWidget(QLabel("ジョブ名で絞り込み:"))
+        search_toolbar.addWidget(QLabel(tr("ジョブ名で絞り込み:")))
         self.search_edit = QLineEdit()
         self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.setPlaceholderText("ジョブ名の一部を入力")
+        self.search_edit.setPlaceholderText(tr("ジョブ名の一部を入力"))
         # 1文字入力するたびに絞り込みを走らせると、入力途中の文字列で毎回
         # 再描画されてしまう。入力が止まってからまとめて反映する（デバウンス）。
         self._search_debounce_timer = QTimer(self)
@@ -175,10 +176,10 @@ class GanttTab(QWidget):
         self.search_edit.editingFinished.connect(self._refresh_chart)
         # 20文字程度が入る幅に固定する（addWidget(..., 1)で親の幅いっぱいに
         # 伸びてしまうと、他の絞り込みチェックボックスと並べたときに長すぎるため）。
-        search_edit_width = QFontMetrics(self.search_edit.font()).horizontalAdvance("あ" * 20) + 24
+        search_edit_width = QFontMetrics(self.search_edit.font()).horizontalAdvance(chr(0x3042) * 20)  # 全角20文字ぶん（翻訳しない） + 24
         self.search_edit.setFixedWidth(search_edit_width)
         search_toolbar.addWidget(self.search_edit)
-        self.overrun_only_checkbox = QCheckBox("間に合わないジョブのみ表示")
+        self.overrun_only_checkbox = QCheckBox(tr("間に合わないジョブのみ表示"))
         self.overrun_only_checkbox.stateChanged.connect(self._refresh_chart)
         search_toolbar.addWidget(self.overrun_only_checkbox)
         search_toolbar.addStretch(1)
@@ -203,16 +204,16 @@ class GanttTab(QWidget):
         # ガントチャートの縦方向を圧迫しないよう、タイトル・ラベル・スライダー・
         # スピンボックスを縦に積まず1行に収める（そのぶん幅を確保する）。
         placement_layout = QHBoxLayout(self.placement_group)
-        placement_layout.addWidget(QLabel("配置コントロール"))
-        placement_layout.addWidget(QLabel("最速"))
+        placement_layout.addWidget(QLabel(tr("配置コントロール")))
+        placement_layout.addWidget(QLabel(tr("最速")))
         self.placement_slider = NoWheelSlider(Qt.Horizontal)
         self.placement_slider.setRange(0, 100)
         self.placement_slider.setToolTip(
-            "各タスクを、依存関係が満たされ次第の最速開始～締切から逆算した"
-            "最遅開始の範囲内のどこに配置するかの基準点（distribution_ratio）。"
+            tr("各タスクを、依存関係が満たされ次第の最速開始～締切から逆算した"
+            "最遅開始の範囲内のどこに配置するかの基準点（distribution_ratio）。")
         )
         placement_layout.addWidget(self.placement_slider, 1)
-        placement_layout.addWidget(QLabel("ギリギリ"))
+        placement_layout.addWidget(QLabel(tr("ギリギリ")))
         self.placement_spinbox = NoWheelSpinBox()
         self.placement_spinbox.setRange(0, 100)
         self.placement_spinbox.setSuffix("%")
@@ -331,7 +332,7 @@ class GanttTab(QWidget):
             self._clear_chart_state(self.cache.error_message, is_error=True)
             return
         if not self.cache.is_fresh():
-            self._set_status("スケジューリングを計算中です...")
+            self._set_status(tr("スケジューリングを計算中です..."))
             return
         self._result_df = self.cache.result_df
         self._display = self.cache.display
@@ -407,7 +408,7 @@ class GanttTab(QWidget):
                 if key not in edited and key in previous_positions
                 and previous_positions[key][:2] != pos[:2]
             ]
-            self._moved_note = f"他に{len(moved)}件のタスクが動きました。" if moved else ""
+            self._moved_note = tr("他に{n}件のタスクが動きました。", n=len(moved)) if moved else ""
             if self._pending_edit.get("note"):
                 self._moved_note += self._pending_edit["note"]
         else:
@@ -428,15 +429,18 @@ class GanttTab(QWidget):
         （project_scheduler.py の Deadline_Overrun_Days を参照）、件数を
         ここで明示しないと気付かないまま見過ごされてしまう。"""
         if self._result_df is None or self._result_df.empty:
-            return "有効なタスクがありません。", False
+            return tr("有効なタスクがありません。"), False
         total = len(self._result_df)
         notes = []
         overruns = self._result_df[self._result_df["Deadline_Overrun_Days"] > 0]
         if not overruns.empty:
             worst = int(overruns["Deadline_Overrun_Days"].max())
             notes.append(
-                f"うち{len(overruns)}件がマイルストーンの締切に間に合いません（最大{worst}日超過）。"
-                f"チームのライン数・依存関係・締切を見直してください。"
+                tr(
+                    "うち{n}件がマイルストーンの締切に間に合いません（最大{worst}日超過）。"
+                    "チームのライン数・依存関係・締切を見直してください。",
+                    n=len(overruns), worst=worst,
+                )
             )
         # 満たせない開始固定日も、締切超過と同じく例外ではなく結果として返って
         # くる（固定を動かして辻褄を合わせず、矛盾はデータを書き換えて解消
@@ -444,12 +448,15 @@ class GanttTab(QWidget):
         broken = self._result_df[self._result_df["Constraint_Violation"] != ""]
         if not broken.empty:
             notes.append(
-                f"うち{len(broken)}件が開始固定日どおりに配置できません"
-                f"（例: {broken.iloc[0]['Task_Name']} — {broken.iloc[0]['Constraint_Violation']}）。"
+                tr(
+                    "うち{n}件が開始固定日どおりに配置できません（例: {task} — {violation}）。",
+                    n=len(broken), task=broken.iloc[0]["Task_Name"],
+                    violation=broken.iloc[0]["Constraint_Violation"],
+                )
             )
         if not notes:
-            return f"{total}件のタスクを生成しました。", False
-        return f"{total}件のタスクを生成しました。" + "".join(notes), True
+            return tr("{total}件のタスクを生成しました。", total=total), False
+        return tr("{total}件のタスクを生成しました。", total=total) + "".join(notes), True
 
     def _set_status(self, message, is_error=False):
         """状況表示。エラーはダイアログを出さずここに表示するため、通常の
@@ -527,7 +534,7 @@ class GanttTab(QWidget):
                 tag_keys.update(keys)
         tag_items = [(tag, tag) for tag in sorted(tag_keys)]
         if has_no_tag:
-            tag_items.append((_NO_TAG_FILTER_KEY, _NO_JOB_TAG_FILTER_LABEL))
+            tag_items.append((_NO_TAG_FILTER_KEY, tr(_NO_JOB_TAG_FILTER_LABEL)))
         self.tag_filter.rebuild(tag_items)
 
         task_tag_keys = set()
@@ -540,7 +547,7 @@ class GanttTab(QWidget):
                 task_tag_keys.update(keys)
         task_tag_items = [(tag, tag) for tag in sorted(task_tag_keys)]
         if has_no_task_tag:
-            task_tag_items.append((_NO_TAG_FILTER_KEY, _NO_TASK_TAG_FILTER_LABEL))
+            task_tag_items.append((_NO_TAG_FILTER_KEY, tr(_NO_TASK_TAG_FILTER_LABEL)))
         self.task_tag_filter.rebuild(task_tag_items)
 
     def _refresh_chart(self):
@@ -637,14 +644,14 @@ class GanttTab(QWidget):
             self._pending_edit = None
             self._pending_selection = None
             self._pending_view_state = None
-            QMessageBox.warning(self, "タスクの編集", str(e))
+            QMessageBox.warning(self, tr("タスクの編集"), str(e))
             return
         adjusted = sum(
             (1 if r["milestone_raised"] else 0) + len(r["milestone_cascaded"])
             for r in (results or []) if r
         )
         if adjusted:
-            self._pending_edit["note"] += f"マイルストーンの前後関係を保つため、{adjusted}件のマイルストーンを自動調整しました。"
+            self._pending_edit["note"] += tr("マイルストーンの前後関係を保つため、{adjusted}件のマイルストーンを自動調整しました。", adjusted=adjusted)
         self.refresh_choices()
 
     def apply_task_fields(self, keys, label, fields):
@@ -704,7 +711,7 @@ class GanttTab(QWidget):
                     )
                     for key, new_start in targets
                 ]
-        label = "ガントでタスクを移動" if len(keys) == 1 else f"ガントで{len(keys)}件のタスクを移動"
+        label = tr("ガントでタスクを移動") if len(keys) == 1 else tr("ガントで{n}件のタスクを移動", n=len(keys))
         self._write_tasks(keys, label, write)
 
     def _on_resize_requested(self, key, new_days):
@@ -716,7 +723,7 @@ class GanttTab(QWidget):
         override = None if new_days == rows[0]["default_days"] else new_days
         job_id, task_id = self._job_and_task_ids(key)
         self._write_tasks(
-            [key], "ガントでタスクの期間を変更",
+            [key], tr("ガントでタスクの期間を変更"),
             lambda: [self.db.update_job_task_override_fields(job_id, task_id, override_days=override)],
         )
 
@@ -736,8 +743,10 @@ class GanttTab(QWidget):
                 continue
             bound = pos[0] if dep_type == "SS" else pos[1]
             if new_start < bound:
-                what = "開始" if dep_type == "SS" else "完了"
-                return f"先行タスク「{pos[2]}」の{what}より前です"
+                # 「開始」「完了」を差し込むと、状態の「完了」と同じ原文になり訳し分けられない
+                if dep_type == "SS":
+                    return tr("先行タスク「{task}」の開始より前です", task=pos[2])
+                return tr("先行タスク「{task}」の完了より前です", task=pos[2])
         return None
 
     def _build_predecessors(self):
@@ -784,7 +793,7 @@ class GanttTab(QWidget):
                 continue
             pos = self._task_positions.get(key)
             team_key = self._team_key(key) if pos is not None else None
-            default_ms = milestones.get(job["default_milestone_id"], "未設定")
+            default_ms = milestones.get(job["default_milestone_id"], tr("未設定"))
             rows.append({
                 **r,
                 "key": key,
@@ -821,23 +830,23 @@ class GanttTab(QWidget):
             return
         bars = self.view.bars()
         menu = QMenu(self)
-        edit_action = menu.addAction("編集…")
+        edit_action = menu.addAction(tr("編集…"))
         menu.addSeparator()
-        pin_action = menu.addAction("開始日を固定")
-        unpin_action = menu.addAction("固定を解除")
+        pin_action = menu.addAction(tr("開始日を固定"))
+        unpin_action = menu.addAction(tr("固定を解除"))
         unpin_action.setEnabled(any(bars[k].pinned for k in keys if k in bars))
-        status_menu = menu.addMenu("状態")
+        status_menu = menu.addMenu(tr("状態"))
         status_actions = {
             status_menu.addAction(label): value
-            for value, label in ((None, "未着手"), ("in_progress", "進行中"), ("done", "完了"))
+            for value, label in ((None, tr("未着手")), ("in_progress", tr("進行中")), ("done", tr("完了")))
         }
-        team_menu = menu.addMenu("チーム")
-        team_actions = {team_menu.addAction("（既定を使用）"): None}
+        team_menu = menu.addMenu(tr("チーム"))
+        team_actions = {team_menu.addAction(tr("（既定を使用）")): None}
         team_menu.addSeparator()
         for team_id, name in self.team_options():
             team_actions[team_menu.addAction(name)] = team_id
         menu.addSeparator()
-        disable_action = menu.addAction("無効にする")
+        disable_action = menu.addAction(tr("無効にする"))
 
         chosen = self._exec_menu(menu, global_pos)
         if chosen is None:
@@ -847,17 +856,17 @@ class GanttTab(QWidget):
         elif chosen is pin_action:
             starts = {k: self._task_positions[k][0] for k in keys if k in self._task_positions}
             self.apply_task_fields(
-                list(starts), "タスクの開始日を固定",
+                list(starts), tr("タスクの開始日を固定"),
                 lambda r: {"start_pin_date": starts[r["key"]].isoformat()},
             )
         elif chosen is unpin_action:
-            self.apply_task_fields(keys, "タスクの開始日の固定を解除", {"start_pin_date": None})
+            self.apply_task_fields(keys, tr("タスクの開始日の固定を解除"), {"start_pin_date": None})
         elif chosen in status_actions:
-            self.apply_task_fields(keys, "タスクの状態を変更", {"status": status_actions[chosen]})
+            self.apply_task_fields(keys, tr("タスクの状態を変更"), {"status": status_actions[chosen]})
         elif chosen in team_actions:
-            self.apply_task_fields(keys, "タスクのチームを変更", {"team_id": team_actions[chosen]})
+            self.apply_task_fields(keys, tr("タスクのチームを変更"), {"team_id": team_actions[chosen]})
         elif chosen is disable_action:
-            self.apply_task_fields(keys, "タスクを無効にする", {"is_active": False})
+            self.apply_task_fields(keys, tr("タスクを無効にする"), {"is_active": False})
 
     def _exec_menu(self, menu, global_pos):
         """メニューを出して選ばれたアクションを返す（テストで差し替えられるよう分けてある）。"""
@@ -886,14 +895,14 @@ class GanttTab(QWidget):
             pos = confirmed.get(key)
             if pos is None:
                 bar.unconfirmed = True
-                bar.setToolTip(bar.toolTip() + "\n未確定")
+                bar.setToolTip(bar.toolTip() + tr("\n未確定"))
                 continue
             if pos != (bar.start, bar.end):
                 set_bar_baseline(scene, bar, *pos)
                 bar.setToolTip(
                     bar.toolTip()
-                    + f"\n確定: {pos[0]:%m/%d}〜{pos[1] - timedelta(days=1):%m/%d}"
-                    + f" → 変更案: {bar.start:%m/%d}〜{bar.end - timedelta(days=1):%m/%d}"
+                    + tr("\n確定: {start:%m/%d}〜{end:%m/%d}", start=pos[0], end=pos[1] - timedelta(days=1))
+                    + tr(" → 変更案: {start:%m/%d}〜{end:%m/%d}", start=bar.start, end=bar.end - timedelta(days=1))
                 )
 
     def plan_band_summary(self):
@@ -907,33 +916,33 @@ class GanttTab(QWidget):
             if project["replanned_at"] and project["replan_base_date"]:
                 base = date.fromisoformat(project["replan_base_date"])
                 done = date.fromisoformat(project["replanned_at"][:10])
-                return CONFIRMED, f"{base:%m/%d} から新計画（{done:%m/%d} 再計画）", ready
+                return CONFIRMED, tr("{base:%m/%d} から新計画（{done:%m/%d} 再計画）", base=base, done=done), ready
             return CONFIRMED, (project["confirmed_at"] or "")[:10], ready
         # 「変更」は確定済みのタスクへの変更（削除を含む）、「未確定」は確定後に
         # 足したタスク。同じタスクを両方に数えない。
         parts = []
         if state.pending_replan:
             base = date.fromisoformat(state.pending_replan[0])
-            parts.append(f"全面再計画（{base:%m/%d} から）")
+            parts.append(tr("全面再計画（{base:%m/%d} から）", base=base))
         edited = sum(1 for k in state.changed if k in state.confirmed)
         if edited:
-            parts.append(f"変更 {edited}件")
+            parts.append(tr("変更 {edited}件", edited=edited))
         unconfirmed = len(state.changed) - edited
         if unconfirmed:
-            parts.append(f"未確定のタスク {unconfirmed}件")
+            parts.append(tr("未確定のタスク {unconfirmed}件", unconfirmed=unconfirmed))
         if ready:
             moved, worst = self._draft_impact()
             if moved:
                 sign = "+" if worst >= 0 else "−"
-                parts.append(f"影響 {moved}タスク（最大 {sign}{abs(worst)}営業日）")
+                parts.append(tr("影響 {moved}タスク（最大 {sign}{days}営業日）", moved=moved, sign=sign, days=abs(worst)))
             guidance = self._replan_guidance(state)
             if guidance:
                 parts.append(guidance)
         else:
-            parts.append("計算中")
+            parts.append(tr("計算中"))
         if state.global_changed:
-            parts.append("全体設定の変更（全面再計画で反映）")
-        return DRAFT, " ｜ ".join(parts), ready
+            parts.append(tr("全体設定の変更（全面再計画で反映）"))
+        return DRAFT, tr(" ｜ ").join(parts), ready
 
     def _replan_guidance(self, state):
         """影響範囲が全タスクの一定割合（オプション）を超えたら全面再計画を案内する
@@ -944,7 +953,7 @@ class GanttTab(QWidget):
         percent = 100 * len(info["released"]) / len(self._result_df)
         if percent <= self.app_settings.get("full_replan_threshold_percent"):
             return ""
-        return f"影響が全体の {percent:.0f}%（全面再計画を検討）"
+        return tr("影響が全体の {percent:.0f}%（全面再計画を検討）", percent=percent)
 
     def _draft_impact(self):
         """確定から日程が動いたタスクの数と、最大のずれ（営業日。符号付き）。"""
@@ -978,7 +987,7 @@ class GanttTab(QWidget):
         box = QMessageBox(QMessageBox.Question, title, text, parent=self)
         box.setInformativeText(details)
         ok = box.addButton(ok_label, QMessageBox.AcceptRole)
-        cancel = box.addButton("キャンセル", QMessageBox.RejectRole)
+        cancel = box.addButton(tr("キャンセル"), QMessageBox.RejectRole)
         box.setDefaultButton(cancel)
         # QMessageBox は幅が狭く、1行の説明が途中で折り返されるので広げる
         layout = box.layout()
@@ -1001,7 +1010,7 @@ class GanttTab(QWidget):
         """状態帯のボタンの処理。いずれも1回のUndoで戻せる。"""
         if action in ("confirm", "confirm_selected") and not (
                 self.cache.is_fresh() and self.cache.result_df is not None):
-            QMessageBox.information(self, "計画の確定", "計算が終わってから操作してください。")
+            QMessageBox.information(self, tr("計画の確定"), tr("計算が終わってから操作してください。"))
             return
         try:
             if action == "confirm":
@@ -1010,13 +1019,13 @@ class GanttTab(QWidget):
                 keys = {self._job_and_task_ids(k) for k in self.view.selected_keys()}
                 if not keys:
                     QMessageBox.information(
-                        self, "選択した変更を確定", "ガントチャートで、確定したいタスクを選んでください。"
+                        self, tr("選択した変更を確定"), tr("ガントチャートで、確定したいタスクを選んでください。")
                     )
                     return
                 count = confirm_selected(self.db, self.cache.result_df, keys, successor_map(self.db))
                 if count == 0:
                     QMessageBox.information(
-                        self, "選択した変更を確定", "選んだタスクには、確定していない変更がありません。"
+                        self, tr("選択した変更を確定"), tr("選んだタスクには、確定していない変更がありません。")
                     )
                     return
             elif action == "replan":
@@ -1026,25 +1035,25 @@ class GanttTab(QWidget):
                 self.db.start_full_replan(base.isoformat(), date.today().isoformat())
             elif action == "discard":
                 if not self._ask_plan_action(
-                    "変更を破棄", "変更案を破棄して、最後に確定した日程に戻しますか？",
-                    "消えるもの: 確定後の変更（ドラッグで動かした位置を含む）\n"
-                    "残るもの: タスクの進捗の更新",
-                    "変更を破棄",
+                    tr("変更を破棄"), tr("変更案を破棄して、最後に確定した日程に戻しますか？"),
+                    tr("消えるもの: 確定後の変更（ドラッグで動かした位置を含む）\n"
+                    "残るもの: タスクの進捗の更新"),
+                    tr("変更を破棄"),
                 ):
                     return
                 self.db.discard_draft()
             elif action == "clear":
                 if not self._ask_plan_action(
-                    "未確定に戻す", "プロジェクト全体を未確定に戻しますか？",
-                    "消えるもの: 未着手のタスクの確定日程、変更案（ドラッグで動かした位置を含む）\n"
+                    tr("未確定に戻す"), tr("プロジェクト全体を未確定に戻しますか？"),
+                    tr("消えるもの: 未着手のタスクの確定日程、変更案（ドラッグで動かした位置を含む）\n"
                     "残るもの: 進行中・完了のタスクの日程、ジョブ・タスクの設定、手動ピン\n\n"
-                    "戻した後は、未着手のタスクを確定前と同じように計算し直します。",
-                    "未確定に戻す",
+                    "戻した後は、未着手のタスクを確定前と同じように計算し直します。"),
+                    tr("未確定に戻す"),
                 ):
                     return
                 self.db.clear_confirmation()
         except ProjectDatabaseError as e:
-            QMessageBox.warning(self, "計画の確定", str(e))
+            QMessageBox.warning(self, tr("計画の確定"), str(e))
             return
         self.refresh_choices()
 

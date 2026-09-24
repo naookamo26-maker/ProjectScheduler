@@ -35,10 +35,14 @@ TRANSLATED_LANGUAGES = [code for code, _label in i18n.LANGUAGES if code != i18n.
 MIGRATED_FILES = {
     "i18n.py",
     "gui/app_settings.py",
+    "gui/gantt_task_editor.py",
+    "gui/gantt_view.py",
     "gui/main.py",
     "gui/options_dialog.py",
     "gui/plan_band.py",
     "gui/replan_dialog.py",
+    "gui/tab_gantt.py",
+    "gui/widgets_common.py",
 }
 
 # 翻訳の対象として集める呼び出し（関数名 → 対象の引数の位置）
@@ -172,3 +176,36 @@ def test_set_language_loads_the_catalog_and_ignores_unknown_languages():
         assert i18n.current_language() == "ja"
     finally:
         i18n.set_language("ja")
+
+
+def _tr_calls_evaluated_at_import(path):
+    """モジュール直下・クラス直下・既定引数で呼んでいる tr()（表示言語を決める前の
+    import 時に評価されて、日本語のまま固まってしまう）。定数には N_() を使い、
+    表示するときに tr(定数) で訳す。"""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    found = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "tr"):
+            continue
+        child, parent = node, parents.get(node)
+        at_import = True
+        while parent is not None:
+            if isinstance(parent, ast.arguments):
+                break  # 既定引数
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and child is not parent.args:
+                at_import = child in parent.decorator_list if hasattr(parent, "decorator_list") else False
+                break
+            child, parent = parent, parents.get(parent)
+        if at_import:
+            found.append(node.lineno)
+    return found
+
+
+@pytest.mark.parametrize("path", SOURCE_FILES, ids=lambda p: p.name)
+def test_tr_is_not_evaluated_at_import_time(path):
+    lines = _tr_calls_evaluated_at_import(path)
+    assert not lines, f"{path.name} の {lines} 行目の tr() は import 時に評価されます（N_() を使う）"
