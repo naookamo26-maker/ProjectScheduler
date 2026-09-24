@@ -43,6 +43,7 @@ from gui.widgets_common import (
     NoWheelSpinBox,
     confirm_and_repair_milestone_consistency,
 )
+from i18n import tr
 
 # エッジのクリック判定の太さ（見た目の線は2px）と、種別・ラグのラベルの見た目。
 EDGE_HIT_WIDTH = 14
@@ -308,7 +309,7 @@ class TaskNodeItem(QGraphicsPathItem):
         team_text = QGraphicsSimpleTextItem(team_name, self)
         team_text.setPos(8, 24)
 
-        days_text = QGraphicsSimpleTextItem(f"{days}日", self)
+        days_text = QGraphicsSimpleTextItem(tr("{days}日", days=days), self)
         days_text.setPos(8, 44)
 
         self.input_anchor = AnchorItem("input", self)
@@ -320,7 +321,7 @@ class TaskNodeItem(QGraphicsPathItem):
         items = [c for c in self.childItems() if isinstance(c, QGraphicsSimpleTextItem)]
         items[0].setText(name)
         items[1].setText(team_name)
-        items[2].setText(f"{days}日")
+        items[2].setText(tr("{days}日", days=days))
 
     def set_color(self, color_hex):
         self.setBrush(QBrush(QColor(color_hex)))
@@ -365,7 +366,7 @@ class TemplateDependencyNodeItem(QGraphicsPathItem):
         header.setBrush(QBrush(QColor(TEMPLATE_EDGE_COLOR)))
         header.setPen(QPen(Qt.NoPen))
 
-        header_text = QGraphicsSimpleTextItem("依存テンプレート", self)
+        header_text = QGraphicsSimpleTextItem(tr("依存テンプレート"), self)
         header_font = header_text.font()
         header_font.setBold(True)
         header_font.setPointSize(max(header_font.pointSize() - 1, 6))
@@ -669,15 +670,15 @@ class WorkflowGraphScene(QGraphicsScene):
             return  # 既に存在する依存
         if self._would_create_cycle(pred_id, succ_id):
             QMessageBox.warning(
-                self.parent_widget, "循環依存",
-                "この依存関係を追加すると循環依存になるため、追加できません。",
+                self.parent_widget, tr("循環依存"),
+                tr("この依存関係を追加すると循環依存になるため、追加できません。"),
             )
             return
         with self.db.undo_group("依存関係を追加"):
             try:
                 dep_id = self.db.add_task_dependency(self.workflow_id, pred_id, succ_id)
             except ProjectDatabaseError as e:
-                QMessageBox.warning(self.parent_widget, "エラー", str(e))
+                QMessageBox.warning(self.parent_widget, tr("エラー"), str(e))
                 return
             # 依存関係が増えると「先行タスクの実効マイルストーン <= 後続タスクの
             # 実効マイルストーン」の判定対象が増えるため、マイルストーンの日付を
@@ -685,7 +686,7 @@ class WorkflowGraphScene(QGraphicsScene):
             # いるここで確認・再調整しておく（キャンセルなら依存の追加ごと取り消す
             # ——同じ単位の中で差し引きゼロになり、Undoエントリも積まれない）。
             if not confirm_and_repair_milestone_consistency(
-                self.db, self.parent_widget, "この依存関係の追加",
+                self.db, self.parent_widget, tr("この依存関係の追加"),
             ):
                 self.db.delete_task_dependency(dep_id)
                 return
@@ -710,7 +711,7 @@ class WorkflowGraphScene(QGraphicsScene):
         try:
             self.db.update_task_dependency(dependency_id, dep_type, lag_days)
         except ProjectDatabaseError as e:
-            QMessageBox.warning(self.parent_widget, "エラー", str(e))
+            QMessageBox.warning(self.parent_widget, tr("エラー"), str(e))
             return
         edge.set_dependency_kind(dep_type, lag_days)
         if self.on_changed:
@@ -753,17 +754,14 @@ class WorkflowGraphScene(QGraphicsScene):
             return True
         if len(nodes) == 1:
             message = (
-                f"このタスクは {usage} 件のジョブ設定/依存関係から参照されています。"
-                "削除すると、それらの参照も削除されます。続行しますか？"
+                tr("このタスクは {usage} 件のジョブ設定/依存関係から参照されています。削除すると、それらの参照も削除されます。続行しますか？", usage=usage)
             )
         else:
             message = (
-                f"選択した{len(nodes)}件のタスクは、合計{usage}件のジョブ設定/依存関係"
-                "から参照されています。削除すると、それらの参照も削除されます。"
-                "続行しますか？"
+                tr("選択した{n_nodes}件のタスクは、合計{usage}件のジョブ設定/依存関係から参照されています。削除すると、それらの参照も削除されます。続行しますか？", n_nodes=len(nodes), usage=usage)
             )
         reply = QMessageBox.question(
-            self.parent_widget, "削除の確認", message,
+            self.parent_widget, tr("削除の確認"), message,
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         return reply == QMessageBox.Yes
@@ -811,7 +809,7 @@ class WorkflowGraphScene(QGraphicsScene):
             self.auto_arrange()
 
     def add_task(self, name, team_id, days, x, y):
-        with self.db.undo_group(f"タスク「{name}」を追加"):
+        with self.db.undo_group(tr("タスク「{name}」を追加", name=name)):
             task_id = self.db.add_workflow_task(self.workflow_id, name, team_id, days)
             colors = team_color_map(self.db.list_teams())
             team = next(t for t in self.db.list_teams() if t["id"] == team_id)
@@ -883,7 +881,7 @@ class WorkflowGraphScene(QGraphicsScene):
         pen = QPen(color, 1.5)
         items = []
 
-        label_item = QGraphicsSimpleTextItem(f"最短{compute_workflow_min_duration(tasks, deps)}日")
+        label_item = QGraphicsSimpleTextItem(tr("最短{days}日", days=compute_workflow_min_duration(tasks, deps)))
         font = label_item.font()
         font.setBold(True)
         label_item.setFont(font)
@@ -945,17 +943,17 @@ class TaskNodeEditDialog(QDialog):
         form = QFormLayout(self)
 
         self.name_edit = QLineEdit(name)
-        form.addRow("タスク名", self.name_edit)
+        form.addRow(tr("タスク名"), self.name_edit)
 
         self.team_combo = NoWheelComboBox()
         self._reload_teams(team_id)
         self.team_combo.activated.connect(self._on_team_activated)
-        form.addRow("担当チーム", self.team_combo)
+        form.addRow(tr("担当チーム"), self.team_combo)
 
         self.days_spin = NoWheelSpinBox()
         self.days_spin.setRange(1, 9999)
         self.days_spin.setValue(days)
-        form.addRow("所要日数", self.days_spin)
+        form.addRow(tr("所要日数"), self.days_spin)
 
         self.predecessor_list = NoWheelListWidget()
         self.predecessor_list.setSelectionMode(NoWheelListWidget.MultiSelection)
@@ -974,7 +972,7 @@ class TaskNodeEditDialog(QDialog):
                 self.predecessor_list.addItem(item)
                 if t["id"] in current_preds:
                     item.setSelected(True)
-        form.addRow("先行タスク（このタスクの前に完了が必要）", self.predecessor_list)
+        form.addRow(tr("先行タスク（このタスクの前に完了が必要）"), self.predecessor_list)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -985,7 +983,7 @@ class TaskNodeEditDialog(QDialog):
         self.team_combo.clear()
         for t in self.db.list_teams():
             self.team_combo.addItem(t["name"], t["id"])
-        self.team_combo.addItem("＋ 新しいチームを追加...", _ADD_TEAM_SENTINEL)
+        self.team_combo.addItem(tr("＋ 新しいチームを追加..."), _ADD_TEAM_SENTINEL)
         if select_team_id is not None:
             idx = self.team_combo.findData(select_team_id)
             if idx >= 0:
@@ -994,18 +992,18 @@ class TaskNodeEditDialog(QDialog):
     def _on_team_activated(self, index):
         if self.team_combo.itemData(index) != _ADD_TEAM_SENTINEL:
             return
-        name, ok = QInputDialog.getText(self, "新しいチーム", "チーム名:")
+        name, ok = QInputDialog.getText(self, tr("新しいチーム"), tr("チーム名:"))
         if not ok or not name.strip():
             self._reload_teams()
             return
-        lines, ok = QInputDialog.getInt(self, "新しいチーム", "同時ライン数:", 1, 1, 999)
+        lines, ok = QInputDialog.getInt(self, tr("新しいチーム"), tr("同時ライン数:"), 1, 1, 999)
         if not ok:
             self._reload_teams()
             return
         try:
             new_id = self.db.add_team(name.strip(), lines)
         except DuplicateNameError as e:
-            QMessageBox.warning(self, "追加できません", str(e))
+            QMessageBox.warning(self, tr("追加できません"), str(e))
             self._reload_teams()
             return
         self._reload_teams(select_team_id=new_id)
@@ -1027,23 +1025,23 @@ class DependencyKindDialog(QDialog):
 
     def __init__(self, pred_name, succ_name, dep_type="FS", lag_days=0, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("依存関係を編集")
+        self.setWindowTitle(tr("依存関係を編集"))
 
         form = QFormLayout(self)
-        form.addRow("依存関係", QLabel(f"{pred_name} → {succ_name}"))
+        form.addRow(tr("依存関係"), QLabel(f"{pred_name} → {succ_name}"))
 
         self.kind_combo = NoWheelComboBox()
-        self.kind_combo.addItem("完了 → 開始（FS）", "FS")
-        self.kind_combo.addItem("開始 → 開始（SS）", "SS")
+        self.kind_combo.addItem(tr("完了 → 開始（FS）"), "FS")
+        self.kind_combo.addItem(tr("開始 → 開始（SS）"), "SS")
         idx = self.kind_combo.findData((dep_type or "FS").upper())
         self.kind_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        form.addRow("種別", self.kind_combo)
+        form.addRow(tr("種別"), self.kind_combo)
 
         self.lag_spin = NoWheelSpinBox()
         self.lag_spin.setRange(-MAX_LAG_DAYS, MAX_LAG_DAYS)
         self.lag_spin.setValue(int(lag_days or 0))
-        self.lag_spin.setSuffix(" 営業日")
-        form.addRow("ラグ", self.lag_spin)
+        self.lag_spin.setSuffix(tr(" 営業日"))
+        form.addRow(tr("ラグ"), self.lag_spin)
 
         self.hint = QLabel()
         self.hint.setWordWrap(True)
@@ -1063,15 +1061,20 @@ class DependencyKindDialog(QDialog):
         組み合わせは意味を取り違えやすいので、記号のまま確定させない。"""
         kind = self.kind_combo.currentData()
         lag = self.lag_spin.value()
-        anchor = "先行タスクの完了後" if kind == "FS" else "先行タスクの開始と同時"
-        if lag == 0:
-            text = f"{anchor}に後続タスクを開始する。"
+        # 語を組み合わせると言語によって語順が合わないので、組み合わせごとに文全体を書く
+        if kind == "FS":
+            if lag == 0:
+                text = tr("先行タスクの完了後に後続タスクを開始する。")
+            elif lag > 0:
+                text = tr("先行タスクの完了後 {lag} 営業日空けてから後続タスクを開始する。", lag=lag)
+            else:
+                text = tr("先行タスクの完了より {lag} 営業日早く後続タスクを開始できる。", lag=abs(lag))
+        elif lag == 0:
+            text = tr("先行タスクの開始と同時に後続タスクを開始する。")
         elif lag > 0:
-            base = "完了後" if kind == "FS" else "開始から"
-            text = f"先行タスクの{base} {lag} 営業日空けてから後続タスクを開始する。"
+            text = tr("先行タスクの開始から {lag} 営業日空けてから後続タスクを開始する。", lag=lag)
         else:
-            base = "完了" if kind == "FS" else "開始"
-            text = f"先行タスクの{base}より {abs(lag)} 営業日早く後続タスクを開始できる。"
+            text = tr("先行タスクの開始より {lag} 営業日早く後続タスクを開始できる。", lag=abs(lag))
         self.hint.setText(text)
 
     def values(self):
@@ -1091,14 +1094,14 @@ class DependencyTemplateDialog(QDialog):
         super().__init__(parent)
         self.db = db
         self.workflow_id = workflow_id
-        self.setWindowTitle("依存テンプレートを編集" if initial else "依存テンプレートを追加")
+        self.setWindowTitle(tr("依存テンプレートを編集") if initial else tr("依存テンプレートを追加"))
 
         form = QFormLayout(self)
 
         self.task_combo = NoWheelComboBox()
         for t in db.list_workflow_tasks(workflow_id):
             self.task_combo.addItem(t["name"], t["id"])
-        form.addRow("このワークフローのタスク", self.task_combo)
+        form.addRow(tr("このワークフローのタスク"), self.task_combo)
 
         self.target_workflow_combo = NoWheelComboBox()
         for wf in db.list_workflows():
@@ -1108,8 +1111,8 @@ class DependencyTemplateDialog(QDialog):
 
         self.target_task_combo = NoWheelComboBox()
 
-        form.addRow("依存先ワークフロー", self.target_workflow_combo)
-        form.addRow("依存先タスク", self.target_task_combo)
+        form.addRow(tr("依存先ワークフロー"), self.target_workflow_combo)
+        form.addRow(tr("依存先タスク"), self.target_task_combo)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -1157,17 +1160,17 @@ def add_task_via_dialog(scene, parent, x=0.0, y=0.0):
     db = scene.db
     if not db.list_teams():
         QMessageBox.information(
-            parent, "チーム未登録",
-            "先にチームを1つ以上登録してください（このダイアログからも追加できます）。",
+            parent, tr("チーム未登録"),
+            tr("先にチームを1つ以上登録してください（このダイアログからも追加できます）。"),
         )
-    dialog = TaskNodeEditDialog(db, "タスクを追加", workflow_id=scene.workflow_id)
+    dialog = TaskNodeEditDialog(db, tr("タスクを追加"), workflow_id=scene.workflow_id)
     if dialog.exec() != QDialog.Accepted:
         return
     name, team_id, days = dialog.values()
     if not name or team_id is None or team_id == _ADD_TEAM_SENTINEL:
-        QMessageBox.warning(parent, "入力エラー", "タスク名とチームを指定してください。")
+        QMessageBox.warning(parent, tr("入力エラー"), tr("タスク名とチームを指定してください。"))
         return
-    with db.undo_group(f"タスク「{name}」を追加"):
+    with db.undo_group(tr("タスク「{name}」を追加", name=name)):
         node = scene.add_task(name, team_id, days, x, y)
         apply_predecessors(scene, node, dialog.selected_predecessor_ids())
 
@@ -1176,7 +1179,7 @@ def edit_task_via_dialog(scene, parent, node):
     db = scene.db
     current = next(t for t in db.list_workflow_tasks(scene.workflow_id) if t["id"] == node.workflow_task_id)
     dialog = TaskNodeEditDialog(
-        db, "タスクを編集", name=current["name"], team_id=current["team_id"],
+        db, tr("タスクを編集"), name=current["name"], team_id=current["team_id"],
         days=current["default_days"], workflow_id=scene.workflow_id,
         task_id=node.workflow_task_id,
     )
@@ -1184,13 +1187,13 @@ def edit_task_via_dialog(scene, parent, node):
         return
     name, team_id, days = dialog.values()
     if not name or team_id is None or team_id == _ADD_TEAM_SENTINEL:
-        QMessageBox.warning(parent, "入力エラー", "タスク名とチームを指定してください。")
+        QMessageBox.warning(parent, tr("入力エラー"), tr("タスク名とチームを指定してください。"))
         return
-    with db.undo_group(f"タスク「{name}」を編集"):
+    with db.undo_group(tr("タスク「{name}」を編集", name=name)):
         try:
             db.update_workflow_task(node.workflow_task_id, name, team_id, days)
         except DuplicateNameError as e:
-            QMessageBox.warning(parent, "変更できません", str(e))
+            QMessageBox.warning(parent, tr("変更できません"), str(e))
             return
         colors = team_color_map(db.list_teams())
         team = next(t for t in db.list_teams() if t["id"] == team_id)
@@ -1243,23 +1246,23 @@ def edit_edge_via_dialog(scene, parent, edge):
 def add_template_via_dialog(scene, parent):
     db = scene.db
     if not db.list_workflow_tasks(scene.workflow_id):
-        QMessageBox.information(parent, "タスク未登録", "先にこのワークフローにタスクを1つ以上追加してください。")
+        QMessageBox.information(parent, tr("タスク未登録"), tr("先にこのワークフローにタスクを1つ以上追加してください。"))
         return
     other_workflows = [w for w in db.list_workflows() if w["id"] != scene.workflow_id]
     if not other_workflows:
-        QMessageBox.information(parent, "依存先ワークフローがありません", "他のワークフローを先に作成してください。")
+        QMessageBox.information(parent, tr("依存先ワークフローがありません"), tr("他のワークフローを先に作成してください。"))
         return
     dialog = DependencyTemplateDialog(db, scene.workflow_id, parent)
     if dialog.exec() != QDialog.Accepted:
         return
     workflow_task_id, target_workflow_id, target_task_id = dialog.values()
     if None in (workflow_task_id, target_workflow_id, target_task_id):
-        QMessageBox.warning(parent, "入力エラー", "すべての項目を選択してください。")
+        QMessageBox.warning(parent, tr("入力エラー"), tr("すべての項目を選択してください。"))
         return
     try:
         scene.add_dependency_template_node(workflow_task_id, target_workflow_id, target_task_id)
     except ProjectDatabaseError as e:
-        QMessageBox.warning(parent, "追加できません", str(e))
+        QMessageBox.warning(parent, tr("追加できません"), str(e))
 
 
 def edit_template_via_dialog(scene, parent, template_id):
@@ -1277,12 +1280,12 @@ def edit_template_via_dialog(scene, parent, template_id):
         return
     workflow_task_id, target_workflow_id, target_task_id = dialog.values()
     if None in (workflow_task_id, target_workflow_id, target_task_id):
-        QMessageBox.warning(parent, "入力エラー", "すべての項目を選択してください。")
+        QMessageBox.warning(parent, tr("入力エラー"), tr("すべての項目を選択してください。"))
         return
     try:
         scene.update_dependency_template_node(template_id, workflow_task_id, target_workflow_id, target_task_id)
     except ProjectDatabaseError as e:
-        QMessageBox.warning(parent, "変更できません", str(e))
+        QMessageBox.warning(parent, tr("変更できません"), str(e))
 
 
 class WorkflowGraphView(QGraphicsView):
@@ -1517,32 +1520,32 @@ class WorkflowGraphView(QGraphicsView):
 
         menu = QMenu(self)
         if node is not None:
-            edit_action = menu.addAction("編集...")
-            delete_action = menu.addAction("削除")
+            edit_action = menu.addAction(tr("編集..."))
+            delete_action = menu.addAction(tr("削除"))
             chosen = menu.exec(event.globalPos())
             if chosen == edit_action:
                 self._edit_node(node)
             elif chosen == delete_action:
                 self.scene().delete_node(node)
         elif template_node is not None:
-            edit_action = menu.addAction("編集...")
-            delete_action = menu.addAction("削除")
+            edit_action = menu.addAction(tr("編集..."))
+            delete_action = menu.addAction(tr("削除"))
             chosen = menu.exec(event.globalPos())
             if chosen == edit_action:
                 edit_template_via_dialog(self.scene(), self, template_node.template_id)
             elif chosen == delete_action:
                 self.scene().delete_dependency_template_node(template_node.template_id)
         elif edge is not None:
-            edit_action = menu.addAction("種別・ラグを編集...")
-            delete_action = menu.addAction("削除")
+            edit_action = menu.addAction(tr("種別・ラグを編集..."))
+            delete_action = menu.addAction(tr("削除"))
             chosen = menu.exec(event.globalPos())
             if chosen == edit_action:
                 edit_edge_via_dialog(self.scene(), self, edge)
             elif chosen == delete_action:
                 self.scene().delete_edge(edge)
         else:
-            add_task_action = menu.addAction("タスクを追加...")
-            add_template_action = menu.addAction("依存テンプレートを追加...")
+            add_task_action = menu.addAction(tr("タスクを追加..."))
+            add_template_action = menu.addAction(tr("依存テンプレートを追加..."))
             chosen = menu.exec(event.globalPos())
             if chosen == add_task_action:
                 self._add_task_at(scene_pos)

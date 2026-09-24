@@ -40,7 +40,11 @@ MIGRATED_FILES = {
     "gui/main.py",
     "gui/options_dialog.py",
     "gui/plan_band.py",
+    "gui/node_canvas.py",
     "gui/replan_dialog.py",
+    "gui/tab_basic_info.py",
+    "gui/tab_jobs.py",
+    "gui/tab_workflows.py",
     "gui/tab_gantt.py",
     "gui/widgets_common.py",
 }

@@ -118,6 +118,7 @@ from gui.widgets_common import (
     set_row_id,
     unique_default_name,
 )
+from i18n import N_, tr
 
 
 # セルウィジェットを用意しておく、可視範囲の上下の余分な行数。スクロール
@@ -127,8 +128,8 @@ _VISIBLE_ROW_MARGIN = 12
 
 # 既定マイルストーン未設定の表示（コンボの空欄と、ウィジェットが無い行の
 # テキスト表示とで文言を揃える必要があるため定数にしてある）。
-_BLANK_MILESTONE_LABEL = "（未設定）"
-_UNSPECIFIED_PRIORITY_LABEL = "（未指定）"
+_BLANK_MILESTONE_LABEL = N_("（未設定）")
+_UNSPECIFIED_PRIORITY_LABEL = N_("（未指定）")
 
 # ジョブ一覧の絞り込み（マイルストーン／ジョブ タグ／タスク タグ）で
 # 「該当が無いジョブ」をまとめるための擬似キー。実在のID・タグ文字列と
@@ -136,8 +137,8 @@ _UNSPECIFIED_PRIORITY_LABEL = "（未指定）"
 # ChoiceFilterGroupなので、同じ値を使っても両者のキー空間は混ざらない）。
 _NO_MILESTONE_FILTER_KEY = None
 _NO_TAG_FILTER_KEY = None
-_NO_JOB_TAG_FILTER_LABEL = "（ジョブ タグなし）"
-_NO_TASK_TAG_FILTER_LABEL = "（タスク タグなし）"
+_NO_JOB_TAG_FILTER_LABEL = N_("（ジョブ タグなし）")
+_NO_TASK_TAG_FILTER_LABEL = N_("（タスク タグなし）")
 
 # 計画の確定（docs/roadmap.md §8-9）の列。一度も確定していないファイルでは隠す
 # （全部が「未確定」になるだけで情報が無いため）。既存の列番号を変えないよう末尾に置く。
@@ -147,10 +148,10 @@ _PLAN_CHANGED_COLOR = "#c62828"
 _PLAN_QUIET_COLOR = "#8a939c"  # 確定済み（大半の行）は目立たせない
 _UNCONFIRMED_BRUSH_COLOR = QColor("#cdd3da")
 _JOB_PLAN_LABELS = {
-    JOB_CONFIRMED: "確定",
-    JOB_CHANGED: "変更あり",
-    JOB_PARTIAL: "一部未確定",
-    JOB_UNCONFIRMED: "未確定",
+    JOB_CONFIRMED: N_("確定"),
+    JOB_CHANGED: N_("変更あり"),
+    JOB_PARTIAL: N_("一部未確定"),
+    JOB_UNCONFIRMED: N_("未確定"),
 }
 # 並び替え・絞り込みの順（手を付けるべきものが先）
 _JOB_PLAN_ORDER = [JOB_CHANGED, JOB_UNCONFIRMED, JOB_PARTIAL, JOB_CONFIRMED]
@@ -163,11 +164,11 @@ def _unconfirmed_brush():
 
 def _job_plan_text(kind, changed, unconfirmed):
     if kind == JOB_CHANGED:
-        text = f"変更 {changed}"
-        return text + (f"・未確定 {unconfirmed}" if unconfirmed else "")
+        text = tr("変更 {changed}", changed=changed)
+        return text + (tr("・未確定 {unconfirmed}", unconfirmed=unconfirmed) if unconfirmed else "")
     if kind == JOB_PARTIAL:
-        return f"一部未確定 {unconfirmed}"
-    return _JOB_PLAN_LABELS[kind]
+        return tr("一部未確定 {unconfirmed}", unconfirmed=unconfirmed)
+    return tr(_JOB_PLAN_LABELS[kind])
 
 
 def _fmt_confirmed(row, team_names):
@@ -178,7 +179,7 @@ def _fmt_confirmed(row, team_names):
         end = end[5:]  # 同じ年なら年を省く
     team = team_names.get(row["team_id"], "")
     # 列幅を取りすぎないよう2段にする（1段目: 期間、2段目: 日数・チーム）
-    return f"{start}〜{end}\n{row['days']}日  {team}".rstrip()
+    return tr("{start}〜{end}\n{days}日  {team}", start=start, end=end, days=row['days'], team=team).rstrip()
 
 
 # コンボボックスの▼やスピンボックスの▲▼のぶん、テキスト幅より少し広くする
@@ -200,7 +201,7 @@ class JobDependencyLinkDialog(QDialog):
         super().__init__(parent)
         self.db = db
         self.job_id = job_id
-        self.setWindowTitle("依存先ジョブを追加")
+        self.setWindowTitle(tr("依存先ジョブを追加"))
         self.resize(360, 420)
 
         self._existing = {link["depends_on_job_id"] for link in db.list_job_dependency_links(job_id)}
@@ -210,14 +211,14 @@ class JobDependencyLinkDialog(QDialog):
         form = QFormLayout()
 
         self.workflow_filter_combo = NoWheelComboBox()
-        self.workflow_filter_combo.addItem("（すべてのワークフロー）", None)
+        self.workflow_filter_combo.addItem(tr("（すべてのワークフロー）"), None)
         for wf in db.list_workflows():
             self.workflow_filter_combo.addItem(wf["name"], wf["id"])
         self.workflow_filter_combo.currentIndexChanged.connect(self._reload_job_list)
-        form.addRow("ワークフローで絞り込み", self.workflow_filter_combo)
+        form.addRow(tr("ワークフローで絞り込み"), self.workflow_filter_combo)
         layout.addLayout(form)
 
-        layout.addWidget(QLabel("依存先ジョブ"))
+        layout.addWidget(QLabel(tr("依存先ジョブ")))
         self.job_list = NoWheelListWidget()
         self.job_list.setSelectionMode(NoWheelListWidget.ExtendedSelection)
         layout.addWidget(self.job_list, 1)
@@ -235,7 +236,7 @@ class JobDependencyLinkDialog(QDialog):
         for j in self._candidates:
             if workflow_id is not None and j["workflow_id"] != workflow_id:
                 continue
-            item = QListWidgetItem(f'{j["name"]}（{j["workflow_name"]}）')
+            item = QListWidgetItem(tr("{name}（{workflow_name}）", name=j["name"], workflow_name=j["workflow_name"]))
             item.setData(Qt.UserRole, j["id"])
             self.job_list.addItem(item)
 
@@ -251,18 +252,18 @@ class TaskPairDialog(QDialog):
 
     def __init__(self, db, job, target_job, parent=None, initial=None):
         super().__init__(parent)
-        self.setWindowTitle("タスク対応を編集" if initial else "タスク対応を追加")
+        self.setWindowTitle(tr("タスク対応を編集") if initial else tr("タスク対応を追加"))
         form = QFormLayout(self)
 
         self.dep_task_combo = NoWheelComboBox()
         for t in db.list_workflow_tasks(target_job["workflow_id"]):
             self.dep_task_combo.addItem(t["name"], t["id"])
-        form.addRow(f"依存先の先行タスク（{target_job['name']}）", self.dep_task_combo)
+        form.addRow(tr("依存先の先行タスク（{name}）", name=target_job['name']), self.dep_task_combo)
 
         self.task_combo = NoWheelComboBox()
         for t in db.list_workflow_tasks(job["workflow_id"]):
             self.task_combo.addItem(t["name"], t["id"])
-        form.addRow(f"本ジョブの後続タスク（{job['name']}）", self.task_combo)
+        form.addRow(tr("本ジョブの後続タスク（{name}）", name=job['name']), self.task_combo)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -314,18 +315,18 @@ class JobsTab(QWidget):
         # （いずれもOR条件のチェックボックス一覧で、4つの間はAND条件で
         # 組み合わせる）。常時展開だと縦幅を取りすぎるため、まとめて1つの
         # 折りたたみセクションに収める。
-        self.filters_section = CollapsibleSection("絞り込み")
+        self.filters_section = CollapsibleSection(tr("絞り込み"))
         layout.addWidget(self.filters_section)
 
-        self.workflow_filter = ChoiceFilterGroup("ワークフロー")
+        self.workflow_filter = ChoiceFilterGroup(tr("ワークフロー"))
         self.workflow_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
         self.filters_section.content_layout.addWidget(self.workflow_filter)
 
-        self.milestone_filter = ChoiceFilterGroup("マイルストーン")
+        self.milestone_filter = ChoiceFilterGroup(tr("マイルストーン"))
         self.milestone_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
         self.filters_section.content_layout.addWidget(self.milestone_filter)
 
-        self.tag_filter = ChoiceFilterGroup("ジョブ タグ")
+        self.tag_filter = ChoiceFilterGroup(tr("ジョブ タグ"))
         self.tag_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
         self.filters_section.content_layout.addWidget(self.tag_filter)
 
@@ -333,20 +334,20 @@ class JobsTab(QWidget):
         # タスクを1つでも含むジョブを表示する（gui/db.pyのlist_all_job_task_overrides
         # から全ジョブ分をまとめて引き、job_id単位のタグ集合に潰して使う。
         # _task_tag_map参照）。
-        self.task_tag_filter = ChoiceFilterGroup("タスク タグ")
+        self.task_tag_filter = ChoiceFilterGroup(tr("タスク タグ"))
         self.task_tag_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
         self.filters_section.content_layout.addWidget(self.task_tag_filter)
 
         # 確定状態での絞り込み（確定後に足したジョブ・変更のあるジョブを探す）。
         # 一度も確定していないファイルでは隠す
-        self.plan_filter = ChoiceFilterGroup("確定状態")
-        self.plan_filter.rebuild([(k, _JOB_PLAN_LABELS[k]) for k in _JOB_PLAN_ORDER])
+        self.plan_filter = ChoiceFilterGroup(tr("確定状態"))
+        self.plan_filter.rebuild([(k, tr(_JOB_PLAN_LABELS[k])) for k in _JOB_PLAN_ORDER])
         self.plan_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
         self.filters_section.content_layout.addWidget(self.plan_filter)
         self._plan_state = None
 
         self.jobs_section = CrudSection(
-            "ジョブ", ["ジョブ名", "ワークフロー", "既定マイルストーン", "優先度", "タグ", "確定"],
+            tr("ジョブ"), [tr("ジョブ名"), tr("ワークフロー"), tr("既定マイルストーン"), tr("優先度"), tr("タグ"), tr("確定")],
             on_add=self._add_job, on_delete=self._delete_job, on_duplicate=self._duplicate_job,
         )
         self.jobs_section.table.itemChanged.connect(self._on_job_cell_text_changed)
@@ -370,13 +371,13 @@ class JobsTab(QWidget):
         jobs_scrollbar.valueChanged.connect(self._sync_job_row_widgets)
         jobs_scrollbar.rangeChanged.connect(lambda _min, _max: self._sync_job_row_widgets())
 
-        override_group = QGroupBox("タスク上書き（選択中のジョブ）")
+        override_group = QGroupBox(tr("タスク上書き（選択中のジョブ）"))
         override_layout = QVBoxLayout(override_group)
 
         self.override_table = QTableWidget(0, 9)
         self.override_table.setHorizontalHeaderLabels(
-            ["タスク名", "有効", "日数", "マイルストーン", "チーム", "開始固定日", "状態", "タグ",
-             "確定日程"]
+            [tr("タスク名"), tr("有効"), tr("日数"), tr("マイルストーン"), tr("チーム"), tr("開始固定日"), tr("状態"), tr("タグ"),
+             tr("確定日程")]
         )
         self.override_table.verticalHeader().setVisible(False)
         # 「確定日程」列も同様に、見た目だけタスク名の隣へ出す
@@ -388,20 +389,20 @@ class JobsTab(QWidget):
         self.override_table.itemChanged.connect(self._on_override_tag_text_changed)
         override_layout.addWidget(self.override_table)
 
-        dep_group = QGroupBox("依存先ジョブ（展開してタスク単位の対応を確認・編集）")
+        dep_group = QGroupBox(tr("依存先ジョブ（展開してタスク単位の対応を確認・編集）"))
         dep_group_layout = QVBoxLayout(dep_group)
 
         dep_toolbar = QHBoxLayout()
-        add_link_btn = QPushButton("＋ 依存先ジョブ")
+        add_link_btn = QPushButton(tr("＋ 依存先ジョブ"))
         add_link_btn.clicked.connect(self._add_dependency_link)
-        del_link_btn = QPushButton("－ 依存先ジョブ")
+        del_link_btn = QPushButton(tr("－ 依存先ジョブ"))
         del_link_btn.clicked.connect(self._delete_selected_dependency_link)
         dep_toolbar.addWidget(add_link_btn)
         dep_toolbar.addWidget(del_link_btn)
         dep_toolbar.addSpacing(16)
-        add_pair_btn = QPushButton("＋ タスク対応")
+        add_pair_btn = QPushButton(tr("＋ タスク対応"))
         add_pair_btn.clicked.connect(self._add_selected_task_pair)
-        del_pair_btn = QPushButton("－ タスク対応")
+        del_pair_btn = QPushButton(tr("－ タスク対応"))
         del_pair_btn.clicked.connect(self._delete_selected_task_pair)
         dep_toolbar.addWidget(add_pair_btn)
         dep_toolbar.addWidget(del_pair_btn)
@@ -410,7 +411,7 @@ class JobsTab(QWidget):
 
         self.dep_tree = QTreeWidget()
         self.dep_tree.setColumnCount(3)
-        self.dep_tree.setHeaderLabels(["依存先ジョブ ／ タスク対応（先行→後続）", "有効", "種別"])
+        self.dep_tree.setHeaderLabels([tr("依存先ジョブ ／ タスク対応（先行→後続）"), tr("有効"), tr("種別")])
         self.dep_tree.setSelectionMode(QTreeWidget.SingleSelection)
         self.dep_tree.itemDoubleClicked.connect(self._on_dep_tree_double_clicked)
         keep_selection_visible(self.dep_tree)
@@ -480,7 +481,7 @@ class JobsTab(QWidget):
         self.workflow_filter.rebuild([(w["id"], w["name"]) for w in self.db.list_workflows()])
         self.milestone_filter.rebuild(
             [(m["id"], m["name"]) for m in self.db.list_milestones()]
-            + [(_NO_MILESTONE_FILTER_KEY, _BLANK_MILESTONE_LABEL)]
+            + [(_NO_MILESTONE_FILTER_KEY, tr(_BLANK_MILESTONE_LABEL))]
         )
         self._rebuild_tag_filter(jobs)
         self._rebuild_task_tag_filter(jobs, task_tag_map)
@@ -497,7 +498,7 @@ class JobsTab(QWidget):
         tag_keys.discard(_NO_TAG_FILTER_KEY)
         tag_items = [(tag, tag) for tag in sorted(tag_keys)]
         if has_no_tag:
-            tag_items.append((_NO_TAG_FILTER_KEY, _NO_JOB_TAG_FILTER_LABEL))
+            tag_items.append((_NO_TAG_FILTER_KEY, tr(_NO_JOB_TAG_FILTER_LABEL)))
         self.tag_filter.rebuild(tag_items)
 
     def _rebuild_task_tag_filter(self, jobs, task_tag_map):
@@ -510,7 +511,7 @@ class JobsTab(QWidget):
         task_tag_keys.discard(_NO_TAG_FILTER_KEY)
         task_tag_items = [(tag, tag) for tag in sorted(task_tag_keys)]
         if has_no_task_tag:
-            task_tag_items.append((_NO_TAG_FILTER_KEY, _NO_TASK_TAG_FILTER_LABEL))
+            task_tag_items.append((_NO_TAG_FILTER_KEY, tr(_NO_TASK_TAG_FILTER_LABEL)))
         self.task_tag_filter.rebuild(task_tag_items)
 
     # -- ジョブ一覧 --------------------------------------------------------------
@@ -579,9 +580,9 @@ class JobsTab(QWidget):
             # 同じ内容を読み取り専用のテキストとして見せておく。
             table.setItem(row, 1, _readonly_item(workflow_names.get(job["workflow_id"], "")))
             table.setItem(row, 2, _readonly_item(
-                milestone_names.get(job["default_milestone_id"], _BLANK_MILESTONE_LABEL)))
+                milestone_names.get(job["default_milestone_id"], tr(_BLANK_MILESTONE_LABEL))))
             table.setItem(row, 3, _readonly_item(
-                str(job["priority"]) if job["priority"] is not None else _UNSPECIFIED_PRIORITY_LABEL))
+                str(job["priority"]) if job["priority"] is not None else tr(_UNSPECIFIED_PRIORITY_LABEL)))
             # ジョブ タグはシンプルなテキスト入力（カンマ区切り）のため、ワーク
             # フロー／マイルストーン／優先度と違って専用ウィジェットを持たず、
             # 常に編集可能なitemとして表示する（ジョブ名列と同じ扱い）。
@@ -644,7 +645,7 @@ class JobsTab(QWidget):
         table.setCellWidget(row, 1, wf_combo)
 
         ms_combo = make_fk_combo(self._milestone_options, job["default_milestone_id"],
-                                  allow_blank=True, blank_label=_BLANK_MILESTONE_LABEL)
+                                  allow_blank=True, blank_label=tr(_BLANK_MILESTONE_LABEL))
         ms_combo.currentIndexChanged.connect(
             lambda _idx, jid=job_id: self._on_job_field_changed(jid)
         )
@@ -652,7 +653,7 @@ class JobsTab(QWidget):
 
         priority_spin = NoWheelSpinBox()
         priority_spin.setRange(0, 999)
-        priority_spin.setSpecialValueText(_UNSPECIFIED_PRIORITY_LABEL)
+        priority_spin.setSpecialValueText(tr(_UNSPECIFIED_PRIORITY_LABEL))
         priority_spin.setValue(job["priority"] if job["priority"] is not None else 0)
         priority_spin.valueChanged.connect(
             lambda _val, jid=job_id: self._on_job_field_changed(jid)
@@ -720,24 +721,24 @@ class JobsTab(QWidget):
     def _add_job(self):
         if not self.db.list_workflows():
             QMessageBox.information(
-                self, "ワークフロー未登録",
-                "先に「ワークフロー設計」タブでワークフローを1つ以上作成してください。",
+                self, tr("ワークフロー未登録"),
+                tr("先に「ワークフロー設計」タブでワークフローを1つ以上作成してください。"),
             )
             return
         existing = {j["name"] for j in self.db.list_jobs()}
-        name = unique_default_name(existing, "新しいジョブ")
+        name = unique_default_name(existing, tr("新しいジョブ"))
         workflow_id = self.db.list_workflows()[0]["id"]
         try:
             new_id = self.db.add_job(name, workflow_id, None, None)
         except DuplicateNameError as e:
-            QMessageBox.warning(self, "追加できません", str(e))
+            QMessageBox.warning(self, tr("追加できません"), str(e))
             return
         self.refresh_jobs(select_id=new_id)
 
     def _delete_job(self, row):
         job_id = row_id(self.jobs_section.table, row)
         count = self.db.job_usage_count(job_id)
-        if not confirm_or_block_delete(self, count, "このジョブ", hard_block=False):
+        if not confirm_or_block_delete(self, count, tr("このジョブ"), hard_block=False):
             return
         self.db.delete_job(job_id)
         self.refresh_jobs()
@@ -793,7 +794,7 @@ class JobsTab(QWidget):
         try:
             self.db.update_job(job_id, name, workflow_id, milestone_id, priority, tags)
         except DuplicateNameError as e:
-            QMessageBox.warning(self, "変更できません", str(e))
+            QMessageBox.warning(self, tr("変更できません"), str(e))
             self.refresh_jobs(select_id=job_id)
             return
         # タグを変えた場合、絞り込みの選択肢（タグ一覧のチェックボックス）に
@@ -854,7 +855,7 @@ class JobsTab(QWidget):
             table.blockSignals(False)
             return
         job = next(j for j in self.db.list_jobs() if j["id"] == self.current_job_id)
-        default_ms_label = job["milestone_name"] or "未設定"
+        default_ms_label = job["milestone_name"] or tr("未設定")
 
         tasks = self.db.list_job_tasks_with_overrides(self.current_job_id)
         self._override_default_team = {r["workflow_task_id"]: r["default_team_id"] for r in tasks}
@@ -877,8 +878,8 @@ class JobsTab(QWidget):
             # （DefaultAwareSpinBox。0自体は「既定を使用」という意味のまま）。
             days_spin = DefaultAwareSpinBox(r["default_days"])
             days_spin.setRange(0, 9999)
-            days_spin.setSuffix("日")
-            days_spin.setSpecialValueText(f"既定（{r['default_days']}日）")
+            days_spin.setSuffix(tr("日"))
+            days_spin.setSpecialValueText(tr("既定（{default_days}日）", default_days=r['default_days']))
             days_spin.setValue(r["override_days"] or 0)
             days_spin.valueChanged.connect(
                 lambda _val, tid=r["workflow_task_id"]: self._on_override_changed(tid)
@@ -905,10 +906,10 @@ class JobsTab(QWidget):
             if current_ms_id is not None and not any(i == current_ms_id for i, _n in milestone_options):
                 current_ms = next((m for m in all_milestones if m["id"] == current_ms_id), None)
                 if current_ms is not None:
-                    milestone_options.insert(0, (current_ms["id"], f'{current_ms["name"]}（要調整）'))
+                    milestone_options.insert(0, (current_ms["id"], tr("{name}（要調整）", name=current_ms["name"])))
             ms_combo = make_fk_combo(
                 milestone_options, r["override_milestone_id"], allow_blank=True,
-                blank_label=f"（既定: {default_ms_label}）",
+                blank_label=tr("（既定: {default_ms_label}）", default_ms_label=default_ms_label),
             )
             ms_combo.currentIndexChanged.connect(
                 lambda _idx, tid=r["workflow_task_id"]:
@@ -919,7 +920,7 @@ class JobsTab(QWidget):
             # 既定チームも同様に、専用列ではなくコンボの未選択時ラベルに埋め込む。
             team_combo = make_fk_combo(
                 team_options, r["override_team_id"], allow_blank=True,
-                blank_label=f"（既定: {r['default_team_name']}）",
+                blank_label=tr("（既定: {default_team_name}）", default_team_name=r['default_team_name']),
             )
             team_combo.currentIndexChanged.connect(
                 lambda _idx, tid=r["workflow_task_id"]: self._on_override_changed(tid)
@@ -941,8 +942,8 @@ class JobsTab(QWidget):
             # ——プロジェクト分析タブの「タスクの状態」はこの値を集計する。
             # gui/db.py の job_task_overrides.status: NULL＝未着手）。
             status_combo = make_fk_combo(
-                [("in_progress", "進行中"), ("done", "完了")], r["status"],
-                allow_blank=True, blank_label="未着手",
+                [("in_progress", tr("進行中")), ("done", tr("完了"))], r["status"],
+                allow_blank=True, blank_label=tr("未着手"),
             )
             status_combo.currentIndexChanged.connect(
                 lambda _idx, tid=r["workflow_task_id"]: self._on_override_changed(tid)
@@ -1048,15 +1049,14 @@ class JobsTab(QWidget):
                     messages = []
                     if raised:
                         messages.append(
-                            "このタスクのマイルストーンが先行タスクより早かったため、"
-                            "先行タスクに合わせて自動的に引き上げました。"
+                            tr("このタスクのマイルストーンが先行タスクより早かったため、"
+                            "先行タスクに合わせて自動的に引き上げました。")
                         )
                     if changed:
                         messages.append(
-                            f"後継タスク{len(changed)}件のマイルストーンが、変更後のマイルストーン"
-                            "より早かったため、整合性を保つよう自動的に合わせました。"
+                            tr("後継タスク{n_changed}件のマイルストーンが、変更後のマイルストーンより早かったため、整合性を保つよう自動的に合わせました。", n_changed=len(changed))
                         )
-                    QMessageBox.information(self, "マイルストーンを自動調整しました", "\n".join(messages))
+                    QMessageBox.information(self, tr("マイルストーンを自動調整しました"), "\n".join(messages))
                 # マイルストーンを変えた場合は、後継タスクの選択肢や自動調整の
                 # 結果が他の行にも及ぶため、テーブル全体を作り直す（シグナル
                 # 発火元セルのウィジェットを直接コールバック内で破棄しないよう
@@ -1134,7 +1134,7 @@ class JobsTab(QWidget):
             item.setBackground(QBrush())
             item.setToolTip("")
             if confirmed is None:
-                item.setText("未確定")
+                item.setText(tr("未確定"))
                 item.setBackground(_unconfirmed_brush())
                 continue
             item.setText(_fmt_confirmed(confirmed, team_names))
@@ -1149,23 +1149,25 @@ class JobsTab(QWidget):
             reasons = []
             days_now = days_spin.value() or days_spin.default_value
             if days_now != confirmed["days"]:
-                tip = f"確定: {confirmed['days']}日 → 変更案: {days_now}日"
+                tip = tr("確定: {days}日 → 変更案: {days_now}日", days=confirmed['days'], days_now=days_now)
                 days_spin.setStyleSheet(red)
                 days_spin.setToolTip(tip)
                 reasons.append(tip)
             team_now = team_combo.currentData() or self._default_team_id(row)
             if confirmed["team_id"] is not None and team_now != confirmed["team_id"]:
-                tip = (f"確定: {team_names.get(confirmed['team_id'], '')} → "
-                       f"変更案: {team_names.get(team_now, '')}")
+                tip = (tr(
+                    "確定: {before} → 変更案: {after}",
+                    before=team_names.get(confirmed["team_id"], ""), after=team_names.get(team_now, ""),
+                ))
                 team_combo.setStyleSheet(red)
                 team_combo.setToolTip(tip)
                 reasons.append(tip)
             if not table.cellWidget(row, 1).isChecked():
-                reasons.append("確定後に無効にしました")
+                reasons.append(tr("確定後に無効にしました"))
             if key in state.draft_moves:
-                reasons.append(f"ガントで移動: 開始 {confirmed['start_date']} → {state.draft_moves[key]}")
+                reasons.append(tr("ガントで移動: 開始 {start_date} → {value}", start_date=confirmed['start_date'], value=state.draft_moves[key]))
             if not reasons:
-                reasons.append("確定後に開始固定日・依存などが変わりました")
+                reasons.append(tr("確定後に開始固定日・依存などが変わりました"))
             item.setForeground(QColor(_PLAN_CHANGED_COLOR))
             item.setToolTip("\n".join(reasons))
         table.blockSignals(False)
@@ -1210,7 +1212,7 @@ class JobsTab(QWidget):
                         self.db.set_external_dependency_active(dep_id, cb.isChecked())
                     )
                     tree.setItemWidget(child, 1, active_checkbox)
-                    tree.setItemWidget(child, 2, QLabel("自動" if is_auto else "手動"))
+                    tree.setItemWidget(child, 2, QLabel(tr("自動") if is_auto else tr("手動")))
                 # 一覧性を優先し、常に展開した状態で表示する。
                 top.setExpanded(True)
         tree.blockSignals(False)
@@ -1232,18 +1234,18 @@ class JobsTab(QWidget):
 
     def _add_dependency_link(self):
         if self.current_job_id is None:
-            QMessageBox.information(self, "ジョブ未選択", "先にジョブを選択してください。")
+            QMessageBox.information(self, tr("ジョブ未選択"), tr("先にジョブを選択してください。"))
             return
         others = [j for j in self.db.list_jobs() if j["id"] != self.current_job_id]
         if not others:
-            QMessageBox.information(self, "依存先ジョブがありません", "他のジョブを先に作成してください。")
+            QMessageBox.information(self, tr("依存先ジョブがありません"), tr("他のジョブを先に作成してください。"))
             return
         dialog = JobDependencyLinkDialog(self.db, self.current_job_id, self)
         if dialog.exec() != QDialog.Accepted:
             return
         depends_on_job_ids = dialog.values()
         if not depends_on_job_ids:
-            QMessageBox.warning(self, "入力エラー", "依存先ジョブを1つ以上選択してください。")
+            QMessageBox.warning(self, tr("入力エラー"), tr("依存先ジョブを1つ以上選択してください。"))
             return
         errors = []
         with self.db.undo_group("依存先ジョブを追加"):
@@ -1253,13 +1255,13 @@ class JobsTab(QWidget):
                 except ProjectDatabaseError as e:
                     errors.append(str(e))
         if errors:
-            QMessageBox.warning(self, "一部追加できませんでした", "\n".join(errors))
+            QMessageBox.warning(self, tr("一部追加できませんでした"), "\n".join(errors))
         self._refresh_dependencies()
 
     def _delete_selected_dependency_link(self):
         _item, data = self._selected_link()
         if data is None:
-            QMessageBox.information(self, "依存先ジョブ未選択", "削除する依存先ジョブを選択してください。")
+            QMessageBox.information(self, tr("依存先ジョブ未選択"), tr("削除する依存先ジョブを選択してください。"))
             return
         self.db.delete_job_dependency_link(data["link_id"])
         self._refresh_dependencies()
@@ -1268,7 +1270,7 @@ class JobsTab(QWidget):
         _item, data = self._selected_link()
         if data is None:
             QMessageBox.information(
-                self, "依存先ジョブ未選択", "タスク対応を追加する依存先ジョブを選択してください。"
+                self, tr("依存先ジョブ未選択"), tr("タスク対応を追加する依存先ジョブを選択してください。")
             )
             return
         self._add_task_pair(data["target_job_id"])
@@ -1281,12 +1283,12 @@ class JobsTab(QWidget):
             return
         task_id, dep_task_id = dialog.values()
         if None in (task_id, dep_task_id):
-            QMessageBox.warning(self, "入力エラー", "すべての項目を選択してください。")
+            QMessageBox.warning(self, tr("入力エラー"), tr("すべての項目を選択してください。"))
             return
         try:
             self.db.add_external_dependency(self.current_job_id, task_id, target_job_id, dep_task_id)
         except ProjectDatabaseError as e:
-            QMessageBox.warning(self, "追加できません", str(e))
+            QMessageBox.warning(self, tr("追加できません"), str(e))
             return
         self._refresh_dependencies()
 
@@ -1295,13 +1297,13 @@ class JobsTab(QWidget):
         data = item.data(0, Qt.UserRole) if item is not None else None
         if data is None or data["kind"] != "pair":
             QMessageBox.information(
-                self, "タスク対応未選択", "削除するタスク対応（依存先ジョブの子項目）を選択してください。"
+                self, tr("タスク対応未選択"), tr("削除するタスク対応（依存先ジョブの子項目）を選択してください。")
             )
             return
         if data["auto"]:
             QMessageBox.information(
-                self, "削除できません",
-                "自動生成された対応です。不要な場合は「有効」のチェックを外してください。",
+                self, tr("削除できません"),
+                tr("自動生成された対応です。不要な場合は「有効」のチェックを外してください。"),
             )
             return
         self.db.delete_external_dependency(data["dep_id"])
