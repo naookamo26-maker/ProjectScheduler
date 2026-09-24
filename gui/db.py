@@ -27,6 +27,7 @@ import heapq
 import os
 import sqlite3
 import tempfile
+import zlib
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
@@ -1351,6 +1352,220 @@ class ProjectDatabase:
         raised = self.enforce_milestone_floor(job_id, workflow_task_id)
         cascaded = self.cascade_milestone_to_successors(job_id, workflow_task_id)
         return {"milestone_raised": raised, "milestone_cascaded": cascaded}
+
+    # -- 計画の確定と変更案（docs/roadmap.md §8） -----------------------------------
+    #
+    # 状態の判定・指紋・影響範囲の計算は gui/plan_confirmation.py が行う。ここは
+    # 確定行（confirmed_schedule）・変更案の記録（draft_moves / draft_base）の
+    # 読み書きだけを持つ。
+
+    def list_confirmed_schedule(self):
+        rows = self._conn.execute(
+            "SELECT job_id, workflow_task_id, start_date, end_date, days, team_id, input_signature "
+            "FROM confirmed_schedule"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def has_confirmation(self):
+        return self._conn.execute("SELECT 1 FROM confirmed_schedule LIMIT 1").fetchone() is not None
+
+    @undoable("計画を確定")
+    def replace_confirmed_schedule(self, rows, confirmed_at, global_signature):
+        """確定行を丸ごと置き換える（「確定する」「変更を確定」）。rows は
+        job_id / workflow_task_id / start_date / end_date / days / team_id /
+        input_signature を持つ辞書の並び。変更案の記録（draft_moves）は消し、
+        確定した時点の状態を破棄用に保存し直す（save_draft_base）。"""
+        self._conn.execute("DELETE FROM confirmed_schedule")
+        self._insert_confirmed_rows(rows)
+        self._conn.execute("DELETE FROM draft_moves")
+        self._conn.execute(
+            "UPDATE project SET confirmed_at = ?, confirmed_global_signature = ? WHERE id = 1",
+            (confirmed_at, global_signature),
+        )
+        self._save_draft_base()
+        self._commit()
+
+    @undoable("選択した変更を確定")
+    def update_confirmed_rows(self, rows, remove_keys, confirmed_at, global_signature=None):
+        """確定行の一部だけを書き換える（「選択した変更を確定」）。rows を上書きし、
+        remove_keys（(job_id, workflow_task_id) の並び。無効にしたタスク等）の行を
+        消す。対象タスクの変更案の記録（draft_moves）も消す。global_signature を
+        渡したとき（全体設定の変更も含めて確定する場合）だけ更新する。"""
+        for key in list(remove_keys) + [(r["job_id"], r["workflow_task_id"]) for r in rows]:
+            self._conn.execute(
+                "DELETE FROM confirmed_schedule WHERE job_id = ? AND workflow_task_id = ?", key
+            )
+            self._conn.execute(
+                "DELETE FROM draft_moves WHERE job_id = ? AND workflow_task_id = ?", key
+            )
+        self._insert_confirmed_rows(rows)
+        if global_signature is None:
+            self._conn.execute("UPDATE project SET confirmed_at = ? WHERE id = 1", (confirmed_at,))
+        else:
+            self._conn.execute(
+                "UPDATE project SET confirmed_at = ?, confirmed_global_signature = ? WHERE id = 1",
+                (confirmed_at, global_signature),
+            )
+        self._commit()
+
+    def _insert_confirmed_rows(self, rows):
+        self._conn.executemany(
+            "INSERT INTO confirmed_schedule(job_id, workflow_task_id, start_date, end_date, days, "
+            "team_id, input_signature) VALUES (:job_id, :workflow_task_id, :start_date, :end_date, "
+            ":days, :team_id, :input_signature)",
+            rows,
+        )
+
+    @undoable("確定を解除")
+    def clear_confirmation(self):
+        """確定を解除する（手動ピンは残す）。変更案の記録と基準日も消す。"""
+        self._conn.execute("DELETE FROM confirmed_schedule")
+        self._conn.execute("DELETE FROM draft_moves")
+        self._conn.execute("DELETE FROM draft_base")
+        self._conn.execute(
+            "UPDATE project SET replan_base_date = NULL, replanned_at = NULL, confirmed_at = NULL, "
+            "confirmed_global_signature = NULL WHERE id = 1"
+        )
+        self._commit()
+
+    def list_draft_moves(self):
+        rows = self._conn.execute(
+            "SELECT job_id, workflow_task_id, start_date FROM draft_moves"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @undoable("変更案でタスクを移動")
+    def set_draft_move(self, job_id, workflow_task_id, start_date):
+        """確定済みのファイルで、ガントからドラッグした開始日を変更案として記録する
+        （手動ピンにはしない。§8-8）。"""
+        start_date = _validate_start_pin_date(start_date)
+        self._conn.execute(
+            "INSERT INTO draft_moves(job_id, workflow_task_id, start_date) VALUES (?, ?, ?) "
+            "ON CONFLICT(job_id, workflow_task_id) DO UPDATE SET start_date = excluded.start_date",
+            (job_id, workflow_task_id, start_date),
+        )
+        self._commit()
+
+    def _save_draft_base(self):
+        """いまの状態（確定した直後の状態）を、変更案の破棄用に圧縮して保存する。
+        draft_base 自身を含めないよう、行を消してから取り出す。"""
+        self._conn.execute("DELETE FROM draft_base")
+        snapshot = zlib.compress(self._conn.serialize(), 6)
+        self._conn.execute(
+            "INSERT INTO draft_base(id, started_on, snapshot) VALUES (1, ?, ?)",
+            (date.today().isoformat(), snapshot),
+        )
+
+    def has_draft_base(self):
+        return self._conn.execute("SELECT 1 FROM draft_base WHERE id = 1").fetchone() is not None
+
+    @undoable("変更を破棄")
+    def discard_draft(self):
+        """変更案を破棄し、最後に確定した時点の状態に戻す（§8-8）。
+
+        ただし次のものは戻さない:
+        - タスクの状態（未着手／進行中／完了）。日程を動かさない実績の記録であり、
+          変更案の途中で行った週次の進捗反映が破棄で消えてはならないため
+        - 「選択した変更を確定」で既に確定した分（確定行と、その入力＝上書き行）
+        """
+        row = self._conn.execute("SELECT snapshot FROM draft_base WHERE id = 1").fetchone()
+        if row is None:
+            raise ProjectDatabaseError("破棄して戻す先（最後に確定した時点の状態）がありません")
+        snapshot = row["snapshot"]
+        statuses = {
+            (r["job_id"], r["workflow_task_id"]): r["status"]
+            for r in self._conn.execute(
+                "SELECT job_id, workflow_task_id, status FROM job_task_overrides"
+            ).fetchall()
+        }
+        confirmed_now = {
+            (r["job_id"], r["workflow_task_id"]): r for r in self.list_confirmed_schedule()
+        }
+        overrides_now = {
+            (r["job_id"], r["workflow_task_id"]): dict(r)
+            for r in self._conn.execute("SELECT * FROM job_task_overrides").fetchall()
+        }
+        project_now = self.get_project()
+
+        self._conn.deserialize(zlib.decompress(snapshot))
+        self._conn.execute("PRAGMA foreign_keys = ON")
+
+        # 破棄後も draft_base は同じ内容（最後に確定した時点）のまま持ち続ける
+        self._conn.execute("DELETE FROM draft_base")
+        self._conn.execute(
+            "INSERT INTO draft_base(id, started_on, snapshot) VALUES (1, ?, ?)",
+            (date.today().isoformat(), snapshot),
+        )
+        confirmed_base = {
+            (r["job_id"], r["workflow_task_id"]): r for r in self.list_confirmed_schedule()
+        }
+        # 一部だけ確定した分: 確定行と入力（上書き行）を破棄前の内容に戻す
+        partially = [k for k, r in confirmed_now.items() if confirmed_base.get(k) != r]
+        existing_tasks = {
+            (r["job_id"], r["workflow_task_id"])
+            for r in self._conn.execute(
+                "SELECT j.id AS job_id, wt.id AS workflow_task_id FROM jobs j "
+                "JOIN workflow_tasks wt ON wt.workflow_id = j.workflow_id"
+            ).fetchall()
+        }
+        for key in partially:
+            if key not in existing_tasks:
+                continue  # 変更案で足したジョブ等。戻した状態には無いので扱えない
+            self._conn.execute(
+                "DELETE FROM confirmed_schedule WHERE job_id = ? AND workflow_task_id = ?", key
+            )
+            self._insert_confirmed_rows([dict(confirmed_now[key])])
+            self._conn.execute(
+                "DELETE FROM job_task_overrides WHERE job_id = ? AND workflow_task_id = ?", key
+            )
+            if key in overrides_now:
+                o = overrides_now[key]
+                self._conn.execute(
+                    "INSERT INTO job_task_overrides(job_id, workflow_task_id, is_active, "
+                    "override_days, milestone_id, team_id, start_pin_date, tags, status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (o["job_id"], o["workflow_task_id"], o["is_active"], o["override_days"],
+                     o["milestone_id"], o["team_id"], o["start_pin_date"], o["tags"], o["status"]),
+                )
+        if partially:
+            self._conn.execute(
+                "UPDATE project SET confirmed_at = ? WHERE id = 1", (project_now["confirmed_at"],)
+            )
+        # 状態（進捗）は破棄前のものを残す
+        for key, status in statuses.items():
+            if key not in existing_tasks:
+                continue
+            self._conn.execute(
+                "UPDATE job_task_overrides SET status = ? WHERE job_id = ? AND workflow_task_id = ?",
+                (status, *key),
+            )
+            if self._conn.execute(
+                "SELECT changes() AS n"
+            ).fetchone()["n"] == 0 and status is not None:
+                self._conn.execute(
+                    "INSERT INTO job_task_overrides(job_id, workflow_task_id, status) VALUES (?, ?, ?)",
+                    (*key, status),
+                )
+        for key in {k for k in self._status_keys() if k not in statuses}:
+            # 破棄前は未着手（行が無い）だったのに、戻した状態では状態を持つもの
+            self._conn.execute(
+                "UPDATE job_task_overrides SET status = NULL WHERE job_id = ? AND workflow_task_id = ?",
+                key,
+            )
+        self._conn.execute(
+            "DELETE FROM job_task_overrides WHERE is_active = 1 AND override_days IS NULL "
+            "AND milestone_id IS NULL AND team_id IS NULL AND start_pin_date IS NULL "
+            "AND COALESCE(tags, '') = '' AND status IS NULL"
+        )
+        self._commit()
+
+    def _status_keys(self):
+        return {
+            (r["job_id"], r["workflow_task_id"])
+            for r in self._conn.execute(
+                "SELECT job_id, workflow_task_id FROM job_task_overrides WHERE status IS NOT NULL"
+            ).fetchall()
+        }
 
     def _set_override_milestone(self, job_id, workflow_task_id, milestone_id):
         """上書き行のマイルストーンだけを差し替える（他の列には触れない）。

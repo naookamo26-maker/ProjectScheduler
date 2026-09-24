@@ -387,3 +387,117 @@ def generate_gantt(db, plotly_output_path=None, **scheduler_kwargs):
         plotly_output_path=plotly_output_path,
         **scheduler_kwargs,
     )
+
+
+# -- 計画の確定と変更案（docs/roadmap.md §8） ---------------------------------------
+#
+# 確定済みのファイルでは、影響範囲（gui/plan_confirmation.release_set）の外に
+# あるタスクを確定の位置に固定して計算する。固定は開始固定日（パス1で先に予約
+# する仕組み）をそのまま使い、日数・チームも確定行の値にそろえる。計算は
+# ワーカースレッドで走るので、DBから組み立てた材料（plan）はGUIスレッドで
+# 先に作り、DB接続を持たない普通の辞書として渡す。
+
+# 違反による影響範囲の拡大は、この回数の計算で打ち切る（§8-7）。
+PLAN_MAX_RUNS = 3
+
+
+def build_plan(db, state):
+    """PlanState から、スケジューラに渡す材料を作る（GUIスレッドで呼ぶ）。
+    state.status が未確定なら None。"""
+    from gui.plan_confirmation import UNCONFIRMED, release_set, successor_map
+
+    if state.status == UNCONFIRMED:
+        return None
+    successors_int = successor_map(db)
+    released_int = release_set(state, successors_int)
+
+    def key(k):
+        return (_fmt("JOB", k[0]), _fmt("T", k[1]))
+
+    fixed = {}
+    for k, row in state.confirmed.items():
+        if k in released_int or not state.active.get(k, False):
+            continue
+        team = _fmt("TEAM", row["team_id"]) if row["team_id"] is not None else None
+        fixed[key(k)] = (row["start_date"], row["days"], team)
+    lower_bound = max(
+        (d for d in (state.replan_base_date, (state.confirmed_at or "")[:10]) if d), default=None,
+    )
+    return {
+        "fixed": fixed,
+        "released": {key(k) for k in released_int},
+        "started": {key(k) for k in state.started},
+        "draft_moves": {key(k): d for k, d in state.draft_moves.items()},
+        "successors": {key(k): [key(n) for n in v] for k, v in successors_int.items()},
+        "lower_bound": lower_bound,
+    }
+
+
+def _apply_plan_to_frames(frames, fixed, plan):
+    """確定の位置に固定するタスクを、開始固定日・日数・チームの上書きとして
+    job_tasks に書き込んだ frames の写しを返す（DBは変えない）。"""
+    frames = dict(frames)
+    columns = ["Job_ID", "Task_ID", "Is_Active", "Override_Days", "Milestone_ID", "Team_ID",
+               "Start_Pin_Date"]
+    rows = {}
+    if frames.get("job_tasks") is not None:
+        for r in frames["job_tasks"].to_dict("records"):
+            rows[(r["Job_ID"], r["Task_ID"])] = r
+    for k, (start, days, team) in fixed.items():
+        r = rows.setdefault(k, {"Job_ID": k[0], "Task_ID": k[1], "Is_Active": "Y"})
+        r["Start_Pin_Date"] = start
+        r["Override_Days"] = days
+        if team is not None:
+            r["Team_ID"] = team
+    for k, start in plan["draft_moves"].items():
+        if k in fixed:
+            continue
+        r = rows.setdefault(k, {"Job_ID": k[0], "Task_ID": k[1], "Is_Active": "Y"})
+        r["Start_Pin_Date"] = start
+    frames["job_tasks"] = pd.DataFrame(list(rows.values()), columns=columns) if rows else None
+    lower_bound = plan.get("lower_bound")
+    if lower_bound:
+        project = frames["project"].copy()
+        current = str(project.iloc[0]["Start_Date"])
+        if not current or lower_bound > current:
+            project.loc[project.index[0], "Start_Date"] = lower_bound
+        frames["project"] = project
+    return frames
+
+
+def compute_schedule_with_plan(frames, plan, **scheduler_kwargs):
+    """確定を踏まえて計算する（ワーカースレッドから呼んでよい。DBに触れない）。
+
+    影響範囲の外を確定の位置に固定して計算し、固定したタスクが固定どおりに
+    置けなくなった（全体の設定の変更で、固定同士がライン数や依存でぶつかった）
+    未着手のタスクがあれば、それとその後続を影響範囲に加えて計算し直す。
+    タスクの編集そのものからは違反は起きない（編集したタスクの後続は最初から
+    影響範囲にあり、影響範囲のタスクは空いているラインにしか置かれない）ので、
+    通常は2回で収まる。PLAN_MAX_RUNS 回で打ち切り、残った違反はそのまま返す。
+
+    Returns: (result_df, info)。info は {"released": 影響範囲のキー集合, "runs": 計算回数}。
+    """
+    from gui.plan_confirmation import downstream
+
+    fixed = dict(plan["fixed"])
+    released = set(plan["released"])
+    started = plan["started"]
+    runs = 0
+    while True:
+        runs += 1
+        result_df = compute_schedule_from_frames(
+            _apply_plan_to_frames(frames, fixed, plan), **scheduler_kwargs
+        )
+        if runs >= PLAN_MAX_RUNS or result_df.empty:
+            break
+        broken = result_df[result_df["Constraint_Violation"] != ""]
+        violated = {
+            k for k in zip(broken["Job_ID"], broken["Task_ID"]) if k in fixed and k not in started
+        }
+        if not violated:
+            break
+        added = {k for k in downstream(violated, plan["successors"]) if k not in started}
+        for k in added:
+            fixed.pop(k, None)
+        released |= added
+    return result_df, {"released": released, "runs": runs}

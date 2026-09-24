@@ -22,7 +22,15 @@ import gc
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from gui.gantt_generator import build_display, build_frames, compute_schedule_from_frames, validate_for_generation
+from gui.gantt_generator import (
+    build_display,
+    build_frames,
+    build_plan,
+    compute_schedule_from_frames,
+    compute_schedule_with_plan,
+    validate_for_generation,
+)
+from gui.plan_confirmation import PlanState
 from project_scheduler import SchedulingError
 
 # 大規模サンプルで、_ScheduleWorker が別スレッドで大量にオブジェクトを確保して
@@ -60,26 +68,35 @@ class _ScheduleThread(QThread):
     行う（ScheduleCache._on_worker_thread_finished）。
     """
 
-    computed = Signal(int, object)  # (seq, result_df)
-    failed = Signal(int, str)       # (seq, エラーメッセージ)
+    computed = Signal(int, object, object)  # (seq, result_df, 確定を踏まえた計算の情報 or None)
+    failed = Signal(int, str)               # (seq, エラーメッセージ)
 
-    def __init__(self, seq, frames, distribution_ratio, parent=None):
+    def __init__(self, seq, frames, distribution_ratio, plan=None, parent=None):
         super().__init__(parent)
         self._seq = seq
         self._frames = frames
         self._distribution_ratio = distribution_ratio
+        # 確定済みのファイルなら、確定を踏まえて計算する材料（gantt_generator.build_plan）
+        self._plan = plan
 
     def run(self):
+        info = None
         try:
-            result_df = compute_schedule_from_frames(
-                self._frames, verbose=False, distribution_ratio=self._distribution_ratio,
-            )
+            if self._plan is not None:
+                result_df, info = compute_schedule_with_plan(
+                    self._frames, self._plan, verbose=False,
+                    distribution_ratio=self._distribution_ratio,
+                )
+            else:
+                result_df = compute_schedule_from_frames(
+                    self._frames, verbose=False, distribution_ratio=self._distribution_ratio,
+                )
         except SchedulingError as e:
             self.failed.emit(self._seq, str(e))
         except Exception as e:  # noqa: BLE001 - ワーカースレッドで例外を握り潰さない
             self.failed.emit(self._seq, f"予期しないエラー: {e}")
         else:
-            self.computed.emit(self._seq, result_df)
+            self.computed.emit(self._seq, result_df, info)
 
 
 class ScheduleCache(QObject):
@@ -93,6 +110,10 @@ class ScheduleCache(QObject):
         self.result_df = None
         self.display = None
         self.error_message = None
+        # 確定に関する状態（gui/plan_confirmation.PlanState）と、確定を踏まえた
+        # 計算の情報（影響範囲など）。result_df と同じ時点のもの。
+        self.plan_state = None
+        self.plan_info = None
         # 直近の結果がどの時点のDB内容に対応するか（db.revision の値）。
         self._computed_revision = None
         # 現在計算中の要求が対応するrevision。None＝計算中の要求なし
@@ -109,6 +130,7 @@ class ScheduleCache(QObject):
         # result_df/display/_computed_revision へ移す）。
         self._pending_display = None
         self._pending_revision = None
+        self._pending_plan_state = None
 
     def is_fresh(self):
         return self.result_df is not None and self._computed_revision == self.db.revision
@@ -146,6 +168,8 @@ class ScheduleCache(QObject):
         try:
             frames = build_frames(self.db)
             display = build_display(self.db)
+            plan_state = PlanState(self.db)
+            plan = build_plan(self.db, plan_state)
         except Exception as e:  # noqa: BLE001 - 未完成なデータでも落とさない
             self._cancel_pending_request()
             self._set_error(f"スケジューリングに失敗しました: {e}")
@@ -153,12 +177,13 @@ class ScheduleCache(QObject):
 
         self.error_message = None
         self._pending_display = display
+        self._pending_plan_state = plan_state
         self._pending_revision = request_revision
         self._computing_revision = request_revision
         self._request_seq += 1
         seq = self._request_seq
         distribution_ratio = self.db.get_project()["distribution_ratio"]
-        self._start_worker(seq, frames, distribution_ratio)
+        self._start_worker(seq, frames, distribution_ratio, plan)
 
     def _set_error(self, message):
         self.result_df = None
@@ -167,7 +192,7 @@ class ScheduleCache(QObject):
         self.error_message = message
         self.updated.emit()
 
-    def _start_worker(self, seq, frames, distribution_ratio):
+    def _start_worker(self, seq, frames, distribution_ratio, plan=None):
         """ワーカースレッドを起こしてスケジューリングを走らせる。
 
         実行中の古いスレッドは、結果を捨てる（通し番号で判定）だけで止めずに
@@ -179,7 +204,7 @@ class ScheduleCache(QObject):
         保持しておかないと、shutdown() が最後の1本しか待たずに終了し、
         それより前に始まった実行中のスレッドを残したままウィンドウが
         閉じてしまう（"QThread: Destroyed while thread is still running"）。"""
-        thread = _ScheduleThread(seq, frames, distribution_ratio, self)
+        thread = _ScheduleThread(seq, frames, distribution_ratio, plan, self)
         # スレッドのオブジェクトはGUIスレッドに属するので、run() の中から
         # emit したシグナルは自動的にキュー接続になり、GUIスレッドで受け取る。
         thread.computed.connect(self._on_schedule_finished)
@@ -208,11 +233,13 @@ class ScheduleCache(QObject):
         self._request_seq += 1
         self._computing_revision = None
 
-    def _on_schedule_finished(self, seq, result_df):
+    def _on_schedule_finished(self, seq, result_df, plan_info=None):
         if seq != self._request_seq:
             return  # 追い越された古い要求の結果なので捨てる
         self.result_df = result_df
         self.display = self._pending_display
+        self.plan_state = self._pending_plan_state
+        self.plan_info = plan_info
         # 計算完了時点ではなく、要求時点（frames を組み立てた瞬間）の revision を
         # 刻む（gui/tab_gantt.py の同名の説明を参照——結果は古いDB内容のままなのに
         # 完了時点の新しいrevisionを刻んでしまうと、以降の再計算をスキップして
