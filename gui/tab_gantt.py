@@ -960,7 +960,7 @@ class GanttTab(QWidget):
         box.setDefaultButton(cancel)
         # QMessageBox は幅が狭く、1行の説明が途中で折り返されるので広げる
         layout = box.layout()
-        layout.addItem(QSpacerItem(460, 0, QSizePolicy.Minimum, QSizePolicy.Expanding),
+        layout.addItem(QSpacerItem(560, 0, QSizePolicy.Minimum, QSizePolicy.Expanding),
                        layout.rowCount(), 0, 1, layout.columnCount())
         return self._exec_message_box(box) is ok
 
@@ -1003,9 +1003,9 @@ class GanttTab(QWidget):
             elif action == "clear":
                 if not self._ask_plan_action(
                     "未確定に戻す", "プロジェクト全体を未確定に戻しますか？",
-                    "消えるもの: 確定した日程、変更案（ドラッグで動かした位置を含む）\n"
-                    "残るもの: ジョブ・タスクの設定、手動ピン、進捗\n\n"
-                    "戻した後は、確定前と同じように全体を計算し直します。",
+                    "消えるもの: 未着手のタスクの確定日程、変更案（ドラッグで動かした位置を含む）\n"
+                    "残るもの: 進行中・完了のタスクの日程、ジョブ・タスクの設定、手動ピン\n\n"
+                    "戻した後は、未着手のタスクを確定前と同じように計算し直します。",
                     "未確定に戻す",
                 ):
                     return

@@ -116,6 +116,7 @@ class PlanState:
     - global_changed: 全体設定が確定時から変わったか
     - started: 進行中・完了のタスク
     - draft_moves: {(job_id, workflow_task_id): 'YYYY-MM-DD'}
+    - facts: 進行中・完了のタスクの確定行（未確定でも、その日程で固定して計算する）
     """
 
     def __init__(self, db):
@@ -133,11 +134,16 @@ class PlanState:
             (r["job_id"], r["workflow_task_id"])
             for r in db.list_all_job_task_overrides() if r["status"] in _STARTED
         }
-        if not self.confirmed:
+        self.facts = {k: r for k, r in self.confirmed.items() if k in self.started}
+        if not self.confirmed_at:
+            # 未確定（一度も確定していない、または「未確定に戻す」の後）。残っている
+            # 確定行は進行中・完了のタスクのもの（facts）だけを使う
+            self.confirmed = {}
+            self.draft_moves = {}
             self.status = UNCONFIRMED
             self.changed = set()
             self.global_changed = False
-            self.active = {}
+            self.active = _task_inputs(db)[1] if self.facts else {}
             return
         inputs, self.active = _task_inputs(db)
         signatures = {key: _digest(value) for key, value in inputs.items()}

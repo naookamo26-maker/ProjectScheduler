@@ -24,7 +24,7 @@
 | マーカー | 対象モジュール | 必要な依存 | 件数 / 時間 |
 | --- | --- | --- | --- |
 | `core` | `gui/db.py` `gui/db_schema.py` `gui/undo_manager.py` `gui/gantt_edit.py` | pytestのみ | 76件 / 約1.5秒 |
-| `scheduler` | `project_scheduler.py` `gui/gantt_generator.py` `gui/summary_metrics.py` `gui/plan_confirmation.py` `gui/plan_actions.py` | + pandas, numpy | 137件 / 約2.3秒 |
+| `scheduler` | `project_scheduler.py` `gui/gantt_generator.py` `gui/summary_metrics.py` `gui/plan_confirmation.py` `gui/plan_actions.py` | + pandas, numpy | 138件 / 約2.3秒 |
 | `gui` | `gui/`のウィジェット層・描画層 | + PySide6 + システムライブラリ | 154件 / 約38秒 |
 
 変更したファイル → 実行するコマンド:
@@ -42,7 +42,7 @@
 
 ### 全実行（`pytest`）を行う条件
 
-次のいずれかに当てはまるときだけ、引数なしの`pytest`で367件すべてを回す。
+次のいずれかに当てはまるときだけ、引数なしの`pytest`で368件すべてを回す。
 
 - 利用者から明示的に「全部回して」と指示があったとき。
 - 影響が横断的な変更をしたとき。具体的には、DBスキーマの変更（`gui/db_schema.py`・
@@ -54,7 +54,7 @@
 ### 出力を増やさない
 
 - `pytest.ini`の`addopts`で`-q --no-header --tb=short`が既定になっている。
-  **`-v`は付けない**（367件のテスト名が出力を埋めるだけで、得られる情報は増えない）。
+  **`-v`は付けない**（368件のテスト名が出力を埋めるだけで、得られる情報は増えない）。
 - 失敗を追うときは、全体を回し直さず、失敗したテストだけを名指しで再実行する:
   `pytest tests/test_undo_redo.py::test_foo --tb=long`
 

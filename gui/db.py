@@ -1367,7 +1367,10 @@ class ProjectDatabase:
         return [dict(r) for r in rows]
 
     def has_confirmation(self):
-        return self._conn.execute("SELECT 1 FROM confirmed_schedule LIMIT 1").fetchone() is not None
+        """計画を確定しているか。「未確定に戻す」の後も進行中・完了のタスクの確定行は
+        残るので、行の有無ではなく確定した日時（project.confirmed_at）で判定する。"""
+        row = self._conn.execute("SELECT confirmed_at FROM project WHERE id = 1").fetchone()
+        return row is not None and row["confirmed_at"] is not None
 
     @undoable("計画を確定")
     def replace_confirmed_schedule(self, rows, confirmed_at, global_signature):
@@ -1418,8 +1421,16 @@ class ProjectDatabase:
 
     @undoable("未確定に戻す")
     def clear_confirmation(self):
-        """プロジェクト全体を未確定に戻す（手動ピン・進捗は残す）。変更案の記録と基準日も消す。"""
-        self._conn.execute("DELETE FROM confirmed_schedule")
+        """プロジェクト全体を未確定に戻す（手動ピン・進捗は残す）。変更案の記録と基準日も消す。
+
+        進行中・完了のタスクの確定行は残す。実施した事実なので、未確定に戻しても
+        その日程で固定したまま計算する（gui/plan_confirmation.PlanState.facts）。"""
+        self._conn.execute(
+            "DELETE FROM confirmed_schedule WHERE NOT EXISTS ("
+            " SELECT 1 FROM job_task_overrides o WHERE o.job_id = confirmed_schedule.job_id"
+            " AND o.workflow_task_id = confirmed_schedule.workflow_task_id"
+            " AND o.status IN ('in_progress', 'done'))"
+        )
         self._conn.execute("DELETE FROM draft_moves")
         self._conn.execute("DELETE FROM draft_base")
         self._conn.execute(

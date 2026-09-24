@@ -406,20 +406,29 @@ def build_plan(db, state):
     state.status が未確定なら None。"""
     from gui.plan_confirmation import UNCONFIRMED, release_set, successor_map
 
-    if state.status == UNCONFIRMED:
-        return None
-    successors_int = successor_map(db)
-    released_int = release_set(state, successors_int)
-
     def key(k):
         return (_fmt("JOB", k[0]), _fmt("T", k[1]))
+
+    def fixed_value(row):
+        team = _fmt("TEAM", row["team_id"]) if row["team_id"] is not None else None
+        return (row["start_date"], row["days"], team)
+
+    if state.status == UNCONFIRMED:
+        # 未確定でも、進行中・完了のタスクは確定していた日程で固定する（「未確定に
+        # 戻す」の後に残した実績）。それ以外は通常どおり自由に計算する
+        facts = {key(k): fixed_value(r) for k, r in state.facts.items() if state.active.get(k, False)}
+        if not facts:
+            return None
+        return {"fixed": facts, "not_before": {}, "released": set(), "started": set(facts),
+                "draft_moves": {}, "successors": {}, "lower_bound": None}
+    successors_int = successor_map(db)
+    released_int = release_set(state, successors_int)
 
     fixed = {}
     for k, row in state.confirmed.items():
         if k in released_int or not state.active.get(k, False):
             continue
-        team = _fmt("TEAM", row["team_id"]) if row["team_id"] is not None else None
-        fixed[key(k)] = (row["start_date"], row["days"], team)
+        fixed[key(k)] = fixed_value(row)
     lower_bound = max(
         (d for d in (state.replan_base_date, (state.confirmed_at or "")[:10]) if d), default=None,
     )

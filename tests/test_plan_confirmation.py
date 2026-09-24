@@ -357,3 +357,35 @@ def test_clearing_the_confirmation_returns_to_free_simulation(tmp_path):
     db.clear_confirmation()
     assert PlanState(db).status == UNCONFIRMED
     assert not db.has_draft_base()
+
+
+def test_clearing_the_confirmation_keeps_started_and_done_tasks_where_they_were(tmp_path):
+    """「未確定に戻す」でも、進行中・完了のタスクは実施した事実なので確定していた
+    日程のまま固定する。未着手のタスクだけが自由に計算し直される。"""
+    from gui.plan_actions import confirm_all
+    from gui.plan_confirmation import UNCONFIRMED, PlanState
+
+    db, ids = _plan_project(tmp_path, lines=1, jobs=3)
+    df = _compute(db)[0]
+    confirm_all(db, df)
+    before = _positions(df)
+    done = (ids["jobs"][2], ids["t1"])
+    started = (ids["jobs"][1], ids["t1"])
+    db.update_job_task_override_fields(*done, status="done")
+    db.update_job_task_override_fields(*started, status="in_progress")
+    db.clear_confirmation()
+    assert not db.has_confirmation()
+    assert {(r["job_id"], r["workflow_task_id"]) for r in db.list_confirmed_schedule()} == {done, started}
+
+    # 自由に計算すると、全体が最速側へ詰まる（未着手のタスクは動く）
+    db.set_distribution_ratio(0.0)
+    after_df, state, _ = _compute(db)
+    assert state.status == UNCONFIRMED
+    after = _positions(after_df)
+    assert after[_k(*done)] == before[_k(*done)]
+    assert after[_k(*started)] == before[_k(*started)]
+    assert any(after[k] != before[k] for k in before if k not in (_k(*done), _k(*started)))
+
+    # 未着手に戻したタスクは、残っていた確定行を使わずに自由に置かれる
+    db.update_job_task_override_fields(*done, status=None)
+    assert set(PlanState(db).facts) == {started}
