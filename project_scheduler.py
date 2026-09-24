@@ -580,6 +580,13 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
     for job in df_jobs.to_dict("records"):
         job_id, job_name = job["Job_ID"], job["Job_Name"]
         wf_id = job["Workflow_ID"]
+        # 配置のばらつき（_job_ratio_jitter）の種。任意列 Jitter_Key があれば
+        # それを、無ければ Job_ID を使う。GUIはジョブ作成時に決めて変えない
+        # 安定キーを渡す——Job_ID（"JOB_<連番>"）を種にすると、ジョブを作り直す
+        # だけで無関係なジョブの日程まで動くため（docs/roadmap.md §8-1）。
+        jitter_key = job.get("Jitter_Key")
+        if not isinstance(jitter_key, str) or not jitter_key.strip():
+            jitter_key = job_id
         job_default_ms = job.get("Default_Milestone_ID", "")
 
         priority = job.get("Priority")
@@ -673,9 +680,24 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
                     )
                 start_pin_ord = start_pin.toordinal()
 
+            # 着手の下限（任意列 Not_Before）。計画の確定（GUIの変更案）で、影響範囲の
+            # タスクを確定した位置より前へ動かさないために使う。開始固定日と違い、
+            # これより後ろへはずれてよい。
+            not_before_raw = override.get("Not_Before")
+            not_before_ord = None
+            if pd.notna(not_before_raw) and str(not_before_raw).strip() != "":
+                not_before = pd.to_datetime(not_before_raw, errors="coerce")
+                if pd.isna(not_before):
+                    raise SchedulingError(
+                        f"タスク '{g_id}' の着手の下限 '{not_before_raw}' を解釈できません"
+                    )
+                not_before_ord = not_before.toordinal()
+
             active_tasks[g_id] = {
                 "start_pin_ord": start_pin_ord,
+                "not_before_ord": not_before_ord,
                 "job_id": job_id, "job_name": job_name, "task_id": t_id,
+                "jitter_key": jitter_key,
                 "task_name": t["Task_Name"], "days": days,
                 # deps / dep_specs は全ジョブを読み終えてから
                 # （無効化されたタスクを飛ばして）確定させる。
@@ -1184,7 +1206,9 @@ def _calc_asap_dates(active_tasks, leveling_order, project_start_ord, cal):
         t_start = _pinned_start(t_info, cal, team_id)
         if t_start is None:
             dep_ends = _dep_lower_bounds(t_info, asap_dates, cal, team_id, g_id)
-            t_start = cal.next_working_day(max([project_start_ord] + dep_ends), team_id)
+            t_start = cal.next_working_day(
+                max([project_start_ord, t_info.get("not_before_ord") or 0] + dep_ends), team_id
+            )
         t_end = None if t_start is None else cal.business_end(t_start, t_info["days"], team_id)
         if t_end is None:
             raise SchedulingError(
@@ -1261,14 +1285,17 @@ def _calc_job_shift_days(active_tasks, asap_dates, raw_dates, distribution_ratio
         return {}
 
     job_tasks = {}
+    jitter_keys = {}
     for g_id, t_info in active_tasks.items():
-        job_tasks.setdefault(t_info.get("job_id", g_id), []).append(g_id)
+        job_id = t_info.get("job_id", g_id)
+        job_tasks.setdefault(job_id, []).append(g_id)
+        jitter_keys.setdefault(job_id, t_info.get("jitter_key") or job_id)
 
     job_shift_days = {}
     for job_id, g_ids in job_tasks.items():
         min_slack = min(raw_dates[g][0] - asap_dates[g][0] for g in g_ids)
         min_slack = max(0, min_slack)
-        effective_ratio = min(1.0, max(0.0, distribution_ratio + _job_ratio_jitter(job_id)))
+        effective_ratio = min(1.0, max(0.0, distribution_ratio + _job_ratio_jitter(jitter_keys[job_id])))
         job_shift_days[job_id] = round(min_slack * effective_ratio)
     return job_shift_days
 
@@ -1427,7 +1454,9 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
         job_id = t_info.get("job_id", g_id)
 
         dep_ends = _dep_lower_bounds(t_info, scheduled, cal, team_id, g_id)
-        earliest_start = cal.next_working_day(max([project_start_ord] + dep_ends), team_id)
+        earliest_start = cal.next_working_day(
+            max([project_start_ord, t_info.get("not_before_ord") or 0] + dep_ends), team_id
+        )
         if earliest_start is None:
             raise SchedulingError(f"タスク '{g_id}' の着手可能日を求められません")
 
@@ -1844,7 +1873,7 @@ renderAll();
 
 def export_plotly_gantt(result_df, output_path, project_name="プロジェクトスケジュール",
                          team_name_map=None, workflow_name_map=None, team_order=None,
-                         milestone_markers=None):
+                         milestone_markers=None, title_note=None):
     """result_df（run_resource_constrained_scheduler_from_framesの戻り値）から、
     サーバー不要でブラウザで直接開けるインタラクティブなガントチャート（単一HTMLファイル、
     Plotly製）を書き出す。
@@ -1945,6 +1974,9 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
     ]
 
     title = f"{project_name} スケジュール"
+    if title_note:
+        # どの日程を出力したか（GUIの計画の確定: 確定した日程／変更案）
+        title += f"（{title_note}）"
     html_out = (
         _PLOTLY_GANTT_HTML_TEMPLATE
         .replace("__TITLE__", _esc(title))
@@ -1970,7 +2002,8 @@ def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, 
                                                      auto_exclude_jp_holidays=True,
                                                      plotly_output_path=None,
                                                      project_name=None,
-                                                     distribution_ratio=0.7):
+                                                     distribution_ratio=0.7,
+                                                     plotly_title_note=None):
     """
     リソース制約付きスケジューリングを実行し、結果を DataFrame で返す。
 
@@ -2002,6 +2035,8 @@ def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, 
             できる。省略時はファイル出力を行わない。
         project_name: HTML冒頭の見出しに使うプロジェクト名。
             省略時は Project シートの Project_Name を使う。
+        plotly_title_note: HTMLの見出しの後ろに括弧書きで添える注記
+            （GUIの計画の確定で「確定した日程」「変更案」のどちらを出力したか）。
         distribution_ratio: 0.0〜1.0。各タスクをASAP（最速）〜ALAP（締切ギリギリ）の
             どのあたりに配置するかの基準点。
               - 0.0: 依存関係が満たされ次第すぐ着手（従来のASAP前倒しに近い、前に詰まりやすい）
@@ -2038,6 +2073,7 @@ def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, 
         plotly_output_path=plotly_output_path,
         project_name=project_name,
         distribution_ratio=distribution_ratio,
+        plotly_title_note=plotly_title_note,
     )
 
 
@@ -2141,7 +2177,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
                               verbose=True,
                               auto_exclude_weekends=True, auto_exclude_jp_holidays=True,
                               plotly_output_path=None, project_name=None,
-                              distribution_ratio=0.7):
+                              distribution_ratio=0.7, plotly_title_note=None):
     """run_resource_constrained_scheduler_from_frames() のスケジューリング本体
     （_load_data_from_frames() による検証・整形済みのDataFrameを受け取る）。"""
     project_start = _load_project_start(df_project)
@@ -2193,7 +2229,8 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
                                  team_name_map=team_name_map,
                                  workflow_name_map=workflow_name_map,
                                  team_order=list(df_teams["Team_ID"]),
-                                 milestone_markers=milestone_markers)
+                                 milestone_markers=milestone_markers,
+                                 title_note=plotly_title_note)
         return result_df
 
     jp_holidays = set()
@@ -2277,6 +2314,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
                              team_name_map=team_name_map,
                              workflow_name_map=workflow_name_map,
                              team_order=list(df_teams["Team_ID"]),
-                             milestone_markers=milestone_markers)
+                             milestone_markers=milestone_markers,
+                             title_note=plotly_title_note)
 
     return result_df

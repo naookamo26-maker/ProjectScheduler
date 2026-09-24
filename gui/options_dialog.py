@@ -91,6 +91,22 @@ class OptionsDialog(QDialog):
         gantt_form.addRow("編集で動いたバーを強調する時間", self.highlight_spin)
         layout.addWidget(gantt)
 
+        plan = QGroupBox("計画の確定")
+        plan_form = QFormLayout(plan)
+        plan_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+        threshold_option = OPTIONS["full_replan_threshold_percent"]
+        self.replan_threshold_spin = QSpinBox()
+        self.replan_threshold_spin.setRange(threshold_option.minimum, threshold_option.maximum)
+        self.replan_threshold_spin.setSuffix(" %")
+        self.replan_threshold_spin.setMinimumWidth(110)
+        self.replan_threshold_spin.setValue(app_settings.get("full_replan_threshold_percent"))
+        plan_form.addRow("全面再計画を案内する影響範囲", self.replan_threshold_spin)
+        threshold_note = QLabel("変更案で動くタスクが全タスクのこの割合を超えたら、状態帯で全面再計画を案内します。")
+        threshold_note.setForegroundRole(QPalette.PlaceholderText)
+        threshold_note.setWordWrap(True)
+        plan_form.addRow("", threshold_note)
+        layout.addWidget(plan)
+
         path_label = QLabel(f"保存先: {app_settings.path}")
         # 補足情報なので控えめな色にする（ダーク/ライトどちらのパレットにも追従）
         path_label.setForegroundRole(QPalette.PlaceholderText)
@@ -122,12 +138,14 @@ class OptionsDialog(QDialog):
         self.undo_memory_spin.setValue(self.app_settings.default("undo_memory_limit_mb"))
         self._select_data(self.drag_modifier_combo, self.app_settings.default("gantt_drag_modifier"))
         self.highlight_spin.setValue(self.app_settings.default("moved_bar_highlight_seconds"))
+        self.replan_threshold_spin.setValue(self.app_settings.default("full_replan_threshold_percent"))
 
     def accept(self):
         self.app_settings.set("language", self.selected_language())
         self.app_settings.set("undo_memory_limit_mb", self.undo_memory_spin.value())
         self.app_settings.set("gantt_drag_modifier", self.drag_modifier_combo.currentData())
         self.app_settings.set("moved_bar_highlight_seconds", self.highlight_spin.value())
+        self.app_settings.set("full_replan_threshold_percent", self.replan_threshold_spin.value())
         try:
             self.app_settings.sync()
         except OSError as e:

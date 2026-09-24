@@ -18,6 +18,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QSizePolicy,
+    QSpacerItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -25,8 +27,15 @@ from PySide6.QtWidgets import (
 
 from gui.app_settings import AppSettings
 from gui.db import ProjectDatabase
-from gui.gantt_generator import generate_gantt, validate_for_generation
+from gui.gantt_generator import (
+    PLAN_OUTPUT_CONFIRMED,
+    PLAN_OUTPUT_DRAFT,
+    generate_gantt,
+    validate_for_generation,
+)
+from gui.plan_confirmation import DRAFT, PlanState
 from gui.options_dialog import OptionsDialog
+from gui.plan_band import PlanStatusBand
 from gui.schedule_cache import ScheduleCache
 from gui.tab_analysis import AnalysisTab
 from gui.tab_basic_info import BasicInfoTab
@@ -60,7 +69,26 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
         self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
+        # 計画の状態帯（未確定／確定済み／変更案。docs/roadmap.md §8-9）は、
+        # どのタブを開いていても見えるよう、タブの上に1本だけ置く。
+        self.plan_band = PlanStatusBand()
+        self.plan_band.setVisible(False)
+        self.plan_band.confirmRequested.connect(lambda: self._run_plan_action("confirm"))
+        self.plan_band.confirmSelectedRequested.connect(lambda: self._run_plan_action("confirm_selected"))
+        self.plan_band.discardRequested.connect(lambda: self._run_plan_action("discard"))
+        self.plan_band.clearRequested.connect(lambda: self._run_plan_action("clear"))
+        self.plan_band.fullReplanRequested.connect(lambda: self._run_plan_action("replan"))
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(4, 4, 4, 0)
+        central_layout.setSpacing(4)
+        central_layout.addWidget(self.plan_band)
+        central_layout.addWidget(self.tabs, 1)
+        self.setCentralWidget(central)
+        self._plan_band_timer = QTimer(self)
+        self._plan_band_timer.setSingleShot(True)
+        self._plan_band_timer.setInterval(0)
+        self._plan_band_timer.timeout.connect(self._refresh_plan_band)
         # 接続はここで一度だけ行う。プロジェクトを開くたびに実行される
         # _rebuild_tabs() の側で接続すると、同じQTabWidgetに対して接続が
         # 累積し、タブ切り替え1回につき refresh_choices() が開いた回数だけ
@@ -110,6 +138,7 @@ class MainWindow(QMainWindow):
         """プロジェクト未オープン時のプレースホルダー（DB操作を必要とする
         実タブは開いた後に _rebuild_tabs() で差し替える）。"""
         self.tabs.clear()
+        self.plan_band.setVisible(False)
         self.tabs.addTab(
             self._placeholder_tab("プロジェクト名・開始日・マイルストーン・チーム・休業日をここで設定します。"),
             "基本情報設定",
@@ -172,14 +201,17 @@ class MainWindow(QMainWindow):
         # ガントチャートタブ・プロジェクト分析タブはこのキャッシュ経由で
         # スケジューリング結果を共有する（どちらのタブからでも計算を起動できる）。
         self.schedule_cache = ScheduleCache(self.db, parent=self)
+        self.schedule_cache.updated.connect(self._plan_band_timer.start)
 
         self.tab_gantt = GanttTab(self.db, self.schedule_cache, self.app_settings)
         self.tabs.addTab(self.tab_gantt, "ガントチャート")
+        self.tab_gantt.planSelectionChanged.connect(self._plan_band_timer.start)
 
         self.tab_analysis = AnalysisTab(self.db, self.schedule_cache)
         self.tabs.addTab(self.tab_analysis, "プロジェクト分析")
 
         self.tabs.setEnabled(True)
+        self._plan_band_timer.start()
         self.generate_action.setEnabled(True)
         self.save_action.setEnabled(True)
         self.save_as_action.setEnabled(True)
@@ -190,6 +222,7 @@ class MainWindow(QMainWindow):
         widget = self.tabs.widget(index)
         if hasattr(widget, "refresh_choices"):
             widget.refresh_choices()
+        self._plan_band_timer.start()
 
     def _on_teams_changed(self):
         """チームマスタが変更された際、ワークフロー設計タブの表示中キャンバスの
@@ -275,6 +308,8 @@ class MainWindow(QMainWindow):
             self.undo_manager.set_max_total_bytes(self.app_settings.undo_memory_limit_bytes())
         if self.tab_gantt is not None:
             self.tab_gantt.apply_app_settings()
+        # 全面再計画を案内するしきい値が変わりうる
+        self._plan_band_timer.start()
 
     def on_new_project(self):
         """保存先パスはこの時点では選ばせず、初回保存（Ctrl+S/名前を付けて保存）
@@ -377,14 +412,23 @@ class MainWindow(QMainWindow):
             )
             return
 
+        plan_output = PLAN_OUTPUT_DRAFT
+        if PlanState(self.db).status == DRAFT:
+            # 変更案の最中だけ、どちらの日程を出力するかを選ぶ（§8-9）
+            plan_output = self._ask_plan_output()
+            if plan_output is None:
+                return
+
         default_dir = str(Path(self.db.path).resolve().parent) if self.db.path else str(Path.home())
-        out_dir = QFileDialog.getExistingDirectory(self, "ガントチャートの出力先フォルダ", default_dir)
+        out_dir = self._ask_output_dir(default_dir)
         if not out_dir:
             return
 
         html_path = str(Path(out_dir) / "schedule_gantt.html")
         try:
-            result_df = generate_gantt(self.db, plotly_output_path=html_path, verbose=False)
+            result_df = generate_gantt(
+                self.db, plotly_output_path=html_path, plan_output=plan_output, verbose=False,
+            )
         except SchedulingError as e:
             QMessageBox.critical(self, "生成に失敗しました", str(e))
             return
@@ -410,6 +454,32 @@ class MainWindow(QMainWindow):
             )
         QMessageBox.information(self, "生成完了", message)
 
+    def _ask_plan_output(self):
+        """変更案の最中にHTMLを出力するとき、確定した日程と変更案のどちらを出すかを
+        尋ねる（キャンセルなら None。テストで差し替える）。"""
+        box = QMessageBox(QMessageBox.Question, "ガントチャートを生成",
+                          "どちらの日程を出力しますか？", parent=self)
+        box.setInformativeText("出力したファイルの見出しに、どちらの日程かを書き添えます。")
+        draft = box.addButton("変更案", QMessageBox.AcceptRole)
+        confirmed = box.addButton("確定した日程", QMessageBox.AcceptRole)
+        box.addButton("キャンセル", QMessageBox.RejectRole)
+        box.setDefaultButton(draft)
+        # QMessageBox は幅が狭く、説明文が途中で折り返されるので広げる
+        layout = box.layout()
+        layout.addItem(QSpacerItem(440, 0, QSizePolicy.Minimum, QSizePolicy.Expanding),
+                       layout.rowCount(), 0, 1, layout.columnCount())
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is draft:
+            return PLAN_OUTPUT_DRAFT
+        if clicked is confirmed:
+            return PLAN_OUTPUT_CONFIRMED
+        return None
+
+    def _ask_output_dir(self, default_dir):
+        """出力先フォルダを選ばせる（テストで差し替える）。"""
+        return QFileDialog.getExistingDirectory(self, "ガントチャートの出力先フォルダ", default_dir)
+
     def _open_database(self, db):
         # 旧DBを閉じるのは、旧タブを差し替え終えた後にする。タブの差し替えでは
         # 入力欄からフォーカスが外れ、editingFinished 等のシグナルが発火して
@@ -420,12 +490,18 @@ class MainWindow(QMainWindow):
         if previous is not None:
             previous.on_change = None
             previous.undo_manager = None
-        self.db = db
-        self.db.on_change = self._on_db_changed
         # UndoManagerを繋ぐ前に確認しておく（繋いだ後の is_dirty() は
         # Undo履歴上の位置で判定されるようになるため）。既存ファイルを開いた
         # 直後は保存済み、新規プロジェクトは未保存。
-        opened_clean = not self.db.is_dirty()
+        opened_clean = not db.is_dirty()
+        # 依存テンプレートから展開するジョブ間の依存を、開いた時点で揃える。
+        # これまではジョブ作成タブを開いたときにだけ揃えていたため、開いてすぐ
+        # 計画を確定した後にジョブ作成タブを開くと依存が増え、確定したタスクが
+        # 「変更あり」になっていた（docs/roadmap.md §8-7）。テンプレートから
+        # 導かれる内容を揃えるだけなので、Undo履歴にも未保存の印にも含めない。
+        db.sync_dependency_templates()
+        self.db = db
+        self.db.on_change = self._on_db_changed
         self._rebuild_tabs()
         if previous is not None:
             previous.close()
@@ -526,8 +602,28 @@ class MainWindow(QMainWindow):
 
     def _on_db_changed(self):
         """DB変更時のフック（保存以外の全てのCRUD操作後に呼ばれる）。
-        タイトルバーに未保存マークを反映する。"""
+        タイトルバーに未保存マークを反映し、計画の状態帯を更新する（続けて
+        何度も変わっても、イベントループに戻った時点で1回だけ計算する）。"""
         self._update_title()
+        self._plan_band_timer.start()
+
+    # -- 計画の確定（docs/roadmap.md §8） --------------------------------------------
+
+    def _refresh_plan_band(self):
+        if self.db is None or self.tab_gantt is None:
+            self.plan_band.setVisible(False)
+            return
+        status, detail, ready = self.tab_gantt.plan_band_summary()
+        on_gantt = self.tabs.currentWidget() is self.tab_gantt
+        self.plan_band.set_state(
+            status, detail, show_buttons=on_gantt, buttons_enabled=ready,
+            selected_enabled=on_gantt and self.tab_gantt.can_confirm_selected(),
+        )
+        self.plan_band.setVisible(True)
+
+    def _run_plan_action(self, action):
+        if self.tab_gantt is not None:
+            self.tab_gantt.run_plan_action(action)
 
     def _update_title(self):
         if self.db is None:

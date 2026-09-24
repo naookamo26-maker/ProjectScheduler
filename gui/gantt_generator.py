@@ -59,10 +59,16 @@ def build_frames(db):
     （_load_data_from_frames の「シート/データが存在しない」扱いに対応）。
     """
     proj = db.get_project()
+    # 全面再計画の基準日（docs/roadmap.md §8-3）。確定行を持たないタスクを
+    # この日より前に置かないよう、スケジューラへ渡す開始日を差し替える
+    # （開発開始日そのものは変えない——稼働本数の起点等に使われているため）。
+    start_date = proj["start_date"]
+    if proj.get("replan_base_date") and start_date and proj["replan_base_date"] > start_date:
+        start_date = proj["replan_base_date"]
     df_project = pd.DataFrame([{
         "Project_ID": "PRJ_001",
         "Project_Name": proj["project_name"],
-        "Start_Date": proj["start_date"],
+        "Start_Date": start_date,
     }])
 
     teams = db.list_teams()
@@ -133,6 +139,8 @@ def build_frames(db):
         "Workflow_ID": wf_str[j["workflow_id"]],
         "Default_Milestone_ID": ms_str.get(j["default_milestone_id"]),
         "Priority": j["priority"],
+        # 配置のばらつきの種（作成時に決めて変えない安定キー。§8-1）
+        "Jitter_Key": j["stable_key"],
     } for j in jobs])
 
     jt_rows = [{
@@ -361,21 +369,231 @@ def compute_schedule(db, **scheduler_kwargs):
     return result_df, build_display(db)
 
 
-def generate_gantt(db, plotly_output_path=None, **scheduler_kwargs):
-    """build_frames() の結果を project_scheduler.run_resource_constrained_scheduler_from_frames()
-    にそのまま渡す。SchedulingError系（循環依存・リソース不足・マイルストーン不整合等）は
-    そのまま呼び出し元に伝播させる（GUI側でダイアログに変換する）。
+PLAN_OUTPUT_DRAFT = "draft"
+PLAN_OUTPUT_CONFIRMED = "confirmed"
+
+
+def generate_gantt(db, plotly_output_path=None, plan_output=PLAN_OUTPUT_DRAFT, **scheduler_kwargs):
+    """メニューの「ガントチャートを生成」（HTMLファイル出力）。ガントチャートタブと
+    同じく、計画の確定（§8）を踏まえて計算する。SchedulingError系（循環依存・
+    リソース不足・マイルストーン不整合等）はそのまま呼び出し元に伝播させる
+    （GUI側でダイアログに変換する）。
+
+    plan_output: 変更案の最中に、どちらの日程を出力するか（§8-9）。
+      PLAN_OUTPUT_DRAFT: 変更案（ガントチャートタブに出ているもの）
+      PLAN_OUTPUT_CONFIRMED: 確定した日程（確定後に足したタスクは含めない）
+    出力したHTMLの見出しに、どちらの日程かを書き添える。
 
     distribution_ratio を明示指定しなければ、プロジェクト設定
     （db.get_project()["distribution_ratio"]）を既定値として使う——
-    ガントチャートタブで調整した基準点が、メニューの「ガントチャートを
-    生成」（HTMLファイル出力）でもそのまま使われるようにするため。"""
+    ガントチャートタブで調整した基準点が、HTML出力でもそのまま使われるようにするため。"""
+    from gui.plan_confirmation import CONFIRMED, DRAFT, PlanState
+
     frames = build_frames(db)
     scheduler_kwargs.setdefault("distribution_ratio", db.get_project()["distribution_ratio"])
-    return run_resource_constrained_scheduler_from_frames(
-        frames["project"], frames["teams"], frames["milestones"], frames["workflows"],
-        frames["jobs"], frames["job_tasks"], frames["holidays"], frames["external_dependencies"],
-        frames["workflow_names"], df_team_capacity=frames["team_capacity"],
-        plotly_output_path=plotly_output_path,
-        **scheduler_kwargs,
+    state = PlanState(db)
+    note = None
+    if state.status == DRAFT and plan_output == PLAN_OUTPUT_CONFIRMED:
+        plan = build_confirmed_plan(state)
+        note = f"確定した日程 {(state.confirmed_at or '')[:10]}".strip()
+    else:
+        plan = build_plan(db, state)
+        if state.status == CONFIRMED:
+            note = f"確定した日程 {(state.confirmed_at or '')[:10]}".strip()
+        elif state.status == DRAFT:
+            note = "変更案・未確定"
+    scheduler_kwargs["plotly_output_path"] = plotly_output_path
+    scheduler_kwargs["plotly_title_note"] = note
+    if plan is None:
+        return compute_schedule_from_frames(frames, **scheduler_kwargs)
+    # 違反による再計算のたびに書き出し、最後の計算結果が残る
+    result_df, _info = compute_schedule_with_plan(frames, plan, **scheduler_kwargs)
+    return result_df
+
+
+# -- 計画の確定と変更案（docs/roadmap.md §8） ---------------------------------------
+#
+# 確定済みのファイルでは、影響範囲（gui/plan_confirmation.release_set）の外に
+# あるタスクを確定の位置に固定して計算する。固定は開始固定日（パス1で先に予約
+# する仕組み）をそのまま使い、日数・チームも確定行の値にそろえる。計算は
+# ワーカースレッドで走るので、DBから組み立てた材料（plan）はGUIスレッドで
+# 先に作り、DB接続を持たない普通の辞書として渡す。
+
+# 違反による影響範囲の拡大は、この回数の計算で打ち切る（§8-7）。
+PLAN_MAX_RUNS = 3
+
+
+def build_plan(db, state):
+    """PlanState から、スケジューラに渡す材料を作る（GUIスレッドで呼ぶ）。
+    state.status が未確定なら None。"""
+    from gui.plan_confirmation import UNCONFIRMED, release_set, successor_map
+
+    def key(k):
+        return (_fmt("JOB", k[0]), _fmt("T", k[1]))
+
+    def fixed_value(row):
+        team = _fmt("TEAM", row["team_id"]) if row["team_id"] is not None else None
+        return (row["start_date"], row["days"], team)
+
+    if state.status == UNCONFIRMED:
+        # 未確定でも、進行中・完了のタスクは確定していた日程で固定する（「未確定に
+        # 戻す」の後に残した実績）。それ以外は通常どおり自由に計算する
+        facts = {key(k): fixed_value(r) for k, r in state.facts.items() if state.active.get(k, False)}
+        if not facts:
+            return None
+        return {"fixed": facts, "not_before": {}, "released": set(), "started": set(facts),
+                "draft_moves": {}, "successors": {}, "lower_bound": None}
+    successors_int = successor_map(db)
+    released_int = release_set(state, successors_int)
+
+    fixed = {}
+    for k, row in state.confirmed.items():
+        if k in released_int or not state.active.get(k, False):
+            continue
+        fixed[key(k)] = fixed_value(row)
+    lower_bound = max(
+        (d for d in (state.replan_base_date, (state.confirmed_at or "")[:10]) if d), default=None,
     )
+    if state.pending_replan:
+        # 基準日は過去の日付も指定できる（警告して許可）ので、確定日より優先する
+        lower_bound = state.pending_replan[0]
+    # 影響範囲のタスクは、確定していた位置より前へは動かさない（合意した日程を
+    # 前倒しするのは、ドラッグでの明示的な移動か全面再計画に限る。§8-7）
+    not_before = {
+        key(k): state.confirmed[k]["start_date"] for k in released_int if k in state.confirmed
+    }
+    if state.pending_replan:
+        # 全面再計画は、未着手タスクを基準日以降に全体として組み直す（前倒しも許す）
+        not_before = {}
+    return {
+        "fixed": fixed,
+        "not_before": not_before,
+        "released": {key(k) for k in released_int},
+        "started": {key(k) for k in state.started},
+        "draft_moves": {key(k): d for k, d in state.draft_moves.items()},
+        "successors": {key(k): [key(n) for n in v] for k, v in successors_int.items()},
+        "lower_bound": lower_bound,
+        "quiet_before": state.quiet_before,
+    }
+
+
+def build_confirmed_plan(state):
+    """確定した日程そのものを出力するための材料（HTML出力で「確定した日程」を
+    選んだとき）。確定行のあるタスクはすべて確定の位置・日数・チームに固定し、
+    確定後に足したタスク（確定行の無いもの）は出力に含めない。"""
+    def key(k):
+        return (_fmt("JOB", k[0]), _fmt("T", k[1]))
+
+    fixed = {}
+    exclude = set()
+    for k, is_active in state.active.items():
+        if not is_active:
+            continue
+        row = state.confirmed.get(k)
+        if row is None:
+            exclude.add(key(k))
+            continue
+        team = _fmt("TEAM", row["team_id"]) if row["team_id"] is not None else None
+        fixed[key(k)] = (row["start_date"], row["days"], team)
+    return {
+        "fixed": fixed, "exclude": exclude, "not_before": {}, "released": set(),
+        "started": set(fixed), "draft_moves": {}, "successors": {}, "lower_bound": None,
+        "quiet_before": state.replanned_at,
+    }
+
+
+def _apply_plan_to_frames(frames, fixed, plan):
+    """確定の位置に固定するタスクを、開始固定日・日数・チームの上書きとして
+    job_tasks に書き込んだ frames の写しを返す（DBは変えない）。"""
+    frames = dict(frames)
+    columns = ["Job_ID", "Task_ID", "Is_Active", "Override_Days", "Milestone_ID", "Team_ID",
+               "Start_Pin_Date", "Not_Before"]
+    rows = {}
+    if frames.get("job_tasks") is not None:
+        for r in frames["job_tasks"].to_dict("records"):
+            rows[(r["Job_ID"], r["Task_ID"])] = r
+    for k, (start, days, team) in fixed.items():
+        r = rows.setdefault(k, {"Job_ID": k[0], "Task_ID": k[1], "Is_Active": "Y"})
+        r["Start_Pin_Date"] = start
+        r["Override_Days"] = days
+        if team is not None:
+            r["Team_ID"] = team
+    for k in plan.get("exclude", ()):
+        r = rows.setdefault(k, {"Job_ID": k[0], "Task_ID": k[1]})
+        r["Is_Active"] = "N"
+    for k, start in plan.get("not_before", {}).items():
+        if k in fixed or k in plan["draft_moves"]:
+            continue
+        r = rows.setdefault(k, {"Job_ID": k[0], "Task_ID": k[1], "Is_Active": "Y"})
+        r["Not_Before"] = start
+    for k, start in plan["draft_moves"].items():
+        if k in fixed:
+            continue
+        r = rows.setdefault(k, {"Job_ID": k[0], "Task_ID": k[1], "Is_Active": "Y"})
+        r["Start_Pin_Date"] = start
+    frames["job_tasks"] = pd.DataFrame(list(rows.values()), columns=columns) if rows else None
+    lower_bound = plan.get("lower_bound")
+    if lower_bound:
+        project = frames["project"].copy()
+        current = str(project.iloc[0]["Start_Date"])
+        if not current or lower_bound > current:
+            project.loc[project.index[0], "Start_Date"] = lower_bound
+        frames["project"] = project
+    return frames
+
+
+def _quiet_past_violations(result_df, quiet_before):
+    """全面再計画を実行した日より前に始まるタスクの違反を消す（§8-6「過去の違反を
+    ノイズにしない」）。もう変えようがない過去の固定同士の重なりなので報告しない。"""
+    if not quiet_before or result_df.empty:
+        return result_df
+    past = (result_df["Start_Date"] < pd.Timestamp(quiet_before)) & (result_df["Constraint_Violation"] != "")
+    if not past.any():
+        return result_df
+    result_df = result_df.copy()
+    result_df.loc[past, "Constraint_Violation"] = ""
+    if "Constraint_Violation_Days" in result_df.columns:
+        result_df.loc[past, "Constraint_Violation_Days"] = 0
+    return result_df
+
+
+def compute_schedule_with_plan(frames, plan, **scheduler_kwargs):
+    """確定を踏まえて計算する（ワーカースレッドから呼んでよい。DBに触れない）。
+
+    影響範囲の外を確定の位置に固定して計算し、固定したタスクが固定どおりに
+    置けなくなった（全体の設定の変更で、固定同士がライン数や依存でぶつかった）
+    未着手のタスクがあれば、それとその後続を影響範囲に加えて計算し直す。
+    タスクの編集そのものからは違反は起きない（編集したタスクの後続は最初から
+    影響範囲にあり、影響範囲のタスクは空いているラインにしか置かれない）ので、
+    通常は2回で収まる。PLAN_MAX_RUNS 回で打ち切り、残った違反はそのまま返す。
+
+    Returns: (result_df, info)。info は {"released": 影響範囲のキー集合, "runs": 計算回数}。
+    """
+    from gui.plan_confirmation import downstream
+
+    fixed = dict(plan["fixed"])
+    plan = dict(plan, not_before=dict(plan.get("not_before", {})))
+    released = set(plan["released"])
+    started = plan["started"]
+    runs = 0
+    while True:
+        runs += 1
+        result_df = compute_schedule_from_frames(
+            _apply_plan_to_frames(frames, fixed, plan), **scheduler_kwargs
+        )
+        result_df = _quiet_past_violations(result_df, plan.get("quiet_before"))
+        if runs >= PLAN_MAX_RUNS or result_df.empty:
+            break
+        broken = result_df[result_df["Constraint_Violation"] != ""]
+        violated = {
+            k for k in zip(broken["Job_ID"], broken["Task_ID"]) if k in fixed and k not in started
+        }
+        if not violated:
+            break
+        added = {k for k in downstream(violated, plan["successors"]) if k not in started}
+        for k in added:
+            was = fixed.pop(k, None)
+            if was is not None:
+                plan["not_before"][k] = was[0]
+        released |= added
+    return result_df, {"released": released, "runs": runs}

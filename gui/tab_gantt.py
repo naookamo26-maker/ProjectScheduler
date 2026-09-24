@@ -30,18 +30,21 @@ gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、ホイー
 他に動いたタスクの件数を状況表示に出して、そのバーを一時的に強調する。
 """
 
-from datetime import timedelta
+from datetime import date, timedelta
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDialog,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMenu,
     QMessageBox,
+    QSizePolicy,
+    QSpacerItem,
     QVBoxLayout,
     QWidget,
 )
@@ -50,7 +53,10 @@ from gui.app_settings import AppSettings
 from gui.db import ProjectDatabaseError, parse_tags
 from gui.gantt_edit import WorkDayCalendar, format_entity_id, parse_entity_id
 from gui.gantt_task_editor import TaskEditWindow
-from gui.gantt_view import FrozenGanttPane, build_gantt_scenes
+from gui.gantt_view import FrozenGanttPane, build_gantt_scenes, set_bar_baseline
+from gui.plan_actions import confirm_all, confirm_selected, selected_targets
+from gui.plan_confirmation import CONFIRMED, DRAFT, UNCONFIRMED, PlanState, successor_map
+from gui.replan_dialog import ReplanDialog
 from gui.widgets_common import (
     ChoiceFilterGroup,
     CollapsibleSection,
@@ -82,6 +88,8 @@ _DRAG_MODIFIER_KEYS = {"shift": Qt.ShiftModifier, "alt": Qt.AltModifier}
 
 
 class GanttTab(QWidget):
+    # 選択が変わった（状態帯の「選択した変更を確定」を押せるかが変わりうる）
+    planSelectionChanged = Signal()
     def __init__(self, db, schedule_cache, app_settings=None, parent=None):
         super().__init__(parent)
         self.db = db
@@ -582,6 +590,7 @@ class GanttTab(QWidget):
         if scenes is None:
             return
         scenes.body.selectionChanged.connect(self._on_selection_changed)
+        self._decorate_plan(scenes.body)
         if view_state is not None:
             # 編集・Undo/Redo の後は、表示位置（縮尺・スクロール）を保つ。
             # 行の並び（ジョブの最早開始日順）が変わりうるので、選択したバーが
@@ -680,13 +689,21 @@ class GanttTab(QWidget):
             return
         keys = [key for key, _d in targets]
 
-        def write():
-            return [
-                self.db.update_job_task_override_fields(
-                    *self._job_and_task_ids(key), start_pin_date=new_start.isoformat()
-                )
-                for key, new_start in targets
-            ]
+        if self.db.has_confirmation():
+            # 確定済みのファイルでは、ドラッグした位置は変更案として記録する（手動ピン
+            # にはしない。「変更を確定」で確定行に書き込まれる。§8-8）。
+            def write():
+                for key, new_start in targets:
+                    self.db.set_draft_move(*self._job_and_task_ids(key), new_start.isoformat())
+                return []
+        else:
+            def write():
+                return [
+                    self.db.update_job_task_override_fields(
+                        *self._job_and_task_ids(key), start_pin_date=new_start.isoformat()
+                    )
+                    for key, new_start in targets
+                ]
         label = "ガントでタスクを移動" if len(keys) == 1 else f"ガントで{len(keys)}件のタスクを移動"
         self._write_tasks(keys, label, write)
 
@@ -794,6 +811,7 @@ class GanttTab(QWidget):
         self._editor.raise_()
 
     def _on_selection_changed(self):
+        self.planSelectionChanged.emit()
         if self._editor is not None and self._editor.isVisible():
             self._editor.set_keys(self.view.selected_keys())
 
@@ -844,6 +862,191 @@ class GanttTab(QWidget):
     def _exec_menu(self, menu, global_pos):
         """メニューを出して選ばれたアクションを返す（テストで差し替えられるよう分けてある）。"""
         return menu.exec(global_pos)
+
+    # -- 計画の確定（docs/roadmap.md §8） ----------------------------------------------
+
+    def _confirmed_positions(self):
+        """{(Job_ID, Task_ID): (確定の開始, 確定の終了)}（結果と同じ時点の確定行）。"""
+        state = self.cache.plan_state
+        if state is None or state.status == UNCONFIRMED:
+            return {}
+        return {
+            (format_entity_id("JOB", j), format_entity_id("T", t)):
+                (date.fromisoformat(r["start_date"]), date.fromisoformat(r["end_date"]))
+            for (j, t), r in state.confirmed.items()
+        }
+
+    def _decorate_plan(self, scene):
+        """確定済みのファイルで、まだ確定していないバーを斜線に、変更案で動いた
+        バーの下に確定していた位置の細線を出す（§8-9）。"""
+        confirmed = self._confirmed_positions()
+        if not confirmed:
+            return
+        for key, bar in scene.gantt_bars.items():
+            pos = confirmed.get(key)
+            if pos is None:
+                bar.unconfirmed = True
+                bar.setToolTip(bar.toolTip() + "\n未確定")
+                continue
+            if pos != (bar.start, bar.end):
+                set_bar_baseline(scene, bar, *pos)
+                bar.setToolTip(
+                    bar.toolTip()
+                    + f"\n確定: {pos[0]:%m/%d}〜{pos[1] - timedelta(days=1):%m/%d}"
+                    + f" → 変更案: {bar.start:%m/%d}〜{bar.end - timedelta(days=1):%m/%d}"
+                )
+
+    def plan_band_summary(self):
+        """状態帯に出す (状態, 文言, 操作できるか)。文言は事実だけを短く書く。"""
+        state = PlanState(self.db)
+        ready = self.cache.is_fresh() and self.cache.error_message is None
+        if state.status == UNCONFIRMED:
+            return UNCONFIRMED, "", ready
+        project = self.db.get_project()
+        if state.status == CONFIRMED:
+            if project["replanned_at"] and project["replan_base_date"]:
+                base = date.fromisoformat(project["replan_base_date"])
+                done = date.fromisoformat(project["replanned_at"][:10])
+                return CONFIRMED, f"{base:%m/%d} から新計画（{done:%m/%d} 再計画）", ready
+            return CONFIRMED, (project["confirmed_at"] or "")[:10], ready
+        # 「変更」は確定済みのタスクへの変更（削除を含む）、「未確定」は確定後に
+        # 足したタスク。同じタスクを両方に数えない。
+        parts = []
+        if state.pending_replan:
+            base = date.fromisoformat(state.pending_replan[0])
+            parts.append(f"全面再計画（{base:%m/%d} から）")
+        edited = sum(1 for k in state.changed if k in state.confirmed)
+        if edited:
+            parts.append(f"変更 {edited}件")
+        unconfirmed = len(state.changed) - edited
+        if unconfirmed:
+            parts.append(f"未確定のタスク {unconfirmed}件")
+        if ready:
+            moved, worst = self._draft_impact()
+            if moved:
+                sign = "+" if worst >= 0 else "−"
+                parts.append(f"影響 {moved}タスク（最大 {sign}{abs(worst)}営業日）")
+            guidance = self._replan_guidance(state)
+            if guidance:
+                parts.append(guidance)
+        else:
+            parts.append("計算中")
+        if state.global_changed:
+            parts.append("全体設定の変更（全面再計画で反映）")
+        return DRAFT, " ｜ ".join(parts), ready
+
+    def _replan_guidance(self, state):
+        """影響範囲が全タスクの一定割合（オプション）を超えたら全面再計画を案内する
+        （固定されたタスクの隙間に押し込むより収まりがよい可能性が高いため。§8-7）。"""
+        info = self.cache.plan_info
+        if state.pending_replan or not info or self._result_df is None or self._result_df.empty:
+            return ""
+        percent = 100 * len(info["released"]) / len(self._result_df)
+        if percent <= self.app_settings.get("full_replan_threshold_percent"):
+            return ""
+        return f"影響が全体の {percent:.0f}%（全面再計画を検討）"
+
+    def _draft_impact(self):
+        """確定から日程が動いたタスクの数と、最大のずれ（営業日。符号付き）。"""
+        confirmed = self._confirmed_positions()
+        moved = 0
+        worst = 0
+        for key, pos in self._task_positions.items():
+            before = confirmed.get(key)
+            if before is None or before == pos[:2]:
+                continue
+            moved += 1
+            shift = self._calendar.diff(before[0], pos[0], self._team_key(key)) if self._calendar else 0
+            if abs(shift) > abs(worst):
+                worst = shift
+        return moved, worst
+
+    def can_confirm_selected(self):
+        """選んでいるタスクに、確定していない変更（またはその影響）があるか。"""
+        state = self.cache.plan_state
+        keys = self.view.selected_keys() if self.view.scene() is not None else []
+        if state is None or state.status != DRAFT or not keys:
+            return False
+        if state.pending_replan:
+            # 全面再計画は全体として組み直した結果なので、一部だけは確定できない
+            return False
+        ids = {self._job_and_task_ids(k) for k in keys}
+        return bool(selected_targets(state, ids, successor_map(self.db)))
+
+    def _ask_plan_action(self, title, text, details, ok_label):
+        """取り消しの大きい操作の確認。ボタンは操作名と「キャンセル」（既定はキャンセル）。"""
+        box = QMessageBox(QMessageBox.Question, title, text, parent=self)
+        box.setInformativeText(details)
+        ok = box.addButton(ok_label, QMessageBox.AcceptRole)
+        cancel = box.addButton("キャンセル", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel)
+        # QMessageBox は幅が狭く、1行の説明が途中で折り返されるので広げる
+        layout = box.layout()
+        layout.addItem(QSpacerItem(560, 0, QSizePolicy.Minimum, QSizePolicy.Expanding),
+                       layout.rowCount(), 0, 1, layout.columnCount())
+        return self._exec_message_box(box) is ok
+
+    def _exec_replan_dialog(self):
+        """全面再計画ダイアログを出して、選んだ基準日を返す（キャンセルなら None。
+        テストで差し替える）。"""
+        dialog = ReplanDialog(self.db, parent=self)
+        return dialog.base_date() if dialog.exec() == QDialog.Accepted else None
+
+    def _exec_message_box(self, box):
+        """確認ダイアログを出して、押されたボタンを返す（テストで差し替える）。"""
+        box.exec()
+        return box.clickedButton()
+
+    def run_plan_action(self, action):
+        """状態帯のボタンの処理。いずれも1回のUndoで戻せる。"""
+        if action in ("confirm", "confirm_selected") and not (
+                self.cache.is_fresh() and self.cache.result_df is not None):
+            QMessageBox.information(self, "計画の確定", "計算が終わってから操作してください。")
+            return
+        try:
+            if action == "confirm":
+                confirm_all(self.db, self.cache.result_df)
+            elif action == "confirm_selected":
+                keys = {self._job_and_task_ids(k) for k in self.view.selected_keys()}
+                if not keys:
+                    QMessageBox.information(
+                        self, "選択した変更を確定", "ガントチャートで、確定したいタスクを選んでください。"
+                    )
+                    return
+                count = confirm_selected(self.db, self.cache.result_df, keys, successor_map(self.db))
+                if count == 0:
+                    QMessageBox.information(
+                        self, "選択した変更を確定", "選んだタスクには、確定していない変更がありません。"
+                    )
+                    return
+            elif action == "replan":
+                base = self._exec_replan_dialog()
+                if base is None:
+                    return
+                self.db.start_full_replan(base.isoformat(), date.today().isoformat())
+            elif action == "discard":
+                if not self._ask_plan_action(
+                    "変更を破棄", "変更案を破棄して、最後に確定した日程に戻しますか？",
+                    "消えるもの: 確定後の変更（ドラッグで動かした位置を含む）\n"
+                    "残るもの: タスクの進捗の更新",
+                    "変更を破棄",
+                ):
+                    return
+                self.db.discard_draft()
+            elif action == "clear":
+                if not self._ask_plan_action(
+                    "未確定に戻す", "プロジェクト全体を未確定に戻しますか？",
+                    "消えるもの: 未着手のタスクの確定日程、変更案（ドラッグで動かした位置を含む）\n"
+                    "残るもの: 進行中・完了のタスクの日程、ジョブ・タスクの設定、手動ピン\n\n"
+                    "戻した後は、未着手のタスクを確定前と同じように計算し直します。",
+                    "未確定に戻す",
+                ):
+                    return
+                self.db.clear_confirmation()
+        except ProjectDatabaseError as e:
+            QMessageBox.warning(self, "計画の確定", str(e))
+            return
+        self.refresh_choices()
 
     # -- 動いたバーの一時的な強調 -------------------------------------------------------
 

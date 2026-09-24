@@ -56,6 +56,11 @@ def test_create_and_reopen_preserves_data(tmp_path):
     db2 = ProjectDatabase.open_existing(str(path))
     assert db2.get_project() == {
         "project_name": "テストプロジェクト", "start_date": "2026-01-01", "distribution_ratio": 0.7,
+        # 計画の確定（docs/roadmap.md §8）の項目。確定していないので空
+        "replan_base_date": None, "replanned_at": None, "confirmed_at": None,
+        "confirmed_global_signature": None,
+        "pending_replan_base_date": None,
+        "pending_replanned_at": None,
     }
     assert db2.list_teams() == [{"id": team_id, "name": "チームA", "max_lines": 2}]
     db2.close()
