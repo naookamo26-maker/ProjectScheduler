@@ -7,13 +7,13 @@
 
 ## 多言語対応（`i18n.py`、`docs/roadmap.md` §11）
 
-- 画面・メッセージ・Undoのラベル・出力ファイルの文言は、原文（日本語）を
+- 画面・メッセージ・Undoのラベル・出力ファイルの文言（ログは除く）は、原文（日本語）を
   `tr("…")`（差し込みは `tr("{n}件", n=n)`）で包んで書く。後で訳す定数には `N_("…")`。
   `@undoable`・`undo_group`・`bind_undo_session` のラベルは記録時に訳されるので包まない。
 - 文言を追加・変更したコミットでは、**同じコミットで `locales/` の3言語（en・vi・zh_CN）の
   訳も更新する**。訳語は `docs/i18n_glossary.md` に必ず従う（新しい用語は先に足す）。
-- 訳の抜け・使われなくなった訳・差し込みの食い違いは `tests/test_i18n.py`（`core`）が
-  検出する。包み終えたファイルは同テストの `MIGRATED_FILES` に載せる。
+- 訳の抜け・使われなくなった訳・差し込みの食い違い・包み忘れ・import 時に評価される
+  `tr()`（モジュール直下・既定引数。定数には `N_()` を使う）は `tests/test_i18n.py`（`core`）が検出する。
 - 日付は全言語で `2026-09-24` 形式。コメント・docstring・ログは翻訳しない。
 
 ## Undo/Redo
@@ -34,7 +34,7 @@
 
 | マーカー | 対象モジュール | 必要な依存 | 件数 / 時間 |
 | --- | --- | --- | --- |
-| `core` | `gui/db.py` `gui/db_schema.py` `gui/undo_manager.py` `gui/gantt_edit.py` `i18n.py` `locales/` | pytestのみ | 88件 / 約2秒 |
+| `core` | `gui/db.py` `gui/db_schema.py` `gui/undo_manager.py` `gui/gantt_edit.py` `i18n.py` `locales/` | pytestのみ | 143件 / 約4秒 |
 | `scheduler` | `project_scheduler.py` `gui/gantt_generator.py` `gui/summary_metrics.py` `gui/plan_confirmation.py` `gui/plan_actions.py` | + pandas, numpy | 146件 / 約2.8秒 |
 | `gui` | `gui/`のウィジェット層・描画層 | + PySide6 + システムライブラリ | 162件 / 約42秒 |
 
@@ -53,7 +53,7 @@
 
 ### 全実行（`pytest`）を行う条件
 
-次のいずれかに当てはまるときだけ、引数なしの`pytest`で396件すべてを回す。
+次のいずれかに当てはまるときだけ、引数なしの`pytest`で451件すべてを回す。
 
 - 利用者から明示的に「全部回して」と指示があったとき。
 - 影響が横断的な変更をしたとき。具体的には、DBスキーマの変更（`gui/db_schema.py`・
@@ -65,7 +65,7 @@
 ### 出力を増やさない
 
 - `pytest.ini`の`addopts`で`-q --no-header --tb=short`が既定になっている。
-  **`-v`は付けない**（396件のテスト名が出力を埋めるだけで、得られる情報は増えない）。
+  **`-v`は付けない**（451件のテスト名が出力を埋めるだけで、得られる情報は増えない）。
 - 失敗を追うときは、全体を回し直さず、失敗したテストだけを名指しで再実行する:
   `pytest tests/test_undo_redo.py::test_foo --tb=long`
 

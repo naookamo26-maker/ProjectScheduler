@@ -51,7 +51,7 @@ class OptionsDialog(QDialog):
             self.language_combo.addItem(LANGUAGE_LABELS[code], code)
         self._select_language(app_settings.get("language"))
         form.addRow(tr("表示言語"), self.language_combo)
-        language_note = QLabel(tr("再起動後に反映（翻訳は作業中のため、一部は日本語のまま表示）"))
+        language_note = QLabel(tr("再起動後に反映"))
         language_note.setForegroundRole(QPalette.PlaceholderText)
         language_note.setWordWrap(True)
         # 説明文は行の全幅に置く（2列目に置くと、訳文が長い言語で折り返した行の

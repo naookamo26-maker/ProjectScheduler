@@ -67,13 +67,14 @@ def current_language():
     return _language
 
 
-def tr(text, **kwargs):
-    """原文 text を今の表示言語に訳す。kwargs は訳文の {名前} に差し込む。"""
+def tr(text, /, **kwargs):
+    """原文 text を今の表示言語に訳す。kwargs は訳文の {名前} に差し込む
+    （text は位置専用なので、差し込みの名前に text を使ってもぶつからない）。"""
     translated = _catalog.get(text) or text
     return translated.format(**kwargs) if kwargs else translated
 
 
-def N_(text):
+def N_(text, /):
     """翻訳の対象だと印を付けるだけで、その場では訳さない（定数の表など、
     表示するときに tr(変数) で訳すもの）。"""
     return text

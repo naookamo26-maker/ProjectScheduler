@@ -29,32 +29,6 @@ SOURCE_FILES = sorted(
 )
 TRANSLATED_LANGUAGES = [code for code, _label in i18n.LANGUAGES if code != i18n.SOURCE_LANGUAGE]
 
-# 文言を tr() 等で包み終えたファイル。ここに載せたファイルでは、包んでいない
-# 日本語の文字列（docstring・ログを除く）があると失敗する。§11 の作業が進むたびに
-# 足していき、最後は SOURCE_FILES 全体になる。
-MIGRATED_FILES = {
-    "i18n.py",
-    "gui/analysis_charts.py",
-    "gui/app_settings.py",
-    "gui/db.py",
-    "gui/db_schema.py",
-    "gui/gantt_generator.py",
-    "gui/gantt_task_editor.py",
-    "gui/gantt_view.py",
-    "gui/main.py",
-    "gui/options_dialog.py",
-    "gui/plan_band.py",
-    "gui/node_canvas.py",
-    "gui/replan_dialog.py",
-    "gui/schedule_cache.py",
-    "gui/summary_metrics.py",
-    "gui/tab_analysis.py",
-    "gui/tab_basic_info.py",
-    "gui/tab_jobs.py",
-    "gui/tab_workflows.py",
-    "gui/tab_gantt.py",
-    "gui/widgets_common.py",
-}
 
 # 翻訳の対象として集める呼び出し（関数名 → 対象の引数の位置）
 _MARKERS = {
@@ -64,8 +38,11 @@ _MARKERS = {
 # のようにロガーのメソッドとして呼んだものだけ（QMessageBox.warning(…) は画面に出るので対象）
 _LOG_METHODS = {"debug", "info", "warning", "error", "exception", "critical"}
 _LOGGERS = {"logger", "logging", "log", "_logger"}
-# 翻訳しない定数（言語の選択肢は、それぞれの言語での呼び名のまま出す。SQL のコメント）
-_EXEMPT_ASSIGNMENTS = {"LANGUAGES", "_SCHEMA_SQL"}
+# 翻訳しない定数（言語の選択肢は、それぞれの言語での呼び名のまま出す。SQL・ログ・HTML
+# テンプレートの日本語はコメントとログだけ。HTMLの文言は _html_texts() で訳して差し込む）
+_EXEMPT_ASSIGNMENTS = {"LANGUAGES", "_SCHEMA_SQL", "_LEVEL_NAME_JA", "_PLOTLY_GANTT_HTML_TEMPLATE"}
+# 翻訳しない関数（日本の祝日の名前は日付の計算のためだけに持ち、画面に出さない）
+_EXEMPT_FUNCTIONS = {"_fixed_and_moving_jp_holidays"}
 _JA = re.compile(r"[぀-ヿ㐀-鿿＀-￯]")
 
 
@@ -111,6 +88,9 @@ def _scan(path):
             for sub in ast.walk(node):
                 exempt_ids.add(id(sub))
     for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in _EXEMPT_FUNCTIONS:
+            for sub in ast.walk(node):
+                exempt_ids.add(id(sub))
         if isinstance(node, ast.Assign) and any(
                 isinstance(t, ast.Name) and t.id in _EXEMPT_ASSIGNMENTS for t in node.targets):
             for sub in ast.walk(node):
@@ -167,10 +147,11 @@ def test_placeholders_match(language):
     assert not wrong, f"{language} の差し込み（{{名前}}）が原文と食い違っています: {wrong[:10]}"
 
 
-@pytest.mark.parametrize("name", sorted(MIGRATED_FILES))
-def test_migrated_files_have_no_bare_japanese(name):
-    bare = _scan(ROOT / name)[1]
-    assert not bare, f"{name} に tr() で包んでいない日本語の文字列があります: {bare[:20]}"
+@pytest.mark.parametrize("path", SOURCE_FILES, ids=lambda p: p.name)
+def test_no_bare_japanese(path):
+    """tr() 等で包んでいない日本語の文字列（docstring・ログ・対象外の定数を除く）が無い。"""
+    bare = _scan(path)[1]
+    assert not bare, f"{path.name} に tr() で包んでいない日本語の文字列があります: {bare[:20]}"
 
 
 def test_tr_falls_back_to_the_source_and_formats():
