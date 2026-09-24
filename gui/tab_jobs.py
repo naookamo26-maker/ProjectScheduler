@@ -592,6 +592,7 @@ class JobsTab(QWidget):
         table.setColumnHidden(_JOB_PLAN_COLUMN, not plan_on)
 
         auto_size_columns(table)
+        self._fit_job_plan_column()
         for column in (1, 2, 3):
             table.setColumnWidth(column, table.columnWidth(column) + _CELL_WIDGET_EXTRA_WIDTH)
         self._sync_job_row_widgets()
@@ -1086,6 +1087,13 @@ class JobsTab(QWidget):
             item.setForeground(QColor(_PLAN_QUIET_COLOR))
         return item
 
+    def _fit_job_plan_column(self):
+        """「確定」列は中身（「確定」「変更 2」等の短い文字）に合わせて詰める
+        （他の列と同じ最小幅だと、ほぼ全行が「確定」なのに幅を取りすぎるため）。"""
+        table = self.jobs_section.table
+        table.resizeColumnToContents(_JOB_PLAN_COLUMN)
+        table.setColumnWidth(_JOB_PLAN_COLUMN, max(table.columnWidth(_JOB_PLAN_COLUMN), 44))
+
     def _refresh_plan_marks(self):
         """編集の後、表を作り直さずに確定の表示だけを更新する（スピンボックスの
         連続操作中にウィジェットを差し替えないため。_on_override_changed 参照）。"""
@@ -1098,6 +1106,7 @@ class JobsTab(QWidget):
                 table.setItem(row, _JOB_PLAN_COLUMN,
                               self._job_plan_item(summary.get(job_id, (JOB_CONFIRMED, 0, 0))))
             table.blockSignals(False)
+            self._fit_job_plan_column()
         self._update_override_plan_marks()
 
     def _update_override_plan_marks(self):
