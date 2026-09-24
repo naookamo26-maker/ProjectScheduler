@@ -42,6 +42,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
     QMessageBox,
+    QSizePolicy,
+    QSpacerItem,
     QVBoxLayout,
     QWidget,
 )
@@ -949,6 +951,24 @@ class GanttTab(QWidget):
         ids = {self._job_and_task_ids(k) for k in keys}
         return bool(selected_targets(state, ids, successor_map(self.db)))
 
+    def _ask_plan_action(self, title, text, details, ok_label):
+        """取り消しの大きい操作の確認。ボタンは操作名と「キャンセル」（既定はキャンセル）。"""
+        box = QMessageBox(QMessageBox.Question, title, text, parent=self)
+        box.setInformativeText(details)
+        ok = box.addButton(ok_label, QMessageBox.AcceptRole)
+        cancel = box.addButton("キャンセル", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel)
+        # QMessageBox は幅が狭く、1行の説明が途中で折り返されるので広げる
+        layout = box.layout()
+        layout.addItem(QSpacerItem(460, 0, QSizePolicy.Minimum, QSizePolicy.Expanding),
+                       layout.rowCount(), 0, 1, layout.columnCount())
+        return self._exec_message_box(box) is ok
+
+    def _exec_message_box(self, box):
+        """確認ダイアログを出して、押されたボタンを返す（テストで差し替える）。"""
+        box.exec()
+        return box.clickedButton()
+
     def run_plan_action(self, action):
         """状態帯のボタンの処理。いずれも1回のUndoで戻せる。"""
         if action in ("confirm", "confirm_selected") and not (
@@ -972,16 +992,22 @@ class GanttTab(QWidget):
                     )
                     return
             elif action == "discard":
-                if QMessageBox.question(
-                    self, "変更を破棄", "変更案を破棄して、最後に確定した時点に戻しますか？\n"
-                    "（タスクの状態の更新は残ります）",
-                ) != QMessageBox.Yes:
+                if not self._ask_plan_action(
+                    "変更を破棄", "変更案を破棄して、最後に確定した日程に戻しますか？",
+                    "消えるもの: 確定後の変更（ドラッグで動かした位置を含む）\n"
+                    "残るもの: タスクの進捗の更新",
+                    "変更を破棄",
+                ):
                     return
                 self.db.discard_draft()
             elif action == "clear":
-                if QMessageBox.question(
-                    self, "確定を解除", "確定を解除しますか？\n（手動ピンは残ります）",
-                ) != QMessageBox.Yes:
+                if not self._ask_plan_action(
+                    "未確定に戻す", "プロジェクト全体を未確定に戻しますか？",
+                    "消えるもの: 確定した日程、変更案（ドラッグで動かした位置を含む）\n"
+                    "残るもの: ジョブ・タスクの設定、手動ピン、進捗\n\n"
+                    "戻した後は、確定前と同じように全体を計算し直します。",
+                    "未確定に戻す",
+                ):
                     return
                 self.db.clear_confirmation()
         except ProjectDatabaseError as e:

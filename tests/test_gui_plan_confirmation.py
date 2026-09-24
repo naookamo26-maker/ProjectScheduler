@@ -13,8 +13,6 @@ import pytest
 pytest.importorskip("PySide6")
 pytest.importorskip("pandas")
 
-from PySide6.QtWidgets import QMessageBox  # noqa: E402
-
 from test_gui_gantt_edit import (  # noqa: E402,F401  (gantt/qapp はフィクスチャ)
     _drag,
     _key,
@@ -29,6 +27,14 @@ from test_gui_gantt_edit import (  # noqa: E402,F401  (gantt/qapp はフィク�
 from gui.plan_confirmation import CONFIRMED, DRAFT, UNCONFIRMED  # noqa: E402
 
 pytestmark = pytest.mark.gui
+
+
+def _answer(tab, label):
+    """確認ダイアログで、label のボタンを押したことにする。"""
+    return patch.object(
+        tab, "_exec_message_box",
+        side_effect=lambda box: next(b for b in box.buttons() if b.text() == label),
+    )
 
 
 def _band_settled(qapp, w, status):
@@ -93,7 +99,7 @@ def test_dragging_after_confirming_makes_a_draft_with_a_baseline(qapp, gantt):
         assert button.isVisible()
 
     # 変更を破棄すると、確定した位置に戻る
-    with patch.object(QMessageBox, "question", return_value=QMessageBox.Yes):
+    with _answer(tab, "変更を破棄"):
         w.plan_band.discard_button.click()
     assert _band_settled(qapp, w, CONFIRMED)
     _wait_recomputed(qapp, tab)
@@ -153,10 +159,10 @@ def test_confirm_selected_is_grayed_out_unless_a_changed_task_is_selected(qapp, 
 def test_clearing_the_confirmation_asks_first(qapp, gantt):
     w, _tab, _ids = gantt
     _confirm(qapp, w)
-    with patch.object(QMessageBox, "question", return_value=QMessageBox.No):
+    with _answer(w.tab_gantt, "キャンセル"):
         w.plan_band.clear_button.click()
     assert w.db.has_confirmation()
-    with patch.object(QMessageBox, "question", return_value=QMessageBox.Yes):
+    with _answer(w.tab_gantt, "未確定に戻す"):
         w.plan_band.clear_button.click()
     assert _band_settled(qapp, w, UNCONFIRMED)
     assert not w.db.has_confirmation()

@@ -1416,9 +1416,9 @@ class ProjectDatabase:
             rows,
         )
 
-    @undoable("確定を解除")
+    @undoable("未確定に戻す")
     def clear_confirmation(self):
-        """確定を解除する（手動ピンは残す）。変更案の記録と基準日も消す。"""
+        """プロジェクト全体を未確定に戻す（手動ピン・進捗は残す）。変更案の記録と基準日も消す。"""
         self._conn.execute("DELETE FROM confirmed_schedule")
         self._conn.execute("DELETE FROM draft_moves")
         self._conn.execute("DELETE FROM draft_base")

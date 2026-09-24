@@ -45,7 +45,7 @@ class PlanStatusBand(QFrame):
         self.confirm_draft_button = QPushButton("変更を確定")
         self.confirm_selected_button = QPushButton("選択した変更を確定")
         self.discard_button = QPushButton("変更を破棄")
-        self.clear_button = QPushButton("確定を解除")
+        self.clear_button = QPushButton("未確定に戻す")
         self.confirm_button.clicked.connect(self.confirmRequested)
         self.confirm_draft_button.clicked.connect(self.confirmRequested)
         self.confirm_selected_button.clicked.connect(self.confirmSelectedRequested)
