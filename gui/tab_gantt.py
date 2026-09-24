@@ -21,7 +21,16 @@ gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、ホイー
 
 ジョブはそのジョブの最初のタスクの開始日が早い順。マイルストーンは縦線として
 表示する。
+
+タスクの編集（docs/roadmap.md §9）: バーを選んで、Shift（オプションで変更可）を
+押しながらドラッグすると開始日の移動（右端なら期間の伸縮）、ダブルクリックで
+編集ウィンドウ（gui/gantt_task_editor.py）、右クリックでメニュー。書き込み先は
+タスク上書き（開始日は手動ピン＝start_pin_date、期間は日数上書き）で、1回の
+操作が1つのUndo単位。書き込んだ後は再計算し、表示位置と選択を保ったまま、
+他に動いたタスクの件数を状況表示に出して、そのバーを一時的に強調する。
 """
+
+from datetime import timedelta
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFontMetrics
@@ -31,11 +40,16 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
+    QMessageBox,
     QVBoxLayout,
     QWidget,
 )
 
-from gui.db import parse_tags
+from gui.app_settings import AppSettings
+from gui.db import ProjectDatabaseError, parse_tags
+from gui.gantt_edit import WorkDayCalendar, format_entity_id, parse_entity_id
+from gui.gantt_task_editor import TaskEditWindow
 from gui.gantt_view import FrozenGanttPane, build_gantt_scenes
 from gui.widgets_common import (
     ChoiceFilterGroup,
@@ -63,10 +77,31 @@ _PLACEMENT_CONTROL_WIDTH = 420
 _SEARCH_DEBOUNCE_MS = 300
 
 
+# オプション（gui/app_settings.py の gantt_drag_modifier）の値 → Qtの修飾キー
+_DRAG_MODIFIER_KEYS = {"shift": Qt.ShiftModifier, "alt": Qt.AltModifier}
+
+
 class GanttTab(QWidget):
-    def __init__(self, db, schedule_cache, parent=None):
+    def __init__(self, db, schedule_cache, app_settings=None, parent=None):
         super().__init__(parent)
         self.db = db
+        self.app_settings = app_settings or AppSettings()
+        # -- タスクの編集（§9） --
+        # 編集で書き込んだ後、次の再計算結果を描くときに使う（表示位置・選択を保ち、
+        # 動いたバーを数える）。編集以外の再描画（絞り込み等）では None。
+        self._pending_edit = None
+        # Undo/Redo・編集の後に復元したい選択（キーの並び）。
+        self._pending_selection = None
+        self._pending_view_state = None
+        self._moved_note = ""
+        self._highlighted_keys = []
+        self._calendar = None
+        self._task_positions = {}   # {(Job_ID, Task_ID): (開始, 終了, タスク名)}
+        self._predecessors = None   # {(Job_ID, Task_ID): [(先行キー, 種別)]}（遅延構築）
+        self._editor = None
+        self._highlight_timer = QTimer(self)
+        self._highlight_timer.setSingleShot(True)
+        self._highlight_timer.timeout.connect(self._clear_moved_highlight)
         # 結果（_result_df/_display）は ScheduleCache が一元管理する
         # （gui/schedule_cache.py 参照。プロジェクト分析タブと共有する）。
         # ここに持つ同名の属性は、cache の現在の内容を写した「表示用の
@@ -211,6 +246,19 @@ class GanttTab(QWidget):
         self.view = FrozenGanttPane()
         layout.addWidget(self.view, 1)
 
+        body = self.view.body
+        body.moveRequested.connect(self._on_move_requested)
+        body.resizeRequested.connect(self._on_resize_requested)
+        body.editRequested.connect(self.open_editor)
+        body.contextMenuRequested.connect(self._show_context_menu)
+        body.pressed.connect(self._on_body_pressed)
+        body.move_hint_provider = self._move_hint
+        self.apply_app_settings()
+
+    def apply_app_settings(self):
+        """オプション（ドラッグのキー等）を反映する。起動時とオプション変更時に呼ぶ。"""
+        self.view.body.drag_modifier = _DRAG_MODIFIER_KEYS[self.app_settings.get("gantt_drag_modifier")]
+
     def _sync_placement_widgets(self, ratio):
         """配置コントロールのスライダー・スピンボックスの表示をratioに合わせる
         （シグナルを止めて行う——ここからの再計算・DB書き込みは発生させない）。"""
@@ -334,9 +382,36 @@ class GanttTab(QWidget):
 
     def _apply_result(self):
         """計算済みの結果でタブ内の表示（絞り込み選択肢・チャート）を作り直す。"""
+        self._calendar = WorkDayCalendar.from_display(self._display)
+        self._predecessors = None
+        previous_positions = self._task_positions
+        df = self._result_df
+        self._task_positions = {
+            (j, t): (s.date(), e.date(), n)
+            for j, t, s, e, n in zip(df["Job_ID"], df["Task_ID"], df["Start_Date"],
+                                     df["End_Date"], df["Task_Name"])
+        }
+        moved = []
+        if self._pending_edit is not None:
+            edited = self._pending_edit["keys"]
+            moved = [
+                key for key, pos in self._task_positions.items()
+                if key not in edited and key in previous_positions
+                and previous_positions[key][:2] != pos[:2]
+            ]
+            self._moved_note = f"他に{len(moved)}件のタスクが動きました。" if moved else ""
+            if self._pending_edit.get("note"):
+                self._moved_note += self._pending_edit["note"]
+        else:
+            self._moved_note = ""
         self._rebuild_filters()
         self._refresh_chart()
-        self._set_status(*self._result_summary())
+        self._pending_edit = None
+        self._set_highlight(moved)
+        message, is_error = self._result_summary()
+        self._set_status(message + self._moved_note, is_error)
+        if self._editor is not None and self._editor.isVisible():
+            self._editor.reload()
 
     def _result_summary(self):
         """状況表示に出す文言と、エラー扱いにするかどうかを返す。
@@ -381,6 +456,8 @@ class GanttTab(QWidget):
         ように誤解させてしまうため。"""
         self._result_df = None
         self._display = None
+        self._pending_edit = None
+        self._task_positions = {}
         self.view.setScene(None)
         self._rebuild_filters()
         self._set_status(status_message, is_error=is_error)
@@ -489,9 +566,32 @@ class GanttTab(QWidget):
             )
             df = df[df["Job_ID"].isin(overrun_job_ids)]
 
+        selection = self._pending_selection
+        view_state = self._pending_view_state
+        if selection is None and self.view.scene() is not None:
+            # 絞り込みの変更などで描き直すときも、表示中のバーの選択は保つ
+            selection = self.view.selected_keys()
+        self._pending_selection = None
+        self._pending_view_state = None
+
         scenes = build_gantt_scenes(df, self._display, color_by="team")
         self.view.setScene(scenes)
-        if scenes is not None:
+        body = self.view.body
+        body.edit_enabled = scenes is not None
+        body.calendar = self._calendar
+        if scenes is None:
+            return
+        scenes.body.selectionChanged.connect(self._on_selection_changed)
+        if view_state is not None:
+            # 編集・Undo/Redo の後は、表示位置（縮尺・スクロール）を保つ。
+            # 行の並び（ジョブの最早開始日順）が変わりうるので、選択したバーが
+            # 見えるようにスクロールし直す。
+            self.view.restore_view_state(view_state)
+            self.view.select_keys(selection or [], ensure_visible=True)
+            QTimer.singleShot(0, lambda: self._restore_view_after_layout(view_state, selection))
+        else:
+            if selection:
+                self.view.select_keys(selection)
             # setScene直後はビューポートのジオメトリがまだ確定していないことが
             # あるため、次のイベントループでスケジュール全体が収まるようズームを
             # 合わせる（gui/node_canvas.py の fit_all() と同じ考え方）。
@@ -499,3 +599,292 @@ class GanttTab(QWidget):
 
     def _fit_chart_view(self):
         self.view.fit_all()
+
+    def _restore_view_after_layout(self, view_state, selection):
+        if self.view.scene() is None:
+            return
+        self.view.restore_view_state(view_state)
+        if selection:
+            self.view.select_keys(selection, ensure_visible=True)
+
+    # -- タスクの編集（docs/roadmap.md §9） -------------------------------------------
+
+    def _job_and_task_ids(self, key):
+        return parse_entity_id(key[0]), parse_entity_id(key[1])
+
+    def _write_tasks(self, keys, label, write, note=""):
+        """write() を1つのUndo単位で実行し、再計算を要求する。
+
+        書き込みの前に、表示位置・選択・今の日程を覚えておき、次の再計算結果を
+        描くときに使う（_apply_result / _refresh_chart）。"""
+        self._pending_edit = {"keys": set(keys), "note": note}
+        self._pending_selection = self.view.selected_keys() or list(keys)
+        self._pending_view_state = self.view.view_state() if self.view.scene() is not None else None
+        self._clear_moved_highlight()
+        try:
+            with self.db.undo_group(label):
+                results = write()
+        except ProjectDatabaseError as e:
+            self._pending_edit = None
+            self._pending_selection = None
+            self._pending_view_state = None
+            QMessageBox.warning(self, "タスクの編集", str(e))
+            return
+        adjusted = sum(
+            (1 if r["milestone_raised"] else 0) + len(r["milestone_cascaded"])
+            for r in (results or []) if r
+        )
+        if adjusted:
+            self._pending_edit["note"] += f"マイルストーンの前後関係を保つため、{adjusted}件のマイルストーンを自動調整しました。"
+        self.refresh_choices()
+
+    def apply_task_fields(self, keys, label, fields):
+        """keys の各タスクの上書き列を変える。fields は列→値の辞書、または
+        編集ウィンドウの行（editor_task_rows の1要素）を受け取って辞書を返す関数。"""
+        rows = {r["key"]: r for r in self.editor_task_rows(keys)} if callable(fields) else {}
+
+        def write():
+            results = []
+            for key in keys:
+                job_id, task_id = self._job_and_task_ids(key)
+                values = fields(rows[key]) if callable(fields) else fields
+                results.append(self.db.update_job_task_override_fields(job_id, task_id, **values))
+            return results
+        self._write_tasks(keys, label, write)
+
+    def shift_tasks(self, keys, n):
+        """keys の各タスクの開始日を、そのチームの営業日で n 日ずらして固定する。"""
+        if self._calendar is None:
+            return
+        targets = []
+        for key in keys:
+            pos = self._task_positions.get(key)
+            if pos is None:
+                continue
+            team_key = self._team_key(key)
+            targets.append((key, self._calendar.shift(pos[0], n, team_key)))
+        self._on_move_requested(targets, n)
+
+    def _team_key(self, key):
+        bar = self.view.bars().get(key)
+        if bar is not None:
+            return bar.team_key
+        df = self._result_df
+        match = df[(df["Job_ID"] == key[0]) & (df["Task_ID"] == key[1])]
+        return match.iloc[0]["Team_ID"] if not match.empty else None
+
+    def _on_move_requested(self, targets, shift):
+        """ドラッグ（または編集ウィンドウの「ずらす」）で決まった新しい開始日を、
+        手動ピン（開始固定日）として書き込む。"""
+        if not targets:
+            return
+        keys = [key for key, _d in targets]
+
+        def write():
+            return [
+                self.db.update_job_task_override_fields(
+                    *self._job_and_task_ids(key), start_pin_date=new_start.isoformat()
+                )
+                for key, new_start in targets
+            ]
+        label = "ガントでタスクを移動" if len(keys) == 1 else f"ガントで{len(keys)}件のタスクを移動"
+        self._write_tasks(keys, label, write)
+
+    def _on_resize_requested(self, key, new_days):
+        """バー右端のドラッグで決まった期間（営業日）を、日数上書きとして書き込む。
+        既定の日数と同じになったら上書きを外す（差分のみ保持）。"""
+        rows = self.editor_task_rows([key])
+        if not rows:
+            return
+        override = None if new_days == rows[0]["default_days"] else new_days
+        job_id, task_id = self._job_and_task_ids(key)
+        self._write_tasks(
+            [key], "ガントでタスクの期間を変更",
+            lambda: [self.db.update_job_task_override_fields(job_id, task_id, override_days=override)],
+        )
+
+    def _move_hint(self, key, new_start):
+        """ドラッグ中の注意書き。先行タスクの完了（SSなら開始）より前に置こうと
+        しているときだけ返す。拒否はしない（矛盾する固定もそのまま保存し、結果と
+        して違反を返す既存の方針どおり）。
+
+        誤った警告を出さないよう、確実に言える場合だけを見る: ラグが0以上の依存
+        （ラグは開始をさらに遅らせる方向にしか働かない）で、先行タスクが今の結果に
+        載っているもの。"""
+        if self._predecessors is None:
+            self._predecessors = self._build_predecessors()
+        for pred_key, dep_type in self._predecessors.get(key, ()):
+            pos = self._task_positions.get(pred_key)
+            if pos is None:
+                continue
+            bound = pos[0] if dep_type == "SS" else pos[1]
+            if new_start < bound:
+                what = "開始" if dep_type == "SS" else "完了"
+                return f"先行タスク「{pos[2]}」の{what}より前です"
+        return None
+
+    def _build_predecessors(self):
+        preds = {}
+        job_workflows = {j["id"]: j["workflow_id"] for j in self.db.list_jobs()}
+        deps_by_workflow = {}
+        for job_id, workflow_id in job_workflows.items():
+            if workflow_id not in deps_by_workflow:
+                deps_by_workflow[workflow_id] = [
+                    d for d in self.db.list_task_dependencies(workflow_id) if d["lag_days"] >= 0
+                ]
+            job_key = format_entity_id("JOB", job_id)
+            for d in deps_by_workflow[workflow_id]:
+                preds.setdefault((job_key, format_entity_id("T", d["successor_task_id"])), []).append(
+                    ((job_key, format_entity_id("T", d["predecessor_task_id"])), d["dep_type"])
+                )
+        for e in self.db.list_external_dependencies():
+            if not e["is_active"]:
+                continue
+            preds.setdefault(
+                (format_entity_id("JOB", e["job_id"]), format_entity_id("T", e["workflow_task_id"])), []
+            ).append((
+                (format_entity_id("JOB", e["depends_on_job_id"]),
+                 format_entity_id("T", e["depends_on_workflow_task_id"])),
+                "FS",
+            ))
+        return preds
+
+    def editor_task_rows(self, keys):
+        """編集ウィンドウ用に、各タスクの上書きの現在値と計算上の日程をまとめる。"""
+        by_job = {}
+        rows = []
+        milestones = {m["id"]: m["name"] for m in self.db.list_milestones()}
+        jobs = {j["id"]: j for j in self.db.list_jobs()}
+        for key in keys:
+            job_id, task_id = self._job_and_task_ids(key)
+            job = jobs.get(job_id)
+            if job is None:
+                continue
+            if job_id not in by_job:
+                by_job[job_id] = {r["workflow_task_id"]: r for r in self.db.list_job_tasks_with_overrides(job_id)}
+            r = by_job[job_id].get(task_id)
+            if r is None:
+                continue
+            pos = self._task_positions.get(key)
+            team_key = self._team_key(key) if pos is not None else None
+            default_ms = milestones.get(job["default_milestone_id"], "未設定")
+            rows.append({
+                **r,
+                "key": key,
+                "job_name": job["name"],
+                "default_milestone_name": default_ms,
+                "start": pos[0] if pos else None,
+                "last_day": (pos[1] - timedelta(days=1)) if pos else None,
+                "working_days": self._calendar.count(pos[0], pos[1], team_key)
+                if pos and self._calendar else None,
+            })
+        return rows
+
+    def team_options(self):
+        return [(t["id"], t["name"]) for t in self.db.list_teams()]
+
+    def milestone_options(self):
+        return [(m["id"], m["name"]) for m in self.db.list_milestones()]
+
+    def open_editor(self):
+        if self._editor is None:
+            self._editor = TaskEditWindow(self)
+        self._editor.set_keys(self.view.selected_keys())
+        self._editor.show()
+        self._editor.raise_()
+
+    def _on_selection_changed(self):
+        if self._editor is not None and self._editor.isVisible():
+            self._editor.set_keys(self.view.selected_keys())
+
+    def _show_context_menu(self, global_pos):
+        keys = self.view.selected_keys()
+        if not keys:
+            return
+        bars = self.view.bars()
+        menu = QMenu(self)
+        edit_action = menu.addAction("編集…")
+        menu.addSeparator()
+        pin_action = menu.addAction("開始日を固定")
+        unpin_action = menu.addAction("固定を解除")
+        unpin_action.setEnabled(any(bars[k].pinned for k in keys if k in bars))
+        status_menu = menu.addMenu("状態")
+        status_actions = {
+            status_menu.addAction(label): value
+            for value, label in ((None, "未着手"), ("in_progress", "進行中"), ("done", "完了"))
+        }
+        team_menu = menu.addMenu("チーム")
+        team_actions = {team_menu.addAction("（既定を使用）"): None}
+        team_menu.addSeparator()
+        for team_id, name in self.team_options():
+            team_actions[team_menu.addAction(name)] = team_id
+        menu.addSeparator()
+        disable_action = menu.addAction("無効にする")
+
+        chosen = self._exec_menu(menu, global_pos)
+        if chosen is None:
+            return
+        if chosen is edit_action:
+            self.open_editor()
+        elif chosen is pin_action:
+            starts = {k: self._task_positions[k][0] for k in keys if k in self._task_positions}
+            self.apply_task_fields(
+                list(starts), "タスクの開始日を固定",
+                lambda r: {"start_pin_date": starts[r["key"]].isoformat()},
+            )
+        elif chosen is unpin_action:
+            self.apply_task_fields(keys, "タスクの開始日の固定を解除", {"start_pin_date": None})
+        elif chosen in status_actions:
+            self.apply_task_fields(keys, "タスクの状態を変更", {"status": status_actions[chosen]})
+        elif chosen in team_actions:
+            self.apply_task_fields(keys, "タスクのチームを変更", {"team_id": team_actions[chosen]})
+        elif chosen is disable_action:
+            self.apply_task_fields(keys, "タスクを無効にする", {"is_active": False})
+
+    def _exec_menu(self, menu, global_pos):
+        """メニューを出して選ばれたアクションを返す（テストで差し替えられるよう分けてある）。"""
+        return menu.exec(global_pos)
+
+    # -- 動いたバーの一時的な強調 -------------------------------------------------------
+
+    def _set_highlight(self, keys):
+        self._clear_moved_highlight()
+        bars = self.view.bars()
+        self._highlighted_keys = [k for k in keys if k in bars]
+        for key in self._highlighted_keys:
+            bars[key].set_highlighted(True)
+        seconds = self.app_settings.get("moved_bar_highlight_seconds")
+        if self._highlighted_keys and seconds > 0:
+            self._highlight_timer.start(seconds * 1000)
+
+    def _clear_moved_highlight(self):
+        self._highlight_timer.stop()
+        bars = self.view.bars()
+        for key in self._highlighted_keys:
+            if key in bars:
+                bars[key].set_highlighted(False)
+        self._highlighted_keys = []
+
+    def _on_body_pressed(self):
+        # 既定（0秒＝次の操作まで）のときは、次のクリックで強調を消す
+        if self.app_settings.get("moved_bar_highlight_seconds") == 0:
+            self._clear_moved_highlight()
+
+    # -- Undo/Redo（選択と表示位置） -----------------------------------------------------
+
+    def capture_ui_state(self):
+        if self.view.scene() is None:
+            return None
+        return {"selection": self.view.selected_keys(), "view": self.view.view_state()}
+
+    def restore_ui_state(self, state):
+        """gui/main.py の _restore_ui_state から、refresh_choices() の直後に呼ばれる。
+        再計算が終わっていれば今すぐ、まだならその結果を描くときに選択と表示位置を戻す。"""
+        if not state:
+            return
+        if self.cache.is_fresh() and self.view.scene() is not None:
+            self.view.restore_view_state(state["view"])
+            self.view.select_keys(state["selection"], ensure_visible=True)
+        else:
+            self._pending_selection = state["selection"]
+            self._pending_view_state = state["view"]

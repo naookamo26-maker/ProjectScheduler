@@ -33,8 +33,8 @@ from project_scheduler import SchedulingError
 gc.disable()
 
 
-class _ScheduleWorker(QObject):
-    """スケジューリングをGUIスレッドの外で実行するためのワーカー。
+class _ScheduleThread(QThread):
+    """スケジューリングをGUIスレッドの外で実行するスレッド。
 
     受け取るのは build_frames() が作ったDataFrame群だけで、DB接続は持たない
     （sqlite3の接続はスレッドをまたげないうえ、計算中にGUI側がDBを書き換えると
@@ -44,13 +44,27 @@ class _ScheduleWorker(QObject):
     完了したら結果を、失敗したら例外メッセージを、いずれも要求時の通し番号
     （seq）付きでシグナルとして返す。呼び出し側は自分が最後に出した要求の
     番号と照合し、古い要求の結果を捨てる。
+
+    以前は QObject のワーカーを moveToThread() でこのスレッドへ移し、スレッドの
+    終了（finished）に worker.deleteLater() を繋いでいた。そうすると、ワーカー
+    （と、それが抱える大きなDataFrame群）の破棄が**終了しかけのワーカー
+    スレッド上で**起きる。その瞬間にGUIスレッドがGILを手放す処理（sqlite3の
+    close等）をしていると両者が衝突し、テストの後片付けで数回に1回
+    Segmentation fault になっていた（faulthandler で「落ちたのはPythonの
+    フレームを持たないスレッド、GUIスレッドは db.close() の中」と確認）。
+
+    いまは QThread 自体に run() を持たせ、スレッドのオブジェクトはGUIスレッドに
+    置いたままにする。ワーカースレッド上ではPythonのオブジェクトを破棄しない
+    （入力のDataFrame群はスレッドのオブジェクトと一緒に、GUIスレッドで解放される）。
+    スレッドのオブジェクトの破棄は、GUIスレッドが wait() で終了を確かめてから
+    行う（ScheduleCache._on_worker_thread_finished）。
     """
 
-    finished = Signal(int, object)   # (seq, result_df)
-    failed = Signal(int, str)        # (seq, エラーメッセージ)
+    computed = Signal(int, object)  # (seq, result_df)
+    failed = Signal(int, str)       # (seq, エラーメッセージ)
 
-    def __init__(self, seq, frames, distribution_ratio):
-        super().__init__()
+    def __init__(self, seq, frames, distribution_ratio, parent=None):
+        super().__init__(parent)
         self._seq = seq
         self._frames = frames
         self._distribution_ratio = distribution_ratio
@@ -65,7 +79,7 @@ class _ScheduleWorker(QObject):
         except Exception as e:  # noqa: BLE001 - ワーカースレッドで例外を握り潰さない
             self.failed.emit(self._seq, f"予期しないエラー: {e}")
         else:
-            self.finished.emit(self._seq, result_df)
+            self.computed.emit(self._seq, result_df)
 
 
 class ScheduleCache(QObject):
@@ -158,38 +172,36 @@ class ScheduleCache(QObject):
 
         実行中の古いスレッドは、結果を捨てる（通し番号で判定）だけで止めずに
         放置する。スケジューリングはDBに触れない純粋な計算なので、放置しても
-        害はなく、途中で強制終了させるより安全なため（終了は quit()/wait() を
-        shutdown() でまとめて待つ）。
+        害はなく、途中で強制終了させるより安全なため（終了は wait() で
+        shutdown() がまとめて待つ）。
 
         複数本が同時に走っている状態になり得るため、self._threads に全件を
         保持しておかないと、shutdown() が最後の1本しか待たずに終了し、
         それより前に始まった実行中のスレッドを残したままウィンドウが
         閉じてしまう（"QThread: Destroyed while thread is still running"）。"""
-        thread = QThread(self)
-        worker = _ScheduleWorker(seq, frames, distribution_ratio)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_schedule_finished)
-        worker.failed.connect(self._on_schedule_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        # deleteLater() によるQt側の破棄後、追跡リストからも手放す
-        # （self._threads がPython側の唯一の参照であり続けないよう、
-        # 終わったスレッドをいつまでも溜め込まない）。self（GUIスレッドに
-        # 属するQObject）の束縛メソッドを繋ぐことで、PySide側が自動的に
-        # キュー接続にしてくれる——ラムダ等の素のcallableを直接繋ぐと
+        thread = _ScheduleThread(seq, frames, distribution_ratio, self)
+        # スレッドのオブジェクトはGUIスレッドに属するので、run() の中から
+        # emit したシグナルは自動的にキュー接続になり、GUIスレッドで受け取る。
+        thread.computed.connect(self._on_schedule_finished)
+        thread.failed.connect(self._on_schedule_failed)
+        # self（GUIスレッドに属するQObject）の束縛メソッドを繋ぐことで、PySide側が
+        # 自動的にキュー接続にしてくれる——ラムダ等の素のcallableを直接繋ぐと
         # ワーカースレッド側で実行されてしまい、GUIスレッドの self._threads を
         # ロック無しで書き換えることになる（sender()で「どのスレッドが
         # 終わったか」をGUIスレッド側から安全に判定する）。
         thread.finished.connect(self._on_worker_thread_finished)
-        self._threads.append((thread, worker))
+        self._threads.append(thread)
         thread.start()
 
     def _on_worker_thread_finished(self):
+        """finished はスレッドが終わる直前に発火するため、wait() で本当に終わった
+        ことを確かめてから、GUIスレッドで破棄する（_ScheduleThread のdocstring参照）。"""
         thread = self.sender()
-        self._threads = [(t, w) for t, w in self._threads if t is not thread]
+        if thread is None:
+            return
+        thread.wait()
+        self._threads = [t for t in self._threads if t is not thread]
+        thread.deleteLater()
 
     def _cancel_pending_request(self):
         """実行中の要求の結果を無視する（通し番号を進めるだけ）。"""
@@ -226,11 +238,11 @@ class ScheduleCache(QObject):
         追跡している全スレッドを待つ）。"""
         self._cancel_pending_request()
         threads, self._threads = self._threads, []
-        for thread, _worker in threads:
+        for thread in threads:
             try:
-                if thread.isRunning():
-                    thread.quit()
-                    thread.wait(5000)
+                # 計算の途中で止める手段は無い（止めるより待つ方が安全）ので、
+                # 終わるまで待つ。
+                thread.wait(5000)
             except RuntimeError:
                 # 既にdeleteLater()で破棄済み（＝計算は完了している）
                 pass

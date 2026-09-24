@@ -1282,6 +1282,62 @@ class ProjectDatabase:
         )
         self._commit()
 
+    # 上書き行の各列の既定値（＝「上書きなし」）。すべて既定なら行を持たない。
+    _OVERRIDE_DEFAULTS = {
+        "is_active": True, "override_days": None, "milestone_id": None, "team_id": None,
+        "start_pin_date": None, "tags": "", "status": None,
+    }
+
+    @undoable("タスク上書きを変更")
+    def update_job_task_override_fields(self, job_id, workflow_task_id, **fields):
+        """タスク上書きのうち、指定した列だけを変える（他の列は現在の値のまま）。
+
+        ガントチャートタブでの編集（開始日だけ・状態だけ、等）の書き込み先。
+        upsert_job_task_override() は全列を受け取って行ごと置き換えるAPIのため、
+        1列だけ変えたい呼び出し元が使うと、渡さなかった列（タグ等）が既定値で
+        上書きされて消えてしまう。
+
+        変更後の全列が既定値なら行自体を消す（差分のみ保持、タブ3と同じ）。
+        続けてタブ3と同じくマイルストーンの前後整合（enforce_milestone_floor /
+        cascade_milestone_to_successors）を取る。
+
+        fields のキー: is_active / override_days / milestone_id / team_id /
+        start_pin_date / tags / status。
+        Returns: {"milestone_raised": bool, "milestone_cascaded": [workflow_task_id, ...]}
+        """
+        unknown = set(fields) - set(self._OVERRIDE_DEFAULTS)
+        if unknown:
+            raise ProjectDatabaseError(f"タスク上書きに無い項目です: {', '.join(sorted(unknown))}")
+        row = self._conn.execute(
+            "SELECT is_active, override_days, milestone_id, team_id, start_pin_date, "
+            "COALESCE(tags, '') AS tags, status "
+            "FROM job_task_overrides WHERE job_id = ? AND workflow_task_id = ?",
+            (job_id, workflow_task_id),
+        ).fetchone()
+        values = dict(self._OVERRIDE_DEFAULTS)
+        if row is not None:
+            values.update(dict(row))
+            values["is_active"] = bool(values["is_active"])
+        values.update(fields)
+        values["is_active"] = bool(values["is_active"])
+        if values["override_days"] is not None:
+            values["override_days"] = int(values["override_days"])
+            if values["override_days"] < 1:
+                raise ProjectDatabaseError("日数上書きは1以上で指定してください")
+        values["start_pin_date"] = _validate_start_pin_date(values["start_pin_date"])
+        values["tags"] = normalize_tags(values["tags"])
+        values["status"] = normalize_task_status(values["status"])
+
+        if values == self._OVERRIDE_DEFAULTS:
+            if row is not None:
+                self.clear_job_task_override(job_id, workflow_task_id)
+        else:
+            self.upsert_job_task_override(job_id, workflow_task_id, **values)
+
+        raised = self.enforce_milestone_floor(job_id, workflow_task_id)
+        cascaded = self.cascade_milestone_to_successors(job_id, workflow_task_id)
+        return {"milestone_raised": raised, "milestone_cascaded": cascaded}
+
     def _set_override_milestone(self, job_id, workflow_task_id, milestone_id):
         """上書き行のマイルストーンだけを差し替える（他の列には触れない）。
 

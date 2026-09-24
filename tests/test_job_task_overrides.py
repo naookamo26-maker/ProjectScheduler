@@ -185,3 +185,60 @@ def test_task_status_survives_a_milestone_only_adjustment_when_other_columns_are
     assert _override(db, ids["job"], ids["t2"])["status"] == "done"
     db.close()
     db.close()
+
+
+# -- update_job_task_override_fields（ガントチャートタブからの部分的な書き込み） --------
+
+
+def test_partial_update_changes_only_the_given_column(tmp_path):
+    """開始日だけを変えても、他の上書き列（タグ・日数・状態等）は消えない。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    ids = _build_chain_job(db)
+    _pin_successor(db, ids)
+
+    db.update_job_task_override_fields(ids["job"], ids["t2"], start_pin_date="2026-06-01")
+
+    row = _override(db, ids["job"], ids["t2"])
+    assert row["start_pin_date"] == "2026-06-01"
+    assert row["tags"] == "確定, 外注"
+    assert row["override_days"] == 9
+    assert row["override_team_id"] == ids["team"]
+    assert row["status"] == "in_progress"
+
+
+def test_partial_update_creates_a_row_and_removes_it_when_back_to_defaults(tmp_path):
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    ids = _build_chain_job(db)
+
+    db.update_job_task_override_fields(ids["job"], ids["t1"], status="done")
+    assert _override(db, ids["job"], ids["t1"])["override_id"] is not None
+
+    db.update_job_task_override_fields(ids["job"], ids["t1"], status=None)
+    assert _override(db, ids["job"], ids["t1"])["override_id"] is None
+
+
+def test_partial_update_applies_milestone_consistency_like_the_job_tab(tmp_path):
+    """先行タスクのマイルストーンを遅くすると、後続も同じ規則で繰り下がる。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    ids = _build_chain_job(db)
+
+    result = db.update_job_task_override_fields(ids["job"], ids["t1"], milestone_id=ids["ms_late"])
+
+    assert result["milestone_cascaded"] == [ids["t2"]]
+    assert db.effective_milestone(ids["job"], ids["t2"])["milestone_id"] == ids["ms_late"]
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"override_days": 0},
+        {"start_pin_date": "2026/06/01"},
+        {"status": "paused"},
+        {"unknown_column": 1},
+    ],
+)
+def test_partial_update_rejects_invalid_values(tmp_path, fields):
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    ids = _build_chain_job(db)
+    with pytest.raises(ProjectDatabaseError):
+        db.update_job_task_override_fields(ids["job"], ids["t1"], **fields)
