@@ -16,7 +16,7 @@ CRUD本体（gui/db.py）から分離しているのは、この2つが「増え
 4. `docs/db_design.md` のテーブル一覧を追随させる。
 """
 
-SCHEMA_VERSION = "17"
+SCHEMA_VERSION = "18"
 
 
 class SchemaError(Exception):
@@ -106,13 +106,18 @@ CREATE TABLE project (
     -- replan_base_date: 確定行を持たないタスクをこの日より前に置かない下限
     --   （全面再計画を確定したときに書く。未設定なら開発開始日と同じ扱い）
     -- replanned_at: 全面再計画を実行した日（過去の違反を報告しない境界）
+    -- pending_replan_base_date / pending_replanned_at: 全面再計画を実行して、まだ
+    --   「変更を確定」していない間の基準日と実行日。確定すると上の2列へ移す
+    --   （変更案として保存・破棄できるよう、確定とは別に持つ）
     -- confirmed_at: 最後に確定した日時（状態帯の表示用）
     -- confirmed_global_signature: 確定時の全体設定（休業日・ライン数の推移・
     --   配置コントロール・ジョブの優先度）の指紋。変わったら「変更あり」
     replan_base_date TEXT,
     replanned_at TEXT,
     confirmed_at TEXT,
-    confirmed_global_signature TEXT
+    confirmed_global_signature TEXT,
+    pending_replan_base_date TEXT,
+    pending_replanned_at TEXT
 );
 
 CREATE TABLE milestones (
@@ -681,6 +686,14 @@ def migrate(conn):
             "start_date TEXT NOT NULL, PRIMARY KEY (job_id, workflow_task_id))"
         )
         version = "17"
+
+    if version == "17":
+        # v18: 全面再計画を実行中（まだ確定していない）の基準日と実行日
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(project)").fetchall()]
+        for column in ("pending_replan_base_date", "pending_replanned_at"):
+            if cols and column not in cols:
+                conn.execute(f"ALTER TABLE project ADD COLUMN {column} TEXT")
+        version = "18"
 
     conn.execute(
         "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)

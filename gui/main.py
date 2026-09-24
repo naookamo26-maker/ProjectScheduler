@@ -69,6 +69,7 @@ class MainWindow(QMainWindow):
         self.plan_band.confirmSelectedRequested.connect(lambda: self._run_plan_action("confirm_selected"))
         self.plan_band.discardRequested.connect(lambda: self._run_plan_action("discard"))
         self.plan_band.clearRequested.connect(lambda: self._run_plan_action("clear"))
+        self.plan_band.fullReplanRequested.connect(lambda: self._run_plan_action("replan"))
         central = QWidget()
         central_layout = QVBoxLayout(central)
         central_layout.setContentsMargins(4, 4, 4, 0)
@@ -299,6 +300,8 @@ class MainWindow(QMainWindow):
             self.undo_manager.set_max_total_bytes(self.app_settings.undo_memory_limit_bytes())
         if self.tab_gantt is not None:
             self.tab_gantt.apply_app_settings()
+        # 全面再計画を案内するしきい値が変わりうる
+        self._plan_band_timer.start()
 
     def on_new_project(self):
         """保存先パスはこの時点では選ばせず、初回保存（Ctrl+S/名前を付けて保存）

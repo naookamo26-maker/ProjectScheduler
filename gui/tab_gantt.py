@@ -36,6 +36,7 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDialog,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -55,6 +56,7 @@ from gui.gantt_task_editor import TaskEditWindow
 from gui.gantt_view import FrozenGanttPane, build_gantt_scenes, set_bar_baseline
 from gui.plan_actions import confirm_all, confirm_selected, selected_targets
 from gui.plan_confirmation import CONFIRMED, DRAFT, UNCONFIRMED, PlanState, successor_map
+from gui.replan_dialog import ReplanDialog
 from gui.widgets_common import (
     ChoiceFilterGroup,
     CollapsibleSection,
@@ -910,6 +912,9 @@ class GanttTab(QWidget):
         # 「変更」は確定済みのタスクへの変更（削除を含む）、「未確定」は確定後に
         # 足したタスク。同じタスクを両方に数えない。
         parts = []
+        if state.pending_replan:
+            base = date.fromisoformat(state.pending_replan[0])
+            parts.append(f"全面再計画（{base:%m/%d} から）")
         edited = sum(1 for k in state.changed if k in state.confirmed)
         if edited:
             parts.append(f"変更 {edited}件")
@@ -921,11 +926,25 @@ class GanttTab(QWidget):
             if moved:
                 sign = "+" if worst >= 0 else "−"
                 parts.append(f"影響 {moved}タスク（最大 {sign}{abs(worst)}営業日）")
+            guidance = self._replan_guidance(state)
+            if guidance:
+                parts.append(guidance)
         else:
             parts.append("計算中")
         if state.global_changed:
             parts.append("全体設定の変更（全面再計画で反映）")
         return DRAFT, " ｜ ".join(parts), ready
+
+    def _replan_guidance(self, state):
+        """影響範囲が全タスクの一定割合（オプション）を超えたら全面再計画を案内する
+        （固定されたタスクの隙間に押し込むより収まりがよい可能性が高いため。§8-7）。"""
+        info = self.cache.plan_info
+        if state.pending_replan or not info or self._result_df is None or self._result_df.empty:
+            return ""
+        percent = 100 * len(info["released"]) / len(self._result_df)
+        if percent <= self.app_settings.get("full_replan_threshold_percent"):
+            return ""
+        return f"影響が全体の {percent:.0f}%（全面再計画を検討）"
 
     def _draft_impact(self):
         """確定から日程が動いたタスクの数と、最大のずれ（営業日。符号付き）。"""
@@ -948,6 +967,9 @@ class GanttTab(QWidget):
         keys = self.view.selected_keys() if self.view.scene() is not None else []
         if state is None or state.status != DRAFT or not keys:
             return False
+        if state.pending_replan:
+            # 全面再計画は全体として組み直した結果なので、一部だけは確定できない
+            return False
         ids = {self._job_and_task_ids(k) for k in keys}
         return bool(selected_targets(state, ids, successor_map(self.db)))
 
@@ -963,6 +985,12 @@ class GanttTab(QWidget):
         layout.addItem(QSpacerItem(560, 0, QSizePolicy.Minimum, QSizePolicy.Expanding),
                        layout.rowCount(), 0, 1, layout.columnCount())
         return self._exec_message_box(box) is ok
+
+    def _exec_replan_dialog(self):
+        """全面再計画ダイアログを出して、選んだ基準日を返す（キャンセルなら None。
+        テストで差し替える）。"""
+        dialog = ReplanDialog(self.db, parent=self)
+        return dialog.base_date() if dialog.exec() == QDialog.Accepted else None
 
     def _exec_message_box(self, box):
         """確認ダイアログを出して、押されたボタンを返す（テストで差し替える）。"""
@@ -991,6 +1019,11 @@ class GanttTab(QWidget):
                         self, "選択した変更を確定", "選んだタスクには、確定していない変更がありません。"
                     )
                     return
+            elif action == "replan":
+                base = self._exec_replan_dialog()
+                if base is None:
+                    return
+                self.db.start_full_replan(base.isoformat(), date.today().isoformat())
             elif action == "discard":
                 if not self._ask_plan_action(
                     "変更を破棄", "変更案を破棄して、最後に確定した日程に戻しますか？",

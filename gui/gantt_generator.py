@@ -432,11 +432,17 @@ def build_plan(db, state):
     lower_bound = max(
         (d for d in (state.replan_base_date, (state.confirmed_at or "")[:10]) if d), default=None,
     )
+    if state.pending_replan:
+        # 基準日は過去の日付も指定できる（警告して許可）ので、確定日より優先する
+        lower_bound = state.pending_replan[0]
     # 影響範囲のタスクは、確定していた位置より前へは動かさない（合意した日程を
     # 前倒しするのは、ドラッグでの明示的な移動か全面再計画に限る。§8-7）
     not_before = {
         key(k): state.confirmed[k]["start_date"] for k in released_int if k in state.confirmed
     }
+    if state.pending_replan:
+        # 全面再計画は、未着手タスクを基準日以降に全体として組み直す（前倒しも許す）
+        not_before = {}
     return {
         "fixed": fixed,
         "not_before": not_before,
@@ -445,6 +451,7 @@ def build_plan(db, state):
         "draft_moves": {key(k): d for k, d in state.draft_moves.items()},
         "successors": {key(k): [key(n) for n in v] for k, v in successors_int.items()},
         "lower_bound": lower_bound,
+        "quiet_before": state.quiet_before,
     }
 
 
@@ -485,6 +492,21 @@ def _apply_plan_to_frames(frames, fixed, plan):
     return frames
 
 
+def _quiet_past_violations(result_df, quiet_before):
+    """全面再計画を実行した日より前に始まるタスクの違反を消す（§8-6「過去の違反を
+    ノイズにしない」）。もう変えようがない過去の固定同士の重なりなので報告しない。"""
+    if not quiet_before or result_df.empty:
+        return result_df
+    past = (result_df["Start_Date"] < pd.Timestamp(quiet_before)) & (result_df["Constraint_Violation"] != "")
+    if not past.any():
+        return result_df
+    result_df = result_df.copy()
+    result_df.loc[past, "Constraint_Violation"] = ""
+    if "Constraint_Violation_Days" in result_df.columns:
+        result_df.loc[past, "Constraint_Violation_Days"] = 0
+    return result_df
+
+
 def compute_schedule_with_plan(frames, plan, **scheduler_kwargs):
     """確定を踏まえて計算する（ワーカースレッドから呼んでよい。DBに触れない）。
 
@@ -509,6 +531,7 @@ def compute_schedule_with_plan(frames, plan, **scheduler_kwargs):
         result_df = compute_schedule_from_frames(
             _apply_plan_to_frames(frames, fixed, plan), **scheduler_kwargs
         )
+        result_df = _quiet_past_violations(result_df, plan.get("quiet_before"))
         if runs >= PLAN_MAX_RUNS or result_df.empty:
             break
         broken = result_df[result_df["Constraint_Violation"] != ""]

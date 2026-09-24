@@ -548,7 +548,8 @@ class ProjectDatabase:
     def get_project(self):
         row = self._conn.execute(
             "SELECT project_name, start_date, distribution_ratio, replan_base_date, "
-            "replanned_at, confirmed_at, confirmed_global_signature FROM project WHERE id = 1"
+            "replanned_at, confirmed_at, confirmed_global_signature, "
+            "pending_replan_base_date, pending_replanned_at FROM project WHERE id = 1"
         ).fetchone()
         return dict(row)
 
@@ -1385,6 +1386,12 @@ class ProjectDatabase:
             "UPDATE project SET confirmed_at = ?, confirmed_global_signature = ? WHERE id = 1",
             (confirmed_at, global_signature),
         )
+        # 全面再計画の変更案を確定したら、その基準日・実行日を正式に採用する
+        self._conn.execute(
+            "UPDATE project SET replan_base_date = pending_replan_base_date, "
+            "replanned_at = pending_replanned_at, pending_replan_base_date = NULL, "
+            "pending_replanned_at = NULL WHERE id = 1 AND pending_replan_base_date IS NOT NULL"
+        )
         self._save_draft_base()
         self._commit()
 
@@ -1435,7 +1442,23 @@ class ProjectDatabase:
         self._conn.execute("DELETE FROM draft_base")
         self._conn.execute(
             "UPDATE project SET replan_base_date = NULL, replanned_at = NULL, confirmed_at = NULL, "
+            "pending_replan_base_date = NULL, pending_replanned_at = NULL, "
             "confirmed_global_signature = NULL WHERE id = 1"
+        )
+        self._commit()
+
+    @undoable("全面再計画")
+    def start_full_replan(self, base_date, executed_on):
+        """全面再計画を始める（§8-6）。結果は変更案として見せるだけで、確定は
+        「変更を確定」で初めて書き換わる。base_date: 新しい計画が始まる日（基準日 D）、
+        executed_on: 実行した日（T）。いずれも 'YYYY-MM-DD'。"""
+        if not self.has_confirmation():
+            raise ProjectDatabaseError("確定していない計画は全面再計画できません")
+        for value in (base_date, executed_on):
+            date.fromisoformat(value)
+        self._conn.execute(
+            "UPDATE project SET pending_replan_base_date = ?, pending_replanned_at = ? WHERE id = 1",
+            (base_date, executed_on),
         )
         self._commit()
 

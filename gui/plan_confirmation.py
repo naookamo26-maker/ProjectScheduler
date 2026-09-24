@@ -117,6 +117,9 @@ class PlanState:
     - started: 進行中・完了のタスク
     - draft_moves: {(job_id, workflow_task_id): 'YYYY-MM-DD'}
     - facts: 進行中・完了のタスクの確定行（未確定でも、その日程で固定して計算する）
+    - pending_replan: 全面再計画を実行中なら (基準日 D, 実行日 T)、そうでなければ None
+    - replan_released: 全面再計画で置き直す未着手タスク（確定開始日が T より前、
+      または D 以降。T〜D の前日に始まる予定のものは確定のまま残す。§8-6）
     """
 
     def __init__(self, db):
@@ -130,6 +133,11 @@ class PlanState:
         self.confirmed_at = project["confirmed_at"]
         self.replan_base_date = project["replan_base_date"]
         self.replanned_at = project["replanned_at"]
+        self.pending_replan = (
+            (project["pending_replan_base_date"], project["pending_replanned_at"])
+            if project["pending_replan_base_date"] else None
+        )
+        self.replan_released = set()
         self.started = {
             (r["job_id"], r["workflow_task_id"])
             for r in db.list_all_job_task_overrides() if r["status"] in _STARTED
@@ -160,7 +168,22 @@ class PlanState:
         changed |= set(self.draft_moves)
         self.changed = changed
         self.global_changed = project["confirmed_global_signature"] != global_signature(db)
-        self.status = DRAFT if (changed or self.global_changed) else CONFIRMED
+        if self.pending_replan:
+            base, executed = self.pending_replan
+            self.replan_released = {
+                key for key, row in self.confirmed.items()
+                if key not in self.started and self.active.get(key, False)
+                and (row["start_date"] < executed or row["start_date"] >= base)
+            }
+        self.status = DRAFT if (changed or self.global_changed or self.pending_replan) else CONFIRMED
+
+    @property
+    def quiet_before(self):
+        """この日より前に始まるタスクの違反は報告しない（全面再計画を実行した日 T。
+        再計画を繰り返すと過去の固定同士の重なりが積み上がるため。§8-6）。"""
+        if self.pending_replan:
+            return self.pending_replan[1]
+        return self.replanned_at
 
 
 def successor_map(db):
@@ -205,7 +228,8 @@ def downstream(keys, successors):
 def release_set(state, successors):
     """確定の位置から外して計算し直すタスク（変更の起点とその後続。ただし
     進行中・完了のタスクは除く）。"""
-    return {key for key in downstream(state.changed, successors) if key not in state.started}
+    released = downstream(state.changed, successors) | state.replan_released
+    return {key for key in released if key not in state.started}
 
 
 # ジョブ単位の確定状態（ジョブ作成タブの「確定」列と絞り込み。§8-9）
@@ -250,3 +274,28 @@ def job_plan_summary(state):
             kind = JOB_CONFIRMED
         summary[job_id] = (kind, changed, unconfirmed)
     return summary
+
+
+def replan_preview(db, base_date, executed_on):
+    """全面再計画ダイアログに出す件数（§8-6）。
+
+    - kept: 確定開始日が 実行日 T〜基準日 D の前日 の未着手タスク（今の確定のまま残す）
+    - replaced: それ以外の未着手タスクのうち確定行のあるもの（D 以降に置き直す）
+    - pinned_before: D より前に手動ピン（開始固定日）がある未着手タスク
+      （ピンは入力なので、その日付のまま置かれる）
+    """
+    state = PlanState(db)
+    kept = replaced = 0
+    for key, row in state.confirmed.items():
+        if key in state.started or not state.active.get(key, False):
+            continue
+        if executed_on <= row["start_date"] < base_date:
+            kept += 1
+        else:
+            replaced += 1
+    pinned_before = sum(
+        1 for r in db.list_all_job_task_overrides()
+        if r.get("start_pin_date") and r["start_pin_date"] < base_date
+        and r["status"] not in _STARTED and (r["is_active"] is None or r["is_active"])
+    )
+    return {"kept": kept, "replaced": replaced, "pinned_before": pinned_before}

@@ -288,3 +288,74 @@ def test_opening_a_file_expands_dependency_templates_without_marking_it_modified
         w.db.close()
         shiboken6.delete(w)
         qapp.processEvents()
+
+
+# -- 全面再計画（§8-6） --------------------------------------------------------------
+
+
+def test_full_replan_becomes_a_draft_and_confirming_it_shows_the_new_plan(qapp, gantt):
+    from datetime import date
+
+    w, tab, ids = gantt
+    _confirm(qapp, w)
+    assert w.plan_band.replan_button.isVisible()
+    base = date(2026, 6, 1)
+    with patch.object(tab, "_exec_replan_dialog", return_value=base):
+        w.plan_band.replan_button.click()
+    assert _band_settled(qapp, w, DRAFT)
+    _wait_recomputed(qapp, tab)
+    assert "全面再計画（06/01 から）" in w.plan_band.detail_label.text()
+    assert w.undo_manager.undo_label() == "全面再計画"
+    # 全体として組み直した結果なので、一部だけは確定できない
+    tab.view.select_keys([_key(ids, "job1", "t2")])
+    assert _wait(qapp, lambda: not w.plan_band.confirm_selected_button.isEnabled())
+    assert all(bar.start >= base for bar in tab.view.bars().values())
+
+    w.plan_band.confirm_draft_button.click()
+    assert _band_settled(qapp, w, CONFIRMED)
+    today = date.today()
+    assert w.plan_band.detail_label.text() == f"06/01 から新計画（{today:%m/%d} 再計画）"
+
+
+def test_band_suggests_a_full_replan_when_the_draft_moves_many_tasks(qapp, gantt):
+    w, tab, ids = gantt
+    _confirm(qapp, w)
+    tab.app_settings.set("full_replan_threshold_percent", 10)
+    w.db.update_job_task_override_fields(ids["job1"], ids["t1"], override_days=8)
+    tab.refresh_choices()
+    assert _band_settled(qapp, w, DRAFT)
+    _wait_recomputed(qapp, tab)
+    assert _wait(qapp, lambda: "全面再計画を検討" in w.plan_band.detail_label.text())
+
+    tab.app_settings.set("full_replan_threshold_percent", 100)
+    w._apply_app_settings()  # オプション画面でOKを押したときと同じ
+    assert _wait(qapp, lambda: "全面再計画を検討" not in w.plan_band.detail_label.text())
+
+
+def test_replan_dialog_counts_the_tasks_and_warns_about_past_dates(qapp, gantt):
+    from datetime import date
+
+    from PySide6.QtCore import QDate
+
+    from gui.replan_dialog import ReplanDialog
+
+    w, tab, ids = gantt
+    _confirm(qapp, w)
+    starts = sorted(date.fromisoformat(r["start_date"]) for r in w.db.list_confirmed_schedule())
+    today = starts[1]
+    dialog = ReplanDialog(w.db, today=today)
+    try:
+        assert dialog.base_date() == today
+        assert dialog.warning_label.isHidden()
+        assert "置き直します" in dialog.preview_label.text()
+        # 未来の基準日: 今日〜基準日の前日に始まる予定のタスクは残す
+        future = starts[-1]
+        dialog.date_edit.setDate(QDate(future.year, future.month, future.day))
+        assert "今の確定のまま残します" in dialog.preview_label.text()
+        # 過去の日付は選べるが警告する
+        past = date(2026, 1, 5)
+        dialog.date_edit.setDate(QDate(past.year, past.month, past.day))
+        assert not dialog.warning_label.isHidden()
+        assert "今日より前" in dialog.warning_label.text()
+    finally:
+        dialog.deleteLater()

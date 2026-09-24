@@ -45,7 +45,7 @@ def test_migrating_to_v17_keeps_every_scheduled_date(tmp_path):
     shutil.copy(SAMPLE, path)
     db = ProjectDatabase.open_existing(str(path))
     try:
-        assert SCHEMA_VERSION == "17"
+        assert SCHEMA_VERSION == "18"
         jobs = db.list_jobs()
         assert all(j["stable_key"] == f"JOB_{j['id']:03d}" for j in jobs)
 
@@ -389,3 +389,104 @@ def test_clearing_the_confirmation_keeps_started_and_done_tasks_where_they_were(
     # 未着手に戻したタスクは、残っていた確定行を使わずに自由に置かれる
     db.update_job_task_override_fields(*done, status=None)
     assert set(PlanState(db).facts) == {started}
+
+
+# -- 全面再計画（§8-6） --------------------------------------------------------------
+
+
+def _confirmed_project(tmp_path, jobs=4):
+    """確定日を開発開始より前（2026-04-01）にして確定したプロジェクト。"""
+    from gui.plan_actions import confirm_all
+
+    db, ids = _plan_project(tmp_path, lines=1, jobs=jobs)
+    df = _compute(db)[0]
+    with patch("gui.plan_actions._now", return_value="2026-04-01T09:00:00"):
+        confirm_all(db, df)
+    return db, ids, _positions(df)
+
+
+def test_full_replan_places_every_unstarted_task_on_or_after_the_base_date(tmp_path):
+    from gui.plan_confirmation import DRAFT
+
+    db, ids, before = _confirmed_project(tmp_path)
+    done = (ids["jobs"][0], ids["t1"])
+    db.update_job_task_override_fields(*done, status="done")
+    db.start_full_replan("2026-06-01", "2026-06-01")
+    df, state, _ = _compute(db)
+    assert state.status == DRAFT
+    after = _positions(df)
+    assert after[_k(*done)] == before[_k(*done)]
+    for key, (start, _end) in after.items():
+        if key != _k(*done):
+            assert start >= pd.Timestamp("2026-06-01").date()
+    # まだ確定は書き換わらない
+    assert db.get_project()["replan_base_date"] is None
+
+
+def test_full_replan_with_a_future_base_date_keeps_tasks_starting_before_it(tmp_path):
+    """基準日 D が未来のとき、今日 T〜D の前日に始まる予定の未着手タスクは今の確定の
+    まま残し、それ以外（遅れているもの・D 以降のもの）を D 以降に置き直す。
+
+    ただし残すはずのタスクでも、先行タスクが遅れていて D 以降へ置き直されると
+    予定どおりには始められない（依存の違反として影響範囲に加わる）。ここでは先行
+    タスクを持たない「設計」だけで、残ることを確かめる。"""
+    db, ids, before = _confirmed_project(tmp_path)
+    design = f"T_{ids['t1']:03d}"
+    design_starts = sorted(s for (_j, t), (s, _e) in before.items() if t == design)
+    executed, base = design_starts[1].isoformat(), design_starts[2].isoformat()
+    db.start_full_replan(base, executed)
+    df, state, info = _compute(db)
+    after = _positions(df)
+    kept = [key for key, (start, _e) in before.items()
+            if executed <= start.isoformat() < base and key[1] == design]
+    assert kept
+    for key in kept:
+        assert after[key] == before[key]
+    for key, (start, _e) in before.items():
+        if not executed <= start.isoformat() < base:
+            assert after[key][0].isoformat() >= base
+    assert (df["Constraint_Violation"] != "").sum() == 0
+
+
+def test_confirming_a_full_replan_adopts_the_base_date(tmp_path):
+    from gui.plan_actions import confirm_all
+    from gui.plan_confirmation import CONFIRMED, PlanState
+
+    db, ids, _before = _confirmed_project(tmp_path)
+    db.start_full_replan("2026-06-01", "2026-05-25")
+    df = _compute(db)[0]
+    confirm_all(db, df)
+    project = db.get_project()
+    assert (project["replan_base_date"], project["replanned_at"]) == ("2026-06-01", "2026-05-25")
+    assert project["pending_replan_base_date"] is None
+    # 確定した直後に計算し直すと、確定とタスク単位で一致する
+    again, state, _ = _compute(db)
+    assert state.status == CONFIRMED
+    assert _positions(again) == _positions(df)
+    assert PlanState(db).quiet_before == "2026-05-25"
+
+
+def test_discarding_a_full_replan_returns_to_the_previous_confirmation(tmp_path):
+    from gui.plan_confirmation import CONFIRMED
+
+    db, ids, before = _confirmed_project(tmp_path)
+    db.start_full_replan("2026-06-01", "2026-06-01")
+    db.discard_draft()
+    df, state, _ = _compute(db)
+    assert state.status == CONFIRMED
+    assert db.get_project()["pending_replan_base_date"] is None
+    assert _positions(df) == before
+
+
+def test_violations_before_the_replan_day_are_not_reported():
+    from gui.gantt_generator import _quiet_past_violations
+
+    df = pd.DataFrame({
+        "Start_Date": pd.to_datetime(["2026-05-01", "2026-06-10"]),
+        "Constraint_Violation": ["ライン数の超過", "ライン数の超過"],
+        "Constraint_Violation_Days": [2, 3],
+    })
+    quiet = _quiet_past_violations(df, "2026-06-01")
+    assert list(quiet["Constraint_Violation"]) == ["", "ライン数の超過"]
+    assert list(quiet["Constraint_Violation_Days"]) == [0, 3]
+    assert list(df["Constraint_Violation"]) == ["ライン数の超過", "ライン数の超過"]

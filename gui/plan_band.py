@@ -26,6 +26,7 @@ class PlanStatusBand(QFrame):
     confirmSelectedRequested = Signal()
     discardRequested = Signal()
     clearRequested = Signal()
+    fullReplanRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -45,20 +46,22 @@ class PlanStatusBand(QFrame):
         self.confirm_draft_button = QPushButton("変更を確定")
         self.confirm_selected_button = QPushButton("選択した変更を確定")
         self.discard_button = QPushButton("変更を破棄")
+        self.replan_button = QPushButton("全面再計画…")
         self.clear_button = QPushButton("未確定に戻す")
         self.confirm_button.clicked.connect(self.confirmRequested)
         self.confirm_draft_button.clicked.connect(self.confirmRequested)
         self.confirm_selected_button.clicked.connect(self.confirmSelectedRequested)
         self.discard_button.clicked.connect(self.discardRequested)
         self.clear_button.clicked.connect(self.clearRequested)
+        self.replan_button.clicked.connect(self.fullReplanRequested)
         self._buttons = {
             UNCONFIRMED: [self.confirm_button],
-            CONFIRMED: [self.clear_button],
+            CONFIRMED: [self.replan_button, self.clear_button],
             DRAFT: [self.confirm_draft_button, self.confirm_selected_button, self.discard_button,
-                    self.clear_button],
+                    self.replan_button, self.clear_button],
         }
         for button in (self.confirm_button, self.confirm_draft_button, self.confirm_selected_button,
-                       self.discard_button, self.clear_button):
+                       self.discard_button, self.replan_button, self.clear_button):
             layout.addWidget(button)
         self.status = None
         self.set_state(UNCONFIRMED, "", show_buttons=False, buttons_enabled=False)
