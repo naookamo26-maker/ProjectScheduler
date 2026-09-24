@@ -1559,3 +1559,25 @@ def test_raising_the_limit_keeps_history_and_does_not_notify():
 
     assert len(manager._undo_stack) == 1
     assert notified == []
+
+
+def test_partial_override_update_is_one_undo_step_including_milestone_cascade(tmp_path):
+    """ガントからの1回の編集（上書き＋マイルストーンの自動調整）は、1回のUndoで戻る。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "p.pschedule"))
+    team_id = db.add_team("チームA", 2)
+    wf_id = db.add_workflow("WF1")
+    t1 = db.add_workflow_task(wf_id, "設計", team_id, 3)
+    t2 = db.add_workflow_task(wf_id, "実装", team_id, 5)
+    db.add_task_dependency(wf_id, t1, t2)
+    ms_early = db.add_milestone("早いMS", "2026-03-31")
+    ms_late = db.add_milestone("遅いMS", "2026-09-30")
+    job_id = db.add_job("ジョブ1", wf_id, ms_early, 1)
+    manager, _calls = _attach_dummy_undo_manager(db)
+
+    db.update_job_task_override_fields(job_id, t1, milestone_id=ms_late, start_pin_date="2026-02-02")
+    assert db.effective_milestone(job_id, t2)["milestone_id"] == ms_late
+
+    manager.undo()
+    assert db.effective_milestone(job_id, t1)["milestone_id"] == ms_early
+    assert db.effective_milestone(job_id, t2)["milestone_id"] == ms_early
+    assert db.list_all_job_task_overrides() == []

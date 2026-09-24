@@ -84,6 +84,7 @@ def test_broken_values_in_the_file_fall_back_to_defaults(settings_path):
         ("undo_memory_limit_mb", "128"),
         ("undo_memory_limit_mb", True),
         ("gantt_drag_modifier", "meta"),
+        ("gantt_drag_modifier", "ctrl"),
         ("language", "zh_TW"),
     ],
 )
@@ -216,3 +217,20 @@ def test_options_dialog_lets_the_user_choose_the_display_language(qapp, settings
     assert dialog.selected_language() == "zh_CN"
     dialog.reset_button.click()
     assert dialog.selected_language() == s.default("language")
+
+
+def test_options_dialog_saves_gantt_drag_key_and_highlight_time(qapp, settings_path):
+    from gui.options_dialog import OptionsDialog
+
+    s = AppSettings(settings_path)
+    dialog = OptionsDialog(s)
+    assert [dialog.drag_modifier_combo.itemData(i) for i in range(dialog.drag_modifier_combo.count())] \
+        == ["shift", "alt"]
+    assert dialog.highlight_spin.text() == "次の操作まで"
+    dialog._select_data(dialog.drag_modifier_combo, "alt")
+    dialog.highlight_spin.setValue(5)
+    dialog.accept()
+
+    saved = AppSettings(settings_path)
+    assert saved.get("gantt_drag_modifier") == "alt"
+    assert saved.get("moved_bar_highlight_seconds") == 5

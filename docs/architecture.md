@@ -21,6 +21,8 @@ gui/ ─────────────────────────
   ├ undo_manager.py   Undo/Redoスタック（Qt非依存）
   ├ main.py           MainWindow・5タブ組み立て・File/Editメニュー・D&Dで開く
   ├ app_settings.py   利用者（PC）ごとのオプション設定の読み書き（iniファイル）
+  ├ gantt_edit.py     ガント上の編集の、Qt非依存の部品（営業日の計算・ID変換）
+  ├ gantt_task_editor.py  ガントのタスク編集ウィンドウ（フローティング）
   ├ options_dialog.py  オプション設定ダイアログ（編集メニュー「オプション…」）
   ├ tab_basic_info.py  タブ1「基本情報設定」（チームは変動点付きのツリー表示）
   ├ resource_histogram.py  階段関数の区間化（純粋関数。旧リソース
@@ -1030,6 +1032,40 @@ GUIで編集できる項目はすべてUndo/Redoで元に戻せる。個々の�
   （ファイルをまたいだUndoはしない）。保存では消えない。上限超過で保存時点の
   エントリが捨てられた場合は、以降「保存時と同じ内容か」を判定できなくなるため
   未保存扱いに倒す。
+
+## ガントチャートでのタスク編集（`gui/tab_gantt.py` 他）
+
+ガントの日程は計算結果（出力）なので、編集は**入力（タスク上書き）を書き換えて
+計算し直す**形にしている（§4-1「固定は入力、日程は出力」、`docs/roadmap.md` §9）。
+画面仕様は `docs/screens.md` の「タスクの編集」。
+
+- **バーの識別**: `gui/gantt_view.py` の `TaskBarItem` が (Job_ID, Task_ID) と
+  開始・終了日（終了は exclusive）・チームを持つ。`body_scene.gantt_bars` で
+  キーからバーを引ける。文字列IDとDBの整数IDの変換は `gui/gantt_edit.py` の
+  `format_entity_id` / `parse_entity_id`（`gantt_generator._fmt` もこれを使う）。
+- **営業日**: ドラッグの吸着と「+N営業日」の計算は `gui/gantt_edit.py` の
+  `WorkDayCalendar`（Qt非依存）。スケジューラの `_WorkCalendar` と同じ定義
+  （土日・日本の祝日・共通休業日・チーム別休業日を除く）にするため、
+  `build_display()` が祝日（`generate_jp_holidays`）を `jp_holiday_dates` として渡す。
+- **書き込み**: `ProjectDatabase.update_job_task_override_fields()`（指定した列だけを
+  変え、全列が既定なら行を消す。続けてタブ3と同じマイルストーンの前後整合を取る）。
+  既存の `upsert_job_task_override()` は全列を置き換えるため、ガントから1列だけ
+  変えると他の列（タグ等）が消えてしまう。複数タスクへの書き込みは
+  `db.undo_group()` で1つのUndo単位にまとめる。
+- **ドラッグ**: `GanttGraphicsView` がマウス操作と影の描画だけを担い、決まった
+  結果を `moveRequested` / `resizeRequested` で `GanttTab` に渡す（DBには触れない）。
+  影は半透明の塗り＋破線の枠で z を上げて前面に描く。
+- **編集後の再描画**: 書き込み前に表示位置・選択・今の日程を覚えておき
+  （`GanttTab._write_tasks`）、再計算の結果を描くときに `fit_all` せず復元する。
+  行の並び（ジョブの最早開始日順）が変わりうるので、選択したバーが見えるよう
+  スクロールし直す。今の日程と比べて動いたタスク（編集したものを除く）を数え、
+  状況表示に出して強調する。
+- **Undo/Redo**: `GanttTab.capture_ui_state()` / `restore_ui_state()` が選択と
+  表示位置を記録・復元する。再計算はワーカースレッドで走るため、結果がまだ無い
+  ときは次の描画まで持ち越す。
+- **先行タスクの警告**（ドラッグ中の注意書き）は、誤った警告を出さないよう
+  確実に言える場合だけを見る: ラグが0以上の依存（ラグは開始を遅らせる方向にしか
+  働かない）で、先行タスクが今の結果に載っているもの。
 
 ## オプション設定（`gui/app_settings.py`）
 

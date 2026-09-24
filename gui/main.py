@@ -53,6 +53,7 @@ class MainWindow(QMainWindow):
         # ガントチャートタブ・プロジェクト分析タブが共有するスケジューリング
         # 結果のキャッシュ（gui/schedule_cache.py）。DBを開くたびに作り直す。
         self.schedule_cache: ScheduleCache | None = None
+        self.tab_gantt: GanttTab | None = None
 
         self.setWindowTitle("プロジェクトスケジューラー")
         self.resize(1500, 900)
@@ -172,7 +173,7 @@ class MainWindow(QMainWindow):
         # スケジューリング結果を共有する（どちらのタブからでも計算を起動できる）。
         self.schedule_cache = ScheduleCache(self.db, parent=self)
 
-        self.tab_gantt = GanttTab(self.db, self.schedule_cache)
+        self.tab_gantt = GanttTab(self.db, self.schedule_cache, self.app_settings)
         self.tabs.addTab(self.tab_gantt, "ガントチャート")
 
         self.tab_analysis = AnalysisTab(self.db, self.schedule_cache)
@@ -272,6 +273,8 @@ class MainWindow(QMainWindow):
         プロジェクトの内容ではないので、Undo/Redoの履歴には積まない。"""
         if self.undo_manager is not None:
             self.undo_manager.set_max_total_bytes(self.app_settings.undo_memory_limit_bytes())
+        if self.tab_gantt is not None:
+            self.tab_gantt.apply_app_settings()
 
     def on_new_project(self):
         """保存先パスはこの時点では選ばせず、初回保存（Ctrl+S/名前を付けて保存）

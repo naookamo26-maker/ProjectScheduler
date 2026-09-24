@@ -34,8 +34,9 @@ SETTINGS_PATH_ENV = "PROJECT_SCHEDULER_SETTINGS"
 SUPPORTED_LANGUAGES = ("ja", "en", "vi", "zh_CN")
 FALLBACK_LANGUAGE = "en"
 
-# ガントのバーをドラッグするときに押すキー（docs/roadmap.md §9）。
-DRAG_MODIFIERS = ("shift", "ctrl", "alt")
+# ガントのバーをドラッグするときに押すキー（docs/roadmap.md §9）。Ctrl は
+# 複数選択（Ctrl＋クリック）に使うため選べない。
+DRAG_MODIFIERS = ("shift", "alt")
 
 
 def system_language(locale=None):
@@ -181,6 +182,13 @@ class AppSettings:
         self._qs.sync()
         if self._qs.status() != QSettings.NoError:
             raise OSError(f"設定を保存できませんでした: {self.path}")
+
+    def get_ui_state(self, name):
+        """オプションではない画面の状態（編集ウィンドウの位置など）。検証しない。"""
+        return self._qs.value(f"ui/{name}")
+
+    def set_ui_state(self, name, value):
+        self._qs.setValue(f"ui/{name}", value)
 
     def undo_memory_limit_bytes(self):
         return self.get("undo_memory_limit_mb") * 1024 * 1024

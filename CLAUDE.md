@@ -23,17 +23,17 @@
 
 | マーカー | 対象モジュール | 必要な依存 | 件数 / 時間 |
 | --- | --- | --- | --- |
-| `core` | `gui/db.py` `gui/db_schema.py` `gui/undo_manager.py` | pytestのみ | 61件 / 約1.5秒 |
+| `core` | `gui/db.py` `gui/db_schema.py` `gui/undo_manager.py` `gui/gantt_edit.py` | pytestのみ | 76件 / 約1.5秒 |
 | `scheduler` | `project_scheduler.py` `gui/gantt_generator.py` `gui/summary_metrics.py` | + pandas, numpy | 122件 / 約2.3秒 |
-| `gui` | `gui/`のウィジェット層・描画層 | + PySide6 + システムライブラリ | 129件 / 約31秒 |
+| `gui` | `gui/`のウィジェット層・描画層 | + PySide6 + システムライブラリ | 146件 / 約35秒 |
 
 変更したファイル → 実行するコマンド:
 
 | 変更した場所 | コマンド |
 | --- | --- |
-| `gui/db.py`, `gui/db_schema.py`, `gui/undo_manager.py` | `pytest -m core` |
+| `gui/db.py`, `gui/db_schema.py`, `gui/undo_manager.py`, `gui/gantt_edit.py` | `pytest -m core` |
 | `project_scheduler.py`, `gui/gantt_generator.py`, `gui/summary_metrics.py` | `pytest -m scheduler` |
-| `gui/resource_histogram.py`, `gui/node_canvas.py`, `gui/gantt_view.py`, `gui/analysis_charts.py`, `gui/schedule_cache.py`, `gui/tab_*.py`, `gui/main.py`, `gui/widgets_common.py`, `gui/app_settings.py`, `gui/options_dialog.py` | `pytest -m gui` |
+| `gui/resource_histogram.py`, `gui/node_canvas.py`, `gui/gantt_view.py`, `gui/analysis_charts.py`, `gui/schedule_cache.py`, `gui/tab_*.py`, `gui/main.py`, `gui/widgets_common.py`, `gui/app_settings.py`, `gui/options_dialog.py`, `gui/gantt_task_editor.py` | `pytest -m gui` |
 | ドキュメント・README・コメントのみ | 実行しない |
 
 - 複数階層にまたがる変更は、まとめて指定する: `pytest -m "core or scheduler"`。
@@ -42,7 +42,7 @@
 
 ### 全実行（`pytest`）を行う条件
 
-次のいずれかに当てはまるときだけ、引数なしの`pytest`で312件すべてを回す。
+次のいずれかに当てはまるときだけ、引数なしの`pytest`で344件すべてを回す。
 
 - 利用者から明示的に「全部回して」と指示があったとき。
 - 影響が横断的な変更をしたとき。具体的には、DBスキーマの変更（`gui/db_schema.py`・
@@ -54,7 +54,7 @@
 ### 出力を増やさない
 
 - `pytest.ini`の`addopts`で`-q --no-header --tb=short`が既定になっている。
-  **`-v`は付けない**（312件のテスト名が出力を埋めるだけで、得られる情報は増えない）。
+  **`-v`は付けない**（344件のテスト名が出力を埋めるだけで、得られる情報は増えない）。
 - 失敗を追うときは、全体を回し直さず、失敗したテストだけを名指しで再実行する:
   `pytest tests/test_undo_redo.py::test_foo --tb=long`
 

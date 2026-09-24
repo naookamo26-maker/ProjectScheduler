@@ -11,17 +11,19 @@ from datetime import date
 import pandas as pd
 
 from gui.db import parse_tags
+from gui.gantt_edit import format_entity_id
 from project_scheduler import (
     _TEAM_COLOR_OVERFLOW,
     _build_team_capacity_schedule,
     _build_team_color_map,
     format_dependency_ref,
+    generate_jp_holidays,
     run_resource_constrained_scheduler_from_frames,
 )
 
 
 def _fmt(prefix, entity_id, width=3):
-    return f"{prefix}_{entity_id:0{width}d}"
+    return format_entity_id(prefix, entity_id, width)
 
 
 def validate_for_generation(db):
@@ -201,6 +203,11 @@ def build_display(db):
           `_build_team_capacity_schedule` をそのまま呼ぶ——スケジューリング本体が
           実際に使ったのと同じ区分定数関数を、結果を作り直さずに読めるように
           するため。ライン数「指定なし」は `project_scheduler._UNLIMITED_LINES`）
+        - jp_holiday_dates: {datetime.date, ...}（日本の祝日。スケジューラと同じ
+          generate_jp_holidays で求める。ガント上でのドラッグを営業日単位で
+          吸着させるため——gui/gantt_edit.py の WorkDayCalendar）
+        - start_pins: {(Job_ID(文字列), Task_ID(文字列)): datetime.date}
+          （手動ピン＝開始固定日。ガント上でバーに印を付けるため）
     """
     teams = db.list_teams()
     team_str = {t["id"]: _fmt("TEAM", t["id"]) for t in teams}
@@ -284,6 +291,21 @@ def build_display(db):
         df_teams_for_capacity, df_team_capacity_for_schedule
     )
 
+    # 日本の祝日（営業日の計算用）。範囲はプロジェクト開始の前年から、最も遅い
+    # マイルストーン（無ければ開始）の5年後まで——ドラッグで締切の先へ
+    # 動かす場合も十分に覆える幅にしておく。
+    marker_years = [m[2].year for m in milestone_markers] or [date.today().year]
+    jp_holiday_dates = {
+        ts.date() for ts in generate_jp_holidays(min(marker_years) - 1, max(marker_years) + 5)
+    }
+
+    start_pins = {
+        (_fmt("JOB", o["job_id"]), _fmt("T", o["workflow_task_id"])):
+            date.fromisoformat(o["start_pin_date"])
+        for o in db.list_all_job_task_overrides()
+        if o["start_pin_date"]
+    }
+
     return {
         "team_names": team_names, "team_colors": team_colors,
         "workflow_names": workflow_names, "workflow_colors": workflow_colors,
@@ -291,6 +313,7 @@ def build_display(db):
         "common_holiday_dates": common_holiday_dates, "holidays_by_team": holidays_by_team,
         "job_tags": job_tags, "job_task_tags": job_task_tags, "task_status": task_status,
         "team_capacity_schedule": team_capacity_schedule,
+        "jp_holiday_dates": jp_holiday_dates, "start_pins": start_pins,
     }
 
 
