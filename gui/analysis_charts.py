@@ -46,6 +46,7 @@ from PySide6.QtWidgets import QGraphicsItem, QGraphicsPathItem, QGraphicsScene, 
 
 from gui.gantt_view import GanttGraphicsView
 from gui.summary_metrics import GRANULARITY_MONTH, GRANULARITY_WEEK, period_end_of, period_index
+from i18n import tr
 
 # 1期間あたりの横幅と、値域（0〜最大値）に割り当てる縦幅（いずれもシーン座標）。
 # 縦は「1本＝固定px」ではなく最大値に対する比率でスケールする——チームによって
@@ -271,7 +272,7 @@ def _polyline_path(axis, values):
 
 
 def _fmt_week(week_start):
-    return week_start.strftime("%Y/%m/%d") + " の週"
+    return tr("{date} の週", date=week_start.strftime("%Y/%m/%d"))
 
 
 def _fmt_period(period_start, granularity):
@@ -354,18 +355,18 @@ def build_team_stacked_scene(weeks, breakdown_by_team, totals, color_map, labels
 
     _add_stacked_bands(
         scene, axis, breakdown_by_team, color_map, labels_by_team,
-        lambda name, values: f"{name}\nピーク {max(values)} 本",
+        lambda name, values: tr("{name}\nピーク {values} 本", name=name, values=max(values)),
     )
 
     # 週ごとの合計を出す透明な当たり判定（帯のツールチップはチーム単位のため、
     # 「その週に全体で何本走っているか」はこちらで読ませる）。
     for i, week_start in enumerate(weeks):
         scene.addItem(_hit_area(
-            axis, i, f"{_fmt_week(week_start)}\n同時タスク数 合計 {totals[i]:,} 本",
+            axis, i, tr("{week_start}\n同時タスク数 合計 {value:,} 本", week_start=_fmt_week(week_start), value=totals[i]),
         ))
 
     _add_peak_marker(
-        scene, axis, totals, max_value, f"全チーム合計のピーク {max_value:,} 本",
+        scene, axis, totals, max_value, tr("全チーム合計のピーク {max_value:,} 本", max_value=max_value),
     )
 
     scene.analysis_chart_max_value = max_value
@@ -394,7 +395,7 @@ def build_workflow_stacked_scene(periods, counts_by_workflow, totals, color_map,
 
     _add_stacked_bands(
         scene, axis, counts_by_workflow, color_map, labels_by_workflow,
-        lambda name, values: f"{name}\n最大 {max(values)} 件",
+        lambda name, values: tr("{name}\n最大 {values} 件", name=name, values=max(values)),
     )
 
     # 期間ごとの合計を出す透明な当たり判定（帯のツールチップはワークフロー単位
@@ -402,11 +403,11 @@ def build_workflow_stacked_scene(periods, counts_by_workflow, totals, color_map,
     for i, period_start in enumerate(periods):
         scene.addItem(_hit_area(
             axis, i,
-            f"{_fmt_period(period_start, granularity)}\n稼働タスク件数 合計 {totals[i]:,} 件",
+            tr("{period_start}\n稼働タスク件数 合計 {value:,} 件", period_start=_fmt_period(period_start, granularity), value=totals[i]),
         ))
 
     _add_peak_marker(
-        scene, axis, totals, max_value, f"稼働タスク件数のピーク {max_value:,} 件",
+        scene, axis, totals, max_value, tr("稼働タスク件数のピーク {max_value:,} 件", max_value=max_value),
     )
 
     scene.analysis_chart_max_value = max_value
@@ -453,9 +454,9 @@ def build_team_detail_scene(weeks, values, capacity_values, color,
     # 各週に、その週の値（と上限）を出す透明な当たり判定を重ねる。
     for i, week_start in enumerate(weeks):
         cap = capacity_values[i] if i < len(capacity_values) else None
-        cap_text = f"\n上限 {cap} 本" if cap is not None else "\n上限 指定なし"
+        cap_text = tr("\n上限 {cap} 本", cap=cap) if cap is not None else tr("\n上限 指定なし")
         scene.addItem(_hit_area(
-            axis, i, f"{_fmt_week(week_start)}\n同時 {values[i]} 本{cap_text}",
+            axis, i, tr("{week_start}\n同時 {value} 本{cap_text}", week_start=_fmt_week(week_start), value=values[i], cap_text=cap_text),
         ))
 
     # 設定上限の破線（階段状の水平線）。
@@ -507,7 +508,7 @@ def build_workflow_detail_scene(periods, values, color, milestone_markers, proje
 
     for i, period_start in enumerate(periods):
         scene.addItem(_hit_area(
-            axis, i, f"{_fmt_period(period_start, granularity)}\n稼働タスク件数 {values[i]:,} 件",
+            axis, i, tr("{period_start}\n稼働タスク件数 {value:,} 件", period_start=_fmt_period(period_start, granularity), value=values[i]),
         ))
 
     scene.analysis_chart_max_value = max_value

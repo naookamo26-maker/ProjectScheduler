@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from i18n import tr
 
 ROW_ID_ROLE = Qt.UserRole
 
@@ -247,12 +248,12 @@ class OptionalDateEdit(NoWheelDateEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumDate(_UNSET_DATE)
-        self.setSpecialValueText("（固定なし）")
+        self.setSpecialValueText(tr("（固定なし）"))
         self.setCalendarPopup(True)
         self.setDisplayFormat("yyyy-MM-dd")
         self.setDate(_UNSET_DATE)
-        self.setToolTip("クリックしてカレンダーから日付を選択、または"
-                         "Deleteキーで固定を解除できます。")
+        self.setToolTip(tr("クリックしてカレンダーから日付を選択、または"
+                         "Deleteキーで固定を解除できます。"))
 
     def value(self):
         """設定されていれば 'YYYY-MM-DD'、未設定なら None。"""
@@ -437,12 +438,13 @@ def unique_default_name(existing_names, base):
     return f"{base} ({n})"
 
 
-def make_fk_combo(options, current_id=None, allow_blank=False, blank_label="（未設定）"):
+def make_fk_combo(options, current_id=None, allow_blank=False, blank_label=None):
     """options: [(id, display_name), ...]。選択中の値はコンボの currentData() で
-    取得できる（未設定/空欄の場合は None）。"""
+    取得できる（未設定/空欄の場合は None）。blank_label の既定は「（未設定）」
+    （既定引数で tr() すると、表示言語を決める前の import 時に評価されるため、ここで訳す）。"""
     combo = NoWheelComboBox()
     if allow_blank:
-        combo.addItem(blank_label, None)
+        combo.addItem(blank_label if blank_label is not None else tr("（未設定）"), None)
     for entity_id, name in options:
         combo.addItem(name, entity_id)
     if current_id is not None:
@@ -479,14 +481,13 @@ def confirm_or_block_delete(parent, usage_count, entity_label, hard_block):
         return True
     if hard_block:
         QMessageBox.warning(
-            parent, "削除できません",
-            f"{entity_label}は {usage_count} 件から参照されているため削除できません。",
+            parent, tr("削除できません"),
+            tr("{entity_label}は {usage_count} 件から参照されているため削除できません。", entity_label=entity_label, usage_count=usage_count),
         )
         return False
     reply = QMessageBox.question(
-        parent, "削除の確認",
-        f"{entity_label}は {usage_count} 件から参照されています。"
-        "削除すると、それらの参照が解除されます。続行しますか？",
+        parent, tr("削除の確認"),
+        tr("{entity_label}は {usage_count} 件から参照されています。削除すると、それらの参照が解除されます。続行しますか？", entity_label=entity_label, usage_count=usage_count),
         QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
     )
     return reply == QMessageBox.Yes
@@ -502,27 +503,23 @@ class MilestoneRepairConfirmDialog(QDialog):
 
     def __init__(self, plan, trigger_label, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("マイルストーンの整合性を調整")
+        self.setWindowTitle(tr("マイルストーンの整合性を調整"))
         self.resize(560, 380)
 
         layout = QVBoxLayout(self)
         info = QLabel(
-            f"{trigger_label}により、以下のタスクが「先行タスクより早い締切」に"
-            "なってしまいます。\n"
-            "先行タスクに合わせてマイルストーンを引き上げますか？\n"
-            "（マイルストーン自体が先行タスクのものに差し替わります。"
-            "キャンセルすると、この変更自体を取り消します）"
+            tr("{trigger_label}により、以下のタスクが「先行タスクより早い締切」になってしまいます。\n先行タスクに合わせてマイルストーンを引き上げますか？\n（マイルストーン自体が先行タスクのものに差し替わります。キャンセルすると、この変更自体を取り消します）", trigger_label=trigger_label)
         )
         info.setWordWrap(True)
         layout.addWidget(info)
 
         def label_of(name, end_date):
             if name is None and end_date is None:
-                return "（未設定）"
-            return f"{name}（{end_date}）"
+                return tr("（未設定）")
+            return tr("{name}（{end_date}）", name=name, end_date=end_date)
 
         table = QTableWidget(0, 4)
-        table.setHorizontalHeaderLabels(["ジョブ", "タスク", "現在", "調整後"])
+        table.setHorizontalHeaderLabels([tr("ジョブ"), tr("タスク"), tr("現在"), tr("調整後")])
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QTableWidget.NoEditTriggers)
         table.setSelectionMode(QTableWidget.NoSelection)
@@ -539,8 +536,8 @@ class MilestoneRepairConfirmDialog(QDialog):
         layout.addWidget(table, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("調整して変更")
-        buttons.button(QDialogButtonBox.Cancel).setText("変更を取り消す")
+        buttons.button(QDialogButtonBox.Ok).setText(tr("調整して変更"))
+        buttons.button(QDialogButtonBox.Cancel).setText(tr("変更を取り消す"))
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -587,18 +584,18 @@ class CrudSection(QGroupBox):
         layout = QVBoxLayout(self)
 
         toolbar = QHBoxLayout()
-        add_btn = QPushButton("＋ 追加")
+        add_btn = QPushButton(tr("＋ 追加"))
         add_btn.clicked.connect(self._handle_add)
         toolbar.addWidget(add_btn)
         if on_edit is not None:
-            edit_btn = QPushButton("編集...")
+            edit_btn = QPushButton(tr("編集..."))
             edit_btn.clicked.connect(self._handle_edit)
             toolbar.addWidget(edit_btn)
         if on_duplicate is not None:
-            duplicate_btn = QPushButton("複製")
+            duplicate_btn = QPushButton(tr("複製"))
             duplicate_btn.clicked.connect(self._handle_duplicate)
             toolbar.addWidget(duplicate_btn)
-        del_btn = QPushButton("－ 削除")
+        del_btn = QPushButton(tr("－ 削除"))
         del_btn.clicked.connect(self._handle_delete)
         toolbar.addWidget(del_btn)
         toolbar.addStretch(1)
@@ -625,21 +622,21 @@ class CrudSection(QGroupBox):
     def _handle_edit(self):
         row = self.table.currentRow()
         if row < 0:
-            QMessageBox.information(self, "編集", "編集する行を選択してください。")
+            QMessageBox.information(self, tr("編集"), tr("編集する行を選択してください。"))
             return
         self.on_edit(row)
 
     def _handle_delete(self):
         row = self.table.currentRow()
         if row < 0:
-            QMessageBox.information(self, "削除", "削除する行を選択してください。")
+            QMessageBox.information(self, tr("削除"), tr("削除する行を選択してください。"))
             return
         self.on_delete(row)
 
     def _handle_duplicate(self):
         row = self.table.currentRow()
         if row < 0:
-            QMessageBox.information(self, "複製", "複製する行を選択してください。")
+            QMessageBox.information(self, tr("複製"), tr("複製する行を選択してください。"))
             return
         self.on_duplicate(row)
 
@@ -667,9 +664,9 @@ class ChoiceFilterGroup(QGroupBox):
         super().__init__(title, parent)
         self._checks = {}  # key -> QCheckBox
         layout = QHBoxLayout(self)
-        select_all_btn = QPushButton("すべて表示")
+        select_all_btn = QPushButton(tr("すべて表示"))
         select_all_btn.clicked.connect(lambda: self.set_all(True))
-        select_none_btn = QPushButton("すべて解除")
+        select_none_btn = QPushButton(tr("すべて解除"))
         select_none_btn.clicked.connect(lambda: self.set_all(False))
         layout.addWidget(select_all_btn)
         layout.addWidget(select_none_btn)

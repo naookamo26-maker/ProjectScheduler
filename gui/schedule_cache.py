@@ -32,6 +32,7 @@ from gui.gantt_generator import (
 )
 from gui.plan_confirmation import PlanState
 from project_scheduler import SchedulingError
+from i18n import tr
 
 # 大規模サンプルで、_ScheduleWorker が別スレッドで大量にオブジェクトを確保して
 # CPythonの循環GCが走るタイミングが、GUIスレッドが大きな QGraphicsScene を
@@ -94,7 +95,7 @@ class _ScheduleThread(QThread):
         except SchedulingError as e:
             self.failed.emit(self._seq, str(e))
         except Exception as e:  # noqa: BLE001 - ワーカースレッドで例外を握り潰さない
-            self.failed.emit(self._seq, f"予期しないエラー: {e}")
+            self.failed.emit(self._seq, tr("予期しないエラー: {e}", e=e))
         else:
             self.computed.emit(self._seq, result_df, info)
 
@@ -151,7 +152,7 @@ class ScheduleCache(QObject):
         errors = validate_for_generation(self.db)
         if errors:
             self._cancel_pending_request()
-            self._set_error("スケジューリングできません。以下を解決してください:\n- " + "\n- ".join(errors))
+            self._set_error(tr("スケジューリングできません。以下を解決してください:\n- ") + "\n- ".join(errors))
             return
 
         if self.is_fresh():
@@ -172,7 +173,7 @@ class ScheduleCache(QObject):
             plan = build_plan(self.db, plan_state)
         except Exception as e:  # noqa: BLE001 - 未完成なデータでも落とさない
             self._cancel_pending_request()
-            self._set_error(f"スケジューリングに失敗しました: {e}")
+            self._set_error(tr("スケジューリングに失敗しました: {e}", e=e))
             return
 
         self.error_message = None
@@ -253,7 +254,7 @@ class ScheduleCache(QObject):
         if seq != self._request_seq:
             return
         self._computing_revision = None
-        self._set_error(f"スケジューリングに失敗しました: {message}")
+        self._set_error(tr("スケジューリングに失敗しました: {message}", message=message))
 
     def shutdown(self):
         """ウィンドウを閉じる・DBを閉じる際に、走っているスケジューリング

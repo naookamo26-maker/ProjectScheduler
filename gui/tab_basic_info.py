@@ -54,10 +54,11 @@ from gui.widgets_common import (
     set_row_id,
     unique_default_name,
 )
+from i18n import N_, tr
 
 # チームの同時ライン数入力欄の上限（gui/tab_basic_info.py 全体で共通）。
 _MAX_LINES = 999
-_LINES_UNSET_TEXT = "指定なし"
+_LINES_UNSET_TEXT = N_("指定なし")
 
 
 def _to_qdate(iso_str):
@@ -74,17 +75,17 @@ class AddMilestoneDialog(QDialog):
 
     def __init__(self, default_name, default_date, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("マイルストーンを追加")
+        self.setWindowTitle(tr("マイルストーンを追加"))
 
         form = QFormLayout(self)
 
         self.name_edit = QLineEdit(default_name)
-        form.addRow("マイルストーン名", self.name_edit)
+        form.addRow(tr("マイルストーン名"), self.name_edit)
 
         self.date_edit = NoWheelDateEdit(default_date)
         self.date_edit.setCalendarPopup(True)
         self.date_edit.setDisplayFormat("yyyy-MM-dd")
-        form.addRow("締切日", self.date_edit)
+        form.addRow(tr("締切日"), self.date_edit)
 
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.buttons.accepted.connect(self.accept)
@@ -100,16 +101,16 @@ class AddTeamDialog(QDialog):
 
     def __init__(self, default_name, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("チームを追加")
+        self.setWindowTitle(tr("チームを追加"))
 
         form = QFormLayout(self)
 
         self.name_edit = QLineEdit(default_name)
-        form.addRow("チーム名", self.name_edit)
+        form.addRow(tr("チーム名"), self.name_edit)
 
-        self.lines_spin = OptionalSpinBox(_MAX_LINES, _LINES_UNSET_TEXT)
+        self.lines_spin = OptionalSpinBox(_MAX_LINES, tr(_LINES_UNSET_TEXT))
         self.lines_spin.set_optional_value(None)  # 新規チームの既定は「指定なし」
-        form.addRow("同時ライン数（開発開始日からの既定値）", self.lines_spin)
+        form.addRow(tr("同時ライン数（開発開始日からの既定値）"), self.lines_spin)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -127,18 +128,18 @@ class AddCapacityChangeDialog(QDialog):
 
     def __init__(self, default_date, default_lines, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("同時ライン数の変動点を追加")
+        self.setWindowTitle(tr("同時ライン数の変動点を追加"))
 
         form = QFormLayout(self)
 
         self.date_edit = NoWheelDateEdit(default_date)
         self.date_edit.setCalendarPopup(True)
         self.date_edit.setDisplayFormat("yyyy-MM-dd")
-        form.addRow("適用開始日", self.date_edit)
+        form.addRow(tr("適用開始日"), self.date_edit)
 
-        self.lines_spin = OptionalSpinBox(_MAX_LINES, _LINES_UNSET_TEXT)
+        self.lines_spin = OptionalSpinBox(_MAX_LINES, tr(_LINES_UNSET_TEXT))
         self.lines_spin.set_optional_value(default_lines)
-        form.addRow("同時ライン数", self.lines_spin)
+        form.addRow(tr("同時ライン数"), self.lines_spin)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -154,17 +155,17 @@ class AddHolidayDialog(QDialog):
 
     def __init__(self, team_options, default_date, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("休業日を追加")
+        self.setWindowTitle(tr("休業日を追加"))
 
         form = QFormLayout(self)
 
         self.date_edit = NoWheelDateEdit(default_date)
         self.date_edit.setCalendarPopup(True)
         self.date_edit.setDisplayFormat("yyyy-MM-dd")
-        form.addRow("日付", self.date_edit)
+        form.addRow(tr("日付"), self.date_edit)
 
-        self.team_combo = make_fk_combo(team_options, allow_blank=True, blank_label="（全チーム共通）")
-        form.addRow("対象チーム", self.team_combo)
+        self.team_combo = make_fk_combo(team_options, allow_blank=True, blank_label=tr("（全チーム共通）"))
+        form.addRow(tr("対象チーム"), self.team_combo)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -199,13 +200,13 @@ class BasicInfoTab(QWidget):
         layout = QVBoxLayout(content)
 
         self.milestones_section = CrudSection(
-            "マイルストーン", ["マイルストーン名", "締切日", "備考"],
+            tr("マイルストーン"), [tr("マイルストーン名"), tr("締切日"), tr("備考")],
             on_add=self._add_milestone, on_delete=self._delete_milestone,
         )
         self.milestones_section.table.itemChanged.connect(self._on_milestone_cell_changed)
 
         self.holidays_section = CrudSection(
-            "休業日", ["日付", "対象チーム（未設定＝全チーム共通）", "備考"],
+            tr("休業日"), [tr("日付"), tr("対象チーム（未設定＝全チーム共通）"), tr("備考")],
             on_add=self._add_holiday, on_delete=self._delete_holiday,
         )
         self.holidays_section.table.itemChanged.connect(self._on_holiday_note_changed)
@@ -275,19 +276,19 @@ class BasicInfoTab(QWidget):
     # -- プロジェクト概要 -----------------------------------------------------
 
     def _build_project_group(self):
-        group = QGroupBox("プロジェクト概要")
+        group = QGroupBox(tr("プロジェクト概要"))
         form = QFormLayout(group)
 
         self.project_name_edit = QLineEdit()
         self.project_name_edit.editingFinished.connect(self._on_project_changed)
-        form.addRow("プロジェクト名", self.project_name_edit)
+        form.addRow(tr("プロジェクト名"), self.project_name_edit)
 
         self.start_date_edit = NoWheelDateEdit()
         self.start_date_edit.setCalendarPopup(True)
         self.start_date_edit.setDisplayFormat("yyyy-MM-dd")
         self.start_date_edit.dateChanged.connect(self._on_project_changed)
         bind_undo_session(self.start_date_edit, self.db, "開発開始日を変更")
-        form.addRow("開発開始日", self.start_date_edit)
+        form.addRow(tr("開発開始日"), self.start_date_edit)
 
         return group
 
@@ -336,7 +337,7 @@ class BasicInfoTab(QWidget):
 
     def _add_milestone(self):
         existing = {ms["name"] for ms in self.db.list_milestones()}
-        default_name = unique_default_name(existing, "新しいマイルストーン")
+        default_name = unique_default_name(existing, tr("新しいマイルストーン"))
         dialog = AddMilestoneDialog(default_name, QDate.currentDate(), self)
         while True:
             if dialog.exec() != QDialog.Accepted:
@@ -345,7 +346,7 @@ class BasicInfoTab(QWidget):
             try:
                 new_id = self.db.add_milestone(name, end_date)
             except DuplicateNameError as e:
-                QMessageBox.warning(self, "追加できません", str(e))
+                QMessageBox.warning(self, tr("追加できません"), str(e))
                 continue
             break
         self.refresh_milestones()
@@ -355,7 +356,7 @@ class BasicInfoTab(QWidget):
         table = self.milestones_section.table
         ms_id = row_id(table, row)
         count = self.db.milestone_usage_count(ms_id)
-        if not confirm_or_block_delete(self, count, "このマイルストーン", hard_block=False):
+        if not confirm_or_block_delete(self, count, tr("このマイルストーン"), hard_block=False):
             return
         self.db.delete_milestone(ms_id)
         self.refresh_milestones()
@@ -373,7 +374,7 @@ class BasicInfoTab(QWidget):
         try:
             self.db.update_milestone(ms_id, name, _to_iso(date_edit.date()), note)
         except DuplicateNameError as e:
-            QMessageBox.warning(self, "変更できません", str(e))
+            QMessageBox.warning(self, tr("変更できません"), str(e))
             self.refresh_milestones()
             return
         if item.column() == 0:
@@ -416,7 +417,7 @@ class BasicInfoTab(QWidget):
         if edited is None:
             return
         if confirm_and_repair_milestone_consistency(
-            self.db, self, "マイルストーンの締切日の変更",
+            self.db, self, tr("マイルストーンの締切日の変更"),
         ):
             self._notify_jobs_changed()
             return
@@ -442,16 +443,16 @@ class BasicInfoTab(QWidget):
         panel_layout.setContentsMargins(0, 0, 0, 0)
 
         toolbar = QHBoxLayout()
-        add_team_btn = QPushButton("＋ チーム")
+        add_team_btn = QPushButton(tr("＋ チーム"))
         add_team_btn.clicked.connect(self._add_team)
-        del_team_btn = QPushButton("－ チーム")
+        del_team_btn = QPushButton(tr("－ チーム"))
         del_team_btn.clicked.connect(self._delete_team_selected)
         toolbar.addWidget(add_team_btn)
         toolbar.addWidget(del_team_btn)
         toolbar.addSpacing(16)
-        add_change_btn = QPushButton("＋ 変動点")
+        add_change_btn = QPushButton(tr("＋ 変動点"))
         add_change_btn.clicked.connect(self._add_capacity_change_selected)
-        del_change_btn = QPushButton("－ 変動点")
+        del_change_btn = QPushButton(tr("－ 変動点"))
         del_change_btn.clicked.connect(self._delete_capacity_change_selected)
         toolbar.addWidget(add_change_btn)
         toolbar.addWidget(del_change_btn)
@@ -460,7 +461,7 @@ class BasicInfoTab(QWidget):
 
         self.teams_tree = QTreeWidget()
         self.teams_tree.setColumnCount(2)
-        self.teams_tree.setHeaderLabels(["チーム名 ／ 適用開始日", "ライン数"])
+        self.teams_tree.setHeaderLabels([tr("チーム名 ／ 適用開始日"), tr("ライン数")])
         # 列幅を1:1にする（両方をStretchにすると残り幅を均等に分け合う）。
         teams_header = self.teams_tree.header()
         teams_header.setSectionResizeMode(0, QHeaderView.Stretch)
@@ -492,7 +493,7 @@ class BasicInfoTab(QWidget):
             default_child.setData(0, Qt.UserRole, {"kind": "default_capacity", "team_id": team["id"]})
             top.addChild(default_child)
 
-            default_spin = OptionalSpinBox(_MAX_LINES, _LINES_UNSET_TEXT)
+            default_spin = OptionalSpinBox(_MAX_LINES, tr(_LINES_UNSET_TEXT))
             default_spin.set_optional_value(team["max_lines"])
             default_spin.valueChanged.connect(
                 lambda _val, eid=team["id"], spin=default_spin:
@@ -521,7 +522,7 @@ class BasicInfoTab(QWidget):
                 )
                 tree.setItemWidget(child, 0, date_edit)
 
-                lines_spin = OptionalSpinBox(_MAX_LINES, _LINES_UNSET_TEXT)
+                lines_spin = OptionalSpinBox(_MAX_LINES, tr(_LINES_UNSET_TEXT))
                 lines_spin.set_optional_value(c["lines"])
                 lines_spin.valueChanged.connect(
                     lambda _val, cid=c["id"], it=child: self._on_team_capacity_change_edited(cid, it)
@@ -566,7 +567,7 @@ class BasicInfoTab(QWidget):
     def _add_capacity_change_selected(self):
         _item, data = self._resolve_team_item(self._selected_team_tree_item())
         if data is None:
-            QMessageBox.information(self, "追加", "変動点を追加するチームを選択してください。")
+            QMessageBox.information(self, tr("追加"), tr("変動点を追加するチームを選択してください。"))
             return
         team_id = data["team_id"]
         team = next((t for t in self.db.list_teams() if t["id"] == team_id), None)
@@ -593,7 +594,7 @@ class BasicInfoTab(QWidget):
             try:
                 new_id = self.db.add_team_capacity_change(team_id, start_date, lines)
             except DuplicateNameError as e:
-                QMessageBox.warning(self, "追加できません", str(e))
+                QMessageBox.warning(self, tr("追加できません"), str(e))
                 continue
             break
         self.refresh_teams()
@@ -604,7 +605,7 @@ class BasicInfoTab(QWidget):
         data = item.data(0, Qt.UserRole) if item is not None else None
         if data is None or data.get("kind") != "capacity_change":
             QMessageBox.information(
-                self, "削除", "削除する変動点を選択してください（既定値の行は削除できません）。"
+                self, tr("削除"), tr("削除する変動点を選択してください（既定値の行は削除できません）。")
             )
             return
         team_id = data["team_id"]
@@ -633,7 +634,7 @@ class BasicInfoTab(QWidget):
                 change_id, _to_iso(date_edit.date()), lines_spin.optional_value()
             )
         except DuplicateNameError as e:
-            QMessageBox.warning(self, "変更できません", str(e))
+            QMessageBox.warning(self, tr("変更できません"), str(e))
             self.refresh_teams()
             return
 
@@ -660,7 +661,7 @@ class BasicInfoTab(QWidget):
 
     def _add_team(self):
         existing = {t["name"] for t in self.db.list_teams()}
-        default_name = unique_default_name(existing, "新しいチーム")
+        default_name = unique_default_name(existing, tr("新しいチーム"))
         dialog = AddTeamDialog(default_name, self)
         while True:
             if dialog.exec() != QDialog.Accepted:
@@ -669,7 +670,7 @@ class BasicInfoTab(QWidget):
             try:
                 new_id = self.db.add_team(name, max_lines)
             except DuplicateNameError as e:
-                QMessageBox.warning(self, "追加できません", str(e))
+                QMessageBox.warning(self, tr("追加できません"), str(e))
                 continue
             break
         self.refresh_teams()
@@ -679,16 +680,16 @@ class BasicInfoTab(QWidget):
     def _delete_team_selected(self):
         _item, data = self._resolve_team_item(self._selected_team_tree_item())
         if data is None:
-            QMessageBox.information(self, "削除", "削除するチームを選択してください。")
+            QMessageBox.information(self, tr("削除"), tr("削除するチームを選択してください。"))
             return
         team_id = data["team_id"]
         count = self.db.team_usage_count(team_id)
-        if not confirm_or_block_delete(self, count, "このチーム", hard_block=True):
+        if not confirm_or_block_delete(self, count, tr("このチーム"), hard_block=True):
             return
         try:
             self.db.delete_team(team_id)
         except ReferencedEntityError as e:
-            QMessageBox.warning(self, "削除できません", str(e))
+            QMessageBox.warning(self, tr("削除できません"), str(e))
             return
         self.refresh_teams()
         self._notify_teams_changed()
@@ -706,7 +707,7 @@ class BasicInfoTab(QWidget):
         try:
             self.db.update_team(team_id, item.text(0), team["max_lines"])
         except DuplicateNameError as e:
-            QMessageBox.warning(self, "変更できません", str(e))
+            QMessageBox.warning(self, tr("変更できません"), str(e))
             self.refresh_teams()
             return
         self._notify_teams_changed()
@@ -724,7 +725,7 @@ class BasicInfoTab(QWidget):
     # -- チーム（枠） ---------------------------------------------------------------
 
     def _build_teams_group(self):
-        group = QGroupBox("チーム")
+        group = QGroupBox(tr("チーム"))
         group_layout = QVBoxLayout(group)
         self._teams_panel = self._build_teams_panel()
         group_layout.addWidget(self._teams_panel)
@@ -752,7 +753,7 @@ class BasicInfoTab(QWidget):
             bind_undo_session(date_edit, self.db, "休業日の日付を変更")
             table.setCellWidget(row, 0, date_edit)
 
-            combo = make_fk_combo(team_options, hol["team_id"], allow_blank=True, blank_label="（全チーム共通）")
+            combo = make_fk_combo(team_options, hol["team_id"], allow_blank=True, blank_label=tr("（全チーム共通）"))
             combo.currentIndexChanged.connect(
                 lambda idx, eid=hol["id"]: self._on_holiday_changed(eid)
             )
@@ -779,7 +780,7 @@ class BasicInfoTab(QWidget):
             try:
                 new_id = self.db.add_holiday(hol_date, team_id)
             except DuplicateNameError as e:
-                QMessageBox.warning(self, "追加できません", str(e))
+                QMessageBox.warning(self, tr("追加できません"), str(e))
                 continue
             break
         self.refresh_holidays()
@@ -801,7 +802,7 @@ class BasicInfoTab(QWidget):
                 try:
                     self.db.update_holiday(holiday_id, _to_iso(date_edit.date()), combo.currentData(), note)
                 except DuplicateNameError as e:
-                    QMessageBox.warning(self, "変更できません", str(e))
+                    QMessageBox.warning(self, tr("変更できません"), str(e))
                     self.refresh_holidays()
                 return
 
@@ -817,7 +818,7 @@ class BasicInfoTab(QWidget):
         try:
             self.db.update_holiday(hol_id, _to_iso(date_edit.date()), combo.currentData(), item.text())
         except DuplicateNameError as e:
-            QMessageBox.warning(self, "変更できません", str(e))
+            QMessageBox.warning(self, tr("変更できません"), str(e))
             self.refresh_holidays()
 
     # -- 全体再読み込み ----------------------------------------------------------

@@ -94,6 +94,8 @@ from datetime import date as date_cls, timedelta
 import numpy as np
 import pandas as pd
 
+from i18n import current_language, tr
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -171,14 +173,12 @@ def parse_dependency_ref(text):
     m = _DEP_REF_RE.match(str(text).strip())
     if m is None:
         raise SchedulingError(
-            f"依存関係の書き方 '{text}' を解釈できません"
-            f"（'T_003' / 'T_003(SS+2)' / 'T_003(FS-1)' の形で指定してください）"
+            tr("依存関係の書き方 '{text}' を解釈できません（'T_003' / 'T_003(SS+2)' / 'T_003(FS-1)' の形で指定してください）", text=text)
         )
     kind = (m.group("kind") or "FS").upper()
     if kind not in DEPENDENCY_KINDS:
         raise SchedulingError(
-            f"依存関係の種別 '{kind}'（'{text}'）は不正です"
-            f"（{' / '.join(DEPENDENCY_KINDS)} のいずれか）"
+            tr("依存関係の種別 '{kind}'（'{text}'）は不正です（{value} のいずれか）", kind=kind, text=text, value=' / '.join(DEPENDENCY_KINDS))
         )
     lag = m.group("lag")
     return m.group("task"), kind, int(lag.replace(" ", "")) if lag else 0
@@ -307,7 +307,7 @@ def _require_columns(df, required_cols, sheet_name):
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise MissingSheetOrColumnError(
-            f"シート '{sheet_name}' に必須列が不足しています: {missing}"
+            tr("シート '{sheet_name}' に必須列が不足しています: {missing}", sheet_name=sheet_name, missing=missing)
         )
 
 
@@ -332,7 +332,7 @@ def _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
     _require_columns(df_jobs, ["Job_ID", "Job_Name", "Workflow_ID", "Priority"], "Jobs")
 
     if df_project.empty:
-        raise MissingSheetOrColumnError("Project シートが空です（1行必要）")
+        raise MissingSheetOrColumnError(tr("Project シートが空です（1行必要）"))
     if len(df_project) > 1:
         logger.warning("Project シートに複数行あります。1行目のみ使用します")
 
@@ -385,7 +385,7 @@ def _load_data_from_frames(df_project, df_teams, df_ms, df_wf, df_jobs,
 def _load_project_start(df_project):
     start = pd.to_datetime(df_project.iloc[0]["Start_Date"])
     if pd.isna(start):
-        raise MissingSheetOrColumnError("Project シートの Start_Date が空です")
+        raise MissingSheetOrColumnError(tr("Project シートの Start_Date が空です"))
     return start
 
 
@@ -618,7 +618,7 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
             override_days = override.get("Override_Days")
             days = int(override_days) if pd.notna(override_days) else int(t["Default_Days"])
             if days <= 0:
-                raise SchedulingError(f"タスク '{g_id}' の所要日数が不正です（{days}日）")
+                raise SchedulingError(tr("タスク '{g_id}' の所要日数が不正です（{days}日）", g_id=g_id, days=days))
 
             task_ms = override.get("Milestone_ID")
             if not pd.notna(task_ms) or str(task_ms).strip() == "":
@@ -656,13 +656,13 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
                     )
             elif task_ms not in ms_end_map:
                 raise MissingMilestoneError(
-                    f"タスク '{g_id}' が参照するマイルストーン '{task_ms}' が Milestones シートに見つかりません"
+                    tr("タスク '{g_id}' が参照するマイルストーン '{task_ms}' が Milestones シートに見つかりません", g_id=g_id, task_ms=task_ms)
                 )
             else:
                 ms_end = ms_end_map[task_ms]
                 if pd.isna(ms_end):
                     raise MissingMilestoneError(
-                        f"マイルストーン '{task_ms}'（タスク '{g_id}' が参照）の End_Date が空です"
+                        tr("マイルストーン '{task_ms}'（タスク '{g_id}' が参照）の End_Date が空です", task_ms=task_ms, g_id=g_id)
                     )
 
             raw_deps[g_id] = deps
@@ -676,7 +676,7 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
                 start_pin = pd.to_datetime(start_pin_raw, errors="coerce")
                 if pd.isna(start_pin):
                     raise SchedulingError(
-                        f"タスク '{g_id}' の開始固定日 '{start_pin_raw}' を解釈できません"
+                        tr("タスク '{g_id}' の開始固定日 '{start_pin_raw}' を解釈できません", g_id=g_id, start_pin_raw=start_pin_raw)
                     )
                 start_pin_ord = start_pin.toordinal()
 
@@ -689,7 +689,7 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
                 not_before = pd.to_datetime(not_before_raw, errors="coerce")
                 if pd.isna(not_before):
                     raise SchedulingError(
-                        f"タスク '{g_id}' の着手の下限 '{not_before_raw}' を解釈できません"
+                        tr("タスク '{g_id}' の着手の下限 '{not_before_raw}' を解釈できません", g_id=g_id, not_before_raw=not_before_raw)
                     )
                 not_before_ord = not_before.toordinal()
 
@@ -785,7 +785,7 @@ def _build_scheduling_order(active_tasks, active_ids):
     if len(scheduling_order) != len(active_ids):
         remaining = active_ids - set(scheduling_order)
         raise CircularDependencyError(
-            f"循環依存が検出されました。関係するタスク: {sorted(remaining)}"
+            tr("循環依存が検出されました。関係するタスク: {remaining}", remaining=sorted(remaining))
         )
 
     return successors, scheduling_order
@@ -876,7 +876,7 @@ class _WorkCalendar:
         self.base = int(lo_ord)
         self.size = int(hi_ord) - self.base + 1
         if self.size <= 0:
-            raise SchedulingError("稼働日カレンダーの範囲が不正です")
+            raise SchedulingError(tr("稼働日カレンダーの範囲が不正です"))
 
         common = np.ones(self.size, dtype=bool)
         if auto_exclude_weekends:
@@ -907,7 +907,7 @@ class _WorkCalendar:
         nth = np.flatnonzero(work).astype(np.int32)
         if nth.size == 0:
             raise SchedulingError(
-                "対象期間内に稼働日が1日もありません。休業日の設定を見直してください。"
+                tr("対象期間内に稼働日が1日もありません。休業日の設定を見直してください。")
             )
         return work, cum, nth
 
@@ -922,8 +922,10 @@ class _WorkCalendar:
         i = int(ordinal) - self.base
         if not 0 <= i < self.size:
             raise SchedulingError(
-                f"日付 {pd.Timestamp.fromordinal(int(ordinal)).date()} が"
-                f"事前計算した稼働日カレンダーの範囲外です"
+                tr(
+                    "日付 {date} が事前計算した稼働日カレンダーの範囲外です",
+                    date=pd.Timestamp.fromordinal(int(ordinal)).date(),
+                )
             )
         return i
 
@@ -1050,9 +1052,7 @@ def _dep_lower_bounds(t_info, dates, cal, team_id, g_id):
         bound = cal.shift_working_days(anchor, lag, team_id)
         if bound is None:
             raise SchedulingError(
-                f"タスク '{g_id}' の依存 '{d}'（{kind}{lag:+d}日）を反映した"
-                f"着手可能日が稼働日カレンダーの範囲を超えました。ラグの値を"
-                f"見直してください。"
+                tr("タスク '{g_id}' の依存 '{d}'（{kind}{lag:+d}日）を反映した着手可能日が稼働日カレンダーの範囲を超えました。ラグの値を見直してください。", g_id=g_id, d=d, kind=kind, lag=lag)
             )
         bounds.append(bound)
     return bounds
@@ -1147,7 +1147,7 @@ def _calc_raw_dates(active_tasks, successors, scheduling_order, cal):
             pin_end = cal.business_end(pin, days, team_id)
             if pin_end is None:
                 raise SchedulingError(
-                    f"タスク '{g_id}' の固定開始日から所要日数ぶんの稼働日を確保できません"
+                    tr("タスク '{g_id}' の固定開始日から所要日数ぶんの稼働日を確保できません", g_id=g_id)
                 )
             raw_dates[g_id] = (pin, pin_end)
             continue
@@ -1169,8 +1169,7 @@ def _calc_raw_dates(active_tasks, successors, scheduling_order, cal):
                 cap = cal.shift_working_days(succ_start, -lag, team_id)
             if cap is None:
                 raise SchedulingError(
-                    f"タスク '{g_id}' の最遅日程を求められません（後続 '{s}' への"
-                    f"依存 {kind}{lag:+d}日 が稼働日カレンダーの範囲を超えました）"
+                    tr("タスク '{g_id}' の最遅日程を求められません（後続 '{s}' への依存 {kind}{lag:+d}日 が稼働日カレンダーの範囲を超えました）", g_id=g_id, s=s, kind=kind, lag=lag)
                 )
             if cap < t_end:
                 t_end = cap
@@ -1178,8 +1177,7 @@ def _calc_raw_dates(active_tasks, successors, scheduling_order, cal):
         t_start = cal.business_start(t_end, days, team_id)
         if t_start is None:
             raise SchedulingError(
-                f"タスク '{g_id}' の最遅日程を求められません。マイルストーンの締切が"
-                f"早すぎるか、所要日数が長すぎる可能性があります。"
+                tr("タスク '{g_id}' の最遅日程を求められません。マイルストーンの締切が早すぎるか、所要日数が長すぎる可能性があります。", g_id=g_id)
             )
         raw_dates[g_id] = (t_start, t_end)
     return raw_dates
@@ -1212,8 +1210,7 @@ def _calc_asap_dates(active_tasks, leveling_order, project_start_ord, cal):
         t_end = None if t_start is None else cal.business_end(t_start, t_info["days"], team_id)
         if t_end is None:
             raise SchedulingError(
-                f"タスク '{g_id}' の最速日程を求められません。休業日の設定、"
-                f"または所要日数を見直してください。"
+                tr("タスク '{g_id}' の最速日程を求められません。休業日の設定、または所要日数を見直してください。", g_id=g_id)
             )
         asap_dates[g_id] = (t_start, t_end)
     return asap_dates
@@ -1428,9 +1425,10 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
         end_ord = cal.business_end(pin, t_info["days"], team_id)
         if end_ord is None:
             raise SchedulingError(
-                f"タスク '{g_id}' の固定開始日 "
-                f"{pd.Timestamp.fromordinal(pin).date()} から所要日数ぶんの"
-                f"稼働日を確保できません"
+                tr(
+                    "タスク '{g_id}' の固定開始日 {date} から所要日数ぶんの稼働日を確保できません",
+                    g_id=g_id, date=pd.Timestamp.fromordinal(pin).date(),
+                )
             )
         # 固定同士がぶつかる（同じチーム・同じ期間に固定が集中する）場合は、
         # 片方を動かして辻褄を合わせることはしない——固定は入力であり、
@@ -1458,7 +1456,7 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
             max([project_start_ord, t_info.get("not_before_ord") or 0] + dep_ends), team_id
         )
         if earliest_start is None:
-            raise SchedulingError(f"タスク '{g_id}' の着手可能日を求められません")
+            raise SchedulingError(tr("タスク '{g_id}' の着手可能日を求められません", g_id=g_id))
 
         # 締切から逆算した、このタスク自身の最遅開始日（鎖全体の残り所要日数を
         # 織り込み済みの静的な値）。依存元の実際の終了が想定より遅れた場合に
@@ -1478,7 +1476,7 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
             target_start = min(max(static_target, earliest_start), latest_start)
         target_start = cal.next_working_day(target_start, team_id)
         if target_start is None:
-            raise SchedulingError(f"タスク '{g_id}' の配置基準日を求められません")
+            raise SchedulingError(tr("タスク '{g_id}' の配置基準日を求められません", g_id=g_id))
         # 上限が非稼働日の場合、その日を開始日とする窓は「次の稼働日を開始日と
         # する窓」と全く同じ期間を指す。稼働日に丸めておくことで、開始日が
         # 土日祝に記録されるのを防ぎつつ探索範囲は変えずに済む。
@@ -1514,8 +1512,7 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
 
         if placed is None:
             raise ResourceOverflowError(
-                f"タスク '{g_id}'（チーム '{team_id}'）を配置できる日程が見つかりません。"
-                f"チームのライン数、休業日の設定、または所要日数を見直してください。"
+                tr("タスク '{g_id}'（チーム '{team_id}'）を配置できる日程が見つかりません。チームのライン数、休業日の設定、または所要日数を見直してください。", g_id=g_id, team_id=team_id)
             )
 
         start_ord, end_ord = placed
@@ -1530,7 +1527,7 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
 
 
 _PLOTLY_GANTT_HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="ja">
+<html lang="__LANG__">
 <head>
 <meta charset="utf-8">
 <title>__TITLE__</title>
@@ -1572,18 +1569,16 @@ _PLOTLY_GANTT_HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <h1>__TITLE__</h1>
-<div class="subtitle">
-  ジョブ単位で1行にまとめ（時間が重なるタスクだけ行を分ける）、作業開始が早い順に上から並べている。
-  チームのチェックを外すとそのチームのタスクを非表示にし、行の高さも詰めて再描画する。
-</div>
+<div class="subtitle">__SUBTITLE__</div>
 <div id="overrun-note"></div>
 <div id="filter-panel">
-  <div class="filter-title">チームで絞り込み</div>
+  <div class="filter-title">__FILTER_TITLE__</div>
 </div>
 <div id="charts"></div>
 <script>__PLOTLY_JS__</script>
 <script>
 const TASKS = __TASKS_JSON__;
+const I18N = __I18N_JSON__;
 const TEAMS = __TEAMS_JSON__;
 const WORKFLOWS = __WORKFLOWS_JSON__;
 const MILESTONES = __MILESTONES_JSON__;
@@ -1646,17 +1641,22 @@ function groupBy(arr, keyFn) {
   return m;
 }
 
+// 画面の文言（表示言語に訳したもの。project_scheduler.py の _html_texts）。
+// {n} 等の差し込みは fmt() で埋める。
+function fmt(text, values) {
+  return text.replace(/\\{(\\w+)\\}/g, function (_m, k) { return values[k]; });
+}
+
 function hoverText(t) {
-  var adj = t.adjusted ? "あり（リソース制約）" : "なし";
+  var adj = t.adjusted ? I18N.adjusted_yes : I18N.adjusted_no;
   var overrun = t.overrun > 0
-    ? "<br><b>締切超過: " + t.overrun + "日</b>"
+    ? "<br><b>" + fmt(I18N.hover_overrun, { days: t.overrun }) + "</b>"
     : "";
   return "<b>" + t.job_name + " ＞ " + t.task_name + "</b><br>" +
-    "ワークフロー: " + t.workflow_name + "<br>" +
-    "チーム: " + t.team_name + "<br>" +
-    "優先度: " + t.priority + "<br>" +
-    "開始: " + t.start + " ／ 終了: " + t.end + "<br>" +
-    "リソース調整: " + adj + overrun;
+    fmt(I18N.hover_body, {
+      workflow: t.workflow_name, team: t.team_name, priority: t.priority,
+      start: t.start, end: t.end, adjusted: adj,
+    }) + overrun;
 }
 
 function getSelectedTeamIds() {
@@ -1673,10 +1673,10 @@ function buildFilterPanel() {
   var actions = document.createElement('div');
   actions.className = 'filter-actions';
   var allBtn = document.createElement('button');
-  allBtn.textContent = 'すべて表示';
+  allBtn.textContent = I18N.show_all;
   allBtn.onclick = function () { setAll(true); };
   var noneBtn = document.createElement('button');
-  noneBtn.textContent = 'すべて非表示';
+  noneBtn.textContent = I18N.hide_all;
   noneBtn.onclick = function () { setAll(false); };
   actions.appendChild(allBtn);
   actions.appendChild(noneBtn);
@@ -1735,7 +1735,7 @@ function renderWorkflow(wf) {
 
   if (tasks.length === 0) {
     Plotly.purge(container);
-    container.innerHTML = '<div class="empty-note">表示するタスクがありません（フィルタ条件に一致するタスクなし）</div>';
+    container.innerHTML = '<div class="empty-note">' + I18N.no_tasks + '</div>';
     meta.textContent = '';
     return;
   }
@@ -1755,7 +1755,7 @@ function renderWorkflow(wf) {
     return a.jobName.localeCompare(b.jobName);
   });
 
-  meta.textContent = jobEntries.length + ' ジョブ ／ ' + tasks.length + ' タスク';
+  meta.textContent = fmt(I18N.chart_meta, { jobs: jobEntries.length, tasks: tasks.length });
 
   var cursor = 0;
   var tickvals = [], ticktext = [], separators = [];
@@ -1849,12 +1849,7 @@ function buildOverrunNote() {
     return;
   }
   var worst = overruns.reduce(function (m, t) { return Math.max(m, t.overrun); }, 0);
-  note.innerHTML =
-    '<b>マイルストーンの締切に間に合わないタスクが ' + overruns.length + ' 件あります'
-    + '（最大 ' + worst + ' 日超過）。</b><br>'
-    + '該当タスクは<span class="swatch"></span>のように<b>赤く太い枠線</b>で表示しています'
-    + '（バーにマウスを乗せると超過日数を確認できます）。'
-    + 'チームのライン数・依存関係・締切のいずれかを見直してください。';
+  note.innerHTML = fmt(I18N.overrun_note, { n: overruns.length, worst: worst });
 }
 
 function renderAll() {
@@ -1871,7 +1866,31 @@ renderAll();
 """
 
 
-def export_plotly_gantt(result_df, output_path, project_name="プロジェクトスケジュール",
+def _html_texts():
+    """HTMLガントチャートの JavaScript 側で使う文言（表示言語に訳したもの）。
+    {名前} は JavaScript の fmt() で埋める。"""
+    return {
+        "adjusted_yes": tr("あり（リソース制約）"),
+        "adjusted_no": tr("なし"),
+        "hover_overrun": tr("締切超過: {days}日"),
+        "hover_body": tr(
+            "ワークフロー: {workflow}<br>チーム: {team}<br>優先度: {priority}<br>"
+            "開始: {start} ／ 終了: {end}<br>リソース調整: {adjusted}"
+        ),
+        "show_all": tr("すべて表示"),
+        "hide_all": tr("すべて非表示"),
+        "no_tasks": tr("表示するタスクがありません（フィルタ条件に一致するタスクなし）"),
+        "chart_meta": tr("{jobs} ジョブ ／ {tasks} タスク"),
+        "overrun_note": tr(
+            "<b>マイルストーンの締切に間に合わないタスクが {n} 件あります（最大 {worst} 日超過）。</b><br>"
+            "該当タスクは<span class=\"swatch\"></span>のように<b>赤く太い枠線</b>で表示しています"
+            "（バーにマウスを乗せると超過日数を確認できます）。"
+            "チームのライン数・依存関係・締切のいずれかを見直してください。"
+        ),
+    }
+
+
+def export_plotly_gantt(result_df, output_path, project_name=None,
                          team_name_map=None, workflow_name_map=None, team_order=None,
                          milestone_markers=None, title_note=None):
     """result_df（run_resource_constrained_scheduler_from_framesの戻り値）から、
@@ -1911,6 +1930,8 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
     Returns:
         書き出したファイルパス。
     """
+    if project_name is None:
+        project_name = tr("プロジェクトスケジュール")
     import json as _json
     from html import escape as _esc
 
@@ -1918,8 +1939,8 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
         import plotly.offline as pyo
     except ImportError as e:
         raise ImportError(
-            "export_plotly_gantt には plotly が必要です。`pip install plotly` を"
-            "実行するか、requirements.txt から依存関係をインストールしてください。"
+            tr("export_plotly_gantt には plotly が必要です。`pip install plotly` を"
+            "実行するか、requirements.txt から依存関係をインストールしてください。")
         ) from e
 
     team_name_map = team_name_map or {}
@@ -1928,7 +1949,7 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
 
     if result_df.empty:
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write(f"<html><body><p>{_esc(project_name)}: タスクなし</p></body></html>")
+            f.write(tr("<html><body><p>{project_name}: タスクなし</p></body></html>", project_name=_esc(project_name)))
         logger.info(f"Plotlyガントチャートを書き出しました（タスクなし）: {output_path}")
         return output_path
 
@@ -1973,15 +1994,22 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
         for mid, mlabel, mdate in milestone_markers
     ]
 
-    title = f"{project_name} スケジュール"
+    title = tr("{project_name} スケジュール", project_name=project_name)
     if title_note:
         # どの日程を出力したか（GUIの計画の確定: 確定した日程／変更案）
-        title += f"（{title_note}）"
+        title += tr("（{title_note}）", title_note=title_note)
     html_out = (
         _PLOTLY_GANTT_HTML_TEMPLATE
         .replace("__TITLE__", _esc(title))
         .replace("__PLOTLY_JS__", pyo.get_plotlyjs())
         .replace("__TASKS_JSON__", _json.dumps(tasks_json, ensure_ascii=False))
+        .replace("__I18N_JSON__", _json.dumps(_html_texts(), ensure_ascii=False))
+        .replace("__SUBTITLE__", _esc(tr(
+            "ジョブ単位で1行にまとめ（時間が重なるタスクだけ行を分ける）、作業開始が早い順に上から並べている。"
+            "チームのチェックを外すとそのチームのタスクを非表示にし、行の高さも詰めて再描画する。"
+        )))
+        .replace("__FILTER_TITLE__", _esc(tr("チームで絞り込み")))
+        .replace("__LANG__", current_language().replace("_", "-"))
         .replace("__TEAMS_JSON__", _json.dumps(teams_json, ensure_ascii=False))
         .replace("__WORKFLOWS_JSON__", _json.dumps(workflows_json, ensure_ascii=False))
         .replace("__MILESTONES_JSON__", _json.dumps(milestones_json, ensure_ascii=False))
@@ -2106,16 +2134,17 @@ def _check_constraint_violations(active_tasks, scheduled, cal, overbooked_pins):
             floor = cal.next_working_day(max(dep_floor), team_id)
             if floor is not None and start_ord < floor:
                 record(floor - start_ord,
-                       f"固定開始日（{pin_label}）が依存タスクの着手可能日（{_fmt_ord(floor)}）"
-                       f"より{floor - start_ord}日早いです")
+                       tr(
+                           "固定開始日（{pin_label}）が依存タスクの着手可能日（{floor}）より{days}日早いです",
+                           pin_label=pin_label, floor=_fmt_ord(floor), days=floor - start_ord,
+                       ))
         if g_id in overbooked_pins:
             # ライン数の超過に「何日超過」に相当する量は無いので日数は0のまま。
             # 違反しているかどうかは説明文が空かどうかで判定する。
-            record(0, f"固定開始日（{pin_label}）がチーム「{team_id}」のライン数を"
-                      f"超えて予約されています")
+            record(0, tr("固定開始日（{pin_label}）がチーム「{team_id}」のライン数を超えて予約されています", pin_label=pin_label, team_id=team_id))
 
         if notes:
-            violations[g_id] = (worst, "／".join(notes))
+            violations[g_id] = (worst, tr("／").join(notes))
     return violations
 
 
@@ -2182,7 +2211,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
     （_load_data_from_frames() による検証・整形済みのDataFrameを受け取る）。"""
     project_start = _load_project_start(df_project)
     if project_name is None:
-        project_name = str(df_project.iloc[0].get("Project_Name", "プロジェクトスケジュール"))
+        project_name = str(df_project.iloc[0].get("Project_Name", tr("プロジェクトスケジュール")))
     holidays_all, holidays_by_team = _load_holidays(df_holidays)
 
     # ガントチャート見出し用の表示名マップ（未指定なら ID をそのまま使う）
@@ -2202,7 +2231,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
     # ガントチャートに表示するマイルストーン群（プロジェクト開始日 + 各マイルストーン）。
     # 全チャートに同じ集合を差し込むことで、表示期間（軸の範囲）を
     # チャート間で揃える（比較しやすくするため）。
-    milestone_markers = [("PROJECT_START", "プロジェクト開始", project_start)]
+    milestone_markers = [("PROJECT_START", tr("プロジェクト開始"), project_start)]
     for ms_id, ms_row in df_ms.iterrows():
         ms_name = ms_row.get("Milestone_Name")
         if not pd.notna(ms_name) or str(ms_name).strip() == "":
@@ -2300,7 +2329,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
     if verbose:
         print("=== リソース制約考慮スケジューリング結果 ===")
         for _, r in result_df.iterrows():
-            mark = " ⚠️ [リソース制約により前倒し]" if r["Resource_Adjusted"] else ""
+            mark = tr(" ⚠️ [リソース制約により前倒し]") if r["Resource_Adjusted"] else ""
             if r["Constraint_Violation"]:
                 mark += f" ⚠️ [{r['Constraint_Violation']}]"
             print(

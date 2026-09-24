@@ -46,8 +46,9 @@ from gui.widgets_common import (
     row_id,
     set_row_id,
 )
+from i18n import N_, tr
 
-_HELP_TEXT = (
+_HELP_TEXT = N_(
     "左のリストからワークフローを選択するか、「＋追加」で新規作成してください。\n\n"
     "ノードビューでキャンバスを右クリックすると、その位置にタスクや\n"
     "依存テンプレートを追加できます。タスク右端の丸（出力）から別タスク\n"
@@ -75,11 +76,11 @@ class WorkflowsTab(QWidget):
         left_layout = QVBoxLayout(left)
 
         toolbar = QHBoxLayout()
-        add_btn = QPushButton("＋追加")
+        add_btn = QPushButton(tr("＋追加"))
         add_btn.clicked.connect(self._add_workflow)
-        duplicate_btn = QPushButton("複製")
+        duplicate_btn = QPushButton(tr("複製"))
         duplicate_btn.clicked.connect(self._duplicate_workflow)
-        delete_btn = QPushButton("－削除")
+        delete_btn = QPushButton(tr("－削除"))
         delete_btn.clicked.connect(self._delete_workflow)
         toolbar.addWidget(add_btn)
         toolbar.addWidget(duplicate_btn)
@@ -108,31 +109,31 @@ class WorkflowsTab(QWidget):
         # ワークフローを切り替えても選んでいたビューはそのまま維持される
         # （QTabWidget自体は作り直さず、中身だけ差し替えるため）。
         self.view_tabs = QTabWidget()
-        self.view_tabs.addTab(self.view, "ノードビュー")
+        self.view_tabs.addTab(self.view, tr("ノードビュー"))
 
         table_view = QWidget()
         table_view_layout = QVBoxLayout(table_view)
         table_view_layout.setContentsMargins(0, 0, 0, 0)
 
         self.task_section = CrudSection(
-            "タスク一覧（上流→下流の順に表示）",
-            ["タスク名", "担当チーム", "所要日数", "先行タスク"],
+            tr("タスク一覧（上流→下流の順に表示）"),
+            [tr("タスク名"), tr("担当チーム"), tr("所要日数"), tr("先行タスク")],
             on_add=self._add_task_row, on_delete=self._delete_task_row,
             on_edit=self._edit_task_row,
         )
         table_view_layout.addWidget(self.task_section, 2)
 
         self.template_section = CrudSection(
-            "依存テンプレート（このワークフローが他のワークフローに依存する場合の既定タスク対応）",
-            ["このワークフローのタスク", "依存先ワークフロー", "依存先タスク"],
+            tr("依存テンプレート（このワークフローが他のワークフローに依存する場合の既定タスク対応）"),
+            [tr("このワークフローのタスク"), tr("依存先ワークフロー"), tr("依存先タスク")],
             on_add=self._add_template, on_delete=self._delete_template,
             on_edit=self._edit_template,
         )
         table_view_layout.addWidget(self.template_section, 1)
 
-        self.view_tabs.addTab(table_view, "テーブルビュー")
+        self.view_tabs.addTab(table_view, tr("テーブルビュー"))
 
-        self.empty_label = QLabel(_HELP_TEXT)
+        self.empty_label = QLabel(tr(_HELP_TEXT))
         self.empty_label.setWordWrap(True)
         self.empty_label.setAlignment(Qt.AlignCenter)
 
@@ -228,12 +229,12 @@ class WorkflowsTab(QWidget):
             table.insertRow(row)
             table.setItem(row, 0, QTableWidgetItem(t["name"]))
             table.setItem(row, 1, QTableWidgetItem(t["team_name"]))
-            table.setItem(row, 2, QTableWidgetItem(f'{t["default_days"]}日'))
+            table.setItem(row, 2, QTableWidgetItem(tr("{default_days}日", default_days=t["default_days"])))
             # 種別・ラグが既定（FS・0）でない依存だけ「タスク名（SS+2）」と併記する。
             # ノードビューのエッジラベルと同じ基準で、例外だけを目立たせる。
-            pred_names = "、".join(sorted(
+            pred_names = tr("、").join(sorted(
                 name_by_id[d["predecessor_task_id"]]
-                + (f'（{kind}）' if (kind := format_dependency_kind(d["dep_type"], d["lag_days"])) else "")
+                + (tr("（{kind}）", kind=kind) if (kind := format_dependency_kind(d["dep_type"], d["lag_days"])) else "")
                 for d in preds_by_task.get(t["id"], [])
                 if d["predecessor_task_id"] in name_by_id
             ))
@@ -302,13 +303,13 @@ class WorkflowsTab(QWidget):
         self.current_scene.delete_dependency_template_node(template_id)
 
     def _add_workflow(self):
-        name, ok = QInputDialog.getText(self, "ワークフローを追加", "ワークフロー名:")
+        name, ok = QInputDialog.getText(self, tr("ワークフローを追加"), tr("ワークフロー名:"))
         if not ok or not name.strip():
             return
         try:
             new_id = self.db.add_workflow(name.strip())
         except DuplicateNameError as e:
-            QMessageBox.warning(self, "追加できません", str(e))
+            QMessageBox.warning(self, tr("追加できません"), str(e))
             return
         self.refresh_workflows(select_id=new_id)
 
@@ -320,13 +321,13 @@ class WorkflowsTab(QWidget):
         if item is None:
             return
         wf_id = item.data(Qt.UserRole)
-        name, ok = QInputDialog.getText(self, "ワークフロー名を変更", "ワークフロー名:", text=item.text())
+        name, ok = QInputDialog.getText(self, tr("ワークフロー名を変更"), tr("ワークフロー名:"), text=item.text())
         if not ok or not name.strip():
             return
         try:
             self.db.rename_workflow(wf_id, name.strip())
         except DuplicateNameError as e:
-            QMessageBox.warning(self, "変更できません", str(e))
+            QMessageBox.warning(self, tr("変更できません"), str(e))
             return
         self.refresh_workflows(select_id=wf_id)
 
@@ -344,12 +345,12 @@ class WorkflowsTab(QWidget):
             return
         wf_id = item.data(Qt.UserRole)
         count = self.db.workflow_usage_count(wf_id)
-        if not confirm_or_block_delete(self, count, "このワークフロー", hard_block=True):
+        if not confirm_or_block_delete(self, count, tr("このワークフロー"), hard_block=True):
             return
         try:
             self.db.delete_workflow(wf_id)
         except ReferencedEntityError as e:
-            QMessageBox.warning(self, "削除できません", str(e))
+            QMessageBox.warning(self, tr("削除できません"), str(e))
             return
         self.refresh_workflows()
 

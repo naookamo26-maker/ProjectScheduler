@@ -27,11 +27,13 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QLocale, QSettings, QStandardPaths
 
+from i18n import LANGUAGES, tr
+
 SETTINGS_FILE_NAME = "ProjectScheduler.ini"
 SETTINGS_PATH_ENV = "PROJECT_SCHEDULER_SETTINGS"
 
-# 表示言語（docs/roadmap.md §11）。値は QLocale の名前の形に合わせる。
-SUPPORTED_LANGUAGES = ("ja", "en", "vi", "zh_CN")
+# 表示言語（docs/roadmap.md §11）。値は QLocale の名前の形に合わせる。一覧は i18n.py
+SUPPORTED_LANGUAGES = tuple(code for code, _label in LANGUAGES)
 FALLBACK_LANGUAGE = "en"
 
 # ガントのバーをドラッグするときに押すキー（docs/roadmap.md §9）。Ctrl は
@@ -167,7 +169,7 @@ class AppSettings:
     def set(self, name, value):
         option = OPTIONS[name]
         if not option.is_valid(value):
-            raise ValueError(f"{name} に設定できない値です: {value!r}")
+            raise ValueError(tr("{name} に設定できない値です: {value}", name=name, value=repr(value)))
         self._qs.setValue(option.key, value)
 
     def default(self, name):
@@ -181,7 +183,7 @@ class AppSettings:
         """ファイルへ書き出す。書き込みに失敗したら OSError。"""
         self._qs.sync()
         if self._qs.status() != QSettings.NoError:
-            raise OSError(f"設定を保存できませんでした: {self.path}")
+            raise OSError(tr("設定を保存できませんでした: {path}", path=self.path))
 
     def get_ui_state(self, name):
         """オプションではない画面の状態（編集ウィンドウの位置など）。検証しない。"""

@@ -24,7 +24,8 @@ a = Analysis(
     [os.path.join(REPO_ROOT, "run_gui.py")],
     pathex=[REPO_ROOT],
     binaries=[],
-    datas=[],
+    # 多言語対応の辞書（i18n.py が sys._MEIPASS/locales から読む。docs/roadmap.md §11）
+    datas=[(os.path.join(REPO_ROOT, "locales"), "locales")],
     # pandas/plotly はいずれも project_scheduler.py が使用する実行時依存で、
     # pyinstaller-hooks-contrib が同梱するフックにより通常は自動検出されるが、
     # 明示しておくことで検出漏れ時の切り分けを容易にする。

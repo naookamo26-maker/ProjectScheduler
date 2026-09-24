@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.plan_confirmation import replan_preview
+from i18n import tr
 
 _WARNING_STYLE = "color: #c62828;"
 
@@ -28,15 +29,15 @@ _WARNING_STYLE = "color: #c62828;"
 class ReplanDialog(QDialog):
     def __init__(self, db, today=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("全面再計画")
+        self.setWindowTitle(tr("全面再計画"))
         self.db = db
         self.today = today or date.today()
 
         layout = QVBoxLayout(self)
-        intro = QLabel(
+        intro = QLabel(tr(
             "未着手のタスクを、基準日以降に全体として組み直します。"
             "結果は変更案として表示し、「変更を確定」で確定します。"
-        )
+        ))
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -46,7 +47,7 @@ class ReplanDialog(QDialog):
         self.date_edit.setDisplayFormat("yyyy-MM-dd")
         self.date_edit.setDate(QDate(self.today.year, self.today.month, self.today.day))
         self.date_edit.dateChanged.connect(self._update_preview)
-        form.addRow("新しい計画が始まる日（基準日）", self.date_edit)
+        form.addRow(tr("新しい計画が始まる日（基準日）"), self.date_edit)
         layout.addLayout(form)
 
         self.preview_label = QLabel()
@@ -56,13 +57,13 @@ class ReplanDialog(QDialog):
         self.warning_label.setWordWrap(True)
         self.warning_label.setStyleSheet(_WARNING_STYLE)
         layout.addWidget(self.warning_label)
-        note = QLabel("進行中・完了のタスクは動かしません。")
+        note = QLabel(tr("進行中・完了のタスクは動かしません。"))
         note.setForegroundRole(QPalette.PlaceholderText)
         layout.addWidget(note)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("全面再計画")
-        buttons.button(QDialogButtonBox.Cancel).setText("キャンセル")
+        buttons.button(QDialogButtonBox.Ok).setText(tr("全面再計画"))
+        buttons.button(QDialogButtonBox.Cancel).setText(tr("キャンセル"))
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -77,20 +78,23 @@ class ReplanDialog(QDialog):
         preview = replan_preview(self.db, base.isoformat(), self.today.isoformat())
         lines = []
         if preview["kept"]:
-            lines.append(
-                f"{base:%m/%d} より前に開始予定の未着手タスク {preview['kept']}件は、"
-                "今の確定のまま残します。"
-            )
-        lines.append(f"未着手タスク {preview['replaced']}件を {base:%m/%d} 以降に置き直します。")
+            lines.append(tr(
+                "{date} より前に開始予定の未着手タスク {n}件は、今の確定のまま残します。",
+                date=f"{base:%m/%d}", n=preview["kept"],
+            ))
+        lines.append(tr(
+            "未着手タスク {n}件を {date} 以降に置き直します。", n=preview["replaced"], date=f"{base:%m/%d}",
+        ))
         self.preview_label.setText("\n".join(lines))
 
         warnings = []
         if base < self.today:
-            warnings.append("今日より前の日付です。今日より前に置かれるタスクが出ます。")
+            warnings.append(tr("今日より前の日付です。今日より前に置かれるタスクが出ます。"))
         if preview["pinned_before"]:
-            warnings.append(
-                f"{base:%m/%d} より前に開始固定日（手動ピン）がある未着手タスクが "
-                f"{preview['pinned_before']}件あります。ピンの日付のまま置かれます。"
-            )
+            warnings.append(tr(
+                "{date} より前に開始固定日（手動ピン）がある未着手タスクが {n}件あります。"
+                "ピンの日付のまま置かれます。",
+                date=f"{base:%m/%d}", n=preview["pinned_before"],
+            ))
         self.warning_label.setText("\n".join(warnings))
         self.warning_label.setVisible(bool(warnings))

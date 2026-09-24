@@ -56,32 +56,38 @@ from gui.summary_metrics import (
     weekly_peak_breakdown_by_team,
 )
 from gui.widgets_common import NoWheelComboBox, auto_size_columns
+from i18n import N_, tr
 
 _BREAKDOWN_ALL = "all"
 _BREAKDOWN_TEAM = "team"
 _BREAKDOWN_WORKFLOW = "workflow"
 _BREAKDOWN_LABELS = [
-    (_BREAKDOWN_ALL, "全体"),
-    (_BREAKDOWN_TEAM, "チーム別"),
-    (_BREAKDOWN_WORKFLOW, "ワークフロー別"),
+    (_BREAKDOWN_ALL, N_("全体")),
+    (_BREAKDOWN_TEAM, N_("チーム別")),
+    (_BREAKDOWN_WORKFLOW, N_("ワークフロー別")),
 ]
-_BREAKDOWN_EXTRA_COLUMNS = ["ジョブ", "タスク", "完了", "進行中", "未着手"]
+_BREAKDOWN_EXTRA_COLUMNS = [N_("ジョブ"), N_("タスク"), N_("完了"), N_("進行中"), N_("未着手")]
 
-_BASE_COLUMNS = ["マイルストーン", "進捗", "締切日", "最終終了日", "スラック", "超過"]
+_BASE_COLUMNS = [N_("マイルストーン"), N_("進捗"), N_("締切日"), N_("最終終了日"), N_("スラック"), N_("超過")]
 
-_TEAM_COLUMNS = ["チーム", "ピーク", "ピーク時期", "上限に張り付いた日数", "タスク件数", "押し出された件数", "超過件数"]
+_TEAM_COLUMNS = [
+    N_("チーム"), N_("ピーク"), N_("ピーク時期"), N_("上限に張り付いた日数"), N_("タスク件数"),
+    N_("押し出された件数"), N_("超過件数"),
+]
 # チーム別サマリーの表の先頭「全チーム」行を、個別チームの行と見分けるための
 # キー（Qt.UserRoleに入れる）。Noneのままだと「選択なし」と区別が付かない。
 _ALL_TEAMS_KEY = "__all_teams__"
 
-_WORKFLOW_COLUMNS = ["ワークフロー", "ジョブ件数", "タスク件数", "ジョブ所要期間の中央値", "超過件数"]
+_WORKFLOW_COLUMNS = [
+    N_("ワークフロー"), N_("ジョブ件数"), N_("タスク件数"), N_("ジョブ所要期間の中央値"), N_("超過件数"),
+]
 # ワークフロー別サマリーの表の先頭「全ワークフロー」行を、個別ワークフローの
 # 行と見分けるためのキー（_ALL_TEAMS_KEYと同じ考え方）。
 _ALL_WORKFLOWS_KEY = "__all_workflows__"
 _GRANULARITY_LABELS = [
-    (GRANULARITY_MONTH, "月次"),
-    (GRANULARITY_WEEK, "週次"),
-    (GRANULARITY_DAY, "日次"),
+    (GRANULARITY_MONTH, N_("月次")),
+    (GRANULARITY_WEEK, N_("週次")),
+    (GRANULARITY_DAY, N_("日次")),
 ]
 # 日次に切り替えたときに既定で見せる期間（日数）。全期間（サンプルで約590日）を
 # 一度に描くと横に潰れて読めないため、数か月ぶんに絞る（設計案§2-4）。
@@ -176,12 +182,12 @@ class AnalysisTab(QWidget):
         layout.addWidget(self.status_label)
 
         kpi_row = QHBoxLayout()
-        self.kpi_scale = _KpiTile("規模")
-        self.kpi_period = _KpiTile("計画期間")
-        self.kpi_status = _KpiTile("タスクの状態")
-        self.kpi_peak = _KpiTile("同時タスク数のピーク")
-        self.kpi_overrun = _KpiTile("締切に間に合わないタスク")
-        self.kpi_violation = _KpiTile("開始固定日の違反")
+        self.kpi_scale = _KpiTile(tr("規模"))
+        self.kpi_period = _KpiTile(tr("計画期間"))
+        self.kpi_status = _KpiTile(tr("タスクの状態"))
+        self.kpi_peak = _KpiTile(tr("同時タスク数のピーク"))
+        self.kpi_overrun = _KpiTile(tr("締切に間に合わないタスク"))
+        self.kpi_violation = _KpiTile(tr("開始固定日の違反"))
         for tile in (
             self.kpi_scale, self.kpi_period, self.kpi_status,
             self.kpi_peak, self.kpi_overrun, self.kpi_violation,
@@ -202,12 +208,12 @@ class AnalysisTab(QWidget):
         ms_layout.setContentsMargins(0, 6, 0, 0)
 
         breakdown_bar = QHBoxLayout()
-        breakdown_bar.addWidget(QLabel("内訳"))
+        breakdown_bar.addWidget(QLabel(tr("内訳")))
         self._breakdown_group = QButtonGroup(self)
         self._breakdown_group.setExclusive(True)
         self._breakdown_buttons = {}
         for key, label in _BREAKDOWN_LABELS:
-            btn = QPushButton(label)
+            btn = QPushButton(tr(label))
             btn.setCheckable(True)
             btn.setChecked(key == self._breakdown_mode)
             btn.clicked.connect(lambda _checked, k=key: self._on_breakdown_changed(k))
@@ -228,13 +234,13 @@ class AnalysisTab(QWidget):
         ms_layout.addLayout(breakdown_bar)
 
         self.milestone_table = QTableWidget(0, len(_BASE_COLUMNS))
-        self.milestone_table.setHorizontalHeaderLabels(_BASE_COLUMNS)
+        self.milestone_table.setHorizontalHeaderLabels([tr(c) for c in _BASE_COLUMNS])
         self.milestone_table.verticalHeader().setVisible(False)
         self.milestone_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.milestone_table.setSelectionMode(QAbstractItemView.NoSelection)
         ms_layout.addWidget(self.milestone_table)
 
-        self.section_tabs.addTab(self.milestones_group, "マイルストーン")
+        self.section_tabs.addTab(self.milestones_group, tr("マイルストーン"))
 
         # -- チーム別サマリー ---------------------------------------------------------
         self.team_group = QWidget()
@@ -262,7 +268,7 @@ class AnalysisTab(QWidget):
         team_layout.addWidget(self.team_legend_label)
 
         self.team_table = QTableWidget(0, len(_TEAM_COLUMNS))
-        self.team_table.setHorizontalHeaderLabels(_TEAM_COLUMNS)
+        self.team_table.setHorizontalHeaderLabels([tr(c) for c in _TEAM_COLUMNS])
         self.team_table.verticalHeader().setVisible(False)
         self.team_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.team_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -271,7 +277,7 @@ class AnalysisTab(QWidget):
         self.team_table.itemSelectionChanged.connect(self._on_team_row_selected)
         team_layout.addWidget(self.team_table)
 
-        self.section_tabs.addTab(self.team_group, "チーム")
+        self.section_tabs.addTab(self.team_group, tr("チーム"))
 
         # -- ワークフロー別サマリー ------------------------------------------------------
         #
@@ -284,12 +290,12 @@ class AnalysisTab(QWidget):
         workflow_layout.setContentsMargins(0, 6, 0, 0)
 
         granularity_bar = QHBoxLayout()
-        granularity_bar.addWidget(QLabel("粒度"))
+        granularity_bar.addWidget(QLabel(tr("粒度")))
         self._granularity_group = QButtonGroup(self)
         self._granularity_group.setExclusive(True)
         self._granularity_buttons = {}
         for key, label in _GRANULARITY_LABELS:
-            btn = QPushButton(label)
+            btn = QPushButton(tr(label))
             btn.setCheckable(True)
             btn.setChecked(key == self._granularity)
             btn.clicked.connect(lambda _checked, k=key: self._on_granularity_changed(k))
@@ -314,7 +320,7 @@ class AnalysisTab(QWidget):
         workflow_layout.addWidget(self.workflow_legend_label)
 
         self.workflow_table = QTableWidget(0, len(_WORKFLOW_COLUMNS))
-        self.workflow_table.setHorizontalHeaderLabels(_WORKFLOW_COLUMNS)
+        self.workflow_table.setHorizontalHeaderLabels([tr(c) for c in _WORKFLOW_COLUMNS])
         self.workflow_table.verticalHeader().setVisible(False)
         self.workflow_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.workflow_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -323,7 +329,7 @@ class AnalysisTab(QWidget):
         self.workflow_table.itemSelectionChanged.connect(self._on_workflow_row_selected)
         workflow_layout.addWidget(self.workflow_table)
 
-        self.section_tabs.addTab(self.workflow_group, "ワークフロー")
+        self.section_tabs.addTab(self.workflow_group, tr("ワークフロー"))
 
         # 「チーム」「ワークフロー」サブタブは、初めて表示されるまでQTabWidgetの
         # 非表示ページとしてのサイズ（既定の640x480）のままで、データ更新時に
@@ -388,12 +394,12 @@ class AnalysisTab(QWidget):
             self._show_status_only(self.cache.error_message, is_error=True)
             return
         if not self.cache.is_fresh():
-            self._show_status_only("スケジューリング結果を計算中です...", is_error=False)
+            self._show_status_only(tr("スケジューリング結果を計算中です..."), is_error=False)
             return
 
         result_df, display = self.cache.result_df, self.cache.display
         self.status_label.setStyleSheet("")
-        self.status_label.setText("ガントチャートタブの計算結果を集計しています。")
+        self.status_label.setText(tr("ガントチャートタブの計算結果を集計しています。"))
 
         milestones = [
             (mid, name, due) for mid, name, due in display["milestone_markers"]
@@ -452,7 +458,7 @@ class AnalysisTab(QWidget):
     def _render_kpi(self, result_df, project_start_ts, milestones, task_status_map):
         kpi = compute_kpi(result_df, project_start_ts, milestones, task_status_map)
 
-        self.kpi_scale.set_value(_fmt_int(kpi["jobs"]) + " ジョブ", f"{_fmt_int(kpi['tasks'])} タスク")
+        self.kpi_scale.set_value(tr("{jobs} ジョブ", jobs=_fmt_int(kpi["jobs"])), tr("{tasks} タスク", tasks=_fmt_int(kpi['tasks'])))
 
         if project_start_ts is not None and kpi["plan_end"] is not None:
             period_text = f"{project_start_ts.strftime('%Y/%m')} → {kpi['plan_end'].strftime('%Y/%m')}"
@@ -462,32 +468,32 @@ class AnalysisTab(QWidget):
         if margin is None:
             margin_text = ""
         elif margin >= 0:
-            margin_text = f"最終マイルストーンまで{margin}日の余裕"
+            margin_text = tr("最終マイルストーンまで{margin}日の余裕", margin=margin)
         else:
-            margin_text = f"最終マイルストーンを{-margin}日超過"
+            margin_text = tr("最終マイルストーンを{value}日超過", value=-margin)
         self.kpi_period.set_value(period_text, margin_text)
 
         self.kpi_status.set_value(
-            f"{_fmt_int(kpi['done'])} 完了",
-            f"進行中 {_fmt_int(kpi['in_progress'])} / 未着手 {_fmt_int(kpi['not_started'])}",
+            tr("{done} 完了", done=_fmt_int(kpi['done'])),
+            tr("進行中 {in_progress} / 未着手 {not_started}", in_progress=_fmt_int(kpi['in_progress']), not_started=_fmt_int(kpi['not_started'])),
         )
 
         if kpi["peak_month"] is None:
             self.kpi_peak.set_value("—", "")
         else:
             self.kpi_peak.set_value(
-                f"{_fmt_int(kpi['peak'])} 本", f"全チーム合計 / {kpi['peak_month'].replace('-', '/')}"
+                tr("{peak} 本", peak=_fmt_int(kpi['peak'])), tr("全チーム合計 / {peak_month}", peak_month=kpi['peak_month'].replace('-', '/'))
             )
 
         self.kpi_overrun.set_value(
-            f"{_fmt_int(kpi['overrun_tasks'])} 件",
-            f"{_fmt_int(kpi['overrun_jobs'])} ジョブ / 最大 {kpi['max_overrun_days']}日超過",
+            tr("{overrun_tasks} 件", overrun_tasks=_fmt_int(kpi['overrun_tasks'])),
+            tr("{overrun_jobs} ジョブ / 最大 {max_overrun_days}日超過", overrun_jobs=_fmt_int(kpi['overrun_jobs']), max_overrun_days=kpi['max_overrun_days']),
             alert=kpi["overrun_tasks"] > 0,
         )
 
         self.kpi_violation.set_value(
-            f"{kpi['start_pin_violations']} 件",
-            "固定と依存の矛盾なし" if kpi["start_pin_violations"] == 0 else "固定日どおりに配置できていません",
+            tr("{start_pin_violations} 件", start_pin_violations=kpi['start_pin_violations']),
+            tr("固定と依存の矛盾なし") if kpi["start_pin_violations"] == 0 else tr("固定日どおりに配置できていません"),
             alert=kpi["start_pin_violations"] > 0,
         )
 
@@ -495,15 +501,15 @@ class AnalysisTab(QWidget):
         mode = self._breakdown_mode
         filtered_df = self._sync_dimension_combo(mode, display, result_df)
 
-        hint = "ジョブ件数は延べ（1ジョブが複数マイルストーンにまたがりうる）"
+        hint = tr("ジョブ件数は延べ（1ジョブが複数マイルストーンにまたがりうる）")
         if mode != _BREAKDOWN_ALL and filtered_df.empty:
             # 対象が1件も無い（例: ワークフローが登録されていない、選択中の
             # チーム/ワークフローにタスクが1件も無い）場合、最終終了日・
             # スラック・超過・内訳・進捗のすべてが0/空欄になる——テーブル自体は
             # 表示したまま、理由をここで補う。
-            hint = "選択中の対象にはタスクがありません（締切に対する判定・内訳・進捗は空欄/0になります）。" + hint
+            hint = tr("選択中の対象にはタスクがありません（締切に対する判定・内訳・進捗は空欄/0になります）。") + hint
         self.breakdown_hint_label.setText(hint)
-        headers = _BASE_COLUMNS + _BREAKDOWN_EXTRA_COLUMNS
+        headers = [tr(c) for c in _BASE_COLUMNS + _BREAKDOWN_EXTRA_COLUMNS]
         self.milestone_table.setColumnCount(len(headers))
         self.milestone_table.setHorizontalHeaderLabels(headers)
 
@@ -529,7 +535,7 @@ class AnalysisTab(QWidget):
             self._set_item(row_index, 3, _fmt_date(base["last_end_date"]))
 
             slack = base["slack_days"]
-            slack_text = "—" if slack is None else (f"+{slack}日" if slack >= 0 else f"{slack}日")
+            slack_text = "—" if slack is None else (tr("+{slack}日", slack=slack) if slack >= 0 else tr("{slack}日", slack=slack))
             slack_item = QTableWidgetItem(slack_text)
             if slack is not None and slack < 0:
                 slack_item.setForeground(_ALERT_COLOR)
@@ -667,7 +673,7 @@ class AnalysisTab(QWidget):
         selected_items = self.team_table.selectedItems()
         if not selected_items:
             self.team_chart_view.setScene(None)
-            self.team_chart_label.setText("表の行を選択すると、同時タスク数の推移を表示します。")
+            self.team_chart_label.setText(tr("表の行を選択すると、同時タスク数の推移を表示します。"))
             self.team_legend_label.setText("")
             return
 
@@ -684,7 +690,7 @@ class AnalysisTab(QWidget):
                 weeks, breakdown_by_team, totals, team_colors, team_names,
                 milestones, project_start_ts,
             )
-            self.team_chart_label.setText("同時タスク数の推移（チーム別・積み上げ）")
+            self.team_chart_label.setText(tr("同時タスク数の推移（チーム別・積み上げ）"))
             self.team_legend_label.setText(self._build_legend_html(team_names, team_colors))
         else:
             capacity_values = weekly_capacity(
@@ -696,7 +702,7 @@ class AnalysisTab(QWidget):
             )
             name = team_names.get(selected, selected)
             self.team_chart_label.setText(
-                f"同時タスク数の推移: {name}（塗り＝同時タスク数 / 破線＝設定上限）"
+                tr("同時タスク数の推移: {name}（塗り＝同時タスク数 / 破線＝設定上限）", name=name)
             )
             self.team_legend_label.setText("")  # 1色なので凡例は不要
 
@@ -744,7 +750,7 @@ class AnalysisTab(QWidget):
             self._set_workflow_item(row_index, 2, _fmt_int(row["tasks"]))
             median = row["median_duration_days"]
             self._set_workflow_item(
-                row_index, 3, "—" if median is None else f"{median:g} 日",
+                row_index, 3, "—" if median is None else tr("{median:g} 日", median=median),
             )
             overrun_item = QTableWidgetItem(_fmt_int(row["overrun"]) if row["overrun"] else "—")
             if row["overrun"]:
@@ -804,7 +810,7 @@ class AnalysisTab(QWidget):
         selected_items = self.workflow_table.selectedItems()
         if not selected_items:
             self.workflow_chart_view.setScene(None)
-            self.workflow_chart_label.setText("表の行を選択すると、稼働タスク件数の推移を表示します。")
+            self.workflow_chart_label.setText(tr("表の行を選択すると、稼働タスク件数の推移を表示します。"))
             self.workflow_legend_label.setText("")
             return
 
@@ -820,7 +826,7 @@ class AnalysisTab(QWidget):
                 workflow_colors, workflow_names, milestones, project_start_ts, self._granularity,
             )
             self.workflow_chart_label.setText(
-                "縦軸＝稼働タスク件数（その期間に1日でも走っているタスクの本数）"
+                tr("縦軸＝稼働タスク件数（その期間に1日でも走っているタスクの本数）")
             )
             self.workflow_legend_label.setText(
                 self._build_legend_html(workflow_names, workflow_colors)
@@ -832,7 +838,7 @@ class AnalysisTab(QWidget):
                 self._granularity,
             )
             name = workflow_names.get(selected, selected)
-            self.workflow_chart_label.setText(f"稼働タスク件数の推移: {name}")
+            self.workflow_chart_label.setText(tr("稼働タスク件数の推移: {name}", name=name))
             self.workflow_legend_label.setText("")  # 1色なので凡例は不要
 
         self.workflow_chart_view.setScene(scene)
