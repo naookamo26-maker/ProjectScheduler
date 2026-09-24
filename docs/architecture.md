@@ -514,7 +514,7 @@ GUIのガントチャートタブは件数と最大超過日数を画面上部�
 1. **結果のキャッシュ**: `ProjectDatabase.revision`（内容が変わるたびに増える
    通し番号）を結果と一緒に覚えておき、一致している間は再計算せず表示だけ
    作り直す。タブを行き来しただけで計算し直さない。
-2. **ワーカースレッド**: 計算本体を `_ScheduleWorker`（`gui/schedule_cache.py`）で
+2. **ワーカースレッド**: 計算本体を `_ScheduleThread`（`gui/schedule_cache.py`）で
    実行する。分割の境界は「DBを読むのはGUIスレッド、計算だけ別スレッド」。
    sqlite3の接続はスレッドをまたげず、計算中にGUI側がDBを書き換えると結果が
    壊れるため、`build_frames()` / `build_display()` はGUIスレッドで先に済ませ、
@@ -573,7 +573,7 @@ GUIのガントチャートタブは件数と最大超過日数を画面上部�
 `_start_worker()`は、実行中の古いワーカーを止めずに放置する方針（上記）
 のため、タブを連続して切り替えたり配置スライダーを繰り返し操作したりすると、
 複数本のスレッドが同時に実行中の状態になり得る。`ScheduleCache._threads`は
-`(QThread, _ScheduleWorker)`の**一覧**として全件を保持し、`shutdown()`は
+`_ScheduleThread`の**一覧**として全件を保持し、`shutdown()`は
 その全件を待ち合わせる。「最後の1本」だけを`self._thread`に保持していた
 頃は、それより前に始まった実行中のスレッドを待たずにウィンドウが閉じてしまい、
 "QThread: Destroyed while thread is still running" でクラッシュしうる状態
@@ -588,6 +588,23 @@ PySide側が接続をキュー接続だと判定できず、ワーカースレ�
 繋げば、PySide側が送信元と受信側の所属スレッドの違いを見てキュー接続を
 選ぶため、実行は必ずGUIスレッド側に回る（受信側で`self.sender()`を使い、
 「どのスレッドが終わったか」を判定する）。
+
+### ワーカースレッド上でPythonのオブジェクトを破棄しない
+
+以前は QObject のワーカー（`_ScheduleWorker`）を `moveToThread()` で計算用の
+スレッドへ移し、`thread.finished` に `worker.deleteLater()` を繋いでいた。
+これだとワーカー（と、それが抱える大きなDataFrame群）の破棄が、**終了しかけの
+ワーカースレッド上で**起きる。その瞬間にGUIスレッドがGILを手放す処理
+（`sqlite3` の `close()` 等）をしていると両者が衝突し、GUIテストの後片付けで
+数回に1回 Segmentation fault になっていた（faulthandler で「落ちたのはPythonの
+フレームを持たないスレッド、GUIスレッドは `db.close()` の中」と確認。
+GUI階層の実行で6回中3回再現）。
+
+いまは `QThread` のサブクラス（`_ScheduleThread`）に `run()` を持たせ、スレッドの
+オブジェクトはGUIスレッドに置いたままにする。ワーカースレッド上ではPythonの
+オブジェクトを破棄しない。終わったスレッドは、GUIスレッドが `wait()` で本当に
+終わったことを確かめてから `deleteLater()` する（`finished` はスレッドが終わる
+直前に発火するため）。修正後は同じ条件で8回続けて再現しなかった。
 
 回帰テストは`tests/test_gui_undo_redo.py`
 （`test_schedule_completing_after_a_concurrent_edit_does_not_mask_it` /

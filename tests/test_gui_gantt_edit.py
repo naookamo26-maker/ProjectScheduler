@@ -403,3 +403,36 @@ def test_undo_of_a_gantt_edit_restores_the_selection(qapp, gantt):
     w.undo_manager.undo()
     assert _wait(qapp, lambda: tab.cache.is_fresh() and tab.view.selected_keys() == [key])
     assert w.db.list_all_job_task_overrides() == []
+
+
+def test_task_name_does_not_overlap_the_pin_marker(qapp, gantt):
+    """📍を描いたバーでは、縦に余裕が無いときはタスク名を印の右へ避け、
+    縦に余裕があるとき（印の下に文字が収まる）は中央のまま置く。"""
+    from gui.gantt_view import _PIN_LABEL_RESERVE_PX
+    from PySide6.QtGui import QTransform
+
+    w, tab, ids = gantt
+    key = _key(ids, "job1", "t2")
+    tab.apply_task_fields([key], "pin", {"start_pin_date": tab.view.bars()[key].start.isoformat()})
+    _wait_recomputed(qapp, tab)
+    bar = tab.view.bars()[key]
+    assert bar.pinned
+    label = next(t for t in tab.view.body.scene().gantt_task_labels if t[-1] is bar)[0]
+    body = tab.view.body
+
+    def label_left_offset_px(sx, sy):
+        body.setTransform(QTransform().scale(sx, sy))
+        body.centerOn(bar.sceneBoundingRect().center())  # 画面外のラベルは整形されない
+        tab.view._sync_panes()
+        bar_left = body.mapFromScene(bar.bar_rect.topLeft()).x()
+        return body.mapFromScene(label.pos()).x() - bar_left, label.isVisible()
+
+    # 横に広く縦は標準（バーの高さ20px）: 印の右に避ける
+    offset, visible = label_left_offset_px(8.0, 1.0)
+    assert visible
+    assert offset >= _PIN_LABEL_RESERVE_PX
+    # 縦にも大きく拡大: 中央に置く（文字の左端はバーの中央付近）
+    offset_tall, visible = label_left_offset_px(8.0, 6.0)
+    bar_w_px = bar.bar_rect.width() * 8.0
+    assert visible
+    assert abs((offset_tall + label.boundingRect().width() / 2) - bar_w_px / 2) < 2

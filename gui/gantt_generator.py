@@ -322,7 +322,7 @@ def compute_schedule_from_frames(frames, **scheduler_kwargs):
 
     DBには一切触れないため、**GUIスレッド以外から呼んでも安全**（ガント
     チャートタブは、タスク数の多いプロジェクトでUIが固まらないよう、この関数を
-    ワーカースレッドで実行する。gui/tab_gantt.py の _ScheduleWorker を参照）。
+    ワーカースレッドで実行する。gui/schedule_cache.py の _ScheduleThread を参照）。
     sqlite3の接続はスレッドをまたげず、そもそも計算中にGUI側がDBを書き換えると
     結果が壊れるため、「DBを読むのはGUIスレッド、計算だけ別スレッド」という
     分割にしてある。

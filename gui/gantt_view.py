@@ -158,6 +158,11 @@ _PIN_NEEDLE_COLOR = QColor("#3c4043")
 _PIN_HEAD_RADIUS_PX = 4.5
 _PIN_NEEDLE_PX = 5
 _PIN_MARKER_PX = 12  # この大きさ（幅・高さ）に満たないバーには描かない
+# 📍を描いたバーでは、タスク名をこの幅（画面px）だけ右に避けて置く（重ならないように）
+_PIN_LABEL_RESERVE_PX = 3 + _PIN_HEAD_RADIUS_PX * 2 + 3
+# 📍の下端（バー上端からの画面px）。バーの縦に余裕があり、中央に置いた文字がこれより
+# 下に収まるなら、横に避けずに中央のまま置く（拡大時に無駄に折り返さないように）。
+_PIN_BOTTOM_PX = 2 + _PIN_HEAD_RADIUS_PX * 2 + _PIN_NEEDLE_PX + 1
 # 強調枠（締切超過・固定どおりに置けない）の内側に入れる白い枠。バーの塗りが枠と
 # 同系色（カットシーンの赤いバー等）でも、枠が塗りに埋もれないようにする。
 _EMPHASIS_INNER_COLOR = QColor("#ffffff")
@@ -204,6 +209,10 @@ class TaskBarItem(QGraphicsPathItem):
     def key(self):
         return (self.job_key, self.task_key)
 
+    def shows_pin(self, width_px, height_px):
+        """画面上のバーの大きさで、📍の印を描くかどうか（ラベルの配置と揃える）。"""
+        return self.pinned and width_px >= _PIN_MARKER_PX and height_px >= _PIN_MARKER_PX
+
     def set_highlighted(self, value):
         if self.highlighted != value:
             self.highlighted = value
@@ -227,7 +236,7 @@ class TaskBarItem(QGraphicsPathItem):
             inset = _MOVED_HIGHLIGHT_WIDTH / 2
             painter.setPen(QPen(_MOVED_HIGHLIGHT_COLOR, _MOVED_HIGHLIGHT_WIDTH))
             painter.drawRect(rect.adjusted(inset, inset, -inset, -inset))
-        if self.pinned and rect.width() >= _PIN_MARKER_PX and rect.height() >= _PIN_MARKER_PX:
+        if self.shows_pin(rect.width(), rect.height()):
             cx = rect.left() + 3 + _PIN_HEAD_RADIUS_PX
             cy = rect.top() + 2 + _PIN_HEAD_RADIUS_PX
             painter.setRenderHint(QPainter.Antialiasing, True)
@@ -857,7 +866,7 @@ class FrozenGanttPane(QWidget):
         # QFontMetricsをラベルごとに作り直さず使い回す（画面内に映っている分
         # だけとはいえ、数百件規模になりうるため、地味だが効く最適化）。
         metrics_cache = {}
-        for label, center_x, center_y, bar_width, bar_height, full_text, font in \
+        for label, center_x, center_y, bar_width, bar_height, full_text, font, bar in \
                 getattr(scene, "gantt_task_labels", []):
             half_w, half_h = bar_width / 2, bar_height / 2
             if (center_x + half_w < visible_left or center_x - half_w > visible_right
@@ -873,6 +882,16 @@ class FrozenGanttPane(QWidget):
             line_height = metrics.height()
             avail_w = bar_width * sx - _TASK_LABEL_H_MARGIN_PX
             avail_h = bar_height * sy - _TASK_LABEL_V_MARGIN_PX
+            # 📍を描くバーは、その分だけ左を空けて残りの幅の中央に置く
+            # （印と文字が重ならないように）。
+            shift_px = 0
+            bar_h_px = bar_height * sy
+            if bar is not None and bar.shows_pin(bar_width * sx, bar_h_px):
+                # 2行になっても📍の下に収まるほど縦に余裕があれば、避けない
+                text_h_max = line_height * 2 + _TASK_LABEL_LINE_GAP_PX
+                if (bar_h_px - text_h_max) / 2 < _PIN_BOTTOM_PX:
+                    avail_w -= _PIN_LABEL_RESERVE_PX
+                    shift_px = _PIN_LABEL_RESERVE_PX / 2
 
             if avail_w < metrics.averageCharWidth() or avail_h < line_height:
                 label.setVisible(False)
@@ -894,7 +913,7 @@ class FrozenGanttPane(QWidget):
                 label.setText(text)
             width_px = label.boundingRect().width()
             height_px = label.boundingRect().height()
-            label.setPos(center_x - (width_px / 2) / sx, center_y - (height_px / 2) / sy)
+            label.setPos(center_x + (shift_px - width_px / 2) / sx, center_y - (height_px / 2) / sy)
 
     def _center_milestone_labels(self, sx):
         """マイルストーンラベルを、その縦線を中心に左右均等になるよう配置
@@ -1360,7 +1379,7 @@ def build_gantt_scenes(df, display, color_by="team"):
                     z_value=_TASK_LABEL_Z,
                 )
                 body_scene.gantt_task_labels.append(
-                    (task_label, center_x, center_y, width, bar_height, task_name, task_font)
+                    (task_label, center_x, center_y, width, bar_height, task_name, task_font, rect)
                 )
 
         column_scene.gantt_job_rows.append((y_top - JOB_GAP / 2, y_bottom + JOB_GAP / 2, job_id))
