@@ -547,10 +547,9 @@ class MainWindow(QMainWindow):
     def _update_undo_redo_actions(self):
         can_undo = self.undo_manager is not None and self.undo_manager.can_undo()
         can_redo = self.undo_manager is not None and self.undo_manager.can_redo()
+        # メニューの表示は「元に戻す」「やり直す」だけにする（操作の内容は出さない）
         self.undo_action.setEnabled(can_undo)
-        self.undo_action.setText(tr("元に戻す: {label}", label=self.undo_manager.undo_label()) if can_undo else tr("元に戻す"))
         self.redo_action.setEnabled(can_redo)
-        self.redo_action.setText(tr("やり直す: {label}", label=self.undo_manager.redo_label()) if can_redo else tr("やり直す"))
 
     def _iter_tab_widgets(self):
         return [(i, self.tabs.widget(i)) for i in range(self.tabs.count())]
