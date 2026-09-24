@@ -198,3 +198,21 @@ def test_main_window_applies_undo_memory_limit(qapp, settings_path):
         w.db.close()
         shiboken6.delete(w)
         qapp.processEvents()
+
+
+def test_options_dialog_lets_the_user_choose_the_display_language(qapp, settings_path):
+    from gui.options_dialog import OptionsDialog
+
+    s = AppSettings(settings_path)
+    dialog = OptionsDialog(s)
+    labels = [dialog.language_combo.itemText(i) for i in range(dialog.language_combo.count())]
+    assert labels == ["日本語", "English", "Tiếng Việt", "简体中文"]
+
+    dialog._select_language("zh_CN")
+    dialog.accept()
+    assert AppSettings(settings_path).get("language") == "zh_CN"
+
+    dialog = OptionsDialog(AppSettings(settings_path))
+    assert dialog.selected_language() == "zh_CN"
+    dialog.reset_button.click()
+    assert dialog.selected_language() == s.default("language")
