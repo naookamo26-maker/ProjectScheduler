@@ -23,6 +23,7 @@ import pandas as pd
 
 from gui.resource_histogram import compute_step_segments
 from project_scheduler import _UNLIMITED_LINES
+from i18n import N_, tr
 
 STATUS_NOT_STARTED = "not_started"
 STATUS_IN_PROGRESS = "in_progress"
@@ -443,7 +444,7 @@ def compute_team_summary_rows(result_df, team_names, team_capacity_schedule):
     return rows
 
 
-ALL_TEAMS_ROW_NAME = "全チーム"
+ALL_TEAMS_ROW_NAME = N_("全チーム")
 
 
 def compute_all_teams_row(result_df):
@@ -458,7 +459,7 @@ def compute_all_teams_row(result_df):
     empty = result_df.empty
     return {
         "team_id": None,
-        "name": ALL_TEAMS_ROW_NAME,
+        "name": tr(ALL_TEAMS_ROW_NAME),
         "tasks": int(len(result_df)),
         "peak": peak,
         "peak_month": peak_month,
@@ -560,7 +561,7 @@ def compute_workflow_summary_rows(result_df, workflow_names):
     return rows
 
 
-ALL_WORKFLOWS_ROW_NAME = "全ワークフロー"
+ALL_WORKFLOWS_ROW_NAME = N_("全ワークフロー")
 
 
 def compute_all_workflows_row(result_df):
@@ -582,7 +583,7 @@ def compute_all_workflows_row(result_df):
     empty = result_df.empty
     return {
         "workflow_id": None,
-        "name": ALL_WORKFLOWS_ROW_NAME,
+        "name": tr(ALL_WORKFLOWS_ROW_NAME),
         "jobs": 0 if empty else int(result_df["Job_ID"].nunique()),
         "tasks": int(len(result_df)),
         "median_duration_days": median,

@@ -34,6 +34,7 @@ TRANSLATED_LANGUAGES = [code for code, _label in i18n.LANGUAGES if code != i18n.
 # 足していき、最後は SOURCE_FILES 全体になる。
 MIGRATED_FILES = {
     "i18n.py",
+    "gui/analysis_charts.py",
     "gui/app_settings.py",
     "gui/gantt_task_editor.py",
     "gui/gantt_view.py",
@@ -42,6 +43,9 @@ MIGRATED_FILES = {
     "gui/plan_band.py",
     "gui/node_canvas.py",
     "gui/replan_dialog.py",
+    "gui/schedule_cache.py",
+    "gui/summary_metrics.py",
+    "gui/tab_analysis.py",
     "gui/tab_basic_info.py",
     "gui/tab_jobs.py",
     "gui/tab_workflows.py",
