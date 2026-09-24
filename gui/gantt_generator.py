@@ -423,8 +423,14 @@ def build_plan(db, state):
     lower_bound = max(
         (d for d in (state.replan_base_date, (state.confirmed_at or "")[:10]) if d), default=None,
     )
+    # 影響範囲のタスクは、確定していた位置より前へは動かさない（合意した日程を
+    # 前倒しするのは、ドラッグでの明示的な移動か全面再計画に限る。§8-7）
+    not_before = {
+        key(k): state.confirmed[k]["start_date"] for k in released_int if k in state.confirmed
+    }
     return {
         "fixed": fixed,
+        "not_before": not_before,
         "released": {key(k) for k in released_int},
         "started": {key(k) for k in state.started},
         "draft_moves": {key(k): d for k, d in state.draft_moves.items()},
@@ -438,7 +444,7 @@ def _apply_plan_to_frames(frames, fixed, plan):
     job_tasks に書き込んだ frames の写しを返す（DBは変えない）。"""
     frames = dict(frames)
     columns = ["Job_ID", "Task_ID", "Is_Active", "Override_Days", "Milestone_ID", "Team_ID",
-               "Start_Pin_Date"]
+               "Start_Pin_Date", "Not_Before"]
     rows = {}
     if frames.get("job_tasks") is not None:
         for r in frames["job_tasks"].to_dict("records"):
@@ -449,6 +455,11 @@ def _apply_plan_to_frames(frames, fixed, plan):
         r["Override_Days"] = days
         if team is not None:
             r["Team_ID"] = team
+    for k, start in plan.get("not_before", {}).items():
+        if k in fixed or k in plan["draft_moves"]:
+            continue
+        r = rows.setdefault(k, {"Job_ID": k[0], "Task_ID": k[1], "Is_Active": "Y"})
+        r["Not_Before"] = start
     for k, start in plan["draft_moves"].items():
         if k in fixed:
             continue
@@ -480,6 +491,7 @@ def compute_schedule_with_plan(frames, plan, **scheduler_kwargs):
     from gui.plan_confirmation import downstream
 
     fixed = dict(plan["fixed"])
+    plan = dict(plan, not_before=dict(plan.get("not_before", {})))
     released = set(plan["released"])
     started = plan["started"]
     runs = 0
@@ -498,6 +510,8 @@ def compute_schedule_with_plan(frames, plan, **scheduler_kwargs):
             break
         added = {k for k in downstream(violated, plan["successors"]) if k not in started}
         for k in added:
-            fixed.pop(k, None)
+            was = fixed.pop(k, None)
+            if was is not None:
+                plan["not_before"][k] = was[0]
         released |= added
     return result_df, {"released": released, "runs": runs}

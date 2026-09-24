@@ -27,6 +27,7 @@ from gui.app_settings import AppSettings
 from gui.db import ProjectDatabase
 from gui.gantt_generator import generate_gantt, validate_for_generation
 from gui.options_dialog import OptionsDialog
+from gui.plan_band import PlanStatusBand
 from gui.schedule_cache import ScheduleCache
 from gui.tab_analysis import AnalysisTab
 from gui.tab_basic_info import BasicInfoTab
@@ -60,7 +61,25 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
         self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
+        # 計画の状態帯（未確定／確定済み／変更案。docs/roadmap.md §8-9）は、
+        # どのタブを開いていても見えるよう、タブの上に1本だけ置く。
+        self.plan_band = PlanStatusBand()
+        self.plan_band.setVisible(False)
+        self.plan_band.confirmRequested.connect(lambda: self._run_plan_action("confirm"))
+        self.plan_band.confirmSelectedRequested.connect(lambda: self._run_plan_action("confirm_selected"))
+        self.plan_band.discardRequested.connect(lambda: self._run_plan_action("discard"))
+        self.plan_band.clearRequested.connect(lambda: self._run_plan_action("clear"))
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(4, 4, 4, 0)
+        central_layout.setSpacing(4)
+        central_layout.addWidget(self.plan_band)
+        central_layout.addWidget(self.tabs, 1)
+        self.setCentralWidget(central)
+        self._plan_band_timer = QTimer(self)
+        self._plan_band_timer.setSingleShot(True)
+        self._plan_band_timer.setInterval(0)
+        self._plan_band_timer.timeout.connect(self._refresh_plan_band)
         # 接続はここで一度だけ行う。プロジェクトを開くたびに実行される
         # _rebuild_tabs() の側で接続すると、同じQTabWidgetに対して接続が
         # 累積し、タブ切り替え1回につき refresh_choices() が開いた回数だけ
@@ -110,6 +129,7 @@ class MainWindow(QMainWindow):
         """プロジェクト未オープン時のプレースホルダー（DB操作を必要とする
         実タブは開いた後に _rebuild_tabs() で差し替える）。"""
         self.tabs.clear()
+        self.plan_band.setVisible(False)
         self.tabs.addTab(
             self._placeholder_tab("プロジェクト名・開始日・マイルストーン・チーム・休業日をここで設定します。"),
             "基本情報設定",
@@ -172,6 +192,7 @@ class MainWindow(QMainWindow):
         # ガントチャートタブ・プロジェクト分析タブはこのキャッシュ経由で
         # スケジューリング結果を共有する（どちらのタブからでも計算を起動できる）。
         self.schedule_cache = ScheduleCache(self.db, parent=self)
+        self.schedule_cache.updated.connect(self._plan_band_timer.start)
 
         self.tab_gantt = GanttTab(self.db, self.schedule_cache, self.app_settings)
         self.tabs.addTab(self.tab_gantt, "ガントチャート")
@@ -180,6 +201,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_analysis, "プロジェクト分析")
 
         self.tabs.setEnabled(True)
+        self._plan_band_timer.start()
         self.generate_action.setEnabled(True)
         self.save_action.setEnabled(True)
         self.save_as_action.setEnabled(True)
@@ -190,6 +212,7 @@ class MainWindow(QMainWindow):
         widget = self.tabs.widget(index)
         if hasattr(widget, "refresh_choices"):
             widget.refresh_choices()
+        self._plan_band_timer.start()
 
     def _on_teams_changed(self):
         """チームマスタが変更された際、ワークフロー設計タブの表示中キャンバスの
@@ -526,8 +549,25 @@ class MainWindow(QMainWindow):
 
     def _on_db_changed(self):
         """DB変更時のフック（保存以外の全てのCRUD操作後に呼ばれる）。
-        タイトルバーに未保存マークを反映する。"""
+        タイトルバーに未保存マークを反映し、計画の状態帯を更新する（続けて
+        何度も変わっても、イベントループに戻った時点で1回だけ計算する）。"""
         self._update_title()
+        self._plan_band_timer.start()
+
+    # -- 計画の確定（docs/roadmap.md §8） --------------------------------------------
+
+    def _refresh_plan_band(self):
+        if self.db is None or self.tab_gantt is None:
+            self.plan_band.setVisible(False)
+            return
+        status, detail, ready = self.tab_gantt.plan_band_summary()
+        on_gantt = self.tabs.currentWidget() is self.tab_gantt
+        self.plan_band.set_state(status, detail, show_buttons=on_gantt, buttons_enabled=ready)
+        self.plan_band.setVisible(True)
+
+    def _run_plan_action(self, action):
+        if self.tab_gantt is not None:
+            self.tab_gantt.run_plan_action(action)
 
     def _update_title(self):
         if self.db is None:

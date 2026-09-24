@@ -31,14 +31,14 @@ def _task_inputs(db):
     """{(job_id, workflow_task_id): 指紋の材料} と {(job_id, workflow_task_id): is_active}。
 
     材料は、そのタスクの日程を決める入力のうちタスク単位のもの: 実効の日数・
-    チーム・有効/無効・手動ピン・先行タスク（ワークフロー内は種別とラグ、
-    ジョブ間は相手）。マイルストーンは日程を動かさない（超過の判定だけ）ので含めない。
+    チーム・有効/無効・手動ピン・ジョブの優先度・先行タスク（ワークフロー内は
+    種別とラグ、ジョブ間は相手）。マイルストーンは日程を動かさない（超過の判定だけ）ので含めない。
     """
     conn = db._conn
     rows = conn.execute(
         "SELECT j.id AS job_id, j.workflow_id, wt.id AS workflow_task_id, wt.default_days, "
         "wt.team_id AS default_team_id, o.is_active, o.override_days, o.team_id AS override_team_id, "
-        "o.start_pin_date "
+        "o.start_pin_date, j.priority "
         "FROM jobs j JOIN workflow_tasks wt ON wt.workflow_id = j.workflow_id "
         "LEFT JOIN job_task_overrides o ON o.job_id = j.id AND o.workflow_task_id = wt.id"
     ).fetchall()
@@ -66,6 +66,7 @@ def _task_inputs(db):
             "team": r["override_team_id"] or r["default_team_id"],
             "active": is_active,
             "pin": r["start_pin_date"],
+            "priority": r["priority"],
             "preds": sorted(preds.get(r["workflow_task_id"], [])) + sorted(ext.get(key, [])),
         }
     return inputs, active
@@ -85,7 +86,7 @@ def effective_task_values(db):
 
 def global_signature(db):
     """全体設定の指紋。確定を壊さない変更（ライン数を増やす・休業日を減らす・
-    配置コントロール・ジョブの優先度）は、影響範囲だけを動かす方式では反映
+    配置コントロール）は、影響範囲だけを動かす方式では反映
     できないので、ここで「変更あり」として数えて知らせる（§8-7 (c)）。"""
     conn = db._conn
     value = {
@@ -100,9 +101,6 @@ def global_signature(db):
             "ORDER BY team_id, start_date"
         ).fetchall()],
         "ratio": conn.execute("SELECT distribution_ratio FROM project WHERE id = 1").fetchone()[0],
-        "priorities": [tuple(r) for r in conn.execute(
-            "SELECT id, COALESCE(priority, 0) FROM jobs ORDER BY id"
-        ).fetchall()],
         "start": conn.execute("SELECT start_date FROM project WHERE id = 1").fetchone()[0],
     }
     return _digest(value)

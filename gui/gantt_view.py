@@ -177,6 +177,14 @@ _GHOST_BORDER_COLOR = QColor("#1f3b8c")
 _GHOST_Z = 100
 # バーの右端をこの幅（画面px）以内で掴むと、移動ではなく期間の伸縮になる。
 _RESIZE_HANDLE_PX = 6
+# 確定済みのファイルで、まだ確定していないタスク（確定後に足したジョブ等）の斜線。
+# 下端の細い帯（全体の3割）にはチームの色をそのまま残す。
+_UNCONFIRMED_VEIL = QColor(255, 255, 255, 165)
+_UNCONFIRMED_HATCH = QColor(110, 110, 110, 150)
+_UNCONFIRMED_TEAM_BAND_RATIO = 0.3
+# 変更案で、確定していた位置を示す細線（バーの下）。
+_BASELINE_COLOR = QColor("#6f6f6f")
+_BASELINE_HEIGHT = 3
 
 
 class TaskBarItem(QGraphicsPathItem):
@@ -204,6 +212,8 @@ class TaskBarItem(QGraphicsPathItem):
         self.emphasized = emphasized
         self._emphasis_width = emphasis_width
         self.highlighted = False
+        # 確定済みのファイルで、まだ確定行を持たないタスク（§8-9）
+        self.unconfirmed = False
 
     @property
     def key(self):
@@ -220,11 +230,16 @@ class TaskBarItem(QGraphicsPathItem):
 
     def paint(self, painter, option, widget=None):
         super().paint(painter, option, widget)
-        if not (self.pinned or self.emphasized or self.highlighted):
+        if not (self.pinned or self.emphasized or self.highlighted or self.unconfirmed):
             return
         painter.save()
         rect = painter.worldTransform().mapRect(self.bar_rect)
         painter.resetTransform()
+        if self.unconfirmed:
+            veiled = QRectF(rect)
+            veiled.setHeight(rect.height() * (1 - _UNCONFIRMED_TEAM_BAND_RATIO))
+            painter.fillRect(veiled, _UNCONFIRMED_VEIL)
+            painter.fillRect(veiled, QBrush(_UNCONFIRMED_HATCH, Qt.BDiagPattern))
         painter.setBrush(Qt.NoBrush)
         if self.emphasized:
             inset = self._emphasis_width / 2 + _EMPHASIS_INNER_WIDTH / 2
@@ -248,6 +263,19 @@ class TaskBarItem(QGraphicsPathItem):
             painter.setBrush(QBrush(_PIN_HEAD_COLOR))
             painter.drawEllipse(QPointF(cx, cy), _PIN_HEAD_RADIUS_PX, _PIN_HEAD_RADIUS_PX)
         painter.restore()
+
+
+def set_bar_baseline(scene, bar, start, end):
+    """変更案で動いたバーの下に、確定していた位置（start〜end, end は exclusive）を
+    細線で重ねる。他のバーより前面に描く（§8-9）。"""
+    x0 = _scene_x_of(scene, start)
+    x1 = _scene_x_of(scene, end)
+    item = scene.addRect(
+        QRectF(x0, bar.bar_rect.bottom() + 1, max(x1 - x0, 2), _BASELINE_HEIGHT),
+        QPen(Qt.NoPen), QBrush(_BASELINE_COLOR),
+    )
+    item.setZValue(_GHOST_Z - 1)
+    return item
 
 
 def _scene_x_of(scene, d):

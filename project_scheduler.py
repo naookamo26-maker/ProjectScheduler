@@ -680,8 +680,22 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
                     )
                 start_pin_ord = start_pin.toordinal()
 
+            # 着手の下限（任意列 Not_Before）。計画の確定（GUIの変更案）で、影響範囲の
+            # タスクを確定した位置より前へ動かさないために使う。開始固定日と違い、
+            # これより後ろへはずれてよい。
+            not_before_raw = override.get("Not_Before")
+            not_before_ord = None
+            if pd.notna(not_before_raw) and str(not_before_raw).strip() != "":
+                not_before = pd.to_datetime(not_before_raw, errors="coerce")
+                if pd.isna(not_before):
+                    raise SchedulingError(
+                        f"タスク '{g_id}' の着手の下限 '{not_before_raw}' を解釈できません"
+                    )
+                not_before_ord = not_before.toordinal()
+
             active_tasks[g_id] = {
                 "start_pin_ord": start_pin_ord,
+                "not_before_ord": not_before_ord,
                 "job_id": job_id, "job_name": job_name, "task_id": t_id,
                 "jitter_key": jitter_key,
                 "task_name": t["Task_Name"], "days": days,
@@ -1192,7 +1206,9 @@ def _calc_asap_dates(active_tasks, leveling_order, project_start_ord, cal):
         t_start = _pinned_start(t_info, cal, team_id)
         if t_start is None:
             dep_ends = _dep_lower_bounds(t_info, asap_dates, cal, team_id, g_id)
-            t_start = cal.next_working_day(max([project_start_ord] + dep_ends), team_id)
+            t_start = cal.next_working_day(
+                max([project_start_ord, t_info.get("not_before_ord") or 0] + dep_ends), team_id
+            )
         t_end = None if t_start is None else cal.business_end(t_start, t_info["days"], team_id)
         if t_end is None:
             raise SchedulingError(
@@ -1438,7 +1454,9 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
         job_id = t_info.get("job_id", g_id)
 
         dep_ends = _dep_lower_bounds(t_info, scheduled, cal, team_id, g_id)
-        earliest_start = cal.next_working_day(max([project_start_ord] + dep_ends), team_id)
+        earliest_start = cal.next_working_day(
+            max([project_start_ord, t_info.get("not_before_ord") or 0] + dep_ends), team_id
+        )
         if earliest_start is None:
             raise SchedulingError(f"タスク '{g_id}' の着手可能日を求められません")
 

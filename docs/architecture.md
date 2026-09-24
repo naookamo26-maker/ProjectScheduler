@@ -1084,6 +1084,25 @@ GUIで編集できる項目はすべてUndo/Redoで元に戻せる。個々の�
   確実に言える場合だけを見る: ラグが0以上の依存（ラグは開始を遅らせる方向にしか
   働かない）で、先行タスクが今の結果に載っているもの。
 
+## 計画の確定と変更案（`gui/plan_confirmation.py` 他）
+
+設計の経緯と判断は `docs/roadmap.md` §8。モジュールの分担:
+
+| モジュール | 役割 |
+| --- | --- |
+| `gui/plan_confirmation.py` | 入力の指紋（タスク単位・全体）、状態（`PlanState`）、依存の後続、影響範囲 |
+| `gui/gantt_generator.py` | `build_plan`（GUIスレッドで材料を作る）、`compute_schedule_with_plan`（ワーカーで計算。違反があれば影響範囲を広げて最大3回） |
+| `gui/plan_actions.py` | 計算結果から確定行を作って書き込む（確定する／選択した変更を確定） |
+| `gui/db.py` | 確定行・変更案の移動・`draft_base`（確定時点のスナップショット）の読み書き。いずれも `@undoable` |
+| `gui/plan_band.py` / `gui/main.py` | 全タブ共通の状態帯。DBの変更・タブの切り替え・計算完了のたびに更新 |
+| `gui/tab_gantt.py` | 帯の文言（`plan_band_summary`）とボタンの処理（`run_plan_action`）、バーの装飾、確定後のドラッグを `draft_moves` へ |
+
+確定の位置に固定するタスクは、`job_tasks` の開始固定日・日数・チームの上書きとして
+スケジューラに渡す（スケジューラは確定を知らない）。影響範囲のタスクには、確定して
+いた開始日を任意列 `Not_Before`（着手の下限。開始固定日と違い後ろへはずれてよい）と
+して渡し、確定より前へ動かさない。全体の下限は `replan_base_date` と `confirmed_at`
+の遅いほうで、`project.Start_Date` を引き上げて渡す。
+
 ## オプション設定（`gui/app_settings.py`）
 
 プロジェクトファイルではなく、**利用者（PC）ごと**に保存する設定。プロジェクトを

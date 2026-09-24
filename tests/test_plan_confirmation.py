@@ -6,6 +6,7 @@
 
 import shutil
 import sys
+from unittest.mock import patch
 from pathlib import Path
 
 import pytest
@@ -225,11 +226,49 @@ def test_a_global_change_is_counted_but_moves_nothing(tmp_path):
     db, ids = _plan_project(tmp_path)
     df, _, _ = _compute(db)
     confirm_all(db, df)
-    job = next(j for j in db.list_jobs() if j["id"] == ids["jobs"][2])
-    db.update_job(job["id"], job["name"], job["workflow_id"], job["default_milestone_id"], 1, "")
+    db.set_distribution_ratio(0.2)
     after_df, state, info = _compute(db)
     assert state.status == DRAFT and state.global_changed and state.changed == set()
     assert _positions(after_df) == _positions(df)
+
+
+def test_changing_a_job_priority_changes_only_that_job(tmp_path):
+    """ジョブの優先度はジョブ単位の入力なので、全体設定の変更には数えない
+    （ジョブを足しただけで「全体設定の変更」と出ないように）。"""
+    from gui.plan_actions import confirm_all
+
+    db, ids = _plan_project(tmp_path)
+    df, _, _ = _compute(db)
+    confirm_all(db, df)
+    job = next(j for j in db.list_jobs() if j["id"] == ids["jobs"][2])
+    db.update_job(job["id"], job["name"], job["workflow_id"], job["default_milestone_id"], 1, "")
+    db.add_job("追加", job["workflow_id"], job["default_milestone_id"], 4)
+    state = _compute(db)[1]
+    assert not state.global_changed
+    assert {(ids["jobs"][2], ids["t1"]), (ids["jobs"][2], ids["t2"])} <= state.changed
+    assert all(k[0] != ids["jobs"][0] for k in state.changed)
+
+
+def test_released_tasks_never_move_before_their_confirmed_start(tmp_path):
+    """影響範囲のタスクは、確定していた位置より前には動かない（前倒しはドラッグか
+    全面再計画で明示的に行う）。日数を減らしても後続は前へ詰めない。"""
+    from gui.plan_actions import confirm_all
+
+    db, ids = _plan_project(tmp_path, lines=1, jobs=3)
+    db.set_distribution_ratio(0.0)  # 最速に詰める配置（縮めた分だけ前へ詰めたくなる）
+    df, _, _ = _compute(db)
+    # 確定した日（影響範囲の下限）を開発開始より前にして、下限に邪魔されずに
+    # 前へ詰められる状況を作る
+    with patch("gui.plan_actions._now", return_value="2026-04-01T09:00:00"):
+        confirm_all(db, df)
+    before = _positions(df)
+    for job_id in ids["jobs"]:
+        db.update_job_task_override_fields(job_id, ids["t1"], override_days=2)
+    after_df, _state, info = _compute(db)
+    after = _positions(after_df)
+    assert info["released"]
+    for key in info["released"]:
+        assert after[key][0] >= before[key][0]
 
 
 def test_reducing_lines_releases_the_conflicting_tasks_and_recomputes(tmp_path):
