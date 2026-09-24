@@ -177,7 +177,8 @@ def _fmt_confirmed(row, team_names):
     if end[:4] == start[:4]:
         end = end[5:]  # 同じ年なら年を省く
     team = team_names.get(row["team_id"], "")
-    return f"{start}〜{end}  {row['days']}日  {team}".rstrip()
+    # 列幅を取りすぎないよう2段にする（1段目: 期間、2段目: 日数・チーム）
+    return f"{start}〜{end}\n{row['days']}日  {team}".rstrip()
 
 
 # コンボボックスの▼やスピンボックスの▲▼のぶん、テキスト幅より少し広くする
@@ -1137,6 +1138,10 @@ class JobsTab(QWidget):
                 item.setBackground(_unconfirmed_brush())
                 continue
             item.setText(_fmt_confirmed(confirmed, team_names))
+            # 2段を今の行の高さ（入力欄の高さ）に収めるため、この列だけ文字を小さくする
+            font = item.font()
+            font.setPointSizeF(max(table.font().pointSizeF() - 2, 6))
+            item.setFont(font)
             if state.status != DRAFT or key not in state.changed:
                 continue
             # 変更案: 確定時から変わった入力を赤文字にし、確定値と今の値を並べる。
