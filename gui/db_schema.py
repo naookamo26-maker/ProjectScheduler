@@ -16,7 +16,7 @@ CRUD本体（gui/db.py）から分離しているのは、この2つが「増え
 4. `docs/db_design.md` のテーブル一覧を追随させる。
 """
 
-SCHEMA_VERSION = "16"
+SCHEMA_VERSION = "17"
 
 
 class SchemaError(Exception):
@@ -101,7 +101,18 @@ CREATE TABLE project (
     -- ガントチャートタブの「配置コントロール」で調整する
     -- project_scheduler.py の distribution_ratio（0.0=最速 ASAP 〜
     -- 1.0=ギリギリ ALAP）。既定はスケジューラ本体の既定値と同じ0.7。
-    distribution_ratio REAL NOT NULL DEFAULT 0.7
+    distribution_ratio REAL NOT NULL DEFAULT 0.7,
+    -- 計画の確定と再計画（docs/roadmap.md §8）。
+    -- replan_base_date: 確定行を持たないタスクをこの日より前に置かない下限
+    --   （全面再計画を確定したときに書く。未設定なら開発開始日と同じ扱い）
+    -- replanned_at: 全面再計画を実行した日（過去の違反を報告しない境界）
+    -- confirmed_at: 最後に確定した日時（状態帯の表示用）
+    -- confirmed_global_signature: 確定時の全体設定（休業日・ライン数の推移・
+    --   配置コントロール・ジョブの優先度）の指紋。変わったら「変更あり」
+    replan_base_date TEXT,
+    replanned_at TEXT,
+    confirmed_at TEXT,
+    confirmed_global_signature TEXT
 );
 
 CREATE TABLE milestones (
@@ -167,7 +178,10 @@ CREATE TABLE jobs (
     workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE RESTRICT,
     default_milestone_id INTEGER REFERENCES milestones(id) ON DELETE SET NULL,
     priority INTEGER CHECK (priority IS NULL OR priority >= 1),
-    tags TEXT NOT NULL DEFAULT ''
+    tags TEXT NOT NULL DEFAULT '',
+    -- 作成時に決めて変えない安定キー。スケジューラの配置のばらつきの種にする
+    -- （内部IDを種にすると、ジョブを作り直すだけで無関係なジョブまで動くため）。
+    stable_key TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE job_task_overrides (
@@ -214,6 +228,36 @@ CREATE TABLE workflow_dependency_templates (
     depends_on_workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
     UNIQUE(workflow_id, workflow_task_id, depends_on_workflow_id, depends_on_workflow_task_id),
     CHECK (workflow_id != depends_on_workflow_id)
+);
+
+-- 合意した日程（docs/roadmap.md §8-2）。確定したときの計算結果をタスクごとに持つ。
+-- end_date は exclusive（計算結果の End_Date と同じ）。days・team_id を持つのは、
+-- あとでワークフローを直しても終わった仕事の実績が遡って変わらないようにするため。
+-- input_signature は確定時に実際に使われた入力の指紋（§8-7。変わったら「変更あり」）。
+CREATE TABLE confirmed_schedule (
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    days INTEGER NOT NULL,
+    team_id INTEGER REFERENCES teams(id) ON DELETE SET NULL,
+    input_signature TEXT NOT NULL,
+    PRIMARY KEY (job_id, workflow_task_id)
+);
+
+-- 変更案に入った時点の状態（§8-8。破棄のため）。1行だけ持つ。
+CREATE TABLE draft_base (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    started_on TEXT NOT NULL,
+    snapshot BLOB NOT NULL
+);
+
+-- 変更案の中でガントからドラッグした開始日（§8-8）。確定したら確定行へ書き込んで消す。
+CREATE TABLE draft_moves (
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
+    start_date TEXT NOT NULL,
+    PRIMARY KEY (job_id, workflow_task_id)
 );
 """
 
@@ -602,6 +646,41 @@ def migrate(conn):
         if cols and "status" not in cols:
             conn.execute("ALTER TABLE job_task_overrides ADD COLUMN status TEXT")
         version = "16"
+
+    if version == "16":
+        # v17: 計画の確定と再計画（docs/roadmap.md §8）。
+        # - jobs.stable_key: 既存ジョブには今の内部IDの文字列（"JOB_012"）を入れる。
+        #   スケジューラはこれまで Job_ID をばらつきの種にしていたので、同じ値に
+        #   しておけば移行しただけで日程が動くことは無い。
+        # - project の基準日・確定日時等、confirmed_schedule / draft_base /
+        #   draft_moves を追加（いずれも空で始まる＝未確定のファイル）。
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+        if cols and "stable_key" not in cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN stable_key TEXT NOT NULL DEFAULT ''")
+            conn.execute("UPDATE jobs SET stable_key = printf('JOB_%03d', id)")
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(project)").fetchall()]
+        for column in ("replan_base_date", "replanned_at", "confirmed_at", "confirmed_global_signature"):
+            if cols and column not in cols:
+                conn.execute(f"ALTER TABLE project ADD COLUMN {column} TEXT")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS confirmed_schedule ("
+            "job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, "
+            "workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE, "
+            "start_date TEXT NOT NULL, end_date TEXT NOT NULL, days INTEGER NOT NULL, "
+            "team_id INTEGER REFERENCES teams(id) ON DELETE SET NULL, "
+            "input_signature TEXT NOT NULL, PRIMARY KEY (job_id, workflow_task_id))"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS draft_base ("
+            "id INTEGER PRIMARY KEY CHECK (id = 1), started_on TEXT NOT NULL, snapshot BLOB NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS draft_moves ("
+            "job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, "
+            "workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE, "
+            "start_date TEXT NOT NULL, PRIMARY KEY (job_id, workflow_task_id))"
+        )
+        version = "17"
 
     conn.execute(
         "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)

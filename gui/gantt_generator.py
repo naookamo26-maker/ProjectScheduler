@@ -59,10 +59,16 @@ def build_frames(db):
     （_load_data_from_frames の「シート/データが存在しない」扱いに対応）。
     """
     proj = db.get_project()
+    # 全面再計画の基準日（docs/roadmap.md §8-3）。確定行を持たないタスクを
+    # この日より前に置かないよう、スケジューラへ渡す開始日を差し替える
+    # （開発開始日そのものは変えない——稼働本数の起点等に使われているため）。
+    start_date = proj["start_date"]
+    if proj.get("replan_base_date") and start_date and proj["replan_base_date"] > start_date:
+        start_date = proj["replan_base_date"]
     df_project = pd.DataFrame([{
         "Project_ID": "PRJ_001",
         "Project_Name": proj["project_name"],
-        "Start_Date": proj["start_date"],
+        "Start_Date": start_date,
     }])
 
     teams = db.list_teams()
@@ -133,6 +139,8 @@ def build_frames(db):
         "Workflow_ID": wf_str[j["workflow_id"]],
         "Default_Milestone_ID": ms_str.get(j["default_milestone_id"]),
         "Priority": j["priority"],
+        # 配置のばらつきの種（作成時に決めて変えない安定キー。§8-1）
+        "Jitter_Key": j["stable_key"],
     } for j in jobs])
 
     jt_rows = [{

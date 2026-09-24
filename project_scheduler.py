@@ -580,6 +580,13 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
     for job in df_jobs.to_dict("records"):
         job_id, job_name = job["Job_ID"], job["Job_Name"]
         wf_id = job["Workflow_ID"]
+        # 配置のばらつき（_job_ratio_jitter）の種。任意列 Jitter_Key があれば
+        # それを、無ければ Job_ID を使う。GUIはジョブ作成時に決めて変えない
+        # 安定キーを渡す——Job_ID（"JOB_<連番>"）を種にすると、ジョブを作り直す
+        # だけで無関係なジョブの日程まで動くため（docs/roadmap.md §8-1）。
+        jitter_key = job.get("Jitter_Key")
+        if not isinstance(jitter_key, str) or not jitter_key.strip():
+            jitter_key = job_id
         job_default_ms = job.get("Default_Milestone_ID", "")
 
         priority = job.get("Priority")
@@ -676,6 +683,7 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
             active_tasks[g_id] = {
                 "start_pin_ord": start_pin_ord,
                 "job_id": job_id, "job_name": job_name, "task_id": t_id,
+                "jitter_key": jitter_key,
                 "task_name": t["Task_Name"], "days": days,
                 # deps / dep_specs は全ジョブを読み終えてから
                 # （無効化されたタスクを飛ばして）確定させる。
@@ -1261,14 +1269,17 @@ def _calc_job_shift_days(active_tasks, asap_dates, raw_dates, distribution_ratio
         return {}
 
     job_tasks = {}
+    jitter_keys = {}
     for g_id, t_info in active_tasks.items():
-        job_tasks.setdefault(t_info.get("job_id", g_id), []).append(g_id)
+        job_id = t_info.get("job_id", g_id)
+        job_tasks.setdefault(job_id, []).append(g_id)
+        jitter_keys.setdefault(job_id, t_info.get("jitter_key") or job_id)
 
     job_shift_days = {}
     for job_id, g_ids in job_tasks.items():
         min_slack = min(raw_dates[g][0] - asap_dates[g][0] for g in g_ids)
         min_slack = max(0, min_slack)
-        effective_ratio = min(1.0, max(0.0, distribution_ratio + _job_ratio_jitter(job_id)))
+        effective_ratio = min(1.0, max(0.0, distribution_ratio + _job_ratio_jitter(jitter_keys[job_id])))
         job_shift_days[job_id] = round(min_slack * effective_ratio)
     return job_shift_days
 

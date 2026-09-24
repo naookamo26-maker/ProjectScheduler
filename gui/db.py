@@ -87,6 +87,20 @@ def normalize_dependency_kind(dep_type, lag_days):
     return dep_type, lag_days
 
 
+def _assign_stable_key(conn, job_id):
+    """ジョブの安定キー（jobs.stable_key）を作成時に1度だけ決める（以後変えない）。
+
+    値は作成時の内部IDの文字列（"JOB_012"）。スケジューラがこれまで配置の
+    ばらつきの種にしていた Job_ID と同じ値なので、配置は従来どおりで、同じ操作を
+    すれば同じ結果になる。内部IDを直接使わずに列として固定しておくのは、将来
+    ファイルの取り込み等で内部IDが振り直されても、配置が変わらないようにするため。
+    （ランダムなUUIDにすると、同じ手順で作ったプロジェクトでも作るたびに配置が
+    変わってしまう。）"""
+    conn.execute(
+        "UPDATE jobs SET stable_key = printf('JOB_%03d', id) WHERE id = ?", (job_id,)
+    )
+
+
 def _validate_start_pin_date(value):
     """開始固定日の書式を検証し、'YYYY-MM-DD' または None に正規化する。
 
@@ -532,13 +546,10 @@ class ProjectDatabase:
 
     def get_project(self):
         row = self._conn.execute(
-            "SELECT project_name, start_date, distribution_ratio FROM project WHERE id = 1"
+            "SELECT project_name, start_date, distribution_ratio, replan_base_date, "
+            "replanned_at, confirmed_at, confirmed_global_signature FROM project WHERE id = 1"
         ).fetchone()
-        return {
-            "project_name": row["project_name"],
-            "start_date": row["start_date"],
-            "distribution_ratio": row["distribution_ratio"],
-        }
+        return dict(row)
 
     @undoable("プロジェクト概要を変更")
     def set_project(self, project_name, start_date):
@@ -1016,7 +1027,7 @@ class ProjectDatabase:
     def list_jobs(self):
         rows = self._conn.execute(
             "SELECT j.id, j.name, j.workflow_id, w.name AS workflow_name, "
-            "j.default_milestone_id, m.name AS milestone_name, j.priority, j.tags "
+            "j.default_milestone_id, m.name AS milestone_name, j.priority, j.tags, j.stable_key "
             "FROM jobs j "
             "JOIN workflows w ON w.id = j.workflow_id "
             "LEFT JOIN milestones m ON m.id = j.default_milestone_id "
@@ -1034,6 +1045,7 @@ class ProjectDatabase:
             )
         except sqlite3.IntegrityError as e:
             raise DuplicateNameError(f"ジョブ名 '{name}' は既に使用されています") from e
+        _assign_stable_key(self._conn, cur.lastrowid)
         self._commit()
         return cur.lastrowid
 
@@ -1096,6 +1108,8 @@ class ProjectDatabase:
             (new_name, row["workflow_id"], row["default_milestone_id"], row["priority"], row["tags"]),
         )
         new_job_id = cur.lastrowid
+        # 安定キーは複製元から引き継がない（別のジョブなので、配置のばらつきも別にする）
+        _assign_stable_key(self._conn, new_job_id)
 
         for o in self._conn.execute(
             "SELECT workflow_task_id, is_active, override_days, milestone_id, team_id, "
