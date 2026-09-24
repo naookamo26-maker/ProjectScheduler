@@ -34,6 +34,10 @@ TRANSLATED_LANGUAGES = [code for code, _label in i18n.LANGUAGES if code != i18n.
 # 足していき、最後は SOURCE_FILES 全体になる。
 MIGRATED_FILES = {
     "i18n.py",
+    "gui/app_settings.py",
+    "gui/options_dialog.py",
+    "gui/plan_band.py",
+    "gui/replan_dialog.py",
 }
 
 # 翻訳の対象として集める呼び出し（関数名 → 対象の引数の位置）

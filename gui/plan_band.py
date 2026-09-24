@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton
 
 from gui.plan_confirmation import CONFIRMED, DRAFT, UNCONFIRMED
+from i18n import N_, tr
 
 # (背景, 枠, 文字)
 _COLORS = {
@@ -18,7 +19,7 @@ _COLORS = {
     CONFIRMED: ("#e3f1e6", "#86b893", "#1f4d2b"),
     DRAFT: ("#fff1d6", "#e0a526", "#6b4300"),
 }
-_TITLES = {UNCONFIRMED: "未確定", CONFIRMED: "確定済み", DRAFT: "変更案"}
+_TITLES = {UNCONFIRMED: N_("未確定"), CONFIRMED: N_("確定済み"), DRAFT: N_("変更案")}
 
 
 class PlanStatusBand(QFrame):
@@ -42,12 +43,12 @@ class PlanStatusBand(QFrame):
         self.detail_label.setTextFormat(Qt.RichText)
         layout.addWidget(self.detail_label, 1)
 
-        self.confirm_button = QPushButton("確定する")
-        self.confirm_draft_button = QPushButton("変更を確定")
-        self.confirm_selected_button = QPushButton("選択した変更を確定")
-        self.discard_button = QPushButton("変更を破棄")
-        self.replan_button = QPushButton("全面再計画…")
-        self.clear_button = QPushButton("未確定に戻す")
+        self.confirm_button = QPushButton(tr("確定する"))
+        self.confirm_draft_button = QPushButton(tr("変更を確定"))
+        self.confirm_selected_button = QPushButton(tr("選択した変更を確定"))
+        self.discard_button = QPushButton(tr("変更を破棄"))
+        self.replan_button = QPushButton(tr("全面再計画…"))
+        self.clear_button = QPushButton(tr("未確定に戻す"))
         self.confirm_button.clicked.connect(self.confirmRequested)
         self.confirm_draft_button.clicked.connect(self.confirmRequested)
         self.confirm_selected_button.clicked.connect(self.confirmSelectedRequested)
@@ -76,7 +77,7 @@ class PlanStatusBand(QFrame):
             f"#planStatusBand {{ background: {background}; border: 1px solid {border}; "
             f"border-radius: 4px; }} #planStatusBand QLabel {{ color: {text}; }}"
         )
-        self.title_label.setText(_TITLES[status])
+        self.title_label.setText(tr(_TITLES[status]))
         self.detail_label.setText(detail)
         visible = set(self._buttons[status]) if show_buttons else set()
         for buttons in self._buttons.values():

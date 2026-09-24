@@ -27,7 +27,7 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QLocale, QSettings, QStandardPaths
 
-from i18n import LANGUAGES
+from i18n import LANGUAGES, tr
 
 SETTINGS_FILE_NAME = "ProjectScheduler.ini"
 SETTINGS_PATH_ENV = "PROJECT_SCHEDULER_SETTINGS"
@@ -169,7 +169,7 @@ class AppSettings:
     def set(self, name, value):
         option = OPTIONS[name]
         if not option.is_valid(value):
-            raise ValueError(f"{name} に設定できない値です: {value!r}")
+            raise ValueError(tr("{name} に設定できない値です: {value}", name=name, value=repr(value)))
         self._qs.setValue(option.key, value)
 
     def default(self, name):
@@ -183,7 +183,7 @@ class AppSettings:
         """ファイルへ書き出す。書き込みに失敗したら OSError。"""
         self._qs.sync()
         if self._qs.status() != QSettings.NoError:
-            raise OSError(f"設定を保存できませんでした: {self.path}")
+            raise OSError(tr("設定を保存できませんでした: {path}", path=self.path))
 
     def get_ui_state(self, name):
         """オプションではない画面の状態（編集ウィンドウの位置など）。検証しない。"""
