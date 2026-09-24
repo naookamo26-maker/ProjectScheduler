@@ -18,6 +18,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QSizePolicy,
+    QSpacerItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -25,7 +27,13 @@ from PySide6.QtWidgets import (
 
 from gui.app_settings import AppSettings
 from gui.db import ProjectDatabase
-from gui.gantt_generator import generate_gantt, validate_for_generation
+from gui.gantt_generator import (
+    PLAN_OUTPUT_CONFIRMED,
+    PLAN_OUTPUT_DRAFT,
+    generate_gantt,
+    validate_for_generation,
+)
+from gui.plan_confirmation import DRAFT, PlanState
 from gui.options_dialog import OptionsDialog
 from gui.plan_band import PlanStatusBand
 from gui.schedule_cache import ScheduleCache
@@ -404,14 +412,23 @@ class MainWindow(QMainWindow):
             )
             return
 
+        plan_output = PLAN_OUTPUT_DRAFT
+        if PlanState(self.db).status == DRAFT:
+            # 変更案の最中だけ、どちらの日程を出力するかを選ぶ（§8-9）
+            plan_output = self._ask_plan_output()
+            if plan_output is None:
+                return
+
         default_dir = str(Path(self.db.path).resolve().parent) if self.db.path else str(Path.home())
-        out_dir = QFileDialog.getExistingDirectory(self, "ガントチャートの出力先フォルダ", default_dir)
+        out_dir = self._ask_output_dir(default_dir)
         if not out_dir:
             return
 
         html_path = str(Path(out_dir) / "schedule_gantt.html")
         try:
-            result_df = generate_gantt(self.db, plotly_output_path=html_path, verbose=False)
+            result_df = generate_gantt(
+                self.db, plotly_output_path=html_path, plan_output=plan_output, verbose=False,
+            )
         except SchedulingError as e:
             QMessageBox.critical(self, "生成に失敗しました", str(e))
             return
@@ -436,6 +453,32 @@ class MainWindow(QMainWindow):
                 f"{broken.iloc[0]['Constraint_Violation']}）。"
             )
         QMessageBox.information(self, "生成完了", message)
+
+    def _ask_plan_output(self):
+        """変更案の最中にHTMLを出力するとき、確定した日程と変更案のどちらを出すかを
+        尋ねる（キャンセルなら None。テストで差し替える）。"""
+        box = QMessageBox(QMessageBox.Question, "ガントチャートを生成",
+                          "どちらの日程を出力しますか？", parent=self)
+        box.setInformativeText("出力したファイルの見出しに、どちらの日程かを書き添えます。")
+        draft = box.addButton("変更案", QMessageBox.AcceptRole)
+        confirmed = box.addButton("確定した日程", QMessageBox.AcceptRole)
+        box.addButton("キャンセル", QMessageBox.RejectRole)
+        box.setDefaultButton(draft)
+        # QMessageBox は幅が狭く、説明文が途中で折り返されるので広げる
+        layout = box.layout()
+        layout.addItem(QSpacerItem(440, 0, QSizePolicy.Minimum, QSizePolicy.Expanding),
+                       layout.rowCount(), 0, 1, layout.columnCount())
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is draft:
+            return PLAN_OUTPUT_DRAFT
+        if clicked is confirmed:
+            return PLAN_OUTPUT_CONFIRMED
+        return None
+
+    def _ask_output_dir(self, default_dir):
+        """出力先フォルダを選ばせる（テストで差し替える）。"""
+        return QFileDialog.getExistingDirectory(self, "ガントチャートの出力先フォルダ", default_dir)
 
     def _open_database(self, db):
         # 旧DBを閉じるのは、旧タブを差し替え終えた後にする。タブの差し替えでは

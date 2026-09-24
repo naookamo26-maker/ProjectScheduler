@@ -359,3 +359,37 @@ def test_replan_dialog_counts_the_tasks_and_warns_about_past_dates(qapp, gantt):
         assert "今日より前" in dialog.warning_label.text()
     finally:
         dialog.deleteLater()
+
+
+# -- HTML出力（§8-9） ----------------------------------------------------------------
+
+
+def test_generate_asks_which_schedule_only_during_a_draft(qapp, gantt, tmp_path):
+    from PySide6.QtWidgets import QMessageBox
+
+    from gui.gantt_generator import PLAN_OUTPUT_CONFIRMED
+
+    w, tab, ids = gantt
+    out = tmp_path / "out"
+    out.mkdir()
+    html = out / "schedule_gantt.html"
+    _confirm(qapp, w)
+    with patch.object(w, "_ask_plan_output") as ask, \
+            patch.object(w, "_ask_output_dir", return_value=str(out)), \
+            patch.object(QMessageBox, "information"):
+        w.on_generate_gantt()
+    assert not ask.called  # 確定済み（変更案が無い）なら尋ねない
+    assert "確定した日程" in html.read_text(encoding="utf-8")
+
+    w.db.update_job_task_override_fields(ids["job1"], ids["t1"], override_days=8)
+    html.unlink()
+    with patch.object(w, "_ask_plan_output", return_value=None), \
+            patch.object(w, "_ask_output_dir", return_value=str(out)) as ask_dir:
+        w.on_generate_gantt()
+    assert not ask_dir.called and not html.exists()  # キャンセルしたら何もしない
+
+    with patch.object(w, "_ask_plan_output", return_value=PLAN_OUTPUT_CONFIRMED), \
+            patch.object(w, "_ask_output_dir", return_value=str(out)), \
+            patch.object(QMessageBox, "information"):
+        w.on_generate_gantt()
+    assert "確定した日程" in html.read_text(encoding="utf-8")

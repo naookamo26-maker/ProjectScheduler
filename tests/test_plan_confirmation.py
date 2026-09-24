@@ -490,3 +490,51 @@ def test_violations_before_the_replan_day_are_not_reported():
     assert list(quiet["Constraint_Violation"]) == ["", "ライン数の超過"]
     assert list(quiet["Constraint_Violation_Days"]) == [0, 3]
     assert list(df["Constraint_Violation"]) == ["ライン数の超過", "ライン数の超過"]
+
+
+# -- HTML出力（§8-9） ----------------------------------------------------------------
+
+
+def _generate(db, path, **kwargs):
+    import contextlib
+    import io
+
+    from gui.gantt_generator import generate_gantt
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        df = generate_gantt(db, plotly_output_path=str(path), verbose=False, **kwargs)
+    title = path.read_text(encoding="utf-8").split("<title>")[1].split("</title>")[0]
+    return df, title
+
+
+def test_html_output_of_an_unconfirmed_plan_has_no_note(tmp_path):
+    db, _ids = _plan_project(tmp_path)
+    _df, title = _generate(db, tmp_path / "a.html")
+    assert title == "P スケジュール"
+
+
+def test_html_output_follows_the_confirmation(tmp_path):
+    db, ids, before = _confirmed_project(tmp_path)
+    df, title = _generate(db, tmp_path / "a.html")
+    assert title == "P スケジュール（確定した日程 2026-04-01）"
+    assert _positions(df) == before
+
+
+def test_html_output_during_a_draft_can_choose_the_confirmed_or_the_draft_schedule(tmp_path):
+    from gui.gantt_generator import PLAN_OUTPUT_CONFIRMED, PLAN_OUTPUT_DRAFT
+
+    db, ids, before = _confirmed_project(tmp_path)
+    job = next(j for j in db.list_jobs() if j["id"] == ids["jobs"][0])
+    new_job = db.add_job("追加", job["workflow_id"], job["default_milestone_id"], 9)
+    db.update_job_task_override_fields(ids["jobs"][0], ids["t1"], override_days=9)
+
+    confirmed_df, title = _generate(db, tmp_path / "c.html", plan_output=PLAN_OUTPUT_CONFIRMED)
+    assert title == "P スケジュール（確定した日程 2026-04-01）"
+    # 確定後に足したジョブは含めず、確定した日程のまま出す
+    assert f"JOB_{new_job:03d}" not in set(confirmed_df["Job_ID"])
+    assert _positions(confirmed_df) == before
+
+    draft_df, title = _generate(db, tmp_path / "d.html", plan_output=PLAN_OUTPUT_DRAFT)
+    assert title == "P スケジュール（変更案・未確定）"
+    assert _positions(draft_df) == _positions(_compute(db)[0])
+    assert f"JOB_{new_job:03d}" in set(draft_df["Job_ID"])

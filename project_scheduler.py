@@ -1873,7 +1873,7 @@ renderAll();
 
 def export_plotly_gantt(result_df, output_path, project_name="プロジェクトスケジュール",
                          team_name_map=None, workflow_name_map=None, team_order=None,
-                         milestone_markers=None):
+                         milestone_markers=None, title_note=None):
     """result_df（run_resource_constrained_scheduler_from_framesの戻り値）から、
     サーバー不要でブラウザで直接開けるインタラクティブなガントチャート（単一HTMLファイル、
     Plotly製）を書き出す。
@@ -1974,6 +1974,9 @@ def export_plotly_gantt(result_df, output_path, project_name="プロジェクト
     ]
 
     title = f"{project_name} スケジュール"
+    if title_note:
+        # どの日程を出力したか（GUIの計画の確定: 確定した日程／変更案）
+        title += f"（{title_note}）"
     html_out = (
         _PLOTLY_GANTT_HTML_TEMPLATE
         .replace("__TITLE__", _esc(title))
@@ -1999,7 +2002,8 @@ def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, 
                                                      auto_exclude_jp_holidays=True,
                                                      plotly_output_path=None,
                                                      project_name=None,
-                                                     distribution_ratio=0.7):
+                                                     distribution_ratio=0.7,
+                                                     plotly_title_note=None):
     """
     リソース制約付きスケジューリングを実行し、結果を DataFrame で返す。
 
@@ -2031,6 +2035,8 @@ def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, 
             できる。省略時はファイル出力を行わない。
         project_name: HTML冒頭の見出しに使うプロジェクト名。
             省略時は Project シートの Project_Name を使う。
+        plotly_title_note: HTMLの見出しの後ろに括弧書きで添える注記
+            （GUIの計画の確定で「確定した日程」「変更案」のどちらを出力したか）。
         distribution_ratio: 0.0〜1.0。各タスクをASAP（最速）〜ALAP（締切ギリギリ）の
             どのあたりに配置するかの基準点。
               - 0.0: 依存関係が満たされ次第すぐ着手（従来のASAP前倒しに近い、前に詰まりやすい）
@@ -2067,6 +2073,7 @@ def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, 
         plotly_output_path=plotly_output_path,
         project_name=project_name,
         distribution_ratio=distribution_ratio,
+        plotly_title_note=plotly_title_note,
     )
 
 
@@ -2170,7 +2177,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
                               verbose=True,
                               auto_exclude_weekends=True, auto_exclude_jp_holidays=True,
                               plotly_output_path=None, project_name=None,
-                              distribution_ratio=0.7):
+                              distribution_ratio=0.7, plotly_title_note=None):
     """run_resource_constrained_scheduler_from_frames() のスケジューリング本体
     （_load_data_from_frames() による検証・整形済みのDataFrameを受け取る）。"""
     project_start = _load_project_start(df_project)
@@ -2222,7 +2229,8 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
                                  team_name_map=team_name_map,
                                  workflow_name_map=workflow_name_map,
                                  team_order=list(df_teams["Team_ID"]),
-                                 milestone_markers=milestone_markers)
+                                 milestone_markers=milestone_markers,
+                                 title_note=plotly_title_note)
         return result_df
 
     jp_holidays = set()
@@ -2306,6 +2314,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
                              team_name_map=team_name_map,
                              workflow_name_map=workflow_name_map,
                              team_order=list(df_teams["Team_ID"]),
-                             milestone_markers=milestone_markers)
+                             milestone_markers=milestone_markers,
+                             title_note=plotly_title_note)
 
     return result_df

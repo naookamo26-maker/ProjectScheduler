@@ -369,24 +369,46 @@ def compute_schedule(db, **scheduler_kwargs):
     return result_df, build_display(db)
 
 
-def generate_gantt(db, plotly_output_path=None, **scheduler_kwargs):
-    """build_frames() の結果を project_scheduler.run_resource_constrained_scheduler_from_frames()
-    にそのまま渡す。SchedulingError系（循環依存・リソース不足・マイルストーン不整合等）は
-    そのまま呼び出し元に伝播させる（GUI側でダイアログに変換する）。
+PLAN_OUTPUT_DRAFT = "draft"
+PLAN_OUTPUT_CONFIRMED = "confirmed"
+
+
+def generate_gantt(db, plotly_output_path=None, plan_output=PLAN_OUTPUT_DRAFT, **scheduler_kwargs):
+    """メニューの「ガントチャートを生成」（HTMLファイル出力）。ガントチャートタブと
+    同じく、計画の確定（§8）を踏まえて計算する。SchedulingError系（循環依存・
+    リソース不足・マイルストーン不整合等）はそのまま呼び出し元に伝播させる
+    （GUI側でダイアログに変換する）。
+
+    plan_output: 変更案の最中に、どちらの日程を出力するか（§8-9）。
+      PLAN_OUTPUT_DRAFT: 変更案（ガントチャートタブに出ているもの）
+      PLAN_OUTPUT_CONFIRMED: 確定した日程（確定後に足したタスクは含めない）
+    出力したHTMLの見出しに、どちらの日程かを書き添える。
 
     distribution_ratio を明示指定しなければ、プロジェクト設定
     （db.get_project()["distribution_ratio"]）を既定値として使う——
-    ガントチャートタブで調整した基準点が、メニューの「ガントチャートを
-    生成」（HTMLファイル出力）でもそのまま使われるようにするため。"""
+    ガントチャートタブで調整した基準点が、HTML出力でもそのまま使われるようにするため。"""
+    from gui.plan_confirmation import CONFIRMED, DRAFT, PlanState
+
     frames = build_frames(db)
     scheduler_kwargs.setdefault("distribution_ratio", db.get_project()["distribution_ratio"])
-    return run_resource_constrained_scheduler_from_frames(
-        frames["project"], frames["teams"], frames["milestones"], frames["workflows"],
-        frames["jobs"], frames["job_tasks"], frames["holidays"], frames["external_dependencies"],
-        frames["workflow_names"], df_team_capacity=frames["team_capacity"],
-        plotly_output_path=plotly_output_path,
-        **scheduler_kwargs,
-    )
+    state = PlanState(db)
+    note = None
+    if state.status == DRAFT and plan_output == PLAN_OUTPUT_CONFIRMED:
+        plan = build_confirmed_plan(state)
+        note = f"確定した日程 {(state.confirmed_at or '')[:10]}".strip()
+    else:
+        plan = build_plan(db, state)
+        if state.status == CONFIRMED:
+            note = f"確定した日程 {(state.confirmed_at or '')[:10]}".strip()
+        elif state.status == DRAFT:
+            note = "変更案・未確定"
+    scheduler_kwargs["plotly_output_path"] = plotly_output_path
+    scheduler_kwargs["plotly_title_note"] = note
+    if plan is None:
+        return compute_schedule_from_frames(frames, **scheduler_kwargs)
+    # 違反による再計算のたびに書き出し、最後の計算結果が残る
+    result_df, _info = compute_schedule_with_plan(frames, plan, **scheduler_kwargs)
+    return result_df
 
 
 # -- 計画の確定と変更案（docs/roadmap.md §8） ---------------------------------------
@@ -455,6 +477,31 @@ def build_plan(db, state):
     }
 
 
+def build_confirmed_plan(state):
+    """確定した日程そのものを出力するための材料（HTML出力で「確定した日程」を
+    選んだとき）。確定行のあるタスクはすべて確定の位置・日数・チームに固定し、
+    確定後に足したタスク（確定行の無いもの）は出力に含めない。"""
+    def key(k):
+        return (_fmt("JOB", k[0]), _fmt("T", k[1]))
+
+    fixed = {}
+    exclude = set()
+    for k, is_active in state.active.items():
+        if not is_active:
+            continue
+        row = state.confirmed.get(k)
+        if row is None:
+            exclude.add(key(k))
+            continue
+        team = _fmt("TEAM", row["team_id"]) if row["team_id"] is not None else None
+        fixed[key(k)] = (row["start_date"], row["days"], team)
+    return {
+        "fixed": fixed, "exclude": exclude, "not_before": {}, "released": set(),
+        "started": set(fixed), "draft_moves": {}, "successors": {}, "lower_bound": None,
+        "quiet_before": state.replanned_at,
+    }
+
+
 def _apply_plan_to_frames(frames, fixed, plan):
     """確定の位置に固定するタスクを、開始固定日・日数・チームの上書きとして
     job_tasks に書き込んだ frames の写しを返す（DBは変えない）。"""
@@ -471,6 +518,9 @@ def _apply_plan_to_frames(frames, fixed, plan):
         r["Override_Days"] = days
         if team is not None:
             r["Team_ID"] = team
+    for k in plan.get("exclude", ()):
+        r = rows.setdefault(k, {"Job_ID": k[0], "Task_ID": k[1]})
+        r["Is_Active"] = "N"
     for k, start in plan.get("not_before", {}).items():
         if k in fixed or k in plan["draft_moves"]:
             continue
