@@ -16,6 +16,8 @@ CRUD本体（gui/db.py）から分離しているのは、この2つが「増え
 4. `docs/db_design.md` のテーブル一覧を追随させる。
 """
 
+from i18n import tr
+
 SCHEMA_VERSION = "18"
 
 
@@ -59,33 +61,34 @@ def check_openable(conn):
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'"
     ).fetchone()
     if not exists:
-        raise SchemaError(
+        raise SchemaError(tr(
             "ProjectSchedulerのプロジェクトファイル（.pschedule）ではないようです"
             "（schema_metaテーブルが見つかりません）。"
-        )
+        ))
     row = conn.execute(
         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
     ).fetchone()
     if row is None:
-        raise SchemaError(
+        raise SchemaError(tr(
             "ProjectSchedulerのプロジェクトファイル（.pschedule）として"
             "壊れています（schema_versionの記録が見つかりません）。"
-        )
+        ))
     version = row["value"]
     try:
         version_num = int(version)
         current_num = int(SCHEMA_VERSION)
     except (TypeError, ValueError):
-        raise SchemaError(
-            f"schema_versionの値 '{version}' を解釈できません。"
-            "ファイルが壊れている可能性があります。"
-        ) from None
+        raise SchemaError(tr(
+            "schema_versionの値 '{version}' を解釈できません。ファイルが壊れている可能性があります。",
+            version=version,
+        )) from None
     if version_num > current_num:
-        raise SchemaError(
+        raise SchemaError(tr(
             "このファイルはより新しいバージョンのProjectSchedulerで作成されています"
-            f"（ファイルのバージョン: {version}、このアプリが対応するバージョン: "
-            f"{SCHEMA_VERSION}）。アプリを最新版に更新してから開いてください。"
-        )
+            "（ファイルのバージョン: {version}、このアプリが対応するバージョン: {supported}）。"
+            "アプリを最新版に更新してから開いてください。",
+            version=version, supported=SCHEMA_VERSION,
+        ))
 
 
 _SCHEMA_SQL = """

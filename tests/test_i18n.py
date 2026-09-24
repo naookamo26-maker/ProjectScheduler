@@ -36,6 +36,9 @@ MIGRATED_FILES = {
     "i18n.py",
     "gui/analysis_charts.py",
     "gui/app_settings.py",
+    "gui/db.py",
+    "gui/db_schema.py",
+    "gui/gantt_generator.py",
     "gui/gantt_task_editor.py",
     "gui/gantt_view.py",
     "gui/main.py",
@@ -61,8 +64,8 @@ _MARKERS = {
 # のようにロガーのメソッドとして呼んだものだけ（QMessageBox.warning(…) は画面に出るので対象）
 _LOG_METHODS = {"debug", "info", "warning", "error", "exception", "critical"}
 _LOGGERS = {"logger", "logging", "log", "_logger"}
-# 翻訳しない定数（言語の選択肢は、それぞれの言語での呼び名のまま出す）
-_EXEMPT_ASSIGNMENTS = {"LANGUAGES"}
+# 翻訳しない定数（言語の選択肢は、それぞれの言語での呼び名のまま出す。SQL のコメント）
+_EXEMPT_ASSIGNMENTS = {"LANGUAGES", "_SCHEMA_SQL"}
 _JA = re.compile(r"[぀-ヿ㐀-鿿＀-￯]")
 
 

@@ -77,15 +77,15 @@ def normalize_dependency_kind(dep_type, lag_days):
     dep_type = str(dep_type or "FS").strip().upper()
     if dep_type not in DEPENDENCY_KINDS:
         raise ProjectDatabaseError(
-            f"依存関係の種別 '{dep_type}' は不正です（{' / '.join(DEPENDENCY_KINDS)} のいずれか）"
+            tr("依存関係の種別 '{dep_type}' は不正です（{value} のいずれか）", dep_type=dep_type, value=' / '.join(DEPENDENCY_KINDS))
         )
     try:
         lag_days = int(lag_days)
     except (TypeError, ValueError):
-        raise ProjectDatabaseError("ラグは整数（営業日）で指定してください") from None
+        raise ProjectDatabaseError(tr("ラグは整数（営業日）で指定してください")) from None
     if abs(lag_days) > MAX_LAG_DAYS:
         raise ProjectDatabaseError(
-            f"ラグ {lag_days} 日は範囲外です（±{MAX_LAG_DAYS}日まで）"
+            tr("ラグ {lag_days} 日は範囲外です（±{MAX_LAG_DAYS}日まで）", lag_days=lag_days, MAX_LAG_DAYS=MAX_LAG_DAYS)
         )
     return dep_type, lag_days
 
@@ -117,7 +117,7 @@ def _validate_start_pin_date(value):
         return date.fromisoformat(str(value).strip()).isoformat()
     except (TypeError, ValueError):
         raise ProjectDatabaseError(
-            f"開始固定日 '{value}' が不正です（YYYY-MM-DD 形式で指定してください）"
+            tr("開始固定日 '{value}' が不正です（YYYY-MM-DD 形式で指定してください）", value=value)
         ) from None
 
 
@@ -129,9 +129,9 @@ def _validate_distribution_ratio(value):
     try:
         value = float(value)
     except (TypeError, ValueError):
-        raise ProjectDatabaseError("配置コントロールの値は数値で指定してください") from None
+        raise ProjectDatabaseError(tr("配置コントロールの値は数値で指定してください")) from None
     if not 0.0 <= value <= 1.0:
-        raise ProjectDatabaseError("配置コントロールの値は0.0〜1.0の範囲で指定してください")
+        raise ProjectDatabaseError(tr("配置コントロールの値は0.0〜1.0の範囲で指定してください"))
     return value
 
 
@@ -183,8 +183,7 @@ def normalize_task_status(status):
     status = str(status).strip()
     if status not in TASK_STATUSES:
         raise ProjectDatabaseError(
-            f"タスクの状態 '{status}' は不正です（{' / '.join(TASK_STATUSES)} のいずれか、"
-            "または未着手はNone）"
+            tr("タスクの状態 '{status}' は不正です（{value} のいずれか、または未着手はNone）", status=status, value=' / '.join(TASK_STATUSES))
         )
     return status
 
@@ -434,7 +433,7 @@ class ProjectDatabase:
         """
         p = Path(path)
         if not p.exists():
-            raise FileNotFoundError(f"プロジェクトファイルが見つかりません: {path}")
+            raise FileNotFoundError(tr("プロジェクトファイルが見つかりません: {path}", path=path))
         disk_conn = sqlite3.connect(str(p))
         try:
             db = cls(path)
@@ -442,9 +441,7 @@ class ProjectDatabase:
                 disk_conn.backup(db._conn)
             except sqlite3.DatabaseError as e:
                 raise ProjectDatabaseError(
-                    f"ProjectSchedulerのプロジェクトファイル（.pschedule）として"
-                    f"読み込めませんでした（{e}）。ファイルが破損しているか、"
-                    "SQLite形式ではない可能性があります。"
+                    tr("ProjectSchedulerのプロジェクトファイル（.pschedule）として読み込めませんでした（{e}）。ファイルが破損しているか、SQLite形式ではない可能性があります。", e=e)
                 ) from e
         finally:
             disk_conn.close()
@@ -480,7 +477,7 @@ class ProjectDatabase:
         （path未確定の新規プロジェクト）の場合は呼び出し側の責務漏れなので
         明示的に失敗させる（GUI側はこの場合save_as相当のパス選択に迂回する）。"""
         if self.path is None:
-            raise ProjectDatabaseError("保存先が未設定です（save_asでパスを指定してください）")
+            raise ProjectDatabaseError(tr("保存先が未設定です（save_asでパスを指定してください）"))
         # 編集途中（スピンボックスにフォーカスが残ったまま等）で保存された場合、
         # その編集を先に1つのUndo単位として確定させる。確定させないまま
         # 「保存済み」を記録すると、後でフォーカスが外れてエントリが積まれた
@@ -536,8 +533,7 @@ class ProjectDatabase:
         if (self.undo_manager is not None and not self._in_undoable_call
                 and not self._undo_suppressed and self._open_group is None):
             raise AssertionError(
-                f"{type(self).__name__}._commit() が @undoable / undo_group の外側から呼ばれました。"
-                "変更系メソッドには @undoable(\"ラベル\") を付けてください。"
+                tr("{cls}._commit() が @undoable / undo_group の外側から呼ばれました。変更系メソッドには @undoable(\"ラベル\") を付けてください。", cls=type(self).__name__)
             )
         self._conn.commit()
         self._dirty = True
@@ -591,7 +587,7 @@ class ProjectDatabase:
         ).fetchone()
         return dict(row) if row else None
 
-    @undoable(lambda self, name, end_date, note="": f"マイルストーン「{name}」を追加")
+    @undoable(lambda self, name, end_date, note="": tr("マイルストーン「{name}」を追加", name=name))
     def add_milestone(self, name, end_date, note=""):
         try:
             cur = self._conn.execute(
@@ -599,11 +595,11 @@ class ProjectDatabase:
                 (name, end_date, note),
             )
         except sqlite3.IntegrityError as e:
-            raise DuplicateNameError(f"マイルストーン名 '{name}' は既に使用されています") from e
+            raise DuplicateNameError(tr("マイルストーン名 '{name}' は既に使用されています", name=name)) from e
         self._commit()
         return cur.lastrowid
 
-    @undoable(lambda self, milestone_id, name, end_date, note="": f"マイルストーン「{name}」を変更")
+    @undoable(lambda self, milestone_id, name, end_date, note="": tr("マイルストーン「{name}」を変更", name=name))
     def update_milestone(self, milestone_id, name, end_date, note=""):
         try:
             self._conn.execute(
@@ -611,7 +607,7 @@ class ProjectDatabase:
                 (name, end_date, note, milestone_id),
             )
         except sqlite3.IntegrityError as e:
-            raise DuplicateNameError(f"マイルストーン名 '{name}' は既に使用されています") from e
+            raise DuplicateNameError(tr("マイルストーン名 '{name}' は既に使用されています", name=name)) from e
         self._commit()
 
     def milestone_usage_count(self, milestone_id):
@@ -623,7 +619,7 @@ class ProjectDatabase:
         ).fetchone()
         return row["n"]
 
-    @undoable(lambda self, milestone_id: f"マイルストーン「{_entity_name(self._conn, 'milestones', milestone_id)}」を削除")
+    @undoable(lambda self, milestone_id: tr("マイルストーン「{name}」を削除", name=_entity_name(self._conn, 'milestones', milestone_id)))
     def delete_milestone(self, milestone_id):
         self._conn.execute("DELETE FROM milestones WHERE id = ?", (milestone_id,))
         self._commit()
@@ -636,18 +632,18 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    @undoable(lambda self, name, max_lines: f"チーム「{name}」を追加")
+    @undoable(lambda self, name, max_lines: tr("チーム「{name}」を追加", name=name))
     def add_team(self, name, max_lines):
         try:
             cur = self._conn.execute(
                 "INSERT INTO teams(name, max_lines) VALUES (?, ?)", (name, max_lines)
             )
         except sqlite3.IntegrityError as e:
-            raise DuplicateNameError(f"チーム名 '{name}' は既に使用されています") from e
+            raise DuplicateNameError(tr("チーム名 '{name}' は既に使用されています", name=name)) from e
         self._commit()
         return cur.lastrowid
 
-    @undoable(lambda self, team_id, name, max_lines: f"チーム「{name}」を変更")
+    @undoable(lambda self, team_id, name, max_lines: tr("チーム「{name}」を変更", name=name))
     def update_team(self, team_id, name, max_lines):
         try:
             self._conn.execute(
@@ -655,7 +651,7 @@ class ProjectDatabase:
                 (name, max_lines, team_id),
             )
         except sqlite3.IntegrityError as e:
-            raise DuplicateNameError(f"チーム名 '{name}' は既に使用されています") from e
+            raise DuplicateNameError(tr("チーム名 '{name}' は既に使用されています", name=name)) from e
         self._commit()
 
     def team_usage_count(self, team_id):
@@ -667,10 +663,10 @@ class ProjectDatabase:
         ).fetchone()
         return row["n"]
 
-    @undoable(lambda self, team_id: f"チーム「{_entity_name(self._conn, 'teams', team_id)}」を削除")
+    @undoable(lambda self, team_id: tr("チーム「{name}」を削除", name=_entity_name(self._conn, 'teams', team_id)))
     def delete_team(self, team_id):
         if self.team_usage_count(team_id) > 0:
-            raise ReferencedEntityError("このチームはタスクに使用されているため削除できません")
+            raise ReferencedEntityError(tr("このチームはタスクに使用されているため削除できません"))
         self._conn.execute("DELETE FROM teams WHERE id = ?", (team_id,))
         self._commit()
 
@@ -688,7 +684,7 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    @undoable(lambda self, team_id, start_date, lines: f"同時ライン数の変更点（{start_date}）を追加")
+    @undoable(lambda self, team_id, start_date, lines: tr("同時ライン数の変更点（{start_date}）を追加", start_date=start_date))
     def add_team_capacity_change(self, team_id, start_date, lines):
         try:
             cur = self._conn.execute(
@@ -698,12 +694,12 @@ class ProjectDatabase:
             )
         except sqlite3.IntegrityError as e:
             raise DuplicateNameError(
-                f"この日付（{start_date}）の変更点は既に登録されています"
+                tr("この日付（{start_date}）の変更点は既に登録されています", start_date=start_date)
             ) from e
         self._commit()
         return cur.lastrowid
 
-    @undoable(lambda self, change_id, start_date, lines: f"同時ライン数の変更点（{start_date}）を変更")
+    @undoable(lambda self, change_id, start_date, lines: tr("同時ライン数の変更点（{start_date}）を変更", start_date=start_date))
     def update_team_capacity_change(self, change_id, start_date, lines):
         try:
             self._conn.execute(
@@ -712,7 +708,7 @@ class ProjectDatabase:
             )
         except sqlite3.IntegrityError as e:
             raise DuplicateNameError(
-                f"この日付（{start_date}）の変更点は既に登録されています"
+                tr("この日付（{start_date}）の変更点は既に登録されています", start_date=start_date)
             ) from e
         self._commit()
 
@@ -731,27 +727,27 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    @undoable(lambda self, date, team_id=None, note="": f"休業日（{date}）を追加")
+    @undoable(lambda self, date, team_id=None, note="": tr("休業日（{date}）を追加", date=date))
     def add_holiday(self, date, team_id=None, note=""):
         exists = self._conn.execute(
             "SELECT 1 FROM holidays WHERE date = ? AND team_id IS ?", (date, team_id)
         ).fetchone()
         if exists:
-            raise DuplicateNameError("同じ日付・チームの休業日が既に登録されています")
+            raise DuplicateNameError(tr("同じ日付・チームの休業日が既に登録されています"))
         cur = self._conn.execute(
             "INSERT INTO holidays(date, team_id, note) VALUES (?, ?, ?)", (date, team_id, note)
         )
         self._commit()
         return cur.lastrowid
 
-    @undoable(lambda self, holiday_id, date, team_id=None, note="": f"休業日（{date}）を変更")
+    @undoable(lambda self, holiday_id, date, team_id=None, note="": tr("休業日（{date}）を変更", date=date))
     def update_holiday(self, holiday_id, date, team_id=None, note=""):
         exists = self._conn.execute(
             "SELECT 1 FROM holidays WHERE date = ? AND team_id IS ? AND id != ?",
             (date, team_id, holiday_id),
         ).fetchone()
         if exists:
-            raise DuplicateNameError("同じ日付・チームの休業日が既に登録されています")
+            raise DuplicateNameError(tr("同じ日付・チームの休業日が既に登録されています"))
         self._conn.execute(
             "UPDATE holidays SET date = ?, team_id = ?, note = ? WHERE id = ?",
             (date, team_id, note, holiday_id),
@@ -771,7 +767,7 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    @undoable(lambda self, name: f"ワークフロー「{name}」を追加")
+    @undoable(lambda self, name: tr("ワークフロー「{name}」を追加", name=name))
     def add_workflow(self, name):
         next_order = self._conn.execute(
             "SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM workflows"
@@ -781,7 +777,7 @@ class ProjectDatabase:
                 "INSERT INTO workflows(name, sort_order) VALUES (?, ?)", (name, next_order)
             )
         except sqlite3.IntegrityError as e:
-            raise DuplicateNameError(f"ワークフロー名 '{name}' は既に使用されています") from e
+            raise DuplicateNameError(tr("ワークフロー名 '{name}' は既に使用されています", name=name)) from e
         self._commit()
         return cur.lastrowid
 
@@ -795,17 +791,17 @@ class ProjectDatabase:
             )
         self._commit()
 
-    @undoable(lambda self, workflow_id, name: f"ワークフロー名を「{name}」に変更")
+    @undoable(lambda self, workflow_id, name: tr("ワークフロー名を「{name}」に変更", name=name))
     def rename_workflow(self, workflow_id, name):
         try:
             self._conn.execute(
                 "UPDATE workflows SET name = ? WHERE id = ?", (name, workflow_id)
             )
         except sqlite3.IntegrityError as e:
-            raise DuplicateNameError(f"ワークフロー名 '{name}' は既に使用されています") from e
+            raise DuplicateNameError(tr("ワークフロー名 '{name}' は既に使用されています", name=name)) from e
         self._commit()
 
-    @undoable(lambda self, workflow_id: f"ワークフロー「{_entity_name(self._conn, 'workflows', workflow_id)}」を複製")
+    @undoable(lambda self, workflow_id: tr("ワークフロー「{name}」を複製", name=_entity_name(self._conn, 'workflows', workflow_id)))
     def duplicate_workflow(self, workflow_id):
         """ワークフロー1件を、配下のタスク・タスク間依存・このワークフロー自身が
         持つ依存テンプレート（他ワークフローへの依存）ごと複製する。
@@ -824,7 +820,7 @@ class ProjectDatabase:
             "SELECT name, sort_order FROM workflows WHERE id = ?", (workflow_id,)
         ).fetchone()
         if row is None:
-            raise ProjectDatabaseError("複製元のワークフローが見つかりません")
+            raise ProjectDatabaseError(tr("複製元のワークフローが見つかりません"))
 
         # 「追加」ボタン連打時の衝突回避（gui/widgets_common.py の
         # unique_default_name）と同じ考え方だが、db.py はQt非依存を保つため
@@ -833,7 +829,7 @@ class ProjectDatabase:
         existing_names = {
             r["name"] for r in self._conn.execute("SELECT name FROM workflows").fetchall()
         }
-        base_name = f"{row['name']}のコピー"
+        base_name = tr("{name}のコピー", name=row['name'])
         new_name = base_name
         n = 2
         while new_name in existing_names:
@@ -899,11 +895,11 @@ class ProjectDatabase:
         ).fetchone()
         return row["n"]
 
-    @undoable(lambda self, workflow_id: f"ワークフロー「{_entity_name(self._conn, 'workflows', workflow_id)}」を削除")
+    @undoable(lambda self, workflow_id: tr("ワークフロー「{name}」を削除", name=_entity_name(self._conn, 'workflows', workflow_id)))
     def delete_workflow(self, workflow_id):
         if self.workflow_usage_count(workflow_id) > 0:
             raise ReferencedEntityError(
-                "このワークフローは既存のジョブに使用されているため削除できません"
+                tr("このワークフローは既存のジョブに使用されているため削除できません")
             )
         self._conn.execute("DELETE FROM workflows WHERE id = ?", (workflow_id,))
         self._commit()
@@ -920,7 +916,7 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    @undoable(lambda self, workflow_id, name, team_id, default_days: f"タスク「{name}」を追加")
+    @undoable(lambda self, workflow_id, name, team_id, default_days: tr("タスク「{name}」を追加", name=name))
     def add_workflow_task(self, workflow_id, name, team_id, default_days):
         try:
             cur = self._conn.execute(
@@ -930,12 +926,12 @@ class ProjectDatabase:
             )
         except sqlite3.IntegrityError as e:
             raise DuplicateNameError(
-                f"タスク名 '{name}' はこのワークフロー内で既に使用されています"
+                tr("タスク名 '{name}' はこのワークフロー内で既に使用されています", name=name)
             ) from e
         self._commit()
         return cur.lastrowid
 
-    @undoable(lambda self, task_id, name, team_id, default_days: f"タスク「{name}」を変更")
+    @undoable(lambda self, task_id, name, team_id, default_days: tr("タスク「{name}」を変更", name=name))
     def update_workflow_task(self, task_id, name, team_id, default_days):
         try:
             self._conn.execute(
@@ -945,7 +941,7 @@ class ProjectDatabase:
             )
         except sqlite3.IntegrityError as e:
             raise DuplicateNameError(
-                f"タスク名 '{name}' はこのワークフロー内で既に使用されています"
+                tr("タスク名 '{name}' はこのワークフロー内で既に使用されています", name=name)
             ) from e
         self._commit()
 
@@ -963,7 +959,7 @@ class ProjectDatabase:
         ).fetchone()
         return row["n"]
 
-    @undoable(lambda self, task_id: f"タスク「{_entity_name(self._conn, 'workflow_tasks', task_id)}」を削除")
+    @undoable(lambda self, task_id: tr("タスク「{name}」を削除", name=_entity_name(self._conn, 'workflow_tasks', task_id)))
     def delete_workflow_task(self, task_id):
         self._conn.execute("DELETE FROM workflow_tasks WHERE id = ?", (task_id,))
         self._commit()
@@ -1006,7 +1002,7 @@ class ProjectDatabase:
                 (workflow_id, predecessor_task_id, successor_task_id, dep_type, lag_days),
             )
         except sqlite3.IntegrityError as e:
-            raise ProjectDatabaseError("この依存関係は既に存在するか、不正です") from e
+            raise ProjectDatabaseError(tr("この依存関係は既に存在するか、不正です")) from e
         self._commit()
         return cur.lastrowid
 
@@ -1021,7 +1017,7 @@ class ProjectDatabase:
             (dep_type, lag_days, dependency_id),
         )
         if cur.rowcount == 0:
-            raise ProjectDatabaseError("対象の依存関係が見つかりません")
+            raise ProjectDatabaseError(tr("対象の依存関係が見つかりません"))
         self._commit()
 
     @undoable("依存関係を削除")
@@ -1042,7 +1038,7 @@ class ProjectDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    @undoable(lambda self, name, workflow_id, default_milestone_id, priority=None, tags="": f"ジョブ「{name}」を追加")
+    @undoable(lambda self, name, workflow_id, default_milestone_id, priority=None, tags="": tr("ジョブ「{name}」を追加", name=name))
     def add_job(self, name, workflow_id, default_milestone_id, priority=None, tags=""):
         try:
             cur = self._conn.execute(
@@ -1051,12 +1047,12 @@ class ProjectDatabase:
                 (name, workflow_id, default_milestone_id, priority, normalize_tags(tags)),
             )
         except sqlite3.IntegrityError as e:
-            raise DuplicateNameError(f"ジョブ名 '{name}' は既に使用されています") from e
+            raise DuplicateNameError(tr("ジョブ名 '{name}' は既に使用されています", name=name)) from e
         _assign_stable_key(self._conn, cur.lastrowid)
         self._commit()
         return cur.lastrowid
 
-    @undoable(lambda self, job_id, name, workflow_id, default_milestone_id, priority, tags: f"ジョブ「{name}」を変更")
+    @undoable(lambda self, job_id, name, workflow_id, default_milestone_id, priority, tags: tr("ジョブ「{name}」を変更", name=name))
     def update_job(self, job_id, name, workflow_id, default_milestone_id, priority, tags):
         old = self._conn.execute(
             "SELECT workflow_id FROM jobs WHERE id = ?", (job_id,)
@@ -1069,14 +1065,14 @@ class ProjectDatabase:
                 (name, workflow_id, default_milestone_id, priority, normalize_tags(tags), job_id),
             )
         except sqlite3.IntegrityError as e:
-            raise DuplicateNameError(f"ジョブ名 '{name}' は既に使用されています") from e
+            raise DuplicateNameError(tr("ジョブ名 '{name}' は既に使用されています", name=name)) from e
         self._commit()
         if workflow_changed:
             # ワークフローの組み合わせが変わると、依存先ジョブのタスク対応が
             # 参照すべきテンプレートも変わるため、最新の状態へ同期し直す。
             self.sync_dependency_templates()
 
-    @undoable(lambda self, job_id: f"ジョブ「{_entity_name(self._conn, 'jobs', job_id)}」を複製")
+    @undoable(lambda self, job_id: tr("ジョブ「{name}」を複製", name=_entity_name(self._conn, 'jobs', job_id)))
     def duplicate_job(self, job_id):
         """ジョブ1件を、タスク上書き（job_task_overrides）・依存先ジョブ
         （job_dependency_links）・そのタスク単位の対応（job_external_dependencies）
@@ -1097,12 +1093,12 @@ class ProjectDatabase:
             "FROM jobs WHERE id = ?", (job_id,)
         ).fetchone()
         if row is None:
-            raise ProjectDatabaseError("複製元のジョブが見つかりません")
+            raise ProjectDatabaseError(tr("複製元のジョブが見つかりません"))
 
         existing_names = {
             r["name"] for r in self._conn.execute("SELECT name FROM jobs").fetchall()
         }
-        base_name = f"{row['name']}のコピー"
+        base_name = tr("{name}のコピー", name=row['name'])
         new_name = base_name
         n = 2
         while new_name in existing_names:
@@ -1177,7 +1173,7 @@ class ProjectDatabase:
         ).fetchone()
         return row["n"]
 
-    @undoable(lambda self, job_id: f"ジョブ「{_entity_name(self._conn, 'jobs', job_id)}」を削除")
+    @undoable(lambda self, job_id: tr("ジョブ「{name}」を削除", name=_entity_name(self._conn, 'jobs', job_id)))
     def delete_job(self, job_id):
         self._conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
         self._commit()
@@ -1328,7 +1324,7 @@ class ProjectDatabase:
         """
         unknown = set(fields) - set(self._OVERRIDE_DEFAULTS)
         if unknown:
-            raise ProjectDatabaseError(f"タスク上書きに無い項目です: {', '.join(sorted(unknown))}")
+            raise ProjectDatabaseError(tr("タスク上書きに無い項目です: {value}", value=', '.join(sorted(unknown))))
         row = self._conn.execute(
             "SELECT is_active, override_days, milestone_id, team_id, start_pin_date, "
             "COALESCE(tags, '') AS tags, status "
@@ -1344,7 +1340,7 @@ class ProjectDatabase:
         if values["override_days"] is not None:
             values["override_days"] = int(values["override_days"])
             if values["override_days"] < 1:
-                raise ProjectDatabaseError("日数上書きは1以上で指定してください")
+                raise ProjectDatabaseError(tr("日数上書きは1以上で指定してください"))
         values["start_pin_date"] = _validate_start_pin_date(values["start_pin_date"])
         values["tags"] = normalize_tags(values["tags"])
         values["status"] = normalize_task_status(values["status"])
@@ -1458,7 +1454,7 @@ class ProjectDatabase:
         「変更を確定」で初めて書き換わる。base_date: 新しい計画が始まる日（基準日 D）、
         executed_on: 実行した日（T）。いずれも 'YYYY-MM-DD'。"""
         if not self.has_confirmation():
-            raise ProjectDatabaseError("確定していない計画は全面再計画できません")
+            raise ProjectDatabaseError(tr("確定していない計画は全面再計画できません"))
         for value in (base_date, executed_on):
             date.fromisoformat(value)
         self._conn.execute(
@@ -1509,7 +1505,7 @@ class ProjectDatabase:
         """
         row = self._conn.execute("SELECT snapshot FROM draft_base WHERE id = 1").fetchone()
         if row is None:
-            raise ProjectDatabaseError("破棄して戻す先（最後に確定した時点の状態）がありません")
+            raise ProjectDatabaseError(tr("破棄して戻す先（最後に確定した時点の状態）がありません"))
         snapshot = row["snapshot"]
         statuses = {
             (r["job_id"], r["workflow_task_id"]): r["status"]
@@ -1873,7 +1869,7 @@ class ProjectDatabase:
     def add_external_dependency(self, job_id, workflow_task_id, depends_on_job_id,
                                  depends_on_workflow_task_id):
         if (job_id, workflow_task_id) == (depends_on_job_id, depends_on_workflow_task_id):
-            raise ProjectDatabaseError("同じタスクへの自己依存は設定できません")
+            raise ProjectDatabaseError(tr("同じタスクへの自己依存は設定できません"))
         try:
             cur = self._conn.execute(
                 "INSERT INTO job_external_dependencies(job_id, workflow_task_id, "
@@ -1881,7 +1877,7 @@ class ProjectDatabase:
                 (job_id, workflow_task_id, depends_on_job_id, depends_on_workflow_task_id),
             )
         except sqlite3.IntegrityError as e:
-            raise ProjectDatabaseError("この依存関係は既に登録されています") from e
+            raise ProjectDatabaseError(tr("この依存関係は既に登録されています")) from e
         self._commit()
         return cur.lastrowid
 
@@ -1894,10 +1890,10 @@ class ProjectDatabase:
             "SELECT job_id FROM job_external_dependencies WHERE id = ?", (dependency_id,)
         ).fetchone()
         if row is None:
-            raise ProjectDatabaseError("この依存関係は存在しません")
+            raise ProjectDatabaseError(tr("この依存関係は存在しません"))
         job_id = row["job_id"]
         if (job_id, workflow_task_id) == (depends_on_job_id, depends_on_workflow_task_id):
-            raise ProjectDatabaseError("同じタスクへの自己依存は設定できません")
+            raise ProjectDatabaseError(tr("同じタスクへの自己依存は設定できません"))
         try:
             self._conn.execute(
                 "UPDATE job_external_dependencies SET workflow_task_id = ?, "
@@ -1905,10 +1901,10 @@ class ProjectDatabase:
                 (workflow_task_id, depends_on_job_id, depends_on_workflow_task_id, dependency_id),
             )
         except sqlite3.IntegrityError as e:
-            raise ProjectDatabaseError("この依存関係は既に登録されています") from e
+            raise ProjectDatabaseError(tr("この依存関係は既に登録されています")) from e
         self._commit()
 
-    @undoable(lambda self, dependency_id, is_active: "個別のタスク依存を有効化" if is_active else "個別のタスク依存を無効化")
+    @undoable(lambda self, dependency_id, is_active: tr("個別のタスク依存を有効化") if is_active else tr("個別のタスク依存を無効化"))
     def set_external_dependency_active(self, dependency_id, is_active):
         """個別のタスク依存（自動生成分・手動追加分いずれも）を、削除せずに
         有効/無効だけ切り替える。無効化した依存はスケジューリング時に無視される
@@ -2035,14 +2031,14 @@ class ProjectDatabase:
     @undoable("依存先ジョブを追加")
     def add_job_dependency_link(self, job_id, depends_on_job_id):
         if job_id == depends_on_job_id:
-            raise ProjectDatabaseError("同じジョブへの自己依存は設定できません")
+            raise ProjectDatabaseError(tr("同じジョブへの自己依存は設定できません"))
         try:
             cur = self._conn.execute(
                 "INSERT INTO job_dependency_links(job_id, depends_on_job_id) VALUES (?, ?)",
                 (job_id, depends_on_job_id),
             )
         except sqlite3.IntegrityError as e:
-            raise ProjectDatabaseError("このジョブへの依存は既に登録されています") from e
+            raise ProjectDatabaseError(tr("このジョブへの依存は既に登録されています")) from e
         link_id = cur.lastrowid
         self.sync_dependency_templates()
         return link_id
@@ -2119,7 +2115,7 @@ class ProjectDatabase:
                                  depends_on_workflow_id, depends_on_workflow_task_id):
         if self._would_create_workflow_template_cycle(workflow_id, depends_on_workflow_id):
             raise ProjectDatabaseError(
-                "このテンプレートを追加すると、ワークフロー間で循環依存になるため追加できません"
+                tr("このテンプレートを追加すると、ワークフロー間で循環依存になるため追加できません")
             )
         try:
             cur = self._conn.execute(
@@ -2129,7 +2125,7 @@ class ProjectDatabase:
                 (workflow_id, workflow_task_id, depends_on_workflow_id, depends_on_workflow_task_id),
             )
         except sqlite3.IntegrityError as e:
-            raise ProjectDatabaseError("このテンプレートは既に登録されています") from e
+            raise ProjectDatabaseError(tr("このテンプレートは既に登録されています")) from e
         template_id = cur.lastrowid
         # 既にこのワークフローペアで「依存先ジョブ」のリンクが張られている
         # ジョブがあれば、新しいテンプレートのタスク対応をそのリンクにも展開
@@ -2148,13 +2144,13 @@ class ProjectDatabase:
             (template_id,),
         ).fetchone()
         if row is None:
-            raise ProjectDatabaseError("このテンプレートは存在しません")
+            raise ProjectDatabaseError(tr("このテンプレートは存在しません"))
         workflow_id = row["workflow_id"]
         if self._would_create_workflow_template_cycle(
             workflow_id, depends_on_workflow_id, exclude_template_id=template_id
         ):
             raise ProjectDatabaseError(
-                "この変更を行うと、ワークフロー間で循環依存になるため変更できません"
+                tr("この変更を行うと、ワークフロー間で循環依存になるため変更できません")
             )
         try:
             self._conn.execute(
@@ -2163,7 +2159,7 @@ class ProjectDatabase:
                 (workflow_task_id, depends_on_workflow_id, depends_on_workflow_task_id, template_id),
             )
         except sqlite3.IntegrityError as e:
-            raise ProjectDatabaseError("このテンプレートは既に登録されています") from e
+            raise ProjectDatabaseError(tr("このテンプレートは既に登録されています")) from e
         # 変更前のタスク対応で自動生成されていた行は、もう現在のテンプレートに
         # 合致しなくなるため sync_dependency_templates が削除し、変更後の
         # タスク対応が新たに展開される。

@@ -20,6 +20,7 @@ from project_scheduler import (
     generate_jp_holidays,
     run_resource_constrained_scheduler_from_frames,
 )
+from i18n import tr
 
 
 def _fmt(prefix, entity_id, width=3):
@@ -33,20 +34,20 @@ def validate_for_generation(db):
     errors = []
     proj = db.get_project()
     if not proj["project_name"].strip():
-        errors.append("プロジェクト名が未設定です（基本情報設定タブ）")
+        errors.append(tr("プロジェクト名が未設定です（基本情報設定タブ）"))
     if not proj["start_date"]:
-        errors.append("開発開始日が未設定です（基本情報設定タブ）")
+        errors.append(tr("開発開始日が未設定です（基本情報設定タブ）"))
     if not db.list_teams():
-        errors.append("チームが1件も登録されていません（基本情報設定タブ）")
+        errors.append(tr("チームが1件も登録されていません（基本情報設定タブ）"))
     if not db.list_milestones():
-        errors.append("マイルストーンが1件も登録されていません（基本情報設定タブ）")
+        errors.append(tr("マイルストーンが1件も登録されていません（基本情報設定タブ）"))
     workflows = db.list_workflows()
     if not workflows:
-        errors.append("ワークフローが1件も登録されていません（ワークフロー設計タブ）")
+        errors.append(tr("ワークフローが1件も登録されていません（ワークフロー設計タブ）"))
     elif not any(db.list_workflow_tasks(w["id"]) for w in workflows):
-        errors.append("タスクを持つワークフローが1件もありません（ワークフロー設計タブ）")
+        errors.append(tr("タスクを持つワークフローが1件もありません（ワークフロー設計タブ）"))
     if not db.list_jobs():
-        errors.append("ジョブが1件も登録されていません（ジョブ作成タブ）")
+        errors.append(tr("ジョブが1件も登録されていません（ジョブ作成タブ）"))
     return errors
 
 
@@ -240,7 +241,7 @@ def build_display(db):
     proj = db.get_project()
     milestone_markers = []
     if proj["start_date"]:
-        milestone_markers.append(("PROJECT_START", "プロジェクト開始", pd.to_datetime(proj["start_date"])))
+        milestone_markers.append(("PROJECT_START", tr("プロジェクト開始"), pd.to_datetime(proj["start_date"])))
     for m in db.list_milestones():
         milestone_markers.append((_fmt("MS", m["id"]), m["name"], pd.to_datetime(m["end_date"])))
     milestone_markers.sort(key=lambda marker: marker[2])
@@ -395,13 +396,13 @@ def generate_gantt(db, plotly_output_path=None, plan_output=PLAN_OUTPUT_DRAFT, *
     note = None
     if state.status == DRAFT and plan_output == PLAN_OUTPUT_CONFIRMED:
         plan = build_confirmed_plan(state)
-        note = f"確定した日程 {(state.confirmed_at or '')[:10]}".strip()
+        note = tr("確定した日程 {date}", date=(state.confirmed_at or '')[:10]).strip()
     else:
         plan = build_plan(db, state)
         if state.status == CONFIRMED:
-            note = f"確定した日程 {(state.confirmed_at or '')[:10]}".strip()
+            note = tr("確定した日程 {date}", date=(state.confirmed_at or '')[:10]).strip()
         elif state.status == DRAFT:
-            note = "変更案・未確定"
+            note = tr("変更案・未確定")
     scheduler_kwargs["plotly_output_path"] = plotly_output_path
     scheduler_kwargs["plotly_title_note"] = note
     if plan is None:
