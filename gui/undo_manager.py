@@ -30,6 +30,9 @@ callableとして呼び出し側（gui/main.py）から差し込んでもらう�
 # 加えて、プロジェクトが大きくなるとスナップショット1つが大きくなるため、
 # 段数だけでは使用量が読めない。合計バイト数でも上限を設け、大きい
 # プロジェクトでは段数が減る（＝メモリ使用量は頭打ちになる）ようにしている。
+#
+# 合計バイト数の上限はオプション設定（gui/app_settings.py の
+# undo_memory_limit_mb）で変えられる。ここの値はその既定値と揃えてある。
 _MAX_STACK_SIZE = 100
 _MAX_TOTAL_BYTES = 128 * 1024 * 1024
 
@@ -53,7 +56,8 @@ class _UndoEntry:
 
 class UndoManager:
     def __init__(self, db, capture_ui_state, restore_ui_state, apply_db_state,
-                 on_stack_changed=None, schedule_after_capture=None):
+                 on_stack_changed=None, schedule_after_capture=None,
+                 max_total_bytes=_MAX_TOTAL_BYTES):
         """
         db: gui.db.ProjectDatabase（このマネージャを db.undo_manager に設定するのは
             呼び出し側の責務）。
@@ -66,6 +70,7 @@ class UndoManager:
         schedule_after_capture: (callable) -> None。渡されたcallableを「現在の
             イベント処理が終わった後」に呼ぶよう予約する（Qt側では
             QTimer.singleShot(0, ...)）。省略時は操作直後のUI状態を記録しない。
+        max_total_bytes: 履歴が保持するスナップショットの合計バイト数の上限。
         """
         self.db = db
         self.capture_ui_state = capture_ui_state
@@ -73,6 +78,7 @@ class UndoManager:
         self.apply_db_state = apply_db_state
         self.on_stack_changed = on_stack_changed
         self.schedule_after_capture = schedule_after_capture
+        self._max_total_bytes = max_total_bytes
         self._undo_stack = []
         self._redo_stack = []
         # 「操作直後のUI状態」がまだ埋まっていないエントリ（高々1件）。
@@ -107,8 +113,17 @@ class UndoManager:
         """段数・合計バイト数の上限を超えた分を、古い方から捨てる。"""
         while len(self._undo_stack) > _MAX_STACK_SIZE:
             self._discard_oldest()
-        while len(self._undo_stack) > 1 and self._total_bytes() > _MAX_TOTAL_BYTES:
+        while len(self._undo_stack) > 1 and self._total_bytes() > self._max_total_bytes:
             self._discard_oldest()
+
+    def set_max_total_bytes(self, max_total_bytes):
+        """合計バイト数の上限を変える（オプション設定の変更時）。小さくした場合は、
+        超えた分をその場で古い方から捨てる。"""
+        self._max_total_bytes = max_total_bytes
+        before = len(self._undo_stack)
+        self._trim()
+        if len(self._undo_stack) != before:
+            self._notify()
 
     def _total_bytes(self):
         # push() で隣接エントリ間のスナップショットを共有しているため、

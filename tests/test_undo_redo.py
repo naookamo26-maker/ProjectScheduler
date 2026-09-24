@@ -1508,3 +1508,54 @@ def test_opening_a_file_with_schema_meta_table_but_no_version_row_is_rejected(tm
 
     with pytest.raises(ProjectDatabaseError, match="壊れています"):
         ProjectDatabase.open_existing(str(path))
+
+
+def _bare_undo_manager(max_total_bytes):
+    """DBを持たないUndoManager（履歴の上限の扱いだけを見るため）。"""
+    return UndoManager(
+        db=None,
+        capture_ui_state=lambda: None,
+        restore_ui_state=lambda state: None,
+        apply_db_state=lambda blob: None,
+        max_total_bytes=max_total_bytes,
+    )
+
+
+def test_undo_history_is_trimmed_by_the_given_total_bytes_limit():
+    """合計バイト数の上限（オプション設定の「Undoに使うメモリの上限」）を
+    超えた分は、古い操作から捨てられる。"""
+    manager = _bare_undo_manager(max_total_bytes=1000)
+    for i in range(10):
+        manager.push(bytes(100) + bytes([i]), None, bytes(100) + bytes([i + 1]), f"操作{i}")
+    # 先頭のbefore + 各エントリのafter が1000バイト以内に収まる件数だけ残る
+    assert manager._total_bytes() <= 1000
+    assert manager.can_undo()
+    assert manager.undo_label() == "操作9"
+
+
+def test_lowering_the_limit_trims_history_immediately_and_notifies():
+    notified = []
+    manager = _bare_undo_manager(max_total_bytes=10_000)
+    manager.on_stack_changed = lambda: notified.append(True)
+    for i in range(10):
+        manager.push(bytes(100) + bytes([i]), None, bytes(100) + bytes([i + 1]), f"操作{i}")
+    kept_before = len(manager._undo_stack)
+    notified.clear()
+
+    manager.set_max_total_bytes(350)
+
+    assert len(manager._undo_stack) < kept_before
+    assert manager._total_bytes() <= 350
+    assert notified, "履歴が減ったらUndo/Redoメニューを更新させる"
+
+
+def test_raising_the_limit_keeps_history_and_does_not_notify():
+    notified = []
+    manager = _bare_undo_manager(max_total_bytes=10_000)
+    manager.push(b"a", None, b"b", "操作")
+    manager.on_stack_changed = lambda: notified.append(True)
+
+    manager.set_max_total_bytes(20_000)
+
+    assert len(manager._undo_stack) == 1
+    assert notified == []

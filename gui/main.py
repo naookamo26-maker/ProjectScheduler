@@ -13,6 +13,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFileDialog,
     QLabel,
     QMainWindow,
@@ -22,8 +23,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gui.app_settings import AppSettings
 from gui.db import ProjectDatabase
 from gui.gantt_generator import generate_gantt, validate_for_generation
+from gui.options_dialog import OptionsDialog
 from gui.schedule_cache import ScheduleCache
 from gui.tab_analysis import AnalysisTab
 from gui.tab_basic_info import BasicInfoTab
@@ -38,8 +41,11 @@ DEFAULT_SUFFIX = "pschedule"
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, app_settings=None):
         super().__init__()
+        # 利用者（PC）ごとのオプション設定（gui/app_settings.py）。プロジェクトを
+        # 開き直しても引き継ぐ。
+        self.app_settings = app_settings or AppSettings()
         self.db: ProjectDatabase | None = None
         # プロジェクトファイルを開くたびに作り直す（ファイルをまたいだUndoは
         # 行わない）。詳細は gui/undo_manager.py 参照。
@@ -249,6 +255,24 @@ class MainWindow(QMainWindow):
         self.redo_action.setEnabled(False)
         edit_menu.addAction(self.redo_action)
 
+        edit_menu.addSeparator()
+
+        # プロジェクトを開いていなくても使える（利用者ごとの設定のため）。
+        options_action = QAction("オプション(&O)...", self)
+        options_action.triggered.connect(self.on_options)
+        edit_menu.addAction(options_action)
+
+    def on_options(self):
+        dialog = OptionsDialog(self.app_settings, self)
+        if dialog.exec() == QDialog.Accepted:
+            self._apply_app_settings()
+
+    def _apply_app_settings(self):
+        """保存したオプションを、実行中のウィンドウへ反映する。オプションは
+        プロジェクトの内容ではないので、Undo/Redoの履歴には積まない。"""
+        if self.undo_manager is not None:
+            self.undo_manager.set_max_total_bytes(self.app_settings.undo_memory_limit_bytes())
+
     def on_new_project(self):
         """保存先パスはこの時点では選ばせず、初回保存（Ctrl+S/名前を付けて保存）
         まで未定のまま進める（ファイルはまだディスク上に作られない）。"""
@@ -414,6 +438,7 @@ class MainWindow(QMainWindow):
             # 終わってから取りたいので、現在のイベント処理の後へ回す
             # （gui/undo_manager.py 冒頭参照）。
             schedule_after_capture=lambda fn: QTimer.singleShot(0, fn),
+            max_total_bytes=self.app_settings.undo_memory_limit_bytes(),
         )
         self.db.undo_manager = self.undo_manager
         if opened_clean:
@@ -525,6 +550,8 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    # 利用者ごとの設定フォルダ（QStandardPaths.AppConfigLocation）の名前になる。
+    app.setApplicationName("ProjectScheduler")
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
