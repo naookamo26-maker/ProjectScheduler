@@ -206,3 +206,47 @@ def release_set(state, successors):
     """確定の位置から外して計算し直すタスク（変更の起点とその後続。ただし
     進行中・完了のタスクは除く）。"""
     return {key for key in downstream(state.changed, successors) if key not in state.started}
+
+
+# ジョブ単位の確定状態（ジョブ作成タブの「確定」列と絞り込み。§8-9）
+JOB_CONFIRMED = "confirmed"
+JOB_CHANGED = "changed"
+JOB_PARTIAL = "partial"
+JOB_UNCONFIRMED = "unconfirmed"
+
+
+def job_plan_summary(state):
+    """{job_id: (状態, 変更のあるタスク数, 確定行の無いタスク数)}。
+
+    状態は JOB_UNCONFIRMED（有効なタスクに確定行が1つも無い＝確定後に足した
+    ジョブ）、JOB_CHANGED（確定後に入力が変わったタスクがある）、JOB_PARTIAL
+    （一部のタスクだけ確定行が無い）、JOB_CONFIRMED の順に判定する。
+    確定後に無効にした・削除したタスクは「変更」に数える。"""
+    counts = defaultdict(lambda: [0, 0, 0])  # 変更, 未確定, 確定行あり
+    for key, is_active in state.active.items():
+        c = counts[key[0]]
+        if not is_active:
+            if key in state.confirmed:
+                c[0] += 1
+            continue
+        if key not in state.confirmed:
+            c[1] += 1
+        else:
+            c[2] += 1
+            if key in state.changed:
+                c[0] += 1
+    for key in state.confirmed:
+        if key not in state.active:
+            counts[key[0]][0] += 1
+    summary = {}
+    for job_id, (changed, unconfirmed, confirmed) in counts.items():
+        if confirmed == 0 and unconfirmed:
+            kind = JOB_UNCONFIRMED
+        elif changed:
+            kind = JOB_CHANGED
+        elif unconfirmed:
+            kind = JOB_PARTIAL
+        else:
+            kind = JOB_CONFIRMED
+        summary[job_id] = (kind, changed, unconfirmed)
+    return summary

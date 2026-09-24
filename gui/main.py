@@ -444,12 +444,18 @@ class MainWindow(QMainWindow):
         if previous is not None:
             previous.on_change = None
             previous.undo_manager = None
-        self.db = db
-        self.db.on_change = self._on_db_changed
         # UndoManagerを繋ぐ前に確認しておく（繋いだ後の is_dirty() は
         # Undo履歴上の位置で判定されるようになるため）。既存ファイルを開いた
         # 直後は保存済み、新規プロジェクトは未保存。
-        opened_clean = not self.db.is_dirty()
+        opened_clean = not db.is_dirty()
+        # 依存テンプレートから展開するジョブ間の依存を、開いた時点で揃える。
+        # これまではジョブ作成タブを開いたときにだけ揃えていたため、開いてすぐ
+        # 計画を確定した後にジョブ作成タブを開くと依存が増え、確定したタスクが
+        # 「変更あり」になっていた（docs/roadmap.md §8-7）。テンプレートから
+        # 導かれる内容を揃えるだけなので、Undo履歴にも未保存の印にも含めない。
+        db.sync_dependency_templates()
+        self.db = db
+        self.db.on_change = self._on_db_changed
         self._rebuild_tabs()
         if previous is not None:
             previous.close()

@@ -61,7 +61,10 @@ setCellWidget 1.5秒）。そこで次の2点で行数への依存を切って�
 ため、単位を開いたままウィジェットを破棄すると閉じられなくなるため。
 """
 
+from datetime import date, timedelta
+
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -85,6 +88,16 @@ from PySide6.QtWidgets import (
 )
 
 from gui.db import DuplicateNameError, ProjectDatabaseError, normalize_tags, parse_tags
+from gui.plan_confirmation import (
+    DRAFT,
+    JOB_CHANGED,
+    JOB_CONFIRMED,
+    JOB_PARTIAL,
+    JOB_UNCONFIRMED,
+    UNCONFIRMED,
+    PlanState,
+    job_plan_summary,
+)
 from gui.widgets_common import (
     ChoiceFilterGroup,
     CollapsibleSection,
@@ -125,6 +138,47 @@ _NO_MILESTONE_FILTER_KEY = None
 _NO_TAG_FILTER_KEY = None
 _NO_JOB_TAG_FILTER_LABEL = "（ジョブ タグなし）"
 _NO_TASK_TAG_FILTER_LABEL = "（タスク タグなし）"
+
+# 計画の確定（docs/roadmap.md §8-9）の列。一度も確定していないファイルでは隠す
+# （全部が「未確定」になるだけで情報が無いため）。既存の列番号を変えないよう末尾に置く。
+_JOB_PLAN_COLUMN = 5
+_OVERRIDE_PLAN_COLUMN = 8
+_PLAN_CHANGED_COLOR = "#c62828"
+_PLAN_QUIET_COLOR = "#8a939c"  # 確定済み（大半の行）は目立たせない
+_UNCONFIRMED_BRUSH_COLOR = QColor("#cdd3da")
+_JOB_PLAN_LABELS = {
+    JOB_CONFIRMED: "確定",
+    JOB_CHANGED: "変更あり",
+    JOB_PARTIAL: "一部未確定",
+    JOB_UNCONFIRMED: "未確定",
+}
+# 並び替え・絞り込みの順（手を付けるべきものが先）
+_JOB_PLAN_ORDER = [JOB_CHANGED, JOB_UNCONFIRMED, JOB_PARTIAL, JOB_CONFIRMED]
+
+
+def _unconfirmed_brush():
+    """確定行の無いものの背景（ガントの未確定のバーと同じ斜線）。"""
+    return QBrush(_UNCONFIRMED_BRUSH_COLOR, Qt.BDiagPattern)
+
+
+def _job_plan_text(kind, changed, unconfirmed):
+    if kind == JOB_CHANGED:
+        text = f"変更 {changed}"
+        return text + (f"・未確定 {unconfirmed}" if unconfirmed else "")
+    if kind == JOB_PARTIAL:
+        return f"一部未確定 {unconfirmed}"
+    return _JOB_PLAN_LABELS[kind]
+
+
+def _fmt_confirmed(row, team_names):
+    """確定行の表示（開始〜終了・日数・チーム）。終了は含む日で出す。"""
+    start = row["start_date"]
+    end = (date.fromisoformat(row["end_date"]) - timedelta(days=1)).isoformat()
+    if end[:4] == start[:4]:
+        end = end[5:]  # 同じ年なら年を省く
+    team = team_names.get(row["team_id"], "")
+    return f"{start}〜{end}  {row['days']}日  {team}".rstrip()
+
 
 # コンボボックスの▼やスピンボックスの▲▼のぶん、テキスト幅より少し広くする
 # （列幅は読み取り専用テキストの幅を基準に自動調整されるため）。
@@ -235,6 +289,7 @@ _JOB_SORT_KEYS = {
     2: lambda j: (j["milestone_name"] is None, j["milestone_name"] or ""),
     3: lambda j: (j["priority"] is None, j["priority"] or 0),
     4: lambda j: j["tags"],
+    _JOB_PLAN_COLUMN: lambda j: j.get("_plan_order", 0),
 }
 
 
@@ -281,8 +336,16 @@ class JobsTab(QWidget):
         self.task_tag_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
         self.filters_section.content_layout.addWidget(self.task_tag_filter)
 
+        # 確定状態での絞り込み（確定後に足したジョブ・変更のあるジョブを探す）。
+        # 一度も確定していないファイルでは隠す
+        self.plan_filter = ChoiceFilterGroup("確定状態")
+        self.plan_filter.rebuild([(k, _JOB_PLAN_LABELS[k]) for k in _JOB_PLAN_ORDER])
+        self.plan_filter.changed.connect(lambda: self.refresh_jobs(select_id=self.current_job_id))
+        self.filters_section.content_layout.addWidget(self.plan_filter)
+        self._plan_state = None
+
         self.jobs_section = CrudSection(
-            "ジョブ", ["ジョブ名", "ワークフロー", "既定マイルストーン", "優先度", "タグ"],
+            "ジョブ", ["ジョブ名", "ワークフロー", "既定マイルストーン", "優先度", "タグ", "確定"],
             on_add=self._add_job, on_delete=self._delete_job, on_duplicate=self._duplicate_job,
         )
         self.jobs_section.table.itemChanged.connect(self._on_job_cell_text_changed)
@@ -297,6 +360,9 @@ class JobsTab(QWidget):
         # 吸収させ、パネル幅にかかわらず横スクロールなしで5列すべてが
         # 収まるようにする。
         jobs_header.setSectionResizeMode(4, QHeaderView.Stretch)
+        # 「確定」列は末尾の列番号のまま、見た目だけジョブ名の隣へ出す（右端だと
+        # 横スクロールしないと見えないため）
+        jobs_header.moveSection(jobs_header.visualIndex(_JOB_PLAN_COLUMN), 1)
         # スクロールや表示領域の変化に追従して、見えている行にだけ
         # セルウィジェットを用意する。
         jobs_scrollbar = self.jobs_section.table.verticalScrollBar()
@@ -306,11 +372,15 @@ class JobsTab(QWidget):
         override_group = QGroupBox("タスク上書き（選択中のジョブ）")
         override_layout = QVBoxLayout(override_group)
 
-        self.override_table = QTableWidget(0, 8)
+        self.override_table = QTableWidget(0, 9)
         self.override_table.setHorizontalHeaderLabels(
-            ["タスク名", "有効", "日数", "マイルストーン", "チーム", "開始固定日", "状態", "タグ"]
+            ["タスク名", "有効", "日数", "マイルストーン", "チーム", "開始固定日", "状態", "タグ",
+             "確定日程"]
         )
         self.override_table.verticalHeader().setVisible(False)
+        # 「確定日程」列も同様に、見た目だけタスク名の隣へ出す
+        override_header = self.override_table.horizontalHeader()
+        override_header.moveSection(override_header.visualIndex(_OVERRIDE_PLAN_COLUMN), 1)
         self.override_table.setSelectionMode(QTableWidget.NoSelection)
         # タスク タグ列は、ジョブ タグ列（ジョブ一覧）と同じくカンマ区切りの
         # テキスト入力（専用ウィジェットを持たない、常に編集可能なitem）にする。
@@ -465,6 +535,15 @@ class JobsTab(QWidget):
         visible_milestone_keys = self.milestone_filter.visible_keys()
         visible_tag_keys = self.tag_filter.visible_keys()
         visible_task_tag_keys = self.task_tag_filter.visible_keys()
+        self._plan_state = PlanState(self.db)
+        plan_on = self._plan_state.status != UNCONFIRMED
+        self.plan_filter.setVisible(plan_on)
+        plan_summary = job_plan_summary(self._plan_state) if plan_on else {}
+        visible_plan_keys = self.plan_filter.visible_keys()
+        for job in all_jobs:
+            kind = plan_summary.get(job["id"], (JOB_CONFIRMED, 0, 0))[0]
+            job["_plan"] = plan_summary.get(job["id"], (JOB_CONFIRMED, 0, 0))
+            job["_plan_order"] = _JOB_PLAN_ORDER.index(kind)
 
         table = self.jobs_section.table
         table.blockSignals(True)
@@ -483,6 +562,7 @@ class JobsTab(QWidget):
             and job["default_milestone_id"] in visible_milestone_keys
             and self._job_tag_keys(job) & visible_tag_keys
             and self._job_task_tag_keys(job["id"], task_tag_map) & visible_task_tag_keys
+            and (not plan_on or job["_plan"][0] in visible_plan_keys)
         ]
         self._job_by_id = {job["id"]: job for job in jobs}
         self._row_by_job_id = {job["id"]: row for row, job in enumerate(jobs)}
@@ -505,9 +585,11 @@ class JobsTab(QWidget):
             # フロー／マイルストーン／優先度と違って専用ウィジェットを持たず、
             # 常に編集可能なitemとして表示する（ジョブ名列と同じ扱い）。
             table.setItem(row, 4, QTableWidgetItem(job["tags"]))
+            table.setItem(row, _JOB_PLAN_COLUMN, self._job_plan_item(job["_plan"]))
             if job["id"] == select_id:
                 select_row = row
         table.blockSignals(False)
+        table.setColumnHidden(_JOB_PLAN_COLUMN, not plan_on)
 
         auto_size_columns(table)
         for column in (1, 2, 3):
@@ -772,7 +854,9 @@ class JobsTab(QWidget):
         job = next(j for j in self.db.list_jobs() if j["id"] == self.current_job_id)
         default_ms_label = job["milestone_name"] or "未設定"
 
-        for r in self.db.list_job_tasks_with_overrides(self.current_job_id):
+        tasks = self.db.list_job_tasks_with_overrides(self.current_job_id)
+        self._override_default_team = {r["workflow_task_id"]: r["default_team_id"] for r in tasks}
+        for r in tasks:
             row = table.rowCount()
             table.insertRow(row)
             table.setItem(row, 0, _readonly_item(r["task_name"]))
@@ -867,11 +951,13 @@ class JobsTab(QWidget):
             # 持たない常に編集可能なitemとして表示する（itemChangedは
             # __init__で_on_override_tag_text_changedに一括で繋いである）。
             table.setItem(row, 7, QTableWidgetItem(r["tags"]))
+            table.setItem(row, _OVERRIDE_PLAN_COLUMN, _readonly_item(""))
         table.blockSignals(False)
         # 「タグ」列（最後の列）はジョブ一覧と同様、内容幅に関わらず表の
         # 右側に残る余白をすべて使う。
         auto_size_columns(table, min_width=50, stretch_last=True)
         table.setColumnWidth(1, 44)  # 「有効」列はチェックボックスのみなので詰める
+        self._update_override_plan_marks()
         self._ensure_job_selection()
 
     def _ensure_job_selection(self):
@@ -983,8 +1069,97 @@ class JobsTab(QWidget):
                 if milestone_changed or raised or changed:
                     QTimer.singleShot(0, self._refresh_overrides)
                 else:
+                    self._refresh_plan_marks()
                     self._ensure_job_selection()
                 return
+
+    # -- 計画の確定の表示（docs/roadmap.md §8-9） ------------------------------------
+
+    def _job_plan_item(self, plan):
+        kind, changed, unconfirmed = plan
+        item = _readonly_item(_job_plan_text(kind, changed, unconfirmed))
+        if kind == JOB_UNCONFIRMED:
+            item.setBackground(_unconfirmed_brush())
+        elif kind == JOB_CHANGED:
+            item.setForeground(QColor(_PLAN_CHANGED_COLOR))
+        elif kind == JOB_CONFIRMED:
+            item.setForeground(QColor(_PLAN_QUIET_COLOR))
+        return item
+
+    def _refresh_plan_marks(self):
+        """編集の後、表を作り直さずに確定の表示だけを更新する（スピンボックスの
+        連続操作中にウィジェットを差し替えないため。_on_override_changed 参照）。"""
+        self._plan_state = PlanState(self.db)
+        if self._plan_state.status != UNCONFIRMED:
+            summary = job_plan_summary(self._plan_state)
+            table = self.jobs_section.table
+            table.blockSignals(True)
+            for job_id, row in self._row_by_job_id.items():
+                table.setItem(row, _JOB_PLAN_COLUMN,
+                              self._job_plan_item(summary.get(job_id, (JOB_CONFIRMED, 0, 0))))
+            table.blockSignals(False)
+        self._update_override_plan_marks()
+
+    def _update_override_plan_marks(self):
+        """タスク上書き表の「確定日程」列と、確定時から変わった日数・チームの赤文字。"""
+        table = self.override_table
+        state = self._plan_state if self._plan_state is not None else PlanState(self.db)
+        plan_on = state.status != UNCONFIRMED
+        table.setColumnHidden(_OVERRIDE_PLAN_COLUMN, not plan_on)
+        if not plan_on or self.current_job_id is None:
+            return
+        team_names = {t["id"]: t["name"] for t in self.db.list_teams()}
+        red = f"color: {_PLAN_CHANGED_COLOR};"
+        table.blockSignals(True)
+        for row in range(table.rowCount()):
+            key = (self.current_job_id, row_id(table, row))
+            confirmed = state.confirmed.get(key)
+            item = table.item(row, _OVERRIDE_PLAN_COLUMN)
+            days_spin = table.cellWidget(row, 2)
+            team_combo = table.cellWidget(row, 4)
+            for widget in (days_spin, team_combo):
+                widget.setStyleSheet("")
+                widget.setToolTip("")
+            item.setForeground(QBrush())
+            item.setBackground(QBrush())
+            item.setToolTip("")
+            if confirmed is None:
+                item.setText("未確定")
+                item.setBackground(_unconfirmed_brush())
+                continue
+            item.setText(_fmt_confirmed(confirmed, team_names))
+            if state.status != DRAFT or key not in state.changed:
+                continue
+            # 変更案: 確定時から変わった入力を赤文字にし、確定値と今の値を並べる。
+            # 編集は禁止しない
+            reasons = []
+            days_now = days_spin.value() or days_spin.default_value
+            if days_now != confirmed["days"]:
+                tip = f"確定: {confirmed['days']}日 → 変更案: {days_now}日"
+                days_spin.setStyleSheet(red)
+                days_spin.setToolTip(tip)
+                reasons.append(tip)
+            team_now = team_combo.currentData() or self._default_team_id(row)
+            if confirmed["team_id"] is not None and team_now != confirmed["team_id"]:
+                tip = (f"確定: {team_names.get(confirmed['team_id'], '')} → "
+                       f"変更案: {team_names.get(team_now, '')}")
+                team_combo.setStyleSheet(red)
+                team_combo.setToolTip(tip)
+                reasons.append(tip)
+            if not table.cellWidget(row, 1).isChecked():
+                reasons.append("確定後に無効にしました")
+            if key in state.draft_moves:
+                reasons.append(f"ガントで移動: 開始 {confirmed['start_date']} → {state.draft_moves[key]}")
+            if not reasons:
+                reasons.append("確定後に開始固定日・依存などが変わりました")
+            item.setForeground(QColor(_PLAN_CHANGED_COLOR))
+            item.setToolTip("\n".join(reasons))
+        table.blockSignals(False)
+        table.resizeColumnToContents(_OVERRIDE_PLAN_COLUMN)
+
+    def _default_team_id(self, row):
+        """その行のタスクの既定チーム（上書きしていないときの実効チーム）。"""
+        return self._override_default_team.get(row_id(self.override_table, row))
 
     # -- 依存ジョブ（ツリー表示） ----------------------------------------------------
     #

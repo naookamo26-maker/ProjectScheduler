@@ -166,3 +166,125 @@ def test_clearing_the_confirmation_asks_first(qapp, gantt):
         w.plan_band.clear_button.click()
     assert _band_settled(qapp, w, UNCONFIRMED)
     assert not w.db.has_confirmation()
+
+
+# -- ジョブ作成タブ（§8-9） ---------------------------------------------------------
+
+
+def _open_jobs_tab(qapp, w, job_id):
+    jobs = w.tab_jobs
+    w.tabs.setCurrentWidget(jobs)
+    jobs.refresh_choices()
+    jobs.jobs_section.table.setCurrentCell(jobs._row_by_job_id[job_id], 0)
+    _wait(qapp, lambda: False, timeout=0.1)
+    return jobs
+
+
+def _override_row(jobs, task_id):
+    from gui.widgets_common import row_id
+
+    table = jobs.override_table
+    return next(r for r in range(table.rowCount()) if row_id(table, r) == task_id)
+
+
+def test_jobs_tab_hides_the_plan_columns_until_the_first_confirmation(qapp, gantt):
+    from gui.tab_jobs import _JOB_PLAN_COLUMN, _OVERRIDE_PLAN_COLUMN
+
+    w, _tab, ids = gantt
+    jobs = _open_jobs_tab(qapp, w, ids["job1"])
+    assert jobs.jobs_section.table.isColumnHidden(_JOB_PLAN_COLUMN)
+    assert jobs.override_table.isColumnHidden(_OVERRIDE_PLAN_COLUMN)
+    assert jobs.plan_filter.isHidden()
+
+
+def test_jobs_tab_shows_confirmed_dates_and_marks_changed_inputs_in_red(qapp, gantt):
+    from gui.tab_jobs import _JOB_PLAN_COLUMN, _OVERRIDE_PLAN_COLUMN
+
+    w, tab, ids = gantt
+    _confirm(qapp, w)
+    confirmed = {(r["job_id"], r["workflow_task_id"]): r for r in w.db.list_confirmed_schedule()}
+    jobs = _open_jobs_tab(qapp, w, ids["job1"])
+    table = jobs.jobs_section.table
+    assert not table.isColumnHidden(_JOB_PLAN_COLUMN)
+    assert table.item(jobs._row_by_job_id[ids["job1"]], _JOB_PLAN_COLUMN).text() == "確定"
+    row = _override_row(jobs, ids["t1"])
+    plan_item = jobs.override_table.item(row, _OVERRIDE_PLAN_COLUMN)
+    assert plan_item.text().startswith(confirmed[(ids["job1"], ids["t1"])]["start_date"])
+    assert "5日" in plan_item.text()
+
+    # 日数を変えると（表は作り直さずに）赤文字になり、確定値と今の値が並ぶ
+    spin = jobs.override_table.cellWidget(row, 2)
+    spin.setValue(8)
+    _wait(qapp, lambda: False, timeout=0.1)
+    assert jobs.override_table.cellWidget(row, 2) is spin
+    assert "color" in spin.styleSheet()
+    assert spin.toolTip() == "確定: 5日 → 変更案: 8日"
+    assert "確定: 5日 → 変更案: 8日" in jobs.override_table.item(row, _OVERRIDE_PLAN_COLUMN).toolTip()
+    assert table.item(jobs._row_by_job_id[ids["job1"]], _JOB_PLAN_COLUMN).text() == "変更 1"
+    # 変更していない行は赤くしない
+    other = jobs.override_table.cellWidget(_override_row(jobs, ids["t2"]), 2)
+    assert other.styleSheet() == ""
+
+
+def test_jobs_added_after_confirming_are_unconfirmed_and_can_be_filtered(qapp, gantt):
+    from gui.plan_confirmation import JOB_CONFIRMED
+    from gui.tab_jobs import _JOB_PLAN_COLUMN, _OVERRIDE_PLAN_COLUMN
+
+    w, _tab, ids = gantt
+    _confirm(qapp, w)
+    wf = w.db.list_jobs()[0]["workflow_id"]
+    job3 = w.db.add_job("ジョブ3", wf, None, 3)
+    jobs = _open_jobs_tab(qapp, w, job3)
+    table = jobs.jobs_section.table
+    assert table.item(jobs._row_by_job_id[job3], _JOB_PLAN_COLUMN).text() == "未確定"
+    assert jobs.override_table.item(0, _OVERRIDE_PLAN_COLUMN).text() == "未確定"
+
+    jobs.plan_filter._checks[JOB_CONFIRMED].setChecked(False)
+    assert set(jobs._row_by_job_id) == {job3}
+
+
+def test_opening_a_file_expands_dependency_templates_without_marking_it_modified(qapp, tmp_path):
+    """依存テンプレートから展開するジョブ間の依存は、ファイルを開いた時点で揃える
+    （ジョブ作成タブを開いたときだけだと、確定の後に依存が増えて「変更あり」に
+    なってしまうため）。揃えるだけなので未保存にはしない。"""
+    import shiboken6
+
+    from gui.app_settings import AppSettings
+    from gui.db import ProjectDatabase
+    from gui.main import MainWindow
+
+    path = tmp_path / "tpl.pschedule"
+    db = ProjectDatabase.create_new(str(path))
+    db.set_project("P", "2026-04-06")
+    team = db.add_team("チームA", 2)
+    wf_a = db.add_workflow("WF_A")
+    task_a = db.add_workflow_task(wf_a, "作業A", team, 3)
+    wf_b = db.add_workflow("WF_B")
+    task_b = db.add_workflow_task(wf_b, "作業B", team, 3)
+    job_a = db.add_job("A", wf_a, None, 1)
+    job_b = db.add_job("B", wf_b, None, 2)
+    db.add_job_dependency_link(job_b, job_a)
+    db.add_dependency_template(wf_b, task_b, wf_a, task_a)
+    # テンプレートの展開が済んでいない古いファイルの状態を作る
+    db._conn.execute("DELETE FROM job_external_dependencies")
+    db._conn.commit()
+    db.save()
+    db.close()
+
+    w = MainWindow(app_settings=AppSettings(str(tmp_path / "settings.ini")))
+    try:
+        w._open_database(ProjectDatabase.open_existing(str(path)))
+        pairs = w.db._conn.execute(
+            "SELECT job_id, workflow_task_id, depends_on_job_id, depends_on_workflow_task_id "
+            "FROM job_external_dependencies"
+        ).fetchall()
+        assert [tuple(p) for p in pairs] == [(job_b, task_b, job_a, task_a)]
+        assert not w.db.is_dirty()
+        assert not w.undo_manager.can_undo()
+    finally:
+        w._shutdown_schedule_cache()
+        w.db.on_change = None
+        w.db.undo_manager = None
+        w.db.close()
+        shiboken6.delete(w)
+        qapp.processEvents()
