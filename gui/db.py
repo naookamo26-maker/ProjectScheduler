@@ -32,6 +32,8 @@ from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 
+from i18n import tr
+
 # 再エクスポート: 呼び出し側・テストからは従来どおり gui.db から参照できるようにする。
 from gui.db_schema import (  # noqa: F401
     SCHEMA_VERSION,
@@ -326,7 +328,10 @@ class ProjectDatabase:
             self._in_undoable_call = False
             after_db = self.serialize_state()
             if after_db != before_db:
-                self.undo_manager.push(before_db, before_ui, after_db, label)
+                # ラベルは記録するときに表示言語へ訳す（docs/roadmap.md §11。表示言語は
+                # 起動時に決まり途中で変わらない。名前を埋め込むラベルは呼び出し側が
+                # tr() 済みのものを渡し、訳文はキーに無いのでそのまま残る）
+                self.undo_manager.push(before_db, before_ui, after_db, tr(label))
 
     def begin_undo_group(self, label):
         """複数のイベントにまたがる編集を1つのUndo単位にまとめ始める。
@@ -344,7 +349,7 @@ class ProjectDatabase:
         if self.undo_manager is None or self._undo_suppressed or self._in_undoable_call:
             return
         self.end_undo_group()
-        self._open_group = (label, self.serialize_state(), self.undo_manager.capture_ui_state())
+        self._open_group = (tr(label), self.serialize_state(), self.undo_manager.capture_ui_state())
 
     def end_undo_group(self):
         """begin_undo_group() で開いた単位を確定する（開いていなければ何もしない）。

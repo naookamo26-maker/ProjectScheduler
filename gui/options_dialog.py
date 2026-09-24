@@ -27,15 +27,11 @@ from PySide6.QtWidgets import (
 )
 
 from gui.app_settings import DRAG_MODIFIERS, OPTIONS, SUPPORTED_LANGUAGES
+from i18n import LANGUAGES
 
 # 言語の選択肢は、それぞれの言語での呼び名で出す（別の言語に切り替えた人が
 # 自分の言語を見つけられるように）。
-LANGUAGE_LABELS = {
-    "ja": "日本語",
-    "en": "English",
-    "vi": "Tiếng Việt",
-    "zh_CN": "简体中文",
-}
+LANGUAGE_LABELS = dict(LANGUAGES)
 
 DRAG_MODIFIER_LABELS = {"shift": "Shift", "alt": "Alt"}
 

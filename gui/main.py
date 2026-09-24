@@ -9,8 +9,8 @@ File メニューでプロジェクトファイル（.pschedule）の新規作�
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import QLibraryInfo, Qt, QTimer, QTranslator
+from PySide6.QtGui import QAction, QFontDatabase, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.app_settings import AppSettings
+from i18n import current_language, set_language, tr
 from gui.db import ProjectDatabase
 from gui.gantt_generator import (
     PLAN_OUTPUT_CONFIRMED,
@@ -647,11 +648,41 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+# 表示言語ごとの UI フォントの候補（先頭から、入っているものを使う）。日本語の
+# フォントのまま簡体字を出すと一部の字形が日本式になるため、中国語は専用のものにする。
+# ベトナム語の声調記号は Windows 既定の Segoe UI で正しく出る。
+_LANGUAGE_FONTS = {
+    "zh_CN": ["Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC"],
+    "vi": ["Segoe UI", "Noto Sans"],
+}
+
+
+def apply_language(app, language):
+    """表示言語を決める（docs/roadmap.md §11）。再起動で反映する方式なので、
+    ウィンドウを作る前に1回だけ呼ぶ。Qt 自身の標準ダイアログ（ファイル選択等）は
+    Qt 同梱の翻訳を読み込む（ベトナム語は Qt 同梱の翻訳が無く、英語で出る）。"""
+    set_language(language)
+    language = current_language()
+    if language != "ja":
+        translator = QTranslator(app)
+        if translator.load(f"qtbase_{language}", QLibraryInfo.path(QLibraryInfo.TranslationsPath)):
+            app.installTranslator(translator)
+    families = set(QFontDatabase.families())
+    for family in _LANGUAGE_FONTS.get(language, []):
+        if family in families:
+            font = app.font()
+            font.setFamily(family)
+            app.setFont(font)
+            break
+
+
 def main():
     app = QApplication(sys.argv)
     # 利用者ごとの設定フォルダ（QStandardPaths.AppConfigLocation）の名前になる。
     app.setApplicationName("ProjectScheduler")
-    window = MainWindow()
+    app_settings = AppSettings()
+    apply_language(app, app_settings.get("language"))
+    window = MainWindow(app_settings=app_settings)
     window.show()
     sys.exit(app.exec())
 

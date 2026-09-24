@@ -27,11 +27,13 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QLocale, QSettings, QStandardPaths
 
+from i18n import LANGUAGES
+
 SETTINGS_FILE_NAME = "ProjectScheduler.ini"
 SETTINGS_PATH_ENV = "PROJECT_SCHEDULER_SETTINGS"
 
-# 表示言語（docs/roadmap.md §11）。値は QLocale の名前の形に合わせる。
-SUPPORTED_LANGUAGES = ("ja", "en", "vi", "zh_CN")
+# 表示言語（docs/roadmap.md §11）。値は QLocale の名前の形に合わせる。一覧は i18n.py
+SUPPORTED_LANGUAGES = tuple(code for code, _label in LANGUAGES)
 FALLBACK_LANGUAGE = "en"
 
 # ガントのバーをドラッグするときに押すキー（docs/roadmap.md §9）。Ctrl は
