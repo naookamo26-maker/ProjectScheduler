@@ -33,8 +33,8 @@ from gui.db import ProjectDatabase  # noqa: E402
 from gui.main import MainWindow, apply_language  # noqa: E402
 
 # ドキュメント用のサンプル（活用例の2つの題材。generate_guide_samples.py）
-NEW_PRODUCT = ROOT / "data" / "Guide_Sample_NewProduct.pschedule"
-SYSTEM_ROLLOUT = ROOT / "data" / "Guide_Sample_SystemRollout.pschedule"
+NEW_TITLE = ROOT / "data" / "Guide_Sample_NewTitle.pschedule"
+UPDATE = ROOT / "data" / "Guide_Sample_Update.pschedule"
 OUT_ROOT = ROOT / "docs" / "user_guide" / "images"
 # A4の紙面で画面の文字が読める大きさになるよう、実際の既定サイズより小さめに撮る
 WINDOW_SIZE = (1280, 800)
@@ -87,13 +87,13 @@ def _select_job(name):
 
 # (画像の名前, 開くサンプル, 場面を作る関数)。撮りたい場面はここに足す。
 SHOTS = [
-    ("basic_info_tab", NEW_PRODUCT, _show_tab(TAB_BASIC_INFO)),
-    ("workflows_tab", NEW_PRODUCT, _show_tab(TAB_WORKFLOWS)),
-    ("jobs_tab", NEW_PRODUCT, _show_tab(TAB_JOBS)),
-    ("gantt_tab", NEW_PRODUCT, _show_tab(TAB_GANTT, needs_schedule=True)),
-    ("analysis_tab", NEW_PRODUCT, _show_tab(TAB_ANALYSIS, needs_schedule=True)),
-    ("rollout_jobs_tab", SYSTEM_ROLLOUT, _select_job("勤怠管理")),
-    ("rollout_gantt_tab", SYSTEM_ROLLOUT, _show_tab(TAB_GANTT, needs_schedule=True)),
+    ("basic_info_tab", NEW_TITLE, _show_tab(TAB_BASIC_INFO)),
+    ("workflows_tab", NEW_TITLE, _show_tab(TAB_WORKFLOWS)),
+    ("jobs_tab", NEW_TITLE, _show_tab(TAB_JOBS)),
+    ("gantt_tab", NEW_TITLE, _show_tab(TAB_GANTT, needs_schedule=True)),
+    ("analysis_tab", NEW_TITLE, _show_tab(TAB_ANALYSIS, needs_schedule=True)),
+    ("update_jobs_tab", UPDATE, _select_job("新キャラクター")),
+    ("update_gantt_tab", UPDATE, _show_tab(TAB_GANTT, needs_schedule=True)),
 ]
 
 
