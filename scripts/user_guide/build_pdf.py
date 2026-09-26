@@ -98,6 +98,10 @@ code { font-family: "Noto Sans Mono CJK JP", monospace; font-size: 9.5pt;
   background: #c0392b; color: #fff; font-size: 7.5pt; font-weight: 700;
   line-height: 4.6mm; text-align: center; vertical-align: 0.1em; }
 
+/* 表の中に置く小さな見本の画像（5章のガントチャートの見た目の一覧） */
+.swatch img { max-height: 13mm; max-width: 42mm; border: none; margin-bottom: 1mm; }
+.swatches td:first-child, .swatches th:first-child { width: 46mm; }
+
 /* 表紙・目次 */
 .cover { height: 250mm; display: flex; flex-direction: column; justify-content: center; }
 .cover .product { font-size: 13pt; color: var(--muted); letter-spacing: 0.1em; }

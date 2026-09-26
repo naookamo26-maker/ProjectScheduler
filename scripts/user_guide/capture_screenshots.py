@@ -28,7 +28,7 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QPointF, QRect, Qt  # noqa: E402
-from PySide6.QtGui import QMouseEvent  # noqa: E402
+from PySide6.QtGui import QImage, QMouseEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel, QWidget  # noqa: E402
 
@@ -489,6 +489,38 @@ SHOTS = [
 ]
 
 
+# ガントチャートの見た目の一覧（5章「見方」）に並べる見本。撮った画面から、該当する
+# バーの周りを切り出す: (見本の名前, 切り出し元の画像, (x, y, 幅, 高さ))。
+# 切り出し元の場面を変えたら、座標も合わせて直す。
+SWATCHES = [
+    ("swatch_normal", "gantt_legend", (522, 252, 102, 72)),
+    ("swatch_overrun", "gantt_legend", (522, 346, 102, 72)),
+    ("swatch_pin_conflict", "gantt_legend", (298, 520, 182, 70)),
+    ("swatch_pinned", "gantt_legend", (454, 615, 80, 72)),
+    ("swatch_selected", "gantt_drag", (522, 76, 100, 100)),
+    ("swatch_drag_shadow", "gantt_drag", (745, 76, 60, 100)),
+    ("swatch_moved", "gantt_after_edit", (478, 545, 78, 100)),
+    ("swatch_unconfirmed", "plan_draft_new", (550, 595, 300, 72)),
+    ("swatch_baseline", "plan_draft_changed", (620, 462, 296, 90)),
+]
+
+
+def _cut_swatches(out_dir):
+    """SWATCHES の見本を切り出す（切り出し元の画像がある分だけ）。"""
+    saved = []
+    for name, source, rect in SWATCHES:
+        src = out_dir / f"{source}.png"
+        if not src.exists():
+            continue
+        image = QImage(str(src)).copy(QRect(*rect))
+        path = out_dir / f"{name}.png"
+        if not image.save(str(path)):
+            raise RuntimeError(f"画像を保存できませんでした: {path}")
+        saved.append(path)
+        print(f"saved {path.relative_to(ROOT)}")
+    return saved
+
+
 def _open_sample(app, window, sample, tmp):
     """サンプルを一時フォルダへコピーして開く（元のファイルは変えない）。"""
     if callable(sample):
@@ -555,6 +587,7 @@ def capture(language, only=None):
                 window.db.undo_manager = None
                 window.db.close()
             window.hide()
+    saved += _cut_swatches(out_dir)
     return saved
 
 

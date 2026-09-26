@@ -271,8 +271,54 @@ Delete キーで固定を外せます。
 | <span class="pinref">5</span> | **オレンジの破線の枠**のバー | 開始固定日が依存やライン数と矛盾しているタスク。固定した日のまま置かれますが、先行タスクが終わる前に始まる、チームのライン数を超える、といった無理があることを示します |
 | <span class="pinref">6</span> | 左上に**赤いピン**が付いたバー | 開始固定日が設定されているタスク |
 
-このほか、今日の日付には青い縦線が引かれます。
 バーにマウスを乗せると、そのタスクの日程や締切からの遅れなどが表示されます。
+
+### 見た目の一覧
+
+ガントチャートに出てくるバーと線の見た目を、すべてまとめます。
+編集しているときや、計画を確定しているときにだけ出る見た目もあります。詳しくは右の列の説明を参照してください。
+
+**いつでも出る表示**
+
+<div class="swatches" markdown="1">
+| 見た目 | 意味 | 詳しくは |
+| --- | --- | --- |
+| <span class="swatch"><img src="images/swatch_normal.png" alt=""></span><br>黒い細枠 | 通常のタスク。色は担当チーム | |
+| <span class="swatch"><img src="images/swatch_overrun.png" alt=""></span><br>赤い太枠 | 締切（マイルストーン）に間に合わないタスク | 「日程の決まり方」の章の「締切に間に合わないとき」 |
+| <span class="swatch"><img src="images/swatch_pin_conflict.png" alt=""></span><br>オレンジの破線の枠 | 開始固定日が依存やライン数と矛盾しているタスク | 「日程の決まり方」の章の「開始固定日が矛盾しているとき」 |
+| <span class="swatch"><img src="images/swatch_pinned.png" alt=""></span><br>左上の赤いピン | 開始固定日が設定されているタスク | この章のジョブ作成の「タスク上書き」 |
+
+</div>
+
+**編集しているときの表示**
+
+<div class="swatches" markdown="1">
+| 見た目 | 意味 | 詳しくは |
+| --- | --- | --- |
+| <span class="swatch"><img src="images/swatch_selected.png" alt=""></span><br>点線の枠 | 選んでいるタスク | この章の「タスクを調整する」 |
+| <span class="swatch"><img src="images/swatch_drag_shadow.png" alt=""></span><br>青い破線の半透明の影 | ドラッグしているあいだ、動かす先を示す影 | 同上 |
+| <span class="swatch"><img src="images/swatch_moved.png" alt=""></span><br>黄色の枠 | 直前の編集の影響で日程が動いたタスク（次にチャートをクリックすると消えます） | 同上 |
+
+</div>
+
+**計画を確定しているときの表示**
+
+<div class="swatches" markdown="1">
+| 見た目 | 意味 | 詳しくは |
+| --- | --- | --- |
+| <span class="swatch"><img src="images/swatch_unconfirmed.png" alt=""></span><br>斜線（下端に担当チームの色） | まだ確定していないタスク（確定の後に追加したタスクなど） | 「計画の確定と再計画」の章の「変更案の見え方」 |
+| <span class="swatch"><img src="images/swatch_baseline.png" alt=""></span><br>バーの下の灰色の線 | 変更案で動いたタスクの、確定していた位置 | 同上 |
+
+</div>
+
+**縦の線**
+
+| 見た目 | 意味 |
+| --- | --- |
+| 赤い縦の破線 | マイルストーンの締切（上に名前） |
+| 黒い縦の破線 | プロジェクトの開始（開発開始日） |
+| 青い縦線 | 今日（表示している期間の中にあるときだけ） |
+
 
 入力が足りない（チームが無い、ジョブが無いなど）ときや、依存が輪になっているときは、
 日程を組めない理由が上部に赤字で表示されます。
