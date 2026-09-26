@@ -912,6 +912,71 @@ def test_generate_gantt_rejects_circular_dependency(tmp_path):
     db.close()
 
 
+def test_circular_dependency_message_names_the_tasks_in_the_cycle(tmp_path):
+    """循環依存のメッセージは、内部ID（JOB_001:T_002）ではなく「ジョブ名 / タスク名」で
+    輪になっているタスクだけを示す（輪の手前で待っているだけのタスクは含めない）。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    db.set_project("循環依存テスト", "2026-01-01")
+    team_id = db.add_team("チームA", 1)
+    ms_id = db.add_milestone("マイルストーン1", "2026-03-01")
+    wf_id = db.add_workflow("WF1")
+    t0 = db.add_workflow_task(wf_id, "準備", team_id, 3)
+    t1 = db.add_workflow_task(wf_id, "タスク1", team_id, 3)
+    t2 = db.add_workflow_task(wf_id, "タスク2", team_id, 3)
+    db.add_task_dependency(wf_id, t0, t1)  # 準備は輪の手前にあるだけ
+    db.add_task_dependency(wf_id, t1, t2)
+    db.add_task_dependency(wf_id, t2, t1)
+    db.add_job("ジョブ1", wf_id, ms_id, 1)
+
+    with pytest.raises(SchedulingError) as excinfo:
+        generate_gantt(db, verbose=False)
+    message = str(excinfo.value)
+    assert "ジョブ1 / タスク1" in message
+    assert "ジョブ1 / タスク2" in message
+    assert "準備" not in message
+    assert "JOB_" not in message and "T_0" not in message
+    db.close()
+
+
+def test_no_slot_message_names_the_task_and_team(tmp_path):
+    """置く日が無いときのメッセージは、内部ID（JOB_001:T_001 / TEAM_001）ではなく
+    「ジョブ名 / タスク名」とチーム名で示す。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    db.set_project("配置できないテスト", "2026-01-05")
+    team_id = db.add_team("エフェクト", 0)  # ライン数0のまま変わらない＝置く日が無い
+    ms_id = db.add_milestone("マイルストーン1", "2026-03-01")
+    wf_id = db.add_workflow("WF1")
+    db.add_workflow_task(wf_id, "爆発", team_id, 3)
+    db.add_job("ボス戦", wf_id, ms_id, 1)
+
+    with pytest.raises(ResourceOverflowError) as excinfo:
+        generate_gantt(db, verbose=False)
+    message = str(excinfo.value)
+    assert "ボス戦 / 爆発" in message
+    assert "エフェクト" in message
+    assert "JOB_" not in message and "TEAM_" not in message
+    db.close()
+
+
+def test_overbooked_pin_violation_names_the_team(tmp_path):
+    """開始固定日がライン数を超えて重なったときの説明は、チームを名前で示す。"""
+    db = ProjectDatabase.create_new(str(tmp_path / "project.pschedule"))
+    db.set_project("固定の重なりテスト", "2026-01-05")
+    team_id = db.add_team("モーション", 1)
+    ms_id = db.add_milestone("マイルストーン1", "2026-06-30")
+    wf_id = db.add_workflow("WF1")
+    task_id = db.add_workflow_task(wf_id, "収録", team_id, 3)
+    for name in ("主人公", "ヒロイン"):
+        job_id = db.add_job(name, wf_id, ms_id, 1)
+        db.upsert_job_task_override(job_id, task_id, start_pin_date="2026-01-06")
+
+    result_df = generate_gantt(db, verbose=False)
+    violations = [v for v in result_df["Constraint_Violation"] if v]
+    assert violations
+    assert all("「モーション」" in v and "TEAM_" not in v for v in violations)
+    db.close()
+
+
 # -- マイルストーン未指定ジョブのフォールバック ---------------------------------------
 
 def test_job_without_milestone_uses_latest_milestone_as_deadline(tmp_path):

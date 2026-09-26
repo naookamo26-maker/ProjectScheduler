@@ -382,6 +382,27 @@ def test_editor_window_multi_selection_shows_mixed_values_and_edits_all(qapp, ga
     assert _override(w.db, ids["job2"], ids["t2"])["status"] is None
 
 
+def test_editor_window_shows_tasks_without_overrides_as_active(qapp, gantt):
+    """上書き行の無いタスク（is_active が NULL）も「有効」と表示する。以前は
+    無効に見え、チェックを押すと有効なタスクを無効にしてしまうおそれがあった。"""
+    w, tab, ids = gantt
+    k1 = _key(ids, "job1", "t1")
+    k2 = _key(ids, "job2", "t2")
+    tab.view.select_keys([k2])
+    tab.open_editor()
+    editor = tab._editor
+    assert editor.active_check.isChecked()
+
+    # 上書き行のあるタスク（有効）と無いタスクを一緒に選んでも「混在」にしない
+    w.db.update_job_task_override_fields(ids["job1"], ids["t1"], status="done")
+    tab.refresh_choices()
+    assert _wait(qapp, lambda: tab.cache.is_fresh())
+    _wait(qapp, lambda: False, timeout=0.05)
+    tab.view.select_keys([k1, k2])
+    assert editor.pages.currentWidget() is editor.multi_page
+    assert editor.multi_active_check.checkState() == Qt.Checked
+
+
 def test_editor_window_follows_the_selection(qapp, gantt):
     w, tab, ids = gantt
     tab.view.select_keys([_key(ids, "job1", "t1")])

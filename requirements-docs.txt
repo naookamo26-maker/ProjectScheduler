@@ -1,0 +1,4 @@
+# 利用者向けドキュメント（docs/user_guide/）のPDFビルド用。アプリの実行には不要。
+# 手順は docs/user_guide/README.md を参照。
+markdown>=3.5
+playwright>=1.40

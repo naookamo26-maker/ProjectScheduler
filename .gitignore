@@ -8,3 +8,4 @@ dist/
 output/*.md
 output/*.html
 !output/.gitkeep
+output/*.pdf

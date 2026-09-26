@@ -796,6 +796,10 @@ class GanttTab(QWidget):
             default_ms = milestones.get(job["default_milestone_id"], tr("未設定"))
             rows.append({
                 **r,
+                # 上書き行の無いタスクは is_active が NULL で返る。既定は有効なので、
+                # そのまま真偽値にすると編集ウィンドウで「無効」に見えてしまう
+                # （ジョブ作成タブのタスク上書きと同じ扱いにそろえる）。
+                "is_active": r["is_active"] is None or bool(r["is_active"]),
                 "key": key,
                 "job_name": job["name"],
                 "default_milestone_name": default_ms,
