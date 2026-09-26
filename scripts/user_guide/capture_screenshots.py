@@ -311,7 +311,8 @@ SHOTS = [
     ("tutorial_3_jobs", _tutorial(3), _show_tab(TAB_JOBS)),
     ("tutorial_4_gantt", _tutorial(4), _show_tab(TAB_GANTT, needs_schedule=True)),
     # 5章 ガントチャートの編集（チュートリアル手順4の状態を使う）
-    ("gantt_drag", _tutorial(4), _gantt_drag("新キャラクター", "仕様作成", 7), (0, 180, 800, 200)),
+    # 影がほかのバーと重ならないよう、行の最後のタスクを右の空いている所へ動かす
+    ("gantt_drag", _tutorial(4), _gantt_drag("新キャラクター", "確認", 10), (0, 180, 900, 200)),
     ("gantt_after_edit", _tutorial(4), _gantt_after_edit),
     ("gantt_editor", _tutorial(4), _gantt_editor("新アイテム", "アート制作")),
     ("tutorial_5_gantt", _tutorial(5), _show_tab(TAB_GANTT, needs_schedule=True)),

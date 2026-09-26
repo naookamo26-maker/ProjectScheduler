@@ -252,24 +252,24 @@ Delete キーで固定を外せます。
 <figure>
 <div class="annotated">
 <img src="images/gantt_legend.png" alt="バーの見た目の例">
-<span class="pin" style="left:30%;top:32.5%">1</span>
-<span class="pin" style="left:41.5%;top:44%">2</span>
-<span class="pin" style="left:38.8%;top:69.5%">3</span>
-<span class="pin" style="left:34.3%;top:78.5%">4</span>
-<span class="pin" style="left:36%;top:23.8%">5</span>
-<span class="pin" style="left:1.3%;top:19%">6</span>
+<span class="pin" style="left:1.3%;top:19%">1</span>
+<span class="pin" style="left:36%;top:23.8%">2</span>
+<span class="pin" style="left:30%;top:32.5%">3</span>
+<span class="pin" style="left:41.5%;top:44%">4</span>
+<span class="pin" style="left:38.8%;top:69.5%">5</span>
+<span class="pin" style="left:34.3%;top:78.5%">6</span>
 </div>
 <figcaption>バーの見た目の例</figcaption>
 </figure>
 
 | | 見た目 | 意味 |
 | --- | --- | --- |
-| <span class="pinref">1</span> | 黒い細枠のバー | 通常のタスク |
-| <span class="pinref">2</span> | **赤い太枠**のバー | 締切（マイルストーン）に間に合わないタスク |
-| <span class="pinref">3</span> | **オレンジの破線の枠**のバー | 開始固定日どおりに置けないタスク（依存やライン数と矛盾しているため、固定した日より後ろに置かれています） |
-| <span class="pinref">4</span> | 左上に**赤いピン**が付いたバー | 開始固定日が設定されているタスク |
-| <span class="pinref">5</span> | 赤い縦の破線 | マイルストーンの締切（上に名前） |
-| <span class="pinref">6</span> | 上部の文字 | 作られたタスクの件数。締切に間に合わないタスクや、固定どおりに置けないタスクがあると、その件数と内容が赤字で出ます |
+| <span class="pinref">1</span> | 上部の文字 | 作られたタスクの件数。締切に間に合わないタスクや、固定どおりに置けないタスクがあると、その件数と内容が赤字で出ます |
+| <span class="pinref">2</span> | 赤い縦の破線 | マイルストーンの締切（上に名前） |
+| <span class="pinref">3</span> | 黒い細枠のバー | 通常のタスク |
+| <span class="pinref">4</span> | **赤い太枠**のバー | 締切（マイルストーン）に間に合わないタスク |
+| <span class="pinref">5</span> | **オレンジの破線の枠**のバー | 開始固定日どおりに置けないタスク（依存やライン数と矛盾しているため、固定した日より後ろに置かれています） |
+| <span class="pinref">6</span> | 左上に**赤いピン**が付いたバー | 開始固定日が設定されているタスク |
 
 このほか、今日の日付には青い縦線が引かれます。
 バーにマウスを乗せると、そのタスクの日程や締切からの遅れなどが表示されます。
@@ -325,10 +325,10 @@ Ctrl を押しながらクリックすると追加で選べます。
 <figure>
 <div class="annotated">
 <img src="images/gantt_drag.png" alt="バーをドラッグしているところ">
-<span class="pin" style="left:35.1%;top:40.5%">1</span>
-<span class="pin" style="left:57.6%;top:40.5%">2</span>
+<span class="pin" style="left:58.7%;top:40.5%">1</span>
+<span class="pin" style="left:83.6%;top:40.5%">2</span>
 </div>
-<figcaption>「新キャラクター」の仕様作成を Shift ＋ドラッグで後ろへ動かしているところ</figcaption>
+<figcaption>「新キャラクター」の確認を Shift ＋ドラッグで後ろへ動かしているところ</figcaption>
 </figure>
 
 | | 意味 |
@@ -345,11 +345,11 @@ Ctrl を押しながらクリックすると追加で選べます。
 <figure>
 <div class="annotated">
 <img src="images/gantt_after_edit.png" alt="動かした後のガントチャート">
-<span class="pin" style="left:30.5%;top:18.8%">1</span>
-<span class="pin" style="left:36.5%;top:52.5%">2</span>
-<span class="pin" style="left:21.5%;top:32.5%">3</span>
+<span class="pin" style="left:29.5%;top:18.8%">1</span>
+<span class="pin" style="left:58.8%;top:32.9%">2</span>
+<span class="pin" style="left:37.8%;top:68.9%">3</span>
 </div>
-<figcaption>動かした後。仕様作成を後ろにずらしたので、プランナーの手が空き、ほかのジョブが前に詰まりました</figcaption>
+<figcaption>動かした後。新キャラクターの確認を後ろにずらしたので、その間プランナーの手が空き、新アイテムが前に詰まりました</figcaption>
 </figure>
 
 | | 意味 |
