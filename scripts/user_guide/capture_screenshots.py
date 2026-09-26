@@ -20,6 +20,7 @@ import shutil
 import sys
 import tempfile
 import time
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +37,8 @@ from gui.db import ProjectDatabase  # noqa: E402
 from gui.main import MainWindow, apply_language  # noqa: E402
 from gui.node_canvas import TaskNodeEditDialog  # noqa: E402
 from gui.options_dialog import OptionsDialog  # noqa: E402
+from gui.replan_dialog import ReplanDialog  # noqa: E402
+import gui.plan_actions  # noqa: E402
 from i18n import tr  # noqa: E402
 
 # ドキュメント用のサンプル（活用例の2つの題材。generate_guide_samples.py）
@@ -221,6 +224,106 @@ def _gantt_editor(job_name, task_name):
     return setup
 
 
+# -- 6章 計画の確定と再計画 ------------------------------------------------------
+# 状態帯に確定した日時が写るので、撮る日によって画像が変わらないよう固定する
+gui.plan_actions._now = lambda: "2026-10-02T17:00:00"
+# 全面再計画のダイアログで「今日」として使う日（ダイアログの件数の表示に効く）
+PLAN_TODAY = date(2026, 11, 2)
+
+
+def _plan_sample(tmp):
+    """6章用に、新作タイトルのサンプルを別のコピーとして開く（ほかの章の場面と混ざらないように）。"""
+    path = Path(tmp) / "新作タイトルの制作.pschedule"
+    shutil.copy(NEW_TITLE, path)
+    return path
+
+
+_plan_sample.key = ("plan",)
+
+
+def _wait_schedule(app, window):
+    cache = window.schedule_cache
+    cache.ensure_fresh()
+    if not _wait(app, cache.is_fresh, timeout=60.0):
+        raise RuntimeError("スケジューリングの計算が終わりませんでした")
+
+
+def _plan_confirm(app, window):
+    """ガントチャートタブで「確定する」を押した後の場面。"""
+    window.tabs.setCurrentIndex(TAB_GANTT)
+    _wait_schedule(app, window)
+    window.tab_gantt.run_plan_action("confirm")
+    _settle(app)
+    _wait_schedule(app, window)
+
+
+def _plan_draft(app, window):
+    """確定の後に日程に関わる編集をして、変更案になった場面（影響の小さい変更）。"""
+    db = window.db
+    jobs = {j["name"]: j for j in db.list_jobs()}
+    tasks = {t["name"]: t["id"] for t in db.list_workflow_tasks(jobs["魔王"]["workflow_id"])}
+    # 定例ミーティングで進み具合を反映した（状態の更新だけでは変更案にならない）
+    for job in ("主人公", "ヒロイン"):
+        db.update_job_task_override_fields(jobs[job]["id"], tasks["設定・仕様"], status="done")
+    db.update_job_task_override_fields(jobs["主人公"]["id"], tasks["コンセプトアート"], status="in_progress")
+    # 魔王の組み込みが延びることになった（10日 → 15日）。プログラマーはライン数が
+    # 「指定なし」なので、ほかのタスクとの取り合いが起きず、影響は後続だけにとどまる
+    db.update_job_task_override_fields(jobs["魔王"]["id"], tasks["組み込み"], override_days=15)
+    # 確定の後にジョブを追加した（このジョブのタスクは未確定になる）
+    master = next(m["id"] for m in db.list_milestones() if m["name"] == "マスターアップ")
+    db.add_job("村人", jobs["魔王"]["workflow_id"], master, 5, "サブ")
+    window.tabs.setCurrentIndex(TAB_GANTT)
+    _settle(app)
+    _wait_schedule(app, window)
+
+
+def _plan_draft_large(app, window):
+    """影響の大きい変更。モーションチームのラインが確定済みのタスクで埋まっているので、
+    延ばしたタスクが空きを探して大きく後ろへずれる（全面再計画を使う理由の説明に使う）。"""
+    db = window.db
+    jobs = {j["name"]: j for j in db.list_jobs()}
+    tasks = {t["name"]: t["id"] for t in db.list_workflow_tasks(jobs["魔王"]["workflow_id"])}
+    db.update_job_task_override_fields(jobs["魔王"]["id"], tasks["モーション制作"], override_days=30)
+    window.tabs.setCurrentIndex(TAB_GANTT)
+    _settle(app)
+    _wait_schedule(app, window)
+
+
+def _zoom_to_bar(job_name, task_name, before_days, after_days):
+    """ガントチャートで、指定したバーの前後（営業日ではなく暦日）を拡大して表示する。
+    細い線や斜線など、全体表示では小さすぎて見えない表示を見せるのに使う。"""
+    def setup(app, window):
+        window.tabs.setCurrentIndex(TAB_GANTT)
+        _wait_schedule(app, window)
+        _settle(app)
+        tab = window.tab_gantt
+        bar = tab.view.bars()[_bar_key(window.db, job_name, task_name)]
+        # ガントのシーン座標は1暦日＝10
+        rect = bar.sceneBoundingRect().adjusted(-before_days * 10, -70, after_days * 10, 70)
+        tab.view.body.fitInView(rect)
+        tab.view._sync_panes()
+        _settle(app)
+    return setup
+
+
+def _plan_replanned(app, window):
+    """全面再計画を実行した後の場面（結果は変更案として表示される）。"""
+    base = PLAN_TODAY.isoformat()
+    window.db.start_full_replan(base, base)
+    window.tabs.setCurrentIndex(TAB_GANTT)
+    _settle(app)
+    _wait_schedule(app, window)
+    _settle(app)
+    # 直前の場面で拡大した表示を、全体表示（A キー）に戻す
+    window.tab_gantt.view.fit_all()
+    _settle(app)
+
+
+def _replan_dialog(app, window):
+    dialog = ReplanDialog(window.db, today=PLAN_TODAY, parent=window)
+    return dialog
+
+
 # -- 3章 クイックスタート②のチュートリアル ----------------------------------------
 # 本文（docs/user_guide/ja/03_quickstart.md）の手順と同じ内容を、手順 step まで
 # 進めた状態のプロジェクトを作る。本文の手順を変えたら、ここも合わせて変える。
@@ -317,6 +420,16 @@ SHOTS = [
     ("gantt_editor", _tutorial(4), _gantt_editor("新アイテム", "アート制作")),
     ("tutorial_5_gantt", _tutorial(5), _show_tab(TAB_GANTT, needs_schedule=True)),
     ("gantt_legend", _bar_legend, _show_tab(TAB_GANTT, needs_schedule=True)),
+    # 6章 計画の確定と再計画（同じコピーに対して、この順に操作を重ねる）
+    ("plan_confirmed", _plan_sample, _plan_confirm),
+    ("plan_draft", _plan_sample, _plan_draft),
+    ("plan_draft_changed", _plan_sample, _zoom_to_bar("魔王", "組み込み", 40, 40)),
+    ("plan_draft_new", _plan_sample, _zoom_to_bar("村人", "モデル制作", 50, 60)),
+    ("plan_draft_jobs", _plan_sample, _select_job("魔王")),
+    ("plan_draft_large", _plan_sample, _plan_draft_large),
+    ("plan_draft_large_zoom", _plan_sample, _zoom_to_bar("魔王", "モーション制作", 130, 70)),
+    ("plan_replan_dialog", _plan_sample, _replan_dialog),
+    ("plan_replanned", _plan_sample, _plan_replanned),
 ]
 
 
