@@ -26,8 +26,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
+from PySide6.QtCore import QEvent, QPointF, QRect, Qt  # noqa: E402
+from PySide6.QtGui import QMouseEvent  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel, QWidget  # noqa: E402
 
 from gui.app_settings import AppSettings  # noqa: E402
 from gui.db import ProjectDatabase  # noqa: E402
@@ -126,6 +128,99 @@ def _analysis_section(index):
     return setup
 
 
+# -- 5章 ガントチャートの図解 ------------------------------------------------------
+def _bar_legend(tmp):
+    """バーの見た目を1種類ずつ並べた小さなプロジェクト。ジョブ名がそのまま見た目の説明になる。"""
+    path = Path(tmp) / "バーの見た目.pschedule"
+    if path.exists():
+        path.unlink()
+    db = ProjectDatabase.create_new(str(path))
+    db.set_project("バーの見た目", "2026-10-05")
+    db.set_distribution_ratio(0.0)
+    deadline = db.add_milestone("締切", "2026-11-13", "")
+    early = db.add_milestone("早い締切", "2026-10-14", "")
+    planner = db.add_team("プランナー", None)
+    art = db.add_team("アート", None)
+    wf = db.add_workflow("制作")
+    spec = db.add_workflow_task(wf, "仕様作成", planner, 3)
+    make = db.add_workflow_task(wf, "制作", art, 5)
+    check = db.add_workflow_task(wf, "確認", planner, 2)
+    db.add_task_dependency(wf, spec, make)
+    db.add_task_dependency(wf, make, check)
+    normal = db.add_job("通常のタスク", wf, deadline, 1)
+    late = db.add_job("締切に間に合わない", wf, early, 2)
+    pinned = db.add_job("開始日を固定", wf, deadline, 3)
+    broken = db.add_job("固定どおりに置けない", wf, deadline, 4)
+    db.upsert_job_task_override(pinned, spec, start_pin_date="2026-10-12")
+    # 仕様作成（10/05〜10/07）が終わる前の日付に固定する
+    db.upsert_job_task_override(broken, make, start_pin_date="2026-10-06")
+    db.save()
+    db.close()
+    return path
+
+
+_bar_legend.key = ("bar_legend",)
+
+
+def _bar_key(db, job_name, task_name):
+    """ガントのバーのキー（gui/gantt_generator.py の Job_ID / Task_ID と同じ書式）。"""
+    job = next(j for j in db.list_jobs() if j["name"] == job_name)
+    task = next(t for t in db.list_workflow_tasks(job["workflow_id"]) if t["name"] == task_name)
+    return (f"JOB_{job['id']:03d}", f"T_{task['id']:03d}")
+
+
+def _gantt_drag(job_name, task_name, days):
+    """Shift を押しながらバーをドラッグしている途中の場面。撮った後にボタンを離す
+    （離すと編集が確定し、日程が組み直される。次の場面 _gantt_after_edit で結果を撮る）。"""
+    show = _show_tab(TAB_GANTT, needs_schedule=True)
+
+    def setup(app, window):
+        show(app, window)
+        tab = window.tab_gantt
+        key = _bar_key(window.db, job_name, task_name)
+        tab.view.select_keys([key])
+        _settle(app)
+        bar = tab.view.bars()[key]
+        body = tab.view.body
+        viewport = body.viewport()
+        center = bar.bar_rect.center()
+        start = body.mapFromScene(center)
+        # ガントのシーン座標は1暦日＝10
+        end = body.mapFromScene(center.x() + days * 10, center.y())
+        QTest.mousePress(viewport, Qt.LeftButton, Qt.ShiftModifier, start)
+        move = QMouseEvent(QEvent.MouseMove, QPointF(end), QPointF(viewport.mapToGlobal(end)),
+                           Qt.NoButton, Qt.LeftButton, Qt.ShiftModifier)
+        QApplication.sendEvent(viewport, move)
+
+        def release():
+            QTest.mouseRelease(viewport, Qt.LeftButton, Qt.ShiftModifier, end)
+            app.processEvents()
+        return release
+    return setup
+
+
+def _gantt_after_edit(app, window):
+    """編集が確定して日程が組み直された後の場面（動いたバーが黄色の枠で強調される）。"""
+    tab = window.tab_gantt
+    if not _wait(app, lambda: tab.cache.is_fresh() and tab._pending_edit is None, timeout=60.0):
+        raise RuntimeError("編集後の再計算が終わりませんでした")
+    _settle(app, 0.5)
+
+
+def _gantt_editor(job_name, task_name):
+    """バーを選んで編集ウィンドウを開いた場面（編集ウィンドウだけを撮る）。"""
+    show = _show_tab(TAB_GANTT, needs_schedule=True)
+
+    def setup(app, window):
+        show(app, window)
+        tab = window.tab_gantt
+        tab.view.select_keys([_bar_key(window.db, job_name, task_name)])
+        _settle(app)
+        tab.open_editor()
+        return tab._editor
+    return setup
+
+
 # -- 3章 クイックスタート②のチュートリアル ----------------------------------------
 # 本文（docs/user_guide/ja/03_quickstart.md）の手順と同じ内容を、手順 step まで
 # 進めた状態のプロジェクトを作る。本文の手順を変えたら、ここも合わせて変える。
@@ -192,7 +287,10 @@ def _options_dialog(app, window):
 # (画像の名前, 開くサンプル, 場面を作る関数)。撮りたい場面はここに足す。
 # 開くサンプルは、ファイルのパス・一時フォルダを受けてパスを返す関数（_tutorial）・
 # None（何も開いていない起動直後。先頭に置く）のいずれか。
-# 場面を作る関数がダイアログを返したときは、ウィンドウではなくそのダイアログを撮る。
+# 場面を作る関数がウィジェット（ダイアログ等）を返したときは、ウィンドウではなくそれを撮り、
+# 撮った後に閉じる。関数を返したときは、ウィンドウを撮った後にその関数を呼ぶ（ドラッグの
+# ボタンを離す等の後始末）。4つ目に (x, y, 幅, 高さ) を書くと、撮った画像のその範囲だけを残す
+# （細かい部分を紙面で大きく見せたいとき）。
 SHOTS = [
     ("startup", None, lambda app, window: None),
     ("options_dialog", None, _options_dialog),
@@ -212,7 +310,12 @@ SHOTS = [
     ("tutorial_2_workflow", _tutorial(2), _show_tab(TAB_WORKFLOWS)),
     ("tutorial_3_jobs", _tutorial(3), _show_tab(TAB_JOBS)),
     ("tutorial_4_gantt", _tutorial(4), _show_tab(TAB_GANTT, needs_schedule=True)),
+    # 5章 ガントチャートの編集（チュートリアル手順4の状態を使う）
+    ("gantt_drag", _tutorial(4), _gantt_drag("新キャラクター", "仕様作成", 7), (0, 180, 800, 200)),
+    ("gantt_after_edit", _tutorial(4), _gantt_after_edit),
+    ("gantt_editor", _tutorial(4), _gantt_editor("新アイテム", "アート制作")),
     ("tutorial_5_gantt", _tutorial(5), _show_tab(TAB_GANTT, needs_schedule=True)),
+    ("gantt_legend", _bar_legend, _show_tab(TAB_GANTT, needs_schedule=True)),
 ]
 
 
@@ -248,22 +351,29 @@ def capture(language, only=None):
         saved = []
         opened = None
         try:
-            for name, sample, setup in SHOTS:
+            for name, sample, setup, *crop in SHOTS:
                 if only and name not in only:
                     continue
                 key = getattr(sample, "key", sample)
                 if sample is not None and key != opened:
                     _open_sample(app, window, sample, tmp)
                     opened = key
-                dialog = setup(app, window)
+                result = setup(app, window)
+                dialog = result if isinstance(result, QWidget) else None
+                after = result if callable(result) and dialog is None else None
                 if dialog is not None:
                     dialog.show()
                 _settle(app)
                 path = out_dir / f"{name}.png"
                 target = dialog if dialog is not None else window
-                ok = target.grab().save(str(path))
+                pixmap = target.grab()
+                if crop:
+                    pixmap = pixmap.copy(QRect(*crop[0]))
+                ok = pixmap.save(str(path))
                 if dialog is not None:
                     dialog.close()
+                if after is not None:
+                    after()
                 if not ok:
                     raise RuntimeError(f"画像を保存できませんでした: {path}")
                 saved.append(path)
