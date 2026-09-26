@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
 
 from gui.app_settings import AppSettings  # noqa: E402
@@ -85,6 +86,43 @@ def _select_job(name):
                 table.selectRow(row)
                 return
         raise RuntimeError(f"ジョブが見つかりません: {name}")
+    return setup
+
+
+def _select_workflow(name, view=0):
+    """ワークフロー設計タブで、指定したワークフローを選び、ビュー（0=ノード、1=テーブル）を切り替える。"""
+    def setup(app, window):
+        window.tabs.setCurrentIndex(TAB_WORKFLOWS)
+        tab = window.tab_workflows
+        items = tab.workflow_list.findItems(name, Qt.MatchExactly)
+        if not items:
+            raise RuntimeError(f"ワークフローが見つかりません: {name}")
+        tab.workflow_list.setCurrentItem(items[0])
+        tab.view_tabs.setCurrentIndex(view)
+        _settle(app)
+        if view == 0:
+            tab.view.fit_all()
+    return setup
+
+
+def _job_with_dependencies(name):
+    """ジョブ作成タブで、指定したジョブを選び、依存先ジョブのツリーを展開する。"""
+    select = _select_job(name)
+
+    def setup(app, window):
+        select(app, window)
+        _settle(app)
+        window.tab_jobs.dep_tree.expandAll()
+    return setup
+
+
+def _analysis_section(index):
+    """プロジェクト分析タブのサブタブ（0=マイルストーン、1=チーム、2=ワークフロー）を開く。"""
+    show = _show_tab(TAB_ANALYSIS, needs_schedule=True)
+
+    def setup(app, window):
+        show(app, window)
+        window.tab_analysis.section_tabs.setCurrentIndex(index)
     return setup
 
 
@@ -162,7 +200,11 @@ SHOTS = [
     ("workflows_tab", NEW_TITLE, _show_tab(TAB_WORKFLOWS)),
     ("jobs_tab", NEW_TITLE, _show_tab(TAB_JOBS)),
     ("gantt_tab", NEW_TITLE, _show_tab(TAB_GANTT, needs_schedule=True)),
-    ("analysis_tab", NEW_TITLE, _show_tab(TAB_ANALYSIS, needs_schedule=True)),
+    ("analysis_tab", NEW_TITLE, _analysis_section(0)),
+    ("analysis_team", NEW_TITLE, _analysis_section(1)),
+    ("workflows_table", NEW_TITLE, _select_workflow("キャラクター制作", view=1)),
+    ("workflows_cutscene", NEW_TITLE, _select_workflow("カットシーン制作", view=0)),
+    ("jobs_opening", NEW_TITLE, _job_with_dependencies("オープニング")),
     ("update_jobs_tab", UPDATE, _select_job("新キャラクター")),
     ("update_gantt_tab", UPDATE, _show_tab(TAB_GANTT, needs_schedule=True)),
     ("tutorial_1_basic_info", _tutorial(1), _show_tab(TAB_BASIC_INFO)),

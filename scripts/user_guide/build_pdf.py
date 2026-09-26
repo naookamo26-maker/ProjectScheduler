@@ -15,6 +15,8 @@ docs/user_guide/images/<言語>/ のものを使う（原稿には `images/名�
     !!! lines-note "見出し"     … 同じ見た目で目印が「ライン数≠人数」（ライン数の話）
   （本文は4字下げで続ける。Python-Markdown の admonition 拡張）
 - 表・脚注・見出しのアンカーが使える。図はHTML/SVGを直接書いてもよい
+- 画面写真に番号の目印を重ねるときは <div class="annotated"> と <span class="pin">
+  （本文から指すときは <span class="pinref">1</span>）
 
 必要なパッケージ: markdown, playwright（requirements-docs.txt）。Chromium は
 環境にあるものを探して使い、無ければ `playwright install chromium` のものを使う。
@@ -83,6 +85,18 @@ code { font-family: "Noto Sans Mono CJK JP", monospace; font-size: 9.5pt;
   background: var(--kikan); border-radius: 1mm; padding: 0 1.8mm; margin-right: 2.5mm;
   vertical-align: 0.15em; line-height: 1.7; }
 .admonition.lines-note > .admonition-title::before { content: "ライン数≠人数"; }
+
+/* 画面写真に番号の目印を重ねる図（4章）。位置は画像に対する % で指定する:
+   <div class="annotated"><img …><span class="pin" style="left:3%;top:1%">1</span></div> */
+.annotated { position: relative; display: inline-block; max-width: 100%; }
+.annotated img { display: block; }
+.annotated .pin { position: absolute; transform: translate(-50%, -50%);
+  width: 6mm; height: 6mm; border-radius: 50%; background: #c0392b; color: #fff;
+  font-size: 9pt; font-weight: 700; line-height: 6mm; text-align: center;
+  box-shadow: 0 0 0 0.6mm #fff; }
+.pinref { display: inline-block; width: 4.6mm; height: 4.6mm; border-radius: 50%;
+  background: #c0392b; color: #fff; font-size: 7.5pt; font-weight: 700;
+  line-height: 4.6mm; text-align: center; vertical-align: 0.1em; }
 
 /* 表紙・目次 */
 .cover { height: 250mm; display: flex; flex-direction: column; justify-content: center; }
