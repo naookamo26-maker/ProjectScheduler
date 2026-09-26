@@ -30,6 +30,9 @@ python scripts/user_guide/build_pdf.py
   （CLAUDE.md「環境セットアップ」）と日本語フォント（`fonts-noto-cjk`）が要る。
 - PDFは Chromium の印刷機能で作る。環境に Chromium が無ければ
   `playwright install chromium` で入れる。
+- 目次のページ番号は、1回目に印刷したPDFから各見出しのページを読み取って入れ、2回目を
+  印刷する。読み取りに poppler の `pdfinfo` を使う（Linux では `poppler-utils`、Windows では
+  poppler を入れて `pdfinfo` にパスを通す）。
 - 撮る場面を増やすときは、`capture_screenshots.py` の `SHOTS` に1行足す。
 
 ## 原稿の書き方
