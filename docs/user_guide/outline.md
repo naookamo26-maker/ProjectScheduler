@@ -127,6 +127,6 @@
 
 ## 次の作業
 
-1. 画面の自動撮影スクリプト
-2. Markdown → PDF のビルドスクリプト（「期間≠工数」の囲みのスタイルもここで決める）
-3. 0章から順に本文を執筆
+1. ~~画面の自動撮影スクリプト~~（`scripts/user_guide/capture_screenshots.py`）
+2. ~~Markdown → PDF のビルドスクリプト~~（`scripts/user_guide/build_pdf.py`。手順は `README.md`）
+3. 0章から順に本文を執筆（0章は試作済み）
