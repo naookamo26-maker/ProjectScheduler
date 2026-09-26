@@ -11,7 +11,8 @@ docs/user_guide/images/<言語>/ のものを使う（原稿には `images/名�
 
 - 「期間であって工数ではない」の囲み（docs/user_guide/outline.md 執筆方針1）
     !!! kikan "見出し"          … 0章の大きな囲み
-    !!! kikan-note "見出し"     … 各章で念押しする小さな囲み
+    !!! kikan-note "見出し"     … 各章で念押しする小さな囲み（目印「期間≠工数」。日数の話）
+    !!! lines-note "見出し"     … 同じ見た目で目印が「ライン数≠人数」（ライン数の話）
   （本文は4字下げで続ける。Python-Markdown の admonition 拡張）
 - 表・脚注・見出しのアンカーが使える。図はHTML/SVGを直接書いてもよい
 
@@ -65,20 +66,23 @@ figcaption { font-size: 9pt; color: var(--muted); margin-top: 1.5mm; }
 code { font-family: "Noto Sans Mono CJK JP", monospace; font-size: 9.5pt;
        background: #f1f3f5; padding: 0 1mm; border-radius: 2px; }
 
-/* 期間≠工数の囲み */
+/* 期間≠工数・ライン数≠人数の囲み */
 .admonition { break-inside: avoid; }
 .admonition.kikan { border: 2px solid var(--kikan); background: var(--kikan-bg);
   border-radius: 3mm; padding: 4mm 6mm 2mm; margin: 5mm 0 7mm; }
 .admonition.kikan > .admonition-title { font-size: 13pt; font-weight: 700; color: var(--kikan);
   margin: 0 0 2.5mm; }
-.admonition.kikan-note { border-left: 4px solid var(--kikan); background: var(--kikan-bg);
+.admonition.kikan-note, .admonition.lines-note { border-left: 4px solid var(--kikan); background: var(--kikan-bg);
   padding: 2mm 4mm 0.5mm; margin: 3mm 0 4mm; font-size: 9.8pt; }
-.admonition.kikan-note > .admonition-title { font-weight: 700; color: var(--kikan); margin: 0 0 1mm; }
+.admonition.kikan-note > .admonition-title,
+.admonition.lines-note > .admonition-title { font-weight: 700; color: var(--kikan); margin: 0 0 1mm; }
 .admonition.kikan > .admonition-title::before,
-.admonition.kikan-note > .admonition-title::before {
+.admonition.kikan-note > .admonition-title::before,
+.admonition.lines-note > .admonition-title::before {
   content: "期間≠工数"; display: inline-block; font-size: 8pt; font-weight: 700; color: #fff;
   background: var(--kikan); border-radius: 1mm; padding: 0 1.8mm; margin-right: 2.5mm;
   vertical-align: 0.15em; line-height: 1.7; }
+.admonition.lines-note > .admonition-title::before { content: "ライン数≠人数"; }
 
 /* 表紙・目次 */
 .cover { height: 250mm; display: flex; flex-direction: column; justify-content: center; }
