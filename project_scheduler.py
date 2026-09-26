@@ -542,8 +542,22 @@ def _bridge_inactive_deps(g_id, refs, active_ids, inactive_deps, cache):
     return resolved, bridged, missing
 
 
+def _task_label(t_info):
+    """メッセージに出すタスクの呼び名（「ジョブ名 / タスク名」）。利用者が画面で見る
+    ので、内部ID（JOB_001:T_002）は使わない。"""
+    return f'{t_info["job_name"]} / {t_info["task_name"]}'
+
+
+def _team_label(t_info):
+    """メッセージに出すチームの呼び名。チーム名が無ければ（Excel時代の入力など）IDで代える。"""
+    return t_info.get("team_name") or str(t_info["team_id"])
+
+
 def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project_start):
     teams_dict = df_teams.set_index("Team_ID")["Max_Lines"].to_dict()
+    team_names = (
+        df_teams.set_index("Team_ID")["Team_Name"].to_dict() if "Team_Name" in df_teams.columns else {}
+    )
     ext_dep_map = _build_external_dep_map(df_extdeps)
 
     # ループ内で参照する表は、すべて先に素の辞書・リストへ落としておく
@@ -603,6 +617,7 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
         for t in wf_tasks:
             t_id = t["Task_ID"]
             g_id = f"{job_id}:{t_id}"
+            task_label = f'{job_name} / {t["Task_Name"]}'
 
             override = overrides_by_key.get((job_id, t_id), {})
 
@@ -618,7 +633,7 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
             override_days = override.get("Override_Days")
             days = int(override_days) if pd.notna(override_days) else int(t["Default_Days"])
             if days <= 0:
-                raise SchedulingError(tr("タスク '{g_id}' の所要日数が不正です（{days}日）", g_id=g_id, days=days))
+                raise SchedulingError(tr("タスク「{task}」の所要日数が不正です（{days}日）", task=task_label, days=days))
 
             task_ms = override.get("Milestone_ID")
             if not pd.notna(task_ms) or str(task_ms).strip() == "":
@@ -656,13 +671,13 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
                     )
             elif task_ms not in ms_end_map:
                 raise MissingMilestoneError(
-                    tr("タスク '{g_id}' が参照するマイルストーン '{task_ms}' が Milestones シートに見つかりません", g_id=g_id, task_ms=task_ms)
+                    tr("タスク「{task}」に設定されたマイルストーンが見つかりません", task=task_label)
                 )
             else:
                 ms_end = ms_end_map[task_ms]
                 if pd.isna(ms_end):
                     raise MissingMilestoneError(
-                        tr("マイルストーン '{task_ms}'（タスク '{g_id}' が参照）の End_Date が空です", task_ms=task_ms, g_id=g_id)
+                        tr("タスク「{task}」に設定されたマイルストーンの締切日が空です", task=task_label)
                     )
 
             raw_deps[g_id] = deps
@@ -676,7 +691,7 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
                 start_pin = pd.to_datetime(start_pin_raw, errors="coerce")
                 if pd.isna(start_pin):
                     raise SchedulingError(
-                        tr("タスク '{g_id}' の開始固定日 '{start_pin_raw}' を解釈できません", g_id=g_id, start_pin_raw=start_pin_raw)
+                        tr("タスク「{task}」の開始固定日 '{start_pin_raw}' を解釈できません", task=task_label, start_pin_raw=start_pin_raw)
                     )
                 start_pin_ord = start_pin.toordinal()
 
@@ -689,7 +704,7 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
                 not_before = pd.to_datetime(not_before_raw, errors="coerce")
                 if pd.isna(not_before):
                     raise SchedulingError(
-                        tr("タスク '{g_id}' の着手の下限 '{not_before_raw}' を解釈できません", g_id=g_id, not_before_raw=not_before_raw)
+                        tr("タスク「{task}」の着手の下限 '{not_before_raw}' を解釈できません", task=task_label, not_before_raw=not_before_raw)
                     )
                 not_before_ord = not_before.toordinal()
 
@@ -703,7 +718,8 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
                 # （無効化されたタスクを飛ばして）確定させる。
                 "deps": [], "dep_specs": {},
                 "milestone": task_ms,
-                "team_id": team_id, "ms_end": ms_end, "ms_end_ord": ms_end.toordinal(),
+                "team_id": team_id, "team_name": team_names.get(team_id),
+                "ms_end": ms_end, "ms_end_ord": ms_end.toordinal(),
                 "priority": priority, "workflow_id": wf_id,
             }
 
@@ -808,9 +824,7 @@ def _circular_dependency_message(active_tasks, remaining):
                 left.discard(g_id)
                 changed = True
     members = left or set(remaining)
-    labels = sorted(
-        f'{active_tasks[g_id]["job_name"]} / {active_tasks[g_id]["task_name"]}' for g_id in members
-    )
+    labels = sorted(_task_label(active_tasks[g_id]) for g_id in members)
     tasks = tr("、").join(labels[:_CYCLE_TASKS_SHOWN])
     if len(labels) > _CYCLE_TASKS_SHOWN:
         tasks = tr("{tasks} ほか{n}件", tasks=tasks, n=len(labels) - _CYCLE_TASKS_SHOWN)
@@ -1078,7 +1092,7 @@ def _dep_lower_bounds(t_info, dates, cal, team_id, g_id):
         bound = cal.shift_working_days(anchor, lag, team_id)
         if bound is None:
             raise SchedulingError(
-                tr("タスク '{g_id}' の依存 '{d}'（{kind}{lag:+d}日）を反映した着手可能日が稼働日カレンダーの範囲を超えました。ラグの値を見直してください。", g_id=g_id, d=d, kind=kind, lag=lag)
+                tr("タスク「{task}」の依存（{kind}{lag:+d}日）を反映した着手可能日が稼働日カレンダーの範囲を超えました。ラグの値を見直してください。", task=_task_label(t_info), kind=kind, lag=lag)
             )
         bounds.append(bound)
     return bounds
@@ -1173,7 +1187,7 @@ def _calc_raw_dates(active_tasks, successors, scheduling_order, cal):
             pin_end = cal.business_end(pin, days, team_id)
             if pin_end is None:
                 raise SchedulingError(
-                    tr("タスク '{g_id}' の固定開始日から所要日数ぶんの稼働日を確保できません", g_id=g_id)
+                    tr("タスク「{task}」の固定開始日から所要日数ぶんの稼働日を確保できません", task=_task_label(t_info))
                 )
             raw_dates[g_id] = (pin, pin_end)
             continue
@@ -1195,7 +1209,7 @@ def _calc_raw_dates(active_tasks, successors, scheduling_order, cal):
                 cap = cal.shift_working_days(succ_start, -lag, team_id)
             if cap is None:
                 raise SchedulingError(
-                    tr("タスク '{g_id}' の最遅日程を求められません（後続 '{s}' への依存 {kind}{lag:+d}日 が稼働日カレンダーの範囲を超えました）", g_id=g_id, s=s, kind=kind, lag=lag)
+                    tr("タスク「{task}」の最遅日程を求められません（後続「{successor}」への依存 {kind}{lag:+d}日 が稼働日カレンダーの範囲を超えました）", task=_task_label(t_info), successor=_task_label(active_tasks[s]), kind=kind, lag=lag)
                 )
             if cap < t_end:
                 t_end = cap
@@ -1203,7 +1217,7 @@ def _calc_raw_dates(active_tasks, successors, scheduling_order, cal):
         t_start = cal.business_start(t_end, days, team_id)
         if t_start is None:
             raise SchedulingError(
-                tr("タスク '{g_id}' の最遅日程を求められません。マイルストーンの締切が早すぎるか、所要日数が長すぎる可能性があります。", g_id=g_id)
+                tr("タスク「{task}」の最遅日程を求められません。マイルストーンの締切が早すぎるか、所要日数が長すぎる可能性があります。", task=_task_label(t_info))
             )
         raw_dates[g_id] = (t_start, t_end)
     return raw_dates
@@ -1236,7 +1250,7 @@ def _calc_asap_dates(active_tasks, leveling_order, project_start_ord, cal):
         t_end = None if t_start is None else cal.business_end(t_start, t_info["days"], team_id)
         if t_end is None:
             raise SchedulingError(
-                tr("タスク '{g_id}' の最速日程を求められません。休業日の設定、または所要日数を見直してください。", g_id=g_id)
+                tr("タスク「{task}」の最速日程を求められません。休業日の設定、または所要日数を見直してください。", task=_task_label(t_info))
             )
         asap_dates[g_id] = (t_start, t_end)
     return asap_dates
@@ -1452,8 +1466,8 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
         if end_ord is None:
             raise SchedulingError(
                 tr(
-                    "タスク '{g_id}' の固定開始日 {date} から所要日数ぶんの稼働日を確保できません",
-                    g_id=g_id, date=pd.Timestamp.fromordinal(pin).date(),
+                    "タスク「{task}」の固定開始日 {date} から所要日数ぶんの稼働日を確保できません",
+                    task=_task_label(t_info), date=pd.Timestamp.fromordinal(pin).date(),
                 )
             )
         # 固定同士がぶつかる（同じチーム・同じ期間に固定が集中する）場合は、
@@ -1482,7 +1496,7 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
             max([project_start_ord, t_info.get("not_before_ord") or 0] + dep_ends), team_id
         )
         if earliest_start is None:
-            raise SchedulingError(tr("タスク '{g_id}' の着手可能日を求められません", g_id=g_id))
+            raise SchedulingError(tr("タスク「{task}」の着手可能日を求められません", task=_task_label(t_info)))
 
         # 締切から逆算した、このタスク自身の最遅開始日（鎖全体の残り所要日数を
         # 織り込み済みの静的な値）。依存元の実際の終了が想定より遅れた場合に
@@ -1502,7 +1516,7 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
             target_start = min(max(static_target, earliest_start), latest_start)
         target_start = cal.next_working_day(target_start, team_id)
         if target_start is None:
-            raise SchedulingError(tr("タスク '{g_id}' の配置基準日を求められません", g_id=g_id))
+            raise SchedulingError(tr("タスク「{task}」の配置基準日を求められません", task=_task_label(t_info)))
         # 上限が非稼働日の場合、その日を開始日とする窓は「次の稼働日を開始日と
         # する窓」と全く同じ期間を指す。稼働日に丸めておくことで、開始日が
         # 土日祝に記録されるのを防ぎつつ探索範囲は変えずに済む。
@@ -1538,7 +1552,7 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
 
         if placed is None:
             raise ResourceOverflowError(
-                tr("タスク '{g_id}'（チーム '{team_id}'）を配置できる日程が見つかりません。チームのライン数、休業日の設定、または所要日数を見直してください。", g_id=g_id, team_id=team_id)
+                tr("タスク「{task}」（チーム「{team}」）を配置できる日程が見つかりません。チームのライン数、休業日の設定、または所要日数を見直してください。", task=_task_label(t_info), team=_team_label(t_info))
             )
 
         start_ord, end_ord = placed
@@ -2167,7 +2181,7 @@ def _check_constraint_violations(active_tasks, scheduled, cal, overbooked_pins):
         if g_id in overbooked_pins:
             # ライン数の超過に「何日超過」に相当する量は無いので日数は0のまま。
             # 違反しているかどうかは説明文が空かどうかで判定する。
-            record(0, tr("固定開始日（{pin_label}）がチーム「{team_id}」のライン数を超えて予約されています", pin_label=pin_label, team_id=team_id))
+            record(0, tr("固定開始日（{pin_label}）がチーム「{team}」のライン数を超えて予約されています", pin_label=pin_label, team=_team_label(t_info)))
 
         if notes:
             violations[g_id] = (worst, tr("／").join(notes))
