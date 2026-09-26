@@ -26,11 +26,14 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
 
 from gui.app_settings import AppSettings  # noqa: E402
 from gui.db import ProjectDatabase  # noqa: E402
 from gui.main import MainWindow, apply_language  # noqa: E402
+from gui.node_canvas import TaskNodeEditDialog  # noqa: E402
+from gui.options_dialog import OptionsDialog  # noqa: E402
+from i18n import tr  # noqa: E402
 
 # ドキュメント用のサンプル（活用例の2つの題材。generate_guide_samples.py）
 NEW_TITLE = ROOT / "data" / "Guide_Sample_NewTitle.pschedule"
@@ -85,8 +88,76 @@ def _select_job(name):
     return setup
 
 
+# -- 3章 クイックスタート②のチュートリアル ----------------------------------------
+# 本文（docs/user_guide/ja/03_quickstart.md）の手順と同じ内容を、手順 step まで
+# 進めた状態のプロジェクトを作る。本文の手順を変えたら、ここも合わせて変える。
+TUTORIAL_NAME = "はじめてのアップデート"
+
+
+def _tutorial(step):
+    def build(tmp):
+        path = Path(tmp) / f"{TUTORIAL_NAME}.pschedule"
+        if path.exists():
+            path.unlink()
+        db = ProjectDatabase.create_new(str(path))
+        # 手順1: 基本情報
+        db.set_project(TUTORIAL_NAME, "2026-10-05")
+        db.add_milestone("配信", "2026-11-13", "")
+        planner = db.add_team("プランナー", 1)
+        art = db.add_team("アート", 2)
+        if step >= 1.5:  # 手順2: ワークフロー（1.5 はタスクを1件だけ追加した途中の状態）
+            wf = db.add_workflow("追加コンテンツ制作")
+            spec = db.add_workflow_task(wf, "仕様作成", planner, 3)
+        if step >= 2 and step != 1.5:
+            artwork = db.add_workflow_task(wf, "アート制作", art, 5)
+            check = db.add_workflow_task(wf, "確認", planner, 2)
+            db.add_task_dependency(wf, spec, artwork)
+            db.add_task_dependency(wf, artwork, check)
+        if step >= 3:  # 手順3: ジョブ
+            milestone = db.list_milestones()[0]["id"]
+            for name, priority in (("新キャラクター", 1), ("新ステージ", 2), ("新アイテム", 3)):
+                db.add_job(name, wf, milestone, priority)
+        if step >= 4:  # 手順4: 配置コントロールを「最速」にする
+            db.set_distribution_ratio(0.0)
+        if step >= 5:  # 手順5: 条件を変えてみる
+            db.update_team(planner, "プランナー", 2)
+        db.save()
+        db.close()
+        return path
+    build.key = ("tutorial", step)
+    return build
+
+
+def _task_dialog(app, window):
+    """ワークフロー設計タブの「タスクを追加」ダイアログ（入力途中の状態）。"""
+    window.tabs.setCurrentIndex(TAB_WORKFLOWS)
+    db = window.db
+    wf = db.list_workflows()[0]["id"]
+    art = next(t["id"] for t in db.list_teams() if t["name"] == "アート")
+    dialog = TaskNodeEditDialog(db, tr("タスクを追加"), name="アート制作", team_id=art, days=5,
+                                workflow_id=wf, parent=window)
+    for i in range(dialog.predecessor_list.count()):
+        item = dialog.predecessor_list.item(i)
+        item.setSelected(item.text() == "仕様作成")
+    return dialog
+
+
+def _options_dialog(app, window):
+    dialog = OptionsDialog(window.app_settings, window)
+    # 保存先の表示に一時フォルダのパスが写り込まないよう、ファイル名だけにする
+    for label in dialog.findChildren(QLabel):
+        if window.app_settings.path in label.text():
+            label.setText(label.text().replace(window.app_settings.path, Path(window.app_settings.path).name))
+    return dialog
+
+
 # (画像の名前, 開くサンプル, 場面を作る関数)。撮りたい場面はここに足す。
+# 開くサンプルは、ファイルのパス・一時フォルダを受けてパスを返す関数（_tutorial）・
+# None（何も開いていない起動直後。先頭に置く）のいずれか。
+# 場面を作る関数がダイアログを返したときは、ウィンドウではなくそのダイアログを撮る。
 SHOTS = [
+    ("startup", None, lambda app, window: None),
+    ("options_dialog", None, _options_dialog),
     ("basic_info_tab", NEW_TITLE, _show_tab(TAB_BASIC_INFO)),
     ("workflows_tab", NEW_TITLE, _show_tab(TAB_WORKFLOWS)),
     ("jobs_tab", NEW_TITLE, _show_tab(TAB_JOBS)),
@@ -94,13 +165,22 @@ SHOTS = [
     ("analysis_tab", NEW_TITLE, _show_tab(TAB_ANALYSIS, needs_schedule=True)),
     ("update_jobs_tab", UPDATE, _select_job("新キャラクター")),
     ("update_gantt_tab", UPDATE, _show_tab(TAB_GANTT, needs_schedule=True)),
+    ("tutorial_1_basic_info", _tutorial(1), _show_tab(TAB_BASIC_INFO)),
+    ("tutorial_2_task_dialog", _tutorial(1.5), _task_dialog),
+    ("tutorial_2_workflow", _tutorial(2), _show_tab(TAB_WORKFLOWS)),
+    ("tutorial_3_jobs", _tutorial(3), _show_tab(TAB_JOBS)),
+    ("tutorial_4_gantt", _tutorial(4), _show_tab(TAB_GANTT, needs_schedule=True)),
+    ("tutorial_5_gantt", _tutorial(5), _show_tab(TAB_GANTT, needs_schedule=True)),
 ]
 
 
 def _open_sample(app, window, sample, tmp):
     """サンプルを一時フォルダへコピーして開く（元のファイルは変えない）。"""
-    project = Path(tmp) / sample.name
-    shutil.copy(sample, project)
+    if callable(sample):
+        project = sample(tmp)
+    else:
+        project = Path(tmp) / sample.name
+        shutil.copy(sample, project)
     window._open_database(ProjectDatabase.open_existing(str(project)))
     # ステータスバーには開いたファイルのパスが出る。一時フォルダのパスが
     # 写り込まないよう、ファイル名だけにする。
@@ -116,7 +196,10 @@ def capture(language, only=None):
     apply_language(app, language)
 
     with tempfile.TemporaryDirectory() as tmp:
-        window = MainWindow(app_settings=AppSettings(str(Path(tmp) / "settings.ini")))
+        settings = AppSettings(str(Path(tmp) / "settings.ini"))
+        # オプション画面の表示言語が撮影環境のOSの言語にならないよう、撮る言語にそろえる
+        settings.set("language", language)
+        window = MainWindow(app_settings=settings)
         window.resize(*WINDOW_SIZE)
         window.show()
 
@@ -126,13 +209,20 @@ def capture(language, only=None):
             for name, sample, setup in SHOTS:
                 if only and name not in only:
                     continue
-                if sample != opened:
+                key = getattr(sample, "key", sample)
+                if sample is not None and key != opened:
                     _open_sample(app, window, sample, tmp)
-                    opened = sample
-                setup(app, window)
+                    opened = key
+                dialog = setup(app, window)
+                if dialog is not None:
+                    dialog.show()
                 _settle(app)
                 path = out_dir / f"{name}.png"
-                if not window.grab().save(str(path)):
+                target = dialog if dialog is not None else window
+                ok = target.grab().save(str(path))
+                if dialog is not None:
+                    dialog.close()
+                if not ok:
                     raise RuntimeError(f"画像を保存できませんでした: {path}")
                 saved.append(path)
                 print(f"saved {path.relative_to(ROOT)}")
