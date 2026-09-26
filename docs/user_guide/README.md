@@ -8,6 +8,7 @@
 | `outline.md` | 目次・各章の要点・執筆方針 |
 | `ja/NN_*.md` | 原稿（日本語）。ファイル名の番号順に1冊へまとめる |
 | `images/<言語>/*.png` | 画面の画像。`scripts/user_guide/capture_screenshots.py` が撮る（手で編集しない） |
+| `data/Guide_Sample_*.pschedule` | 撮影に使うサンプル。`scripts/user_guide/generate_guide_samples.py` が作る（業界を問わない題材: 新製品の立ち上げ／社内システムの導入） |
 | `scripts/user_guide/build_pdf.py` | 原稿＋画像から `output/user_guide_<言語>.pdf` を作る |
 
 ## 手順
@@ -15,7 +16,10 @@
 ```bash
 pip install -r requirements.txt -r requirements-docs.txt
 
-# 1. 画面を撮る（同梱サンプルを開いて撮影。画面を変えたら撮り直す）
+# 0. 撮影用のサンプルを作る（サンプルの内容を変えたときだけ）
+python scripts/user_guide/generate_guide_samples.py
+
+# 1. 画面を撮る（撮影用サンプルを開いて撮影。画面を変えたら撮り直す）
 python scripts/user_guide/capture_screenshots.py
 
 # 2. PDFを作る（--html を付けると確認用のHTMLも output/ に残る）
