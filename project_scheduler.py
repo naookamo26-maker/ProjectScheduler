@@ -784,11 +784,37 @@ def _build_scheduling_order(active_tasks, active_ids):
 
     if len(scheduling_order) != len(active_ids):
         remaining = active_ids - set(scheduling_order)
-        raise CircularDependencyError(
-            tr("循環依存が検出されました。関係するタスク: {remaining}", remaining=sorted(remaining))
-        )
+        raise CircularDependencyError(_circular_dependency_message(active_tasks, remaining))
 
     return successors, scheduling_order
+
+
+_CYCLE_TASKS_SHOWN = 10
+
+
+def _circular_dependency_message(active_tasks, remaining):
+    """循環依存のエラーメッセージ。利用者が画面で見るので、内部ID（JOB_001:T_002）ではなく
+    「ジョブ名 / タスク名」で示す。
+
+    remaining（逆方向Kahnで順番を決められなかったタスク）には、輪そのものに加えて、
+    輪の手前で待っているだけのタスクも含まれる。remaining の中で先行タスクを持たない
+    ものを繰り返し除くと、輪（と輪どうしをつなぐ経路）に関わるタスクだけが残る。"""
+    left = set(remaining)
+    changed = True
+    while changed:
+        changed = False
+        for g_id in list(left):
+            if not any(dep in left for dep in active_tasks[g_id]["deps"]):
+                left.discard(g_id)
+                changed = True
+    members = left or set(remaining)
+    labels = sorted(
+        f'{active_tasks[g_id]["job_name"]} / {active_tasks[g_id]["task_name"]}' for g_id in members
+    )
+    tasks = tr("、").join(labels[:_CYCLE_TASKS_SHOWN])
+    if len(labels) > _CYCLE_TASKS_SHOWN:
+        tasks = tr("{tasks} ほか{n}件", tasks=tasks, n=len(labels) - _CYCLE_TASKS_SHOWN)
+    return tr("循環依存が検出されました。次のタスクが、輪になって互いの完了を待っています: {tasks}", tasks=tasks)
 
 
 def _build_leveling_order(active_tasks, active_ids, successors):
