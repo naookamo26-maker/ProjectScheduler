@@ -255,6 +255,9 @@ UP_JOB_LINKS = [
 
 # 進み具合を反映した途中の状態（定例ミーティングで更新した想定）
 UP_OVERRIDES = [
+    # 各コンテンツの仕様作成は「仕様確定」までに終える
+    *[(content, "仕様作成", {"milestone_id": "仕様確定"})
+      for content in ("新キャラクター", "新ステージ", "イベントクエスト", "新アイテム")],
     ("新キャラクター", "仕様作成", {"status": "done"}),
     ("新キャラクター", "データ作成", {"status": "done"}),
     ("新キャラクター", "アート制作", {"status": "in_progress"}),
@@ -307,7 +310,12 @@ def _build(path, project, teams, milestones, holidays, workflows, templates,
     for job, depends_on in job_links:
         db.add_job_dependency_link(job_ids[job], job_ids[depends_on])
 
+    # upsert_job_task_override は行ごと置き換えるので、同じタスクへの上書きは
+    # まとめてから1回で書き込む（別々に書くと、後の行が先の行の値を消す）
+    merged = {}
     for job, task, fields in overrides:
+        merged.setdefault((job, task), {}).update(fields)
+    for (job, task), fields in merged.items():
         if "milestone_id" in fields:  # 原稿ではマイルストーンを名前で書く
             fields = {**fields, "milestone_id": milestone_ids[fields["milestone_id"]]}
         db.upsert_job_task_override(job_ids[job], task_ids[(job_workflow[job], task)], **fields)

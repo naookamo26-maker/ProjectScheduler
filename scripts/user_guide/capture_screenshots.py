@@ -94,6 +94,17 @@ def _select_job(name):
     return setup
 
 
+def _select_job_wide(name):
+    """_select_job に加えて、右側（タスク上書き）を広げる。状態・開始固定日の列まで見せたいときに使う。"""
+    select = _select_job(name)
+
+    def setup(app, window):
+        select(app, window)
+        window.tab_jobs.main_splitter.setSizes([380, 880])
+        _settle(app)
+    return setup
+
+
 def _select_workflow(name, view=0):
     """ワークフロー設計タブで、指定したワークフローを選び、ビュー（0=ノード、1=テーブル）を切り替える。"""
     def setup(app, window):
@@ -319,6 +330,16 @@ def _plan_replanned(app, window):
     _settle(app)
 
 
+def _update_plan_sample(tmp):
+    """8章B用に、アップデートのサンプルを別のコピーとして開く（確定して使う）。"""
+    path = Path(tmp) / "冬のアップデートの制作.pschedule"
+    shutil.copy(UPDATE, path)
+    return path
+
+
+_update_plan_sample.key = ("update_plan",)
+
+
 def _replan_dialog(app, window):
     dialog = ReplanDialog(window.db, today=PLAN_TODAY, parent=window)
     return dialog
@@ -435,8 +456,6 @@ SHOTS = [
     ("workflows_table", NEW_TITLE, _select_workflow("キャラクター制作", view=1)),
     ("workflows_cutscene", NEW_TITLE, _select_workflow("カットシーン制作", view=0)),
     ("jobs_opening", NEW_TITLE, _job_with_dependencies("オープニング")),
-    ("update_jobs_tab", UPDATE, _select_job("新キャラクター")),
-    ("update_gantt_tab", UPDATE, _show_tab(TAB_GANTT, needs_schedule=True)),
     ("tutorial_1_basic_info", _tutorial(1), _show_tab(TAB_BASIC_INFO)),
     ("tutorial_2_task_dialog", _tutorial(1.5), _task_dialog),
     ("tutorial_2_workflow", _tutorial(2), _show_tab(TAB_WORKFLOWS)),
@@ -449,6 +468,10 @@ SHOTS = [
     ("gantt_editor", _tutorial(4), _gantt_editor("新アイテム", "アート制作")),
     ("tutorial_5_gantt", _tutorial(5), _show_tab(TAB_GANTT, needs_schedule=True)),
     ("gantt_legend", _bar_legend, _show_tab(TAB_GANTT, needs_schedule=True)),
+    # 8章B アップデートの制作（確定してから、進み具合を記録した状態を見せる）
+    ("update_plan_gantt", _update_plan_sample, _plan_confirm),
+    ("update_plan_jobs", _update_plan_sample, _select_job_wide("新キャラクター")),
+    ("update_plan_analysis", _update_plan_sample, _analysis_section(0)),
     # 7章 配置コントロールの効果（チャートの部分だけを切り出す）
     ("placement_0", _placement_example(0), _show_tab(TAB_GANTT, needs_schedule=True), (0, 120, 1280, 560)),
     ("placement_70", _placement_example(70), _show_tab(TAB_GANTT, needs_schedule=True), (0, 120, 1280, 560)),
