@@ -129,4 +129,4 @@
 
 1. ~~画面の自動撮影スクリプト~~（`scripts/user_guide/capture_screenshots.py`）
 2. ~~Markdown → PDF のビルドスクリプト~~（`scripts/user_guide/build_pdf.py`。手順は `README.md`）
-3. 0章から順に本文を執筆（0章は試作済み）
+3. 0章から順に本文を執筆（0章・1章は執筆済み）
