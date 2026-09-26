@@ -324,6 +324,35 @@ def _replan_dialog(app, window):
     return dialog
 
 
+# -- 7章 日程の決まり方 --------------------------------------------------------------
+def _placement_example(percent):
+    """配置コントロールの効果を見せる小さなプロジェクト。ライン数を「指定なし」にして
+    チームの取り合いを無くし、配置コントロールの違いだけが日程に出るようにする。"""
+    def build(tmp):
+        path = Path(tmp) / "配置の例.pschedule"
+        if path.exists():
+            path.unlink()
+        db = ProjectDatabase.create_new(str(path))
+        db.set_project("配置の例", "2026-10-05")
+        db.set_distribution_ratio(percent / 100)
+        release = db.add_milestone("配信", "2026-11-13", "")
+        planner = db.add_team("プランナー", None)
+        art = db.add_team("アート", None)
+        wf = db.add_workflow("追加コンテンツ制作")
+        spec = db.add_workflow_task(wf, "仕様作成", planner, 3)
+        make = db.add_workflow_task(wf, "アート制作", art, 5)
+        check = db.add_workflow_task(wf, "確認", planner, 2)
+        db.add_task_dependency(wf, spec, make)
+        db.add_task_dependency(wf, make, check)
+        for name, priority in (("新キャラクター", 1), ("新ステージ", 2), ("新アイテム", 3)):
+            db.add_job(name, wf, release, priority)
+        db.save()
+        db.close()
+        return path
+    build.key = ("placement", percent)
+    return build
+
+
 # -- 3章 クイックスタート②のチュートリアル ----------------------------------------
 # 本文（docs/user_guide/ja/03_quickstart.md）の手順と同じ内容を、手順 step まで
 # 進めた状態のプロジェクトを作る。本文の手順を変えたら、ここも合わせて変える。
@@ -420,6 +449,10 @@ SHOTS = [
     ("gantt_editor", _tutorial(4), _gantt_editor("新アイテム", "アート制作")),
     ("tutorial_5_gantt", _tutorial(5), _show_tab(TAB_GANTT, needs_schedule=True)),
     ("gantt_legend", _bar_legend, _show_tab(TAB_GANTT, needs_schedule=True)),
+    # 7章 配置コントロールの効果（チャートの部分だけを切り出す）
+    ("placement_0", _placement_example(0), _show_tab(TAB_GANTT, needs_schedule=True), (0, 120, 1280, 560)),
+    ("placement_70", _placement_example(70), _show_tab(TAB_GANTT, needs_schedule=True), (0, 120, 1280, 560)),
+    ("placement_100", _placement_example(100), _show_tab(TAB_GANTT, needs_schedule=True), (0, 120, 1280, 560)),
     # 6章 計画の確定と再計画（同じコピーに対して、この順に操作を重ねる）
     ("plan_confirmed", _plan_sample, _plan_confirm),
     ("plan_draft", _plan_sample, _plan_draft),
