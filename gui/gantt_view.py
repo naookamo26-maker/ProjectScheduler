@@ -29,7 +29,7 @@ QGraphicsView は setSceneRect() だけでは実際の描画をクリップし�
 from collections import namedtuple
 from datetime import date, timedelta
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -594,6 +594,12 @@ class _FrozenPaneView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setInteractive(False)
         self.setFrameShape(QGraphicsView.NoFrame)
+        # 本体の枠・スクロールバーに合わせて表示部分の外に余白を取る
+        # （FrozenGanttPane._align_frozen_viewports）。余白も同じ背景色で塗る。
+        self.setAutoFillBackground(True)
+        pal = self.palette()
+        pal.setColor(self.backgroundRole(), _PANE_BG)
+        self.setPalette(pal)
         # GanttGraphicsView と同じ理由（ファイルドロップをMainWindowへ
         # 伝播させるため）で無効化する。
         self.setAcceptDrops(False)
@@ -666,6 +672,9 @@ class FrozenGanttPane(QWidget):
         grid.setRowStretch(1, 1)
 
         self.body.transformChanged.connect(self._sync_panes)
+        # 本体の表示部分の大きさ・位置は、ウィンドウの大きさやスクロールバーの
+        # 表示／非表示で変わる。そのたびにヘッダー・左列を合わせ直す。
+        self.body.viewport().installEventFilter(self)
         self.body.fitAllRequested.connect(self.fit_all)
         self.body.fitSelectedRequested.connect(self.fit_selected)
         self.column.jobClicked.connect(self._select_job)
@@ -780,7 +789,30 @@ class FrozenGanttPane(QWidget):
         self.body._clamp_scale()
         self._sync_panes()
 
+    def eventFilter(self, obj, event):
+        if obj is self.body.viewport() and event.type() in (QEvent.Resize, QEvent.Move):
+            self._sync_panes()
+        return super().eventFilter(obj, event)
+
+    def _align_frozen_viewports(self):
+        """ヘッダーの表示部分を本体の表示部分と同じ横位置・横幅に、左列の表示部分を
+        同じ縦位置・縦幅にそろえる。本体には枠とスクロールバーがあるため、そのままでは
+        ヘッダー・左列の方が広く、スクロールできる範囲が食い違う。すると端まで
+        スクロールしたときに、本体だけがスクロールバーの幅だけ先へ進み、日付・
+        マイルストーンの線や行の位置がずれる。"""
+        viewport = self.body.viewport()
+        origin = viewport.mapTo(self, QPoint(0, 0))
+        header = self.header.geometry()
+        left = origin.x() - header.x()
+        right = header.x() + header.width() - (origin.x() + viewport.width())
+        self.header.setViewportMargins(max(0, left), 0, max(0, right), 0)
+        column = self.column.geometry()
+        top = origin.y() - column.y()
+        bottom = column.y() + column.height() - (origin.y() + viewport.height())
+        self.column.setViewportMargins(0, max(0, top), 0, max(0, bottom))
+
     def _sync_panes(self):
+        self._align_frozen_viewports()
         body_transform = self.body.transform()
         sx, sy = body_transform.m11(), body_transform.m22()
 
