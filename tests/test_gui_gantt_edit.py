@@ -457,3 +457,40 @@ def test_task_name_does_not_overlap_the_pin_marker(qapp, gantt):
     bar_w_px = bar.bar_rect.width() * 8.0
     assert visible
     assert abs((offset_tall + label.boundingRect().width() / 2) - bar_w_px / 2) < 2
+
+
+def _screen_x(view, scene_x):
+    return view.viewport().mapToGlobal(view.mapFromScene(QPointF(scene_x, 0))).x()
+
+
+def _screen_y(view, scene_y):
+    return view.viewport().mapToGlobal(view.mapFromScene(QPointF(0, scene_y))).y()
+
+
+@pytest.mark.parametrize("h_end, v_end", [("min", "min"), ("max", "max")])
+def test_header_and_job_column_stay_aligned_with_the_body_at_the_scroll_ends(qapp, gantt, h_end, v_end):
+    """拡大して本体を端までスクロールしても、見出し（日付・マイルストーンの線）と
+    ジョブ名の列が本体とずれない。本体にはスクロールバーと枠があるので、見出し・列の
+    表示幅をそれに合わせていないと、端では本体だけがスクロールバーの幅だけ先へ進む。"""
+    w, tab, ids = gantt
+    pane = tab.view
+    body = pane.body
+    body.scale(6.0, 6.0)
+    body._clamp_scale()
+    pane._sync_panes()
+    qapp.processEvents()
+    h_bar, v_bar = body.horizontalScrollBar(), body.verticalScrollBar()
+    assert h_bar.isVisible() and v_bar.isVisible()
+    h_bar.setValue(getattr(h_bar, h_end + "imum")())
+    v_bar.setValue(getattr(v_bar, v_end + "imum")())
+    qapp.processEvents()
+
+    rect = body.scene().gantt_body_rect
+    for scene_x in (rect.left() + 5, rect.center().x(), rect.right() - 5):
+        if body.viewport().rect().contains(body.mapFromScene(QPointF(scene_x, rect.top()))):
+            assert _screen_x(pane.header, scene_x) == _screen_x(body, scene_x)
+    visible = body.mapToScene(body.viewport().rect()).boundingRect()
+    assert _screen_x(pane.header, visible.left()) == _screen_x(body, visible.left())
+    assert _screen_x(pane.header, visible.right()) == _screen_x(body, visible.right())
+    assert _screen_y(pane.column, visible.top()) == _screen_y(body, visible.top())
+    assert _screen_y(pane.column, visible.bottom()) == _screen_y(body, visible.bottom())
