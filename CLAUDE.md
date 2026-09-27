@@ -34,7 +34,7 @@
 
 | マーカー | 対象モジュール | 必要な依存 | 件数 / 時間 |
 | --- | --- | --- | --- |
-| `core` | `gui/db.py` `gui/db_schema.py` `gui/undo_manager.py` `gui/gantt_edit.py` `i18n.py` `locales/` | pytestのみ | 143件 / 約4秒 |
+| `core` | `gui/db.py` `gui/db_schema.py` `gui/undo_manager.py` `gui/gantt_edit.py` `i18n.py` `locales/` `app_version.py` | pytestのみ | 143件 / 約4秒 |
 | `scheduler` | `project_scheduler.py` `gui/gantt_generator.py` `gui/summary_metrics.py` `gui/plan_confirmation.py` `gui/plan_actions.py` | + pandas, numpy | 146件 / 約2.8秒 |
 | `gui` | `gui/`のウィジェット層・描画層 | + PySide6 + システムライブラリ | 166件 / 約45秒 |
 
@@ -42,7 +42,7 @@
 
 | 変更した場所 | コマンド |
 | --- | --- |
-| `gui/db.py`, `gui/db_schema.py`, `gui/undo_manager.py`, `gui/gantt_edit.py`, `i18n.py`, `locales/*.json` | `pytest -m core` |
+| `gui/db.py`, `gui/db_schema.py`, `gui/undo_manager.py`, `gui/gantt_edit.py`, `i18n.py`, `locales/*.json`, `app_version.py` | `pytest -m core` |
 | `project_scheduler.py`, `gui/gantt_generator.py`, `gui/summary_metrics.py`, `gui/plan_confirmation.py`, `gui/plan_actions.py` | `pytest -m scheduler` |
 | `gui/resource_histogram.py`, `gui/node_canvas.py`, `gui/gantt_view.py`, `gui/analysis_charts.py`, `gui/schedule_cache.py`, `gui/tab_*.py`, `gui/main.py`, `gui/widgets_common.py`, `gui/plan_band.py`, `gui/app_settings.py`, `gui/options_dialog.py`, `gui/gantt_task_editor.py`, `gui/replan_dialog.py` | `pytest -m gui` |
 | ドキュメント・README・コメントのみ | 実行しない |

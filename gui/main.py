@@ -6,6 +6,7 @@ File メニューでプロジェクトファイル（.pschedule）の新規作�
 プロジェクトファイルをウィンドウにドラッグ&ドロップして開くこともできる。
 """
 
+import html
 import sys
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app_version import APP_VERSION
 from gui.app_settings import AppSettings
 from i18n import current_language, set_language, tr
 from gui.db import ProjectDatabase
@@ -296,6 +298,25 @@ class MainWindow(QMainWindow):
         options_action = QAction(tr("オプション(&O)..."), self)
         options_action.triggered.connect(self.on_options)
         edit_menu.addAction(options_action)
+
+        help_menu = self.menuBar().addMenu(tr("ヘルプ(&H)"))
+        about_action = QAction(tr("バージョン情報(&A)..."), self)
+        about_action.triggered.connect(self.on_about)
+        help_menu.addAction(about_action)
+
+    def about_box(self):
+        """「ヘルプ」→「バージョン情報」で出すメッセージボックス（表示はしない。
+        on_about が表示し、テストと利用者ガイドの撮影はこれを直接使う）。"""
+        box = QMessageBox(self)
+        box.setWindowTitle(tr("バージョン情報"))
+        box.setIconPixmap(QIcon(str(app_icon_path())).pixmap(64, 64))
+        box.setText("<b>" + html.escape(tr("プロジェクトスケジューラー")) + "</b>")
+        box.setInformativeText(tr("バージョン {version}", version=APP_VERSION))
+        box.setStandardButtons(QMessageBox.Ok)
+        return box
+
+    def on_about(self):
+        self.about_box().exec()
 
     def on_options(self):
         dialog = OptionsDialog(self.app_settings, self)
@@ -700,6 +721,7 @@ def main():
     app = QApplication(sys.argv)
     # 利用者ごとの設定フォルダ（QStandardPaths.AppConfigLocation）の名前になる。
     app.setApplicationName("ProjectScheduler")
+    app.setApplicationVersion(APP_VERSION)
     # 全ウィンドウ・ダイアログとタスクバーのアイコンになる（.exe のアイコンは spec の icon=）。
     app.setWindowIcon(QIcon(str(app_icon_path())))
     app_settings = AppSettings()

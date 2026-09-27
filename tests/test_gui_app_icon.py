@@ -16,7 +16,9 @@ pytest.importorskip("pandas")
 from PySide6.QtGui import QIcon  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from gui.main import app_icon_path  # noqa: E402
+from app_version import APP_VERSION  # noqa: E402
+from gui.app_settings import AppSettings  # noqa: E402
+from gui.main import MainWindow, app_icon_path  # noqa: E402
 
 pytestmark = pytest.mark.gui
 
@@ -38,3 +40,20 @@ def test_icon_loads_with_all_required_sizes():
     assert not icon.isNull()
     sizes = {s.width() for s in icon.availableSizes()}
     assert REQUIRED_SIZES <= sizes
+
+
+def test_help_menu_shows_the_version(tmp_path):
+    """「ヘルプ」→「バージョン情報」で、アプリ名とバージョンを確かめられる。"""
+    QApplication.instance() or QApplication([])
+    window = MainWindow(app_settings=AppSettings(str(tmp_path / "settings.ini")))
+    try:
+        menus = {a.text(): a.menu() for a in window.menuBar().actions()}
+        help_menu = menus["ヘルプ(&H)"]
+        assert [a.text() for a in help_menu.actions()] == ["バージョン情報(&A)..."]
+        box = window.about_box()
+        assert box.windowTitle() == "バージョン情報"
+        assert "プロジェクトスケジューラー" in box.text()
+        assert box.informativeText() == f"バージョン {APP_VERSION}"
+        assert not box.iconPixmap().isNull()
+    finally:
+        window.close()
