@@ -34,6 +34,9 @@ python scripts/user_guide/build_pdf.py
   印刷する。読み取りに poppler の `pdfinfo` を使う（Linux では `poppler-utils`、Windows では
   poppler を入れて `pdfinfo` にパスを通す）。
 - 撮る場面を増やすときは、`capture_screenshots.py` の `SHOTS` に1行足す。
+- GitHub Actions の「Build Windows exe」を実行すると、手順2のPDFも作られ、`.exe` と同じzipに
+  入る（`docs/packaging.md`）。画像はコミット済みのものを使うので、画面を変えたら手順1で撮り直して
+  コミットしておく。
 
 ## 表紙
 
