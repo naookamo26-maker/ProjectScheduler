@@ -48,8 +48,12 @@ class ProjectDatabaseError(Exception):
     """DB層で検出した業務エラー（一意性違反・不正な削除など）の基底クラス"""
 
 
-class DuplicateNameError(ProjectDatabaseError):
-    pass
+class InvalidNameError(ProjectDatabaseError):
+    """名前として使えない（空欄・空白だけ、または既に使われている）場合"""
+
+
+class DuplicateNameError(InvalidNameError):
+    """名前（または日付など、一意であるべき値）が既に使われている場合"""
 
 
 class ReferencedEntityError(ProjectDatabaseError):
@@ -60,6 +64,15 @@ class ReferencedEntityError(ProjectDatabaseError):
 #: FS = Finish-to-Start（先行タスクの完了後に開始）
 #: SS = Start-to-Start（先行タスクの開始に合わせて開始）
 DEPENDENCY_KINDS = ("FS", "SS")
+
+#: 入力を受け付ける日付の上限（締切日・休業日・開始固定日など）。スケジューラが
+#: 日付を扱う pandas の Timestamp は 2262-04-11 までしか表せず、それより後の日付が
+#: あると計算が想定外のエラー（OverflowError 等）で止まる。日本の祝日の計算式も
+#: 遠い未来では成り立たない。実務には十分先で、その手前に余裕を持たせた値にする。
+#: GUIの日付欄の上限（gui/widgets_common.py）と、生成前の検査
+#: （gui/gantt_generator.py の validate_for_generation。この値より後の日付を持つ
+#: 既存のファイル向け）で使う。
+MAX_SUPPORTED_DATE = "2199-12-31"
 
 #: ラグ（営業日）の許容範囲。上限は「1タスクの所要日数として現実的な桁」に
 #: 合わせた安全弁で、業務上の意味があるわけではない（入力ミスで
@@ -102,6 +115,20 @@ def _assign_stable_key(conn, job_id):
     conn.execute(
         "UPDATE jobs SET stable_key = printf('JOB_%03d', id) WHERE id = ?", (job_id,)
     )
+
+
+def normalize_name(name):
+    """マイルストーン・チーム・ワークフロー・タスク・ジョブの名前を検証し、前後の
+    空白を落として返す。空欄・空白だけなら InvalidNameError。
+
+    画面の選択肢や絞り込みでは名前だけで見分けるため、空の名前は何も表示されない
+    項目になり、前後の空白だけが違う名前（"A" と "A "）は見分けられない。GUIの
+    入力欄ごとに検査すると漏れる（実際にマイルストーン・チーム・ジョブの名前は
+    空で登録できていた）ので、書き込み経路のここに集約する。"""
+    name = "" if name is None else str(name).strip()
+    if not name:
+        raise InvalidNameError(tr("名前を入力してください"))
+    return name
 
 
 def _validate_start_pin_date(value):
@@ -214,7 +241,14 @@ def undoable(label):
         def wrapper(self, *args, **kwargs):
             resolved_label = label(self, *args, **kwargs) if callable(label) else label
             with self.undo_group(resolved_label):
-                return fn(self, *args, **kwargs)
+                try:
+                    return fn(self, *args, **kwargs)
+                except BaseException:
+                    # 失敗した操作の書きかけ（コミット前の変更）を残さない。
+                    # Undo単位を閉じる前に戻すので、Undoにも積まれない
+                    # （_rollback_uncommitted のdocstring参照）。
+                    self._rollback_uncommitted()
+                    raise
 
         # 反射テストからデコレータの適用有無を判定するための目印。
         wrapper._is_undoable = True
@@ -361,6 +395,10 @@ class ProjectDatabase:
             return False
         label, before_db, before_ui = self._open_group
         self._open_group = None
+        if self.undo_manager is None:
+            # 開いた後にUndo管理が外された（別のプロジェクトへ切り替える途中に、
+            # 旧タブの入力欄からフォーカスが外れた等）。積む先が無いので閉じるだけ。
+            return False
         after_db = self.serialize_state()
         if after_db != before_db:
             self.undo_manager.push(before_db, before_ui, after_db, label)
@@ -505,6 +543,13 @@ class ProjectDatabase:
         一時ファイルを同じフォルダに作るのは、os.replace() が同一ファイル
         システム上でしか原子的に置き換えられないため（テンポラリ領域が別の
         ドライブにあると保証が崩れる）。"""
+        # 開いたままのトランザクションがあると backup() が終わらなくなる
+        # （_rollback_uncommitted 参照）。変更系メソッドは失敗時に巻き戻し、成功時は
+        # コミットするので通常は残らないが、残っていた場合の最後の砦として確定させる
+        # ——メモリ上の内容（Undoのスナップショットにも写っている、画面に見えている
+        # 内容）をそのまま保存するのが正しいため、捨てずにコミットする。
+        if self._conn.in_transaction:
+            self._conn.commit()
         p = Path(path)
         fd, tmp_name = tempfile.mkstemp(dir=str(p.parent), prefix=f".{p.name}.", suffix=".tmp")
         os.close(fd)  # sqlite3が自分で開き直すため、ここではファイル名の確保だけが目的
@@ -539,6 +584,20 @@ class ProjectDatabase:
         self._dirty = True
         self._revision += 1
         self._notify_change()
+
+    def _rollback_uncommitted(self):
+        """コミットしていない変更を捨て、開いたままのトランザクションを閉じる。
+
+        sqlite3 は INSERT/UPDATE/DELETE の前に暗黙にトランザクションを始めるため、
+        その文が一意制約違反等で失敗すると、何も変わっていなくてもトランザクション
+        だけが開いたまま残る。この状態で保存すると、_write_to() の backup() が
+        「書き込み中」（SQLITE_LOCKED）を返し続け、Python がそれを無限に再試行して
+        アプリが固まる（名前の重複エラーの直後に Ctrl+S を押すだけで起きていた）。"""
+        try:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+        except sqlite3.ProgrammingError:
+            pass  # 既に閉じたDB（戻すものは無い。元の例外をそのまま伝える）
 
     def _notify_change(self):
         if self.on_change is not None:
@@ -589,6 +648,7 @@ class ProjectDatabase:
 
     @undoable(lambda self, name, end_date, note="": tr("マイルストーン「{name}」を追加", name=name))
     def add_milestone(self, name, end_date, note=""):
+        name = normalize_name(name)
         try:
             cur = self._conn.execute(
                 "INSERT INTO milestones(name, end_date, note) VALUES (?, ?, ?)",
@@ -601,6 +661,7 @@ class ProjectDatabase:
 
     @undoable(lambda self, milestone_id, name, end_date, note="": tr("マイルストーン「{name}」を変更", name=name))
     def update_milestone(self, milestone_id, name, end_date, note=""):
+        name = normalize_name(name)
         try:
             self._conn.execute(
                 "UPDATE milestones SET name = ?, end_date = ?, note = ? WHERE id = ?",
@@ -634,6 +695,7 @@ class ProjectDatabase:
 
     @undoable(lambda self, name, max_lines: tr("チーム「{name}」を追加", name=name))
     def add_team(self, name, max_lines):
+        name = normalize_name(name)
         try:
             cur = self._conn.execute(
                 "INSERT INTO teams(name, max_lines) VALUES (?, ?)", (name, max_lines)
@@ -645,6 +707,7 @@ class ProjectDatabase:
 
     @undoable(lambda self, team_id, name, max_lines: tr("チーム「{name}」を変更", name=name))
     def update_team(self, team_id, name, max_lines):
+        name = normalize_name(name)
         try:
             self._conn.execute(
                 "UPDATE teams SET name = ?, max_lines = ? WHERE id = ?",
@@ -769,6 +832,7 @@ class ProjectDatabase:
 
     @undoable(lambda self, name: tr("ワークフロー「{name}」を追加", name=name))
     def add_workflow(self, name):
+        name = normalize_name(name)
         next_order = self._conn.execute(
             "SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM workflows"
         ).fetchone()["n"]
@@ -793,6 +857,7 @@ class ProjectDatabase:
 
     @undoable(lambda self, workflow_id, name: tr("ワークフロー名を「{name}」に変更", name=name))
     def rename_workflow(self, workflow_id, name):
+        name = normalize_name(name)
         try:
             self._conn.execute(
                 "UPDATE workflows SET name = ? WHERE id = ?", (name, workflow_id)
@@ -918,6 +983,7 @@ class ProjectDatabase:
 
     @undoable(lambda self, workflow_id, name, team_id, default_days: tr("タスク「{name}」を追加", name=name))
     def add_workflow_task(self, workflow_id, name, team_id, default_days):
+        name = normalize_name(name)
         try:
             cur = self._conn.execute(
                 "INSERT INTO workflow_tasks(workflow_id, name, team_id, default_days) "
@@ -933,6 +999,7 @@ class ProjectDatabase:
 
     @undoable(lambda self, task_id, name, team_id, default_days: tr("タスク「{name}」を変更", name=name))
     def update_workflow_task(self, task_id, name, team_id, default_days):
+        name = normalize_name(name)
         try:
             self._conn.execute(
                 "UPDATE workflow_tasks SET name = ?, team_id = ?, default_days = ? "
@@ -1040,6 +1107,7 @@ class ProjectDatabase:
 
     @undoable(lambda self, name, workflow_id, default_milestone_id, priority=None, tags="": tr("ジョブ「{name}」を追加", name=name))
     def add_job(self, name, workflow_id, default_milestone_id, priority=None, tags=""):
+        name = normalize_name(name)
         try:
             cur = self._conn.execute(
                 "INSERT INTO jobs(name, workflow_id, default_milestone_id, priority, tags) "
@@ -1054,6 +1122,7 @@ class ProjectDatabase:
 
     @undoable(lambda self, job_id, name, workflow_id, default_milestone_id, priority, tags: tr("ジョブ「{name}」を変更", name=name))
     def update_job(self, job_id, name, workflow_id, default_milestone_id, priority, tags):
+        name = normalize_name(name)
         old = self._conn.execute(
             "SELECT workflow_id FROM jobs WHERE id = ?", (job_id,)
         ).fetchone()
@@ -1066,6 +1135,21 @@ class ProjectDatabase:
             )
         except sqlite3.IntegrityError as e:
             raise DuplicateNameError(tr("ジョブ名 '{name}' は既に使用されています", name=name)) from e
+        if workflow_changed:
+            # 手動で追加した個別のタスク依存のうち、旧ワークフローのタスクを指す
+            # もの（このジョブ側・このジョブに依存する他ジョブ側の両方）は、もう
+            # このジョブに存在しないタスクを指すため意味を失う。スケジューラは
+            # 存在しない依存先を黙って無視するので、残すと「画面には出ているのに
+            # 効いていない依存」になる。テンプレート由来の分（source_link_id あり）は
+            # 下の sync_dependency_templates が新しい組み合わせに合わせ直す。
+            self._conn.execute(
+                "DELETE FROM job_external_dependencies WHERE source_link_id IS NULL AND ("
+                " (job_id = ? AND workflow_task_id NOT IN"
+                "   (SELECT id FROM workflow_tasks WHERE workflow_id = ?))"
+                " OR (depends_on_job_id = ? AND depends_on_workflow_task_id NOT IN"
+                "   (SELECT id FROM workflow_tasks WHERE workflow_id = ?)))",
+                (job_id, workflow_id, job_id, workflow_id),
+            )
         self._commit()
         if workflow_changed:
             # ワークフローの組み合わせが変わると、依存先ジョブのタスク対応が
@@ -1522,9 +1606,28 @@ class ProjectDatabase:
         }
         project_now = self.get_project()
 
+        before = self._conn.serialize()
         self._conn.deserialize(zlib.decompress(snapshot))
         self._conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            self._restore_kept_changes_after_discard(
+                snapshot, statuses, confirmed_now, overrides_now, project_now,
+            )
+        except BaseException:
+            # 途中で失敗したら、破棄する前の状態へ丸ごと戻す。deserialize() は
+            # トランザクションの巻き戻しでは戻らないため、そのままだと「最後に確定した
+            # 時点」へ半端に戻っただけの状態（残すはずの進捗や一部確定が消えた状態）が
+            # 残ってしまう。
+            self._rollback_uncommitted()
+            self._conn.deserialize(before)
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            raise
+        self._commit()
 
+    def _restore_kept_changes_after_discard(self, snapshot, statuses, confirmed_now,
+                                            overrides_now, project_now):
+        """discard_draft() の後半: 最後に確定した時点へ戻したDBに、破棄しても残すもの
+        （一部だけ確定した分・タスクの状態）を入れ直す。"""
         # 破棄後も draft_base は同じ内容（最後に確定した時点）のまま持ち続ける
         self._conn.execute("DELETE FROM draft_base")
         self._conn.execute(
@@ -1534,7 +1637,15 @@ class ProjectDatabase:
         confirmed_base = {
             (r["job_id"], r["workflow_task_id"]): r for r in self.list_confirmed_schedule()
         }
-        # 一部だけ確定した分: 確定行と入力（上書き行）を破棄前の内容に戻す
+        # 一部だけ確定した分: 確定行と入力（上書き行）を破棄前の内容に戻す。
+        # ただし、最後に確定した後に追加したマイルストーン・チームは、戻した状態には
+        # 存在しない。それを指したまま入れ直すと外部キー制約で失敗し、破棄が途中で
+        # 止まっていた（確定後に足したマイルストーン・チームをタスクに使い、そのタスク
+        # だけ「選択した変更を確定」してから「変更を破棄」すると起きた）。存在しない
+        # 参照は「未設定」（ジョブの既定・ワークフローの既定のチーム）に戻す——チームが
+        # 変わったタスクは、確定時から変わったタスクとして表示される。
+        existing_teams = {r["id"] for r in self._conn.execute("SELECT id FROM teams").fetchall()}
+        existing_milestones = {r["id"] for r in self._conn.execute("SELECT id FROM milestones").fetchall()}
         partially = [k for k, r in confirmed_now.items() if confirmed_base.get(k) != r]
         existing_tasks = {
             (r["job_id"], r["workflow_task_id"])
@@ -1549,18 +1660,23 @@ class ProjectDatabase:
             self._conn.execute(
                 "DELETE FROM confirmed_schedule WHERE job_id = ? AND workflow_task_id = ?", key
             )
-            self._insert_confirmed_rows([dict(confirmed_now[key])])
+            confirmed_row = dict(confirmed_now[key])
+            if confirmed_row["team_id"] not in existing_teams:
+                confirmed_row["team_id"] = None
+            self._insert_confirmed_rows([confirmed_row])
             self._conn.execute(
                 "DELETE FROM job_task_overrides WHERE job_id = ? AND workflow_task_id = ?", key
             )
             if key in overrides_now:
                 o = overrides_now[key]
+                milestone_id = o["milestone_id"] if o["milestone_id"] in existing_milestones else None
+                team_id = o["team_id"] if o["team_id"] in existing_teams else None
                 self._conn.execute(
                     "INSERT INTO job_task_overrides(job_id, workflow_task_id, is_active, "
                     "override_days, milestone_id, team_id, start_pin_date, tags, status) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (o["job_id"], o["workflow_task_id"], o["is_active"], o["override_days"],
-                     o["milestone_id"], o["team_id"], o["start_pin_date"], o["tags"], o["status"]),
+                     milestone_id, team_id, o["start_pin_date"], o["tags"], o["status"]),
                 )
         if partially:
             self._conn.execute(
@@ -1592,7 +1708,6 @@ class ProjectDatabase:
             "AND milestone_id IS NULL AND team_id IS NULL AND start_pin_date IS NULL "
             "AND COALESCE(tags, '') = '' AND status IS NULL"
         )
-        self._commit()
 
     def _status_keys(self):
         return {
@@ -2041,6 +2156,11 @@ class ProjectDatabase:
             raise ProjectDatabaseError(tr("このジョブへの依存は既に登録されています")) from e
         link_id = cur.lastrowid
         self.sync_dependency_templates()
+        # sync_dependency_templates は自分が何も変えなければコミットしない
+        # （このリンクに当てはまるテンプレートが無い場合）。リンクの追加自体は
+        # ここで確定させる——しないとトランザクションが開いたまま残り、直後の
+        # 保存が固まる（_rollback_uncommitted 参照）うえ、revision も進まない。
+        self._commit()
         return link_id
 
     @undoable("依存先ジョブを削除")
@@ -2132,6 +2252,7 @@ class ProjectDatabase:
         # する（依存先ジョブを先に追加し、後からテンプレートを設定した場合の
         # 救済）。
         self.sync_dependency_templates()
+        self._commit()  # 展開先が無くてもテンプレートの追加自体は確定させる（add_job_dependency_link 参照）
         return template_id
 
     @undoable("依存テンプレートを変更")
@@ -2164,6 +2285,7 @@ class ProjectDatabase:
         # 合致しなくなるため sync_dependency_templates が削除し、変更後の
         # タスク対応が新たに展開される。
         self.sync_dependency_templates()
+        self._commit()  # 展開先が無くても変更自体は確定させる（add_job_dependency_link 参照）
 
     @undoable("依存テンプレートを削除")
     def delete_dependency_template(self, template_id):
@@ -2173,3 +2295,4 @@ class ProjectDatabase:
         # このテンプレートから自動生成されていたタスク対応は、もうどの
         # テンプレートにも合致しなくなるため sync_dependency_templates が削除する。
         self.sync_dependency_templates()
+        self._commit()  # 展開先が無くても削除自体は確定させる（add_job_dependency_link 参照）

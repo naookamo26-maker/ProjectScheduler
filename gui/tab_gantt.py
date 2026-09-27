@@ -108,6 +108,8 @@ class GanttTab(QWidget):
         self._task_positions = {}   # {(Job_ID, Task_ID): (開始, 終了, タスク名)}
         self._predecessors = None   # {(Job_ID, Task_ID): [(先行キー, 種別)]}（遅延構築）
         self._editor = None
+        # タブが隠れたときに一緒に隠した編集ウィンドウを、戻ったときに出し直すか
+        self._editor_hidden_with_tab = False
         self._highlight_timer = QTimer(self)
         self._highlight_timer.setSingleShot(True)
         self._highlight_timer.timeout.connect(self._clear_moved_highlight)
@@ -263,6 +265,30 @@ class GanttTab(QWidget):
         body.pressed.connect(self._on_body_pressed)
         body.move_hint_provider = self._move_hint
         self.apply_app_settings()
+
+    # -- 編集ウィンドウの表示をタブに合わせる ---------------------------------------------
+    #
+    # 編集ウィンドウは独立したウィンドウ（Qt.Tool）なので、このタブが隠れても自動では
+    # 隠れない。出したままだと、他のタブでの変更（ジョブの削除、同じタスクの日数の
+    # 変更等）が反映されない古い内容のまま編集でき、削除済みのジョブへ書き込もうとして
+    # 失敗したり、古い表示と比べて「変更なし」と判定されて入力が無視されたりしていた
+    # （このタブが隠れている間は、再計算の結果を反映しないため）。プロジェクトを開き
+    # 直したときも、旧タブの編集ウィンドウが閉じたDBを指したまま残っていた。
+    # そこで、このタブと一緒に隠し、戻ったときに最新の内容で出し直す。
+
+    def hideEvent(self, event):
+        if self._editor is not None and self._editor.isVisible():
+            self._editor_hidden_with_tab = True
+            self._editor.hide()
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._editor_hidden_with_tab:
+            self._editor_hidden_with_tab = False
+            if self._editor is not None:
+                self._editor.reload()
+                self._editor.show()
 
     def apply_app_settings(self):
         """オプション（ドラッグのキー等）を反映する。起動時とオプション変更時に呼ぶ。"""
@@ -654,10 +680,22 @@ class GanttTab(QWidget):
             self._pending_edit["note"] += tr("マイルストーンの前後関係を保つため、{adjusted}件のマイルストーンを自動調整しました。", adjusted=adjusted)
         self.refresh_choices()
 
+    def _existing_keys(self, keys):
+        """keys のうち、今もDBに存在するタスク（ジョブが残っていて、そのジョブの
+        ワークフローのタスクであるもの）。書き込む直前に、表示時点から削除された
+        ものを除くために使う（除かないと、存在しないジョブ・タスクへの上書きを
+        書こうとして外部キー制約で失敗する）。"""
+        return {r["key"] for r in self.editor_task_rows(keys)}
+
     def apply_task_fields(self, keys, label, fields):
         """keys の各タスクの上書き列を変える。fields は列→値の辞書、または
         編集ウィンドウの行（editor_task_rows の1要素）を受け取って辞書を返す関数。"""
-        rows = {r["key"]: r for r in self.editor_task_rows(keys)} if callable(fields) else {}
+        rows = {r["key"]: r for r in self.editor_task_rows(keys)}
+        keys = [key for key in keys if key in rows]
+        if not keys:
+            if self._editor is not None and self._editor.isVisible():
+                self._editor.reload()
+            return
 
         def write():
             results = []
@@ -692,6 +730,8 @@ class GanttTab(QWidget):
     def _on_move_requested(self, targets, shift):
         """ドラッグ（または編集ウィンドウの「ずらす」）で決まった新しい開始日を、
         手動ピン（開始固定日）として書き込む。"""
+        existing = self._existing_keys([key for key, _d in targets])
+        targets = [(key, new_start) for key, new_start in targets if key in existing]
         if not targets:
             return
         keys = [key for key, _d in targets]

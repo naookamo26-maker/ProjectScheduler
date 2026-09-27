@@ -263,14 +263,19 @@ class ScheduleCache(QObject):
         ワーカーはDBに触れないため放置しても壊れないが、QThreadが動いたまま
         プロセスを終えるとQt側が警告を出すため、明示的に待ち合わせる
         （_start_worker のコメント参照——「最後の1本」だけでなく、
-        追跡している全スレッドを待つ）。"""
+        追跡している全スレッドを待つ）。
+
+        Returns: すべてのスレッドが終わったら True（このキャッシュを破棄してよい）。"""
         self._cancel_pending_request()
         threads, self._threads = self._threads, []
+        all_finished = True
         for thread in threads:
             try:
                 # 計算の途中で止める手段は無い（止めるより待つ方が安全）ので、
                 # 終わるまで待つ。
-                thread.wait(5000)
+                if not thread.wait(5000):
+                    all_finished = False
             except RuntimeError:
                 # 既にdeleteLater()で破棄済み（＝計算は完了している）
                 pass
+        return all_finished

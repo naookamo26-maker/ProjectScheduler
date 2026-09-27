@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.plan_confirmation import replan_preview
+from gui.widgets_common import MAX_INPUT_DATE
 from i18n import tr
 
 _WARNING_STYLE = "color: #c62828;"
@@ -43,6 +44,7 @@ class ReplanDialog(QDialog):
 
         form = QFormLayout()
         self.date_edit = QDateEdit()
+        self.date_edit.setMaximumDate(MAX_INPUT_DATE)
         self.date_edit.setCalendarPopup(True)
         self.date_edit.setDisplayFormat("yyyy-MM-dd")
         self.date_edit.setDate(QDate(self.today.year, self.today.month, self.today.day))

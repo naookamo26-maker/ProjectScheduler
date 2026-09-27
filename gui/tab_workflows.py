@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.db import DuplicateNameError, ReferencedEntityError
+from gui.db import InvalidNameError, ReferencedEntityError
 from gui.node_canvas import (
     WorkflowGraphScene,
     WorkflowGraphView,
@@ -308,7 +308,7 @@ class WorkflowsTab(QWidget):
             return
         try:
             new_id = self.db.add_workflow(name.strip())
-        except DuplicateNameError as e:
+        except InvalidNameError as e:
             QMessageBox.warning(self, tr("追加できません"), str(e))
             return
         self.refresh_workflows(select_id=new_id)
@@ -326,7 +326,7 @@ class WorkflowsTab(QWidget):
             return
         try:
             self.db.rename_workflow(wf_id, name.strip())
-        except DuplicateNameError as e:
+        except InvalidNameError as e:
             QMessageBox.warning(self, tr("変更できません"), str(e))
             return
         self.refresh_workflows(select_id=wf_id)

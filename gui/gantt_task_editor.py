@@ -278,23 +278,40 @@ class TaskEditWindow(QWidget):
         if self._keys:
             self.tab.apply_task_fields(self._keys, label, fields)
 
-    def _commit_pin(self):
+    def _current_single_row(self):
+        """1件を編集しているとき、そのタスクの今の値（DBと計算結果から取り直す）。
+
+        「変わったか」は表示した時点の値ではなく、書き込む直前の値と比べる。表示後に
+        Undo等で値が変わっていると、古い値と比べて「変更なし」と判定され、入力が
+        黙って無視されてしまうため。対象が1件でなくなっていたら（削除された等）
+        表示を作り直して None を返す。"""
         if len(self._rows) != 1:
+            return None
+        rows = self.tab.editor_task_rows(self._keys)
+        if len(rows) != 1:
+            self.reload()
+            return None
+        return rows[0]
+
+    def _commit_pin(self):
+        row = self._current_single_row()
+        if row is None:
             return
         value = self.pin_edit.value()
-        if value != self._rows[0]["start_pin_date"]:
+        if value != row["start_pin_date"]:
             self._apply(tr("タスクの開始固定日を変更"), {"start_pin_date": value})
 
     def _pin_to_current_start(self):
-        r = self._rows[0] if len(self._rows) == 1 else None
+        r = self._current_single_row()
         if r is not None and r["start"] is not None:
             self._apply(tr("タスクの開始日を固定"), {"start_pin_date": r["start"].isoformat()})
 
     def _commit_days(self):
-        if len(self._rows) != 1:
+        row = self._current_single_row()
+        if row is None:
             return
         value = self.days_spin.value() or None
-        if value != self._rows[0]["override_days"]:
+        if value != row["override_days"]:
             self._apply(tr("タスクの日数上書きを変更"), {"override_days": value})
 
     def _commit_combo(self, combo, column):
@@ -316,10 +333,11 @@ class TaskEditWindow(QWidget):
         self._apply(tr("タスクの有効／無効を変更"), {"is_active": checked})
 
     def _commit_tags(self):
-        if len(self._rows) != 1:
+        row = self._current_single_row()
+        if row is None:
             return
         tags = normalize_tags(self.tags_edit.text())
-        if tags != self._rows[0]["tags"]:
+        if tags != row["tags"]:
             self._apply(tr("タスク タグを変更"), {"tags": tags})
         else:
             self.tags_edit.setText(tags)

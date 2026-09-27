@@ -136,9 +136,14 @@ class UndoManager:
 
     def _discard_oldest(self):
         discarded = self._undo_stack.pop(0)
-        if discarded is self._clean_marker:
+        if discarded is self._clean_marker or self._clean_marker is None:
             # 保存済みの状態を指していたエントリを捨てたので、以降は
             # 「保存時と同じ内容かどうか」を判定できない（＝常に未保存扱い）。
+            # None（履歴が空の時点＝最古のエントリの「前」で保存した）も同じ:
+            # 最古のエントリを捨てた以上、その状態へはもうUndoで戻れない。
+            # 見逃すと、すべてUndoしてスタックが空になった時点で、内容は
+            # 保存時と違う（捨てたエントリの変更が残っている）のに「保存済み」と
+            # 判定され、閉じても確認が出ずに変更が失われる。
             self._clean_marker = _NEVER_SAVED
 
     # -- 保存済み状態の追跡 ---------------------------------------------------

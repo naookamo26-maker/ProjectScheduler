@@ -10,7 +10,7 @@ from datetime import date
 
 import pandas as pd
 
-from gui.db import parse_tags
+from gui.db import MAX_SUPPORTED_DATE, parse_tags
 from gui.gantt_edit import format_entity_id
 from project_scheduler import (
     _TEAM_COLOR_OVERFLOW,
@@ -48,6 +48,39 @@ def validate_for_generation(db):
         errors.append(tr("タスクを持つワークフローが1件もありません（ワークフロー設計タブ）"))
     if not db.list_jobs():
         errors.append(tr("ジョブが1件も登録されていません（ジョブ作成タブ）"))
+    errors.extend(_dates_out_of_range(db, proj))
+    return errors
+
+
+def _dates_out_of_range(db, proj):
+    """扱える上限（MAX_SUPPORTED_DATE）より後の日付を、どこにあるかが分かる文言で返す。
+
+    GUIの日付欄はこの上限より後を入力できないが、上限を設ける前に保存したファイルには
+    残りうる。そのまま計算すると pandas の日付の範囲を超えて想定外のエラー
+    （OverflowError 等）になり、原因が分からないため、ここで止める。
+    日付は 'YYYY-MM-DD' の文字列で持っているので、文字列のまま比べられる。"""
+    limit = MAX_SUPPORTED_DATE
+    errors = []
+    if proj["start_date"] and proj["start_date"] > limit:
+        errors.append(tr("開発開始日が {max_date} より後です（基本情報設定タブ）", max_date=limit))
+    for m in db.list_milestones():
+        if m["end_date"] and m["end_date"] > limit:
+            errors.append(tr("マイルストーン「{name}」の締切日が {max_date} より後です（基本情報設定タブ）",
+                             name=m["name"], max_date=limit))
+    for h in db.list_holidays():
+        if h["date"] and h["date"] > limit:
+            errors.append(tr("休業日（{date}）が {max_date} より後です（基本情報設定タブ）",
+                             date=h["date"], max_date=limit))
+    for t in db.list_teams():
+        for c in db.list_team_capacity_changes(t["id"]):
+            if c["start_date"] and c["start_date"] > limit:
+                errors.append(tr("チーム「{team}」の同時ライン数の変動点（{date}）が {max_date} より後です（基本情報設定タブ）",
+                                 team=t["name"], date=c["start_date"], max_date=limit))
+    job_names = {j["id"]: j["name"] for j in db.list_jobs()}
+    for r in db.list_all_job_task_overrides():
+        if r["start_pin_date"] and r["start_pin_date"] > limit:
+            errors.append(tr("ジョブ「{job}」のタスクの開始固定日（{date}）が {max_date} より後です（ジョブ作成タブ）",
+                             job=job_names.get(r["job_id"], "?"), date=r["start_pin_date"], max_date=limit))
     return errors
 
 

@@ -137,10 +137,32 @@ class MainWindow(QMainWindow):
         layout.addWidget(label)
         return widget
 
+    def _clear_tabs(self):
+        """タブをすべて外し、外したタブを破棄する。
+
+        QTabWidget.clear() はタブを外すだけで破棄しない（QStackedWidget の子として
+        残り続ける）。そのままだと、プロジェクトを開き直すたびに旧タブ一式（大きな
+        ガントチャートの描画内容を含む）がメモリに残って増え続け、ガントのタスク
+        編集ウィンドウ（旧タブの子）も閉じたDBを指したまま残っていた。
+        破棄は deleteLater() で次のイベントループに回す——この呼び出し自体が
+        旧タブのシグナル処理の中から来ることがあるため。"""
+        old_widgets = [self.tabs.widget(i) for i in range(self.tabs.count())]
+        # 外す途中で「現在のタブ」が移るたびに currentChanged が出て、捨てる旧タブの
+        # refresh_choices()（旧DBへの同期や、次のイベントループへ予約する再描画を含む）が
+        # 走ってしまう。予約された再描画は旧タブの破棄後に実行され、破棄済みの
+        # オブジェクトを触って例外になるので、外す間は通知を止める。
+        self.tabs.blockSignals(True)
+        try:
+            self.tabs.clear()
+        finally:
+            self.tabs.blockSignals(False)
+        for widget in old_widgets:
+            widget.deleteLater()
+
     def _build_empty_state_tabs(self):
         """プロジェクト未オープン時のプレースホルダー（DB操作を必要とする
         実タブは開いた後に _rebuild_tabs() で差し替える）。"""
-        self.tabs.clear()
+        self._clear_tabs()
         self.plan_band.setVisible(False)
         self.tabs.addTab(
             self._placeholder_tab(tr("プロジェクト名・開始日・マイルストーン・チーム・休業日をここで設定します。")),
@@ -178,7 +200,11 @@ class MainWindow(QMainWindow):
         cache = self.schedule_cache
         if cache is not None:
             try:
-                cache.shutdown()
+                if cache.shutdown():
+                    # 計算結果（大きなDataFrame）を抱えたまま MainWindow の子として
+                    # 残り続けないよう破棄する。計算中のスレッド（キャッシュの子）が
+                    # 残っている間は、スレッドごと破棄すると落ちるので残しておく。
+                    cache.deleteLater()
             except RuntimeError:
                 pass  # 既にQt側で破棄済み
             self.schedule_cache = None
@@ -187,7 +213,7 @@ class MainWindow(QMainWindow):
     def _rebuild_tabs(self):
         """DBオープン後、実際に機能するタブへ差し替える。"""
         self._shutdown_schedule_cache()
-        self.tabs.clear()
+        self._clear_tabs()
 
         self.tab_basic_info = BasicInfoTab(
             self.db, on_teams_changed=self._on_teams_changed,
@@ -453,6 +479,11 @@ class MainWindow(QMainWindow):
             )
         except SchedulingError as e:
             QMessageBox.critical(self, tr("生成に失敗しました"), str(e))
+            return
+        except Exception as e:  # noqa: BLE001 - 想定外でも黙って失敗させない
+            # スロット内の例外はQtが握りつぶすため、捕まえないと何も表示されずに
+            # 終わってしまう（ガントチャートタブは同じ場合に「予期しないエラー」を出す）。
+            QMessageBox.critical(self, tr("生成に失敗しました"), tr("予期しないエラー: {e}", e=e))
             return
 
         message = tr("ガントチャートを書き出しました:\n\n{html_path}", html_path=html_path)

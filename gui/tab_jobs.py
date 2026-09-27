@@ -87,7 +87,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.db import DuplicateNameError, ProjectDatabaseError, normalize_tags, parse_tags
+from gui.db import InvalidNameError, ProjectDatabaseError, normalize_name, normalize_tags, parse_tags
 from gui.plan_confirmation import (
     DRAFT,
     JOB_CHANGED,
@@ -107,6 +107,7 @@ from gui.widgets_common import (
     NoWheelListWidget,
     NoWheelSpinBox,
     OptionalDateEdit,
+    apply_with_milestone_repair,
     auto_size_columns,
     bind_undo_session,
     capture_table_state,
@@ -730,7 +731,7 @@ class JobsTab(QWidget):
         workflow_id = self.db.list_workflows()[0]["id"]
         try:
             new_id = self.db.add_job(name, workflow_id, None, None)
-        except DuplicateNameError as e:
+        except InvalidNameError as e:
             QMessageBox.warning(self, tr("追加できません"), str(e))
             return
         self.refresh_jobs(select_id=new_id)
@@ -791,12 +792,38 @@ class JobsTab(QWidget):
         raw_tags = tags_override if tags_override is not None else table.item(row, 4).text()
         tags = normalize_tags(raw_tags)
 
-        try:
+        def change():
             self.db.update_job(job_id, name, workflow_id, milestone_id, priority, tags)
-        except DuplicateNameError as e:
+
+        workflow_changed = workflow_id != job["workflow_id"]
+        try:
+            name = normalize_name(name)
+            if workflow_changed or milestone_id != job["default_milestone_id"]:
+                # 既定マイルストーン・ワークフローの変更は、タスク上書きを触らずに
+                # 「先行タスクの締切 <= 後続タスクの締切」を崩しうる（上書きの無い
+                # タスクの締切が変わる／元に戻したワークフローの古い上書きが効き
+                # 直す）。締切日の変更と同じく、確認して再調整する。
+                applied = apply_with_milestone_repair(
+                    self.db, self, tr("ジョブの変更"),
+                    tr("ジョブ「{name}」を変更", name=name), change,
+                )
+            else:
+                change()
+                applied = True
+        except InvalidNameError as e:
             QMessageBox.warning(self, tr("変更できません"), str(e))
             self.refresh_jobs(select_id=job_id)
             return
+        if not applied:
+            # 取り消したので、コンボ等の表示を元の値に戻す
+            self.refresh_jobs(select_id=job_id)
+            return
+        # 名前の前後の空白は落として保存しているので、表示もそろえる
+        name_item = table.item(row, 0)
+        if name_item is not None and name_item.text() != name:
+            table.blockSignals(True)
+            name_item.setText(name)
+            table.blockSignals(False)
         # タグを変えた場合、絞り込みの選択肢（タグ一覧のチェックボックス）に
         # タブを切り替えなくても反映されるよう、その場で作り直す。
         if tags != job["tags"]:
@@ -816,6 +843,11 @@ class JobsTab(QWidget):
         )
         if job_id == self.current_job_id:
             self._refresh_overrides()
+            if workflow_changed:
+                # ワークフローを変えると、依存先ジョブのタスク対応が作り直される
+                # （テンプレート由来の分は新しい組み合わせで展開し直し、旧ワーク
+                # フローのタスクを指す手動の分は消える。gui/db.py の update_job）
+                self._refresh_dependencies()
 
     # -- タスク上書き ------------------------------------------------------------
 
@@ -843,6 +875,9 @@ class JobsTab(QWidget):
         self.current_job_id = None
         self.override_table.setRowCount(0)
         self.dep_tree.clear()
+        # 「確定日程」列の表示・非表示は行が無くても合わせる（未確定のプロジェクトで、
+        # ジョブを選ぶ前にこの列の見出しだけが出ていた）
+        self._update_override_plan_marks()
 
     def _refresh_overrides(self):
         table = self.override_table
@@ -853,6 +888,7 @@ class JobsTab(QWidget):
 
         if self.current_job_id is None:
             table.blockSignals(False)
+            self._update_override_plan_marks()  # 行が無くても列の表示を合わせる
             return
         job = next(j for j in self.db.list_jobs() if j["id"] == self.current_job_id)
         default_ms_label = job["milestone_name"] or tr("未設定")
