@@ -53,6 +53,9 @@ pyinstaller packaging\ProjectSchedulerGUI.spec
   データファイルが確実に同梱されることを開発時に確認済み
   （`plotly/package_data/plotly.min.js` が `_internal/` 配下に含まれる）。
 - `console=False` によりGUIアプリとしてコンソールウィンドウを表示しない。
+- `icon=` に起動用アイコン `assets/icon/app_icon.ico` を指定している（エクスプローラー・
+  ショートカットに出る）。同じファイルを `datas` でも同梱し、実行時に
+  `gui/main.py` の `app_icon_path()` が読んでウィンドウ・タスクバーのアイコンにする。
 - `cryptography` を明示的に除外している。このアプリの依存関係には含まれず、
   一部の開発環境で検出される破損／非互換なシステム版 `cryptography` が
   ビルドを失敗させることがあったため（Windows上のクリーンな環境では
@@ -62,6 +65,18 @@ pyinstaller packaging\ProjectSchedulerGUI.spec
   埋め込む。フォルダ配布（`--onedir`）に戻したい場合は、`EXE(...)` の
   `onefile=True` を外して `exclude_binaries=True` にし、`COLLECT(exe,
   a.binaries, a.zipfiles, a.datas, ...)` を追加すればよい。
+
+## 起動用アイコン（`assets/icon/`）
+
+| ファイル | 内容 |
+| --- | --- |
+| `app_icon.svg` | 原画（48px以上で使う）。1本目＝完了、2本目＝今日まで進行、3本目＝未着手、赤の破線＝今日 |
+| `app_icon_small.svg` | 32px以下で使う簡略版。破線が潰れるので今日の線を太い実線にしている |
+| `app_icon.ico` | 生成物。16〜256pxの9サイズをPNG埋め込み形式でまとめたもの |
+| `app_icon_256.png` | 生成物。ドキュメント等に貼るためのプレビュー |
+
+原画を直したら `python scripts/build_icon.py` を実行し、生成物もコミットする
+（PySide6だけで生成するので追加の依存は要らない）。
 
 ## 開発時の検証内容
 

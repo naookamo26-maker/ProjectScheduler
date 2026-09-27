@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+ <!-- 起動用アイコンの原画。1本目=完了、2本目=今日まで進行、3本目=未着手、赤の破線=今日。
+      PNG/.ico は scripts/build_icon.py で生成する。 -->
+ <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2F6FDB"/><stop offset="1" stop-color="#1B4FA8"/></linearGradient></defs>
+ <rect x="10" y="10" width="236" height="236" rx="52" fill="url(#g)"/>
+ <rect x="40" y="56" width="110" height="34" rx="11" fill="#FFB547"/>
+ <rect x="88" y="111" width="104" height="34" rx="11" fill="#FFFFFF"/>
+ <path d="M99 111 h33 v34 h-33 a11 11 0 0 1 -11 -11 v-12 a11 11 0 0 1 11 -11z" fill="#FFB547"/>
+ <rect x="150" y="166" width="68" height="34" rx="11" fill="#FFFFFF"/>
+ <path d="M132 36 V220" stroke="#FF4D5A" stroke-width="7" stroke-linecap="round" stroke-dasharray="14 12"/>
+ <circle cx="132" cy="36" r="9" fill="#FF4D5A"/>
+</svg>
