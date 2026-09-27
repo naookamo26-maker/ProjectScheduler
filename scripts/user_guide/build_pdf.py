@@ -15,6 +15,7 @@ docs/user_guide/images/<言語>/ のものを使う（原稿には `images/名�
     !!! lines-note "見出し"     … 同じ見た目で目印が「ライン数≠人数」（ライン数の話）
   （本文は4字下げで続ける。Python-Markdown の admonition 拡張）
 - 表・脚注・見出しのアンカーが使える。図はHTML/SVGを直接書いてもよい
+- アプリのアイコンを文中に置くときは <img class="inline-icon" src="app-icon" alt="">
 - 画面写真に番号の目印を重ねるときは <div class="annotated"> と <span class="pin">
   （本文から指すときは <span class="pinref">1</span>）
 
@@ -42,6 +43,15 @@ OUTPUT = ROOT / "output"
 TITLES = {
     "ja": ("プロジェクトスケジューラー", "利用者ガイド"),
 }
+
+# 表紙に載せる版数。内容を改めて配り直すときに上げる（誤字の修正など、配り直さない
+# 直しでは上げない）。作成日はビルドした日が入る
+EDITION = {
+    "ja": "第1版",
+}
+
+# 表紙に載せるアプリのアイコン（assets/icon/。scripts/build_icon.py が生成するプレビュー）
+ICON = ROOT / "assets" / "icon" / "app_icon_256.png"
 
 CSS = """
 @page { size: A4; margin: 18mm 17mm 20mm 17mm; }
@@ -111,7 +121,10 @@ code { font-family: "Noto Sans Mono CJK JP", monospace; font-size: 9.5pt;
 .cover { height: 250mm; display: flex; flex-direction: column; justify-content: center; }
 .cover .product { font-size: 13pt; color: var(--muted); letter-spacing: 0.1em; }
 .cover .title { font-size: 30pt; font-weight: 700; margin: 3mm 0 10mm; }
+.cover .icon { width: 30mm; height: 30mm; border: none; margin-bottom: 8mm; }
 .cover .date { font-size: 10pt; color: var(--muted); }
+/* 文中に置くアプリのアイコン（2章「起動する」） */
+img.inline-icon { height: 6mm; width: 6mm; border: none; vertical-align: -1.5mm; margin: 0 0.5mm; }
 .toc { break-before: page; }
 .toc h1 { border-bottom-color: var(--rule); }
 .toc ol { list-style: none; padding: 0; }
@@ -143,6 +156,7 @@ def _render_chapter(path, index, language):
     body = re.sub(r"([^\x00-\x7f])\n[ \t]*([^\x00-\x7f])", r"\1\2", body)
     # 原稿の images/xxx.png を言語別のフォルダへ向ける
     body = body.replace('src="images/', f'src="images/{language}/')
+    body = body.replace('src="app-icon"', f'src="{ICON.as_uri()}"')
     headings = [(t["level"], t["id"], t["name"]) for t in _flatten(md.toc_tokens)]
     return f'<section class="chapter">{body}</section>', headings
 
@@ -170,13 +184,16 @@ def build_html(language, page_numbers=None):
                     f'<span class="dots"></span><span class="pg">{page}</span></a></li>'
                 )
     today = datetime.date.today().isoformat()
+    edition = EDITION.get(language, EDITION["ja"])
     return f"""<!doctype html>
 <html lang="{language}"><head><meta charset="utf-8">
 <base href="{GUIDE.as_uri()}/">
 <title>{html.escape(product)} {html.escape(title)}</title>
 <style>{CSS}</style></head><body>
-<div class="cover"><div class="product">{html.escape(product)}</div>
-<div class="title">{html.escape(title)}</div><div class="date">{today}</div></div>
+<div class="cover"><img class="icon" src="{ICON.as_uri()}" alt="">
+<div class="product">{html.escape(product)}</div>
+<div class="title">{html.escape(title)}</div>
+<div class="date">{html.escape(edition)}　{today}</div></div>
 <nav class="toc"><h1>目次</h1><ol>{''.join(toc)}</ol></nav>
 {''.join(sections)}
 </body></html>"""
