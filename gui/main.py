@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QLibraryInfo, Qt, QTimer, QTranslator
-from PySide6.QtGui import QAction, QFontDatabase, QKeySequence
+from PySide6.QtGui import QAction, QFontDatabase, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -675,10 +675,33 @@ def apply_language(app, language):
             break
 
 
+def app_icon_path():
+    """起動用アイコン（assets/icon/app_icon.ico）の場所。.exe では展開先の
+    一時フォルダ（sys._MEIPASS）の下に同梱している（packaging/ の spec）。"""
+    base = getattr(sys, "_MEIPASS", None)
+    root = Path(base) if base else Path(__file__).resolve().parent.parent
+    return root / "assets" / "icon" / "app_icon.ico"
+
+
+def _set_windows_app_id():
+    """python.exe から起動したとき、タスクバーに Python のアイコンではなく
+    このアプリのアイコンが出るよう、独自の AppUserModelID を名乗る（Windowsのみ）。"""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ProjectScheduler")
+    except (AttributeError, OSError):
+        pass
+
+
 def main():
+    _set_windows_app_id()
     app = QApplication(sys.argv)
     # 利用者ごとの設定フォルダ（QStandardPaths.AppConfigLocation）の名前になる。
     app.setApplicationName("ProjectScheduler")
+    # 全ウィンドウ・ダイアログとタスクバーのアイコンになる（.exe のアイコンは spec の icon=）。
+    app.setWindowIcon(QIcon(str(app_icon_path())))
     app_settings = AppSettings()
     apply_language(app, app_settings.get("language"))
     window = MainWindow(app_settings=app_settings)

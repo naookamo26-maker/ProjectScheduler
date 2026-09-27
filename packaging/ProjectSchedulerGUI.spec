@@ -25,7 +25,11 @@ a = Analysis(
     pathex=[REPO_ROOT],
     binaries=[],
     # 多言語対応の辞書（i18n.py が sys._MEIPASS/locales から読む。docs/roadmap.md §11）
-    datas=[(os.path.join(REPO_ROOT, "locales"), "locales")],
+    # 起動用アイコン（gui/main.py の app_icon_path() が sys._MEIPASS/assets/icon から読む）
+    datas=[
+        (os.path.join(REPO_ROOT, "locales"), "locales"),
+        (os.path.join(REPO_ROOT, "assets", "icon", "app_icon.ico"), os.path.join("assets", "icon")),
+    ],
     # pandas/plotly はいずれも project_scheduler.py が使用する実行時依存で、
     # pyinstaller-hooks-contrib が同梱するフックにより通常は自動検出されるが、
     # 明示しておくことで検出漏れ時の切り分けを容易にする。
@@ -53,6 +57,9 @@ exe = EXE(
     a.datas,
     [],
     name="ProjectSchedulerGUI",
+    # エクスプローラー・デスクトップのショートカットに出るアイコン。
+    # 原画は assets/icon/app_icon.svg、生成は scripts/build_icon.py。
+    icon=os.path.join(REPO_ROOT, "assets", "icon", "app_icon.ico"),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
