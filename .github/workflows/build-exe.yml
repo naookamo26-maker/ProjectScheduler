@@ -3,6 +3,7 @@ name: Build Windows exe
 # PyInstallerはクロスコンパイル非対応のため、Windows用.exeはwindows-latest
 # ランナー上でビルドする。開発環境（Linuxコンテナ）ではこのspecの妥当性を
 # ビルドが通ることまでは確認できるが、実際の.exeバイナリはここでのみ生成される。
+# 利用者ガイド（PDF）も一緒にビルドし、.exe と同じzipに入れる。
 # 詳細は docs/packaging.md を参照。
 
 on:
@@ -11,7 +12,40 @@ on:
   workflow_dispatch: {}
 
 jobs:
+  # 利用者ガイドのPDFは Linux でビルドする（日本語フォント・Chromium・pdfinfo が
+  # apt と playwright ですぐ揃うため）。画面の画像はリポジトリにあるものを使い、
+  # ここでは撮り直さない。手順は docs/user_guide/README.md を参照。
+  build-user-guide:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk poppler-utils
+          pip install -r requirements-docs.txt
+          playwright install --with-deps chromium
+
+      - name: Build user guide PDF
+        run: python scripts/user_guide/build_pdf.py
+
+      - name: Upload user guide PDF
+        uses: actions/upload-artifact@v4
+        with:
+          # 次のジョブでzipに入れるための受け渡し用。配布用のzipは
+          # ProjectSchedulerGUI-windows の方なので、こちらは1日で消す。
+          name: user-guide
+          path: output/user_guide_ja.pdf
+          if-no-files-found: error
+          retention-days: 1
+
   build-windows-exe:
+    needs: build-user-guide
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,12 +62,21 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller packaging/ProjectSchedulerGUI.spec
 
+      - name: Download user guide PDF
+        uses: actions/download-artifact@v4
+        with:
+          name: user-guide
+          path: dist
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: ProjectSchedulerGUI-windows
-          # --onefile構成のため、生成物は dist/ProjectSchedulerGUI.exe の1ファイルのみ。
-          path: dist/ProjectSchedulerGUI.exe
+          # --onefile構成のため、アプリは dist/ProjectSchedulerGUI.exe の1ファイルのみ。
+          # 利用者ガイドの dist/user_guide_ja.pdf を並べて入れる。
+          path: |
+            dist/ProjectSchedulerGUI.exe
+            dist/user_guide_ja.pdf
           if-no-files-found: error
           # 保存容量を圧迫しないよう、既定の90日ではなく短期間で自動削除する。
           # 必要な.exeはこの期間内にダウンロードしておく。

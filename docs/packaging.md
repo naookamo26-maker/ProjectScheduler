@@ -23,9 +23,19 @@ Artifactの保存容量に上限があり、pushのたびに自動ビルドす�
 
 ビルドが成功すると、ワークフローの実行結果ページから
 `ProjectSchedulerGUI-windows` という名前のArtifact（zip）をダウンロードできる。
-展開すると `ProjectSchedulerGUI.exe` の単一ファイルが得られる
-（依存ライブラリ・plotly.min.js等はすべて実行ファイル内に埋め込まれており、
-他に配布するファイルは無い）。
+展開すると次の2ファイルが得られる。
+
+| ファイル | 内容 |
+| --- | --- |
+| `ProjectSchedulerGUI.exe` | アプリ本体（依存ライブラリ・plotly.min.js等はすべて実行ファイル内に埋め込まれている） |
+| `user_guide_ja.pdf` | 利用者ガイド（`docs/user_guide/`） |
+
+利用者ガイドは、`.exe` とは別のジョブ（`build-user-guide`、`ubuntu-latest`）で
+`scripts/user_guide/build_pdf.py` を実行して作り、`.exe` のジョブがそれを受け取って
+同じzipに入れる。画面の画像はリポジトリにあるもの（`docs/user_guide/images/`）を
+そのまま使い、ここでは撮り直さない。画面を変えたときは、画像を撮り直してコミットしてから
+ビルドする（`docs/user_guide/README.md`）。受け渡し用の `user-guide` というArtifactも
+一覧に出るが、1日で自動削除される。
 Artifactは**7日で自動削除**される（`retention-days: 7`）ので、必要な`.exe`は
 それまでにダウンロードしておく。
 
