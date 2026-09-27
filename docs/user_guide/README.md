@@ -35,7 +35,15 @@ python scripts/user_guide/build_pdf.py
   poppler を入れて `pdfinfo` にパスを通す）。
 - 撮る場面を増やすときは、`capture_screenshots.py` の `SHOTS` に1行足す。
 
+## 表紙
+
+- 表紙には、アプリのアイコン（`assets/icon/app_icon_256.png`）、版数、作成日（ビルドした日）が入る。
+- 版数は `scripts/user_guide/build_pdf.py` の `EDITION` で決める。内容を改めて配り直すときに上げる。
+
 ## 原稿の書き方
+
+- アプリのアイコンを文中に置くときは `<img class="inline-icon" src="app-icon" alt="">`
+  （アイコンは `assets/icon/` にあるので、画像の置き場所とは別の書き方にしている）。
 
 - 画像は `![説明](images/名前.png)`、キャプションを付けるときは
   `<figure><img src="images/名前.png"><figcaption>…</figcaption></figure>`。

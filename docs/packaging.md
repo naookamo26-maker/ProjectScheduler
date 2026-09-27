@@ -88,3 +88,12 @@ pyinstaller packaging\ProjectSchedulerGUI.spec
 - `plotly.min.js` がデータファイルとして正しく同梱されること
 - ビルドされた実行ファイルが実際に起動し、（オフスクリーンQtプラットフォーム
   上で）クラッシュせずGUIイベントループに入ること
+
+## バージョン（`app_version.py`）
+
+アプリのバージョンは `app_version.py` の `APP_VERSION`（例: `1.0.0`）が唯一の定義。
+spec はビルド時にここから `build/version_info.txt` を生成して `EXE(version=...)` に渡し、
+`.exe` のファイルのプロパティ（詳細）にファイルバージョン・製品バージョンとして埋め込む。
+画面の「ヘルプ」→「バージョン情報」と、利用者ガイドの表紙（`scripts/user_guide/build_pdf.py`）も
+同じ定義を読むので、バージョンを上げるときは `app_version.py` だけを変える。
+

@@ -5,7 +5,7 @@
 <figure>
 <div class="annotated">
 <img src="images/gantt_tab.png" alt="メイン画面の各部">
-<span class="pin" style="left:12%;top:1.4%">1</span>
+<span class="pin" style="left:17.5%;top:1.4%">1</span>
 <span class="pin" style="left:7.5%;top:5.3%">2</span>
 <span class="pin" style="left:91.5%;top:5.3%">3</span>
 <span class="pin" style="left:44.5%;top:9.6%">4</span>
@@ -17,7 +17,7 @@
 
 | | 部分 | 内容 |
 | --- | --- | --- |
-| <span class="pinref">1</span> | メニュー | ファイルの操作、元に戻す、オプション設定 |
+| <span class="pinref">1</span> | メニュー | ファイルの操作、元に戻す、オプション設定、バージョン情報 |
 | <span class="pinref">2</span> | 計画の状態帯 | 計画が「未確定」「確定済み」「変更案」のどの状態かを示します |
 | <span class="pinref">3</span> | 状態帯のボタン | 計画を確定する、変更を確定するなどの操作です（ガントチャートタブを開いているときだけ表示されます） |
 | <span class="pinref">4</span> | タブ | 5つの画面を切り替えます |
@@ -30,8 +30,9 @@
 | --- | --- |
 | ファイル | 新規プロジェクト、プロジェクトを開く、保存、名前を付けて保存、ガントチャートを生成、終了 |
 | 編集 | 元に戻す、やり直す、オプション |
+| ヘルプ | バージョン情報 |
 
-ファイルの操作と元に戻す／やり直すは「起動と初期設定」の章で、
+ファイルの操作、元に戻す／やり直す、バージョン情報は「起動と初期設定」の章で、
 「ガントチャートを生成」は「タブごとの操作」の章のガントチャートの節で説明します。
 
 ## 計画の状態帯

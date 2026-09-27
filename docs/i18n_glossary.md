@@ -83,4 +83,6 @@ GUIの文言とメッセージを英語・ベトナム語・中国語（簡体�
 | 追加 / 複製 / 削除 | Add / Duplicate / Delete | Thêm / Nhân bản / Xóa | 添加 / 复制 / 删除 |
 | 元に戻す / やり直す | Undo / Redo | Hoàn tác / Làm lại | 撤销 / 重做 |
 | オプション | Options | Tùy chọn | 选项 |
+| ヘルプ | Help | Trợ giúp | 帮助 |
+| バージョン情報 / バージョン | About / Version | Giới thiệu / Phiên bản | 关于 / 版本 |
 | キャンセル | Cancel | Hủy | 取消 |
