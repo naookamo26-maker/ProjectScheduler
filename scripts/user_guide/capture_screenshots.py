@@ -447,6 +447,7 @@ def _options_dialog(app, window):
 SHOTS = [
     ("startup", None, lambda app, window: None),
     ("options_dialog", None, _options_dialog),
+    ("about_box", None, lambda app, window: window.about_box()),
     ("basic_info_tab", NEW_TITLE, _show_tab(TAB_BASIC_INFO)),
     ("workflows_tab", NEW_TITLE, _show_tab(TAB_WORKFLOWS)),
     ("jobs_tab", NEW_TITLE, _show_tab(TAB_JOBS)),

@@ -37,6 +37,9 @@ from pathlib import Path
 import markdown
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from app_version import APP_VERSION  # noqa: E402  表紙の対象バージョン（唯一の定義から読む）
 GUIDE = ROOT / "docs" / "user_guide"
 OUTPUT = ROOT / "output"
 
@@ -48,6 +51,11 @@ TITLES = {
 # 直しでは上げない）。作成日はビルドした日が入る
 EDITION = {
     "ja": "第1版",
+}
+
+# 表紙に載せる対象バージョンの書き方（番号は app_version.py から読む）
+VERSION_LABEL = {
+    "ja": "対象バージョン {version}",
 }
 
 # 表紙に載せるアプリのアイコン（assets/icon/。scripts/build_icon.py が生成するプレビュー）
@@ -62,7 +70,7 @@ CSS = """
 html { font-family: "Noto Sans CJK JP", "Yu Gothic UI", "Meiryo", sans-serif;
        font-size: 10.5pt; line-height: 1.75; color: var(--ink); }
 body { margin: 0; }
-h1, h2, h3 { line-height: 1.4; color: var(--ink); break-after: avoid; }
+h1, h2, h3 { line-height: 1.4; color: var(--ink); break-after: avoid; break-inside: avoid; }
 h1 { font-size: 20pt; margin: 0 0 6mm; padding-bottom: 2mm; border-bottom: 2px solid var(--accent); }
 h2 { font-size: 14pt; margin: 9mm 0 3mm; padding-left: 3mm; border-left: 4px solid var(--accent); }
 h3 { font-size: 11.5pt; margin: 6mm 0 2mm; }
@@ -122,6 +130,7 @@ code { font-family: "Noto Sans Mono CJK JP", monospace; font-size: 9.5pt;
 .cover .product { font-size: 13pt; color: var(--muted); letter-spacing: 0.1em; }
 .cover .title { font-size: 30pt; font-weight: 700; margin: 3mm 0 10mm; }
 .cover .icon { width: 30mm; height: 30mm; border: none; margin-bottom: 8mm; }
+.cover .version { font-size: 11pt; margin-bottom: 2mm; }
 .cover .date { font-size: 10pt; color: var(--muted); }
 /* 文中に置くアプリのアイコン（2章「起動する」） */
 img.inline-icon { height: 6mm; width: 6mm; border: none; vertical-align: -1.5mm; margin: 0 0.5mm; }
@@ -185,6 +194,7 @@ def build_html(language, page_numbers=None):
                 )
     today = datetime.date.today().isoformat()
     edition = EDITION.get(language, EDITION["ja"])
+    target = VERSION_LABEL.get(language, VERSION_LABEL["ja"]).format(version=APP_VERSION)
     return f"""<!doctype html>
 <html lang="{language}"><head><meta charset="utf-8">
 <base href="{GUIDE.as_uri()}/">
@@ -193,6 +203,7 @@ def build_html(language, page_numbers=None):
 <div class="cover"><img class="icon" src="{ICON.as_uri()}" alt="">
 <div class="product">{html.escape(product)}</div>
 <div class="title">{html.escape(title)}</div>
+<div class="version">{html.escape(target)}</div>
 <div class="date">{html.escape(edition)}　{today}</div></div>
 <nav class="toc"><h1>目次</h1><ol>{''.join(toc)}</ol></nav>
 {''.join(sections)}
