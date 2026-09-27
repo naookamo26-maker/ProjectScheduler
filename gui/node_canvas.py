@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 
-from gui.db import MAX_LAG_DAYS, DuplicateNameError, ProjectDatabaseError
+from gui.db import MAX_LAG_DAYS, InvalidNameError, ProjectDatabaseError
 from gui.widgets_common import (
     NoWheelComboBox,
     NoWheelListWidget,
@@ -662,7 +662,14 @@ class WorkflowGraphScene(QGraphicsScene):
             stack.extend(self.adjacency.get(node_id, []))
         return False
 
-    def try_add_edge(self, pred_node, succ_node):
+    def try_add_edge(self, pred_node, succ_node, confirm_milestones=True):
+        """依存関係 pred_node → succ_node を追加する。
+
+        confirm_milestones=False は、タスク削除時の橋渡し（_delete_node_unconfirmed）
+        用。橋渡しは元々あった A→B→C の前後関係を A→C として保つだけで、新しい
+        前後関係を作らないため、マイルストーンの整合性を新たに崩さない。確認を
+        出すと、プロジェクト内の無関係な不整合について尋ねることになり、そこで
+        キャンセルすると橋渡しが作られず前後関係が黙って失われていた。"""
         pred_id, succ_id = pred_node.workflow_task_id, succ_node.workflow_task_id
         if pred_id == succ_id:
             return
@@ -685,7 +692,7 @@ class WorkflowGraphScene(QGraphicsScene):
             # 触っていなくてもジョブ側の整合性が崩れうる。まだUndo単位が開いて
             # いるここで確認・再調整しておく（キャンセルなら依存の追加ごと取り消す
             # ——同じ単位の中で差し引きゼロになり、Undoエントリも積まれない）。
-            if not confirm_and_repair_milestone_consistency(
+            if confirm_milestones and not confirm_and_repair_milestone_consistency(
                 self.db, self.parent_widget, tr("この依存関係の追加"),
             ):
                 self.db.delete_task_dependency(dep_id)
@@ -805,7 +812,7 @@ class WorkflowGraphScene(QGraphicsScene):
             self.removeItem(node)
             for pred_node in pred_nodes:
                 for succ_node in succ_nodes:
-                    self.try_add_edge(pred_node, succ_node)
+                    self.try_add_edge(pred_node, succ_node, confirm_milestones=False)
             self.auto_arrange()
 
     def add_task(self, name, team_id, days, x, y):
@@ -947,6 +954,10 @@ class TaskNodeEditDialog(QDialog):
 
         self.team_combo = NoWheelComboBox()
         self._reload_teams(team_id)
+        # 直前に選んでいたチーム。「＋ 新しいチームを追加...」を選んでキャンセル
+        # した場合に、先頭のチームではなくこれに戻す（戻さないと、気付かずにOKを
+        # 押して別のチームで登録してしまう）。
+        self._selected_team_id = self.team_combo.currentData()
         self.team_combo.activated.connect(self._on_team_activated)
         form.addRow(tr("担当チーム"), self.team_combo)
 
@@ -991,22 +1002,24 @@ class TaskNodeEditDialog(QDialog):
 
     def _on_team_activated(self, index):
         if self.team_combo.itemData(index) != _ADD_TEAM_SENTINEL:
+            self._selected_team_id = self.team_combo.itemData(index)
             return
         name, ok = QInputDialog.getText(self, tr("新しいチーム"), tr("チーム名:"))
         if not ok or not name.strip():
-            self._reload_teams()
+            self._reload_teams(self._selected_team_id)
             return
         lines, ok = QInputDialog.getInt(self, tr("新しいチーム"), tr("同時ライン数:"), 1, 1, 999)
         if not ok:
-            self._reload_teams()
+            self._reload_teams(self._selected_team_id)
             return
         try:
             new_id = self.db.add_team(name.strip(), lines)
-        except DuplicateNameError as e:
+        except InvalidNameError as e:
             QMessageBox.warning(self, tr("追加できません"), str(e))
-            self._reload_teams()
+            self._reload_teams(self._selected_team_id)
             return
         self._reload_teams(select_team_id=new_id)
+        self._selected_team_id = new_id
 
     def values(self):
         return self.name_edit.text().strip(), self.team_combo.currentData(), self.days_spin.value()
@@ -1164,15 +1177,23 @@ def add_task_via_dialog(scene, parent, x=0.0, y=0.0):
             tr("先にチームを1つ以上登録してください（このダイアログからも追加できます）。"),
         )
     dialog = TaskNodeEditDialog(db, tr("タスクを追加"), workflow_id=scene.workflow_id)
-    if dialog.exec() != QDialog.Accepted:
+    # 名前が重複していたら、入力内容を残したままダイアログを出し直す（他の「追加」
+    # ダイアログと同じ）。以前は例外を捕まえておらず、何も表示されずに終わっていた。
+    while True:
+        if dialog.exec() != QDialog.Accepted:
+            return
+        name, team_id, days = dialog.values()
+        if not name or team_id is None or team_id == _ADD_TEAM_SENTINEL:
+            QMessageBox.warning(parent, tr("入力エラー"), tr("タスク名とチームを指定してください。"))
+            return
+        try:
+            with db.undo_group(tr("タスク「{name}」を追加", name=name)):
+                node = scene.add_task(name, team_id, days, x, y)
+                apply_predecessors(scene, node, dialog.selected_predecessor_ids())
+        except InvalidNameError as e:
+            QMessageBox.warning(parent, tr("追加できません"), str(e))
+            continue
         return
-    name, team_id, days = dialog.values()
-    if not name or team_id is None or team_id == _ADD_TEAM_SENTINEL:
-        QMessageBox.warning(parent, tr("入力エラー"), tr("タスク名とチームを指定してください。"))
-        return
-    with db.undo_group(tr("タスク「{name}」を追加", name=name)):
-        node = scene.add_task(name, team_id, days, x, y)
-        apply_predecessors(scene, node, dialog.selected_predecessor_ids())
 
 
 def edit_task_via_dialog(scene, parent, node):
@@ -1192,7 +1213,7 @@ def edit_task_via_dialog(scene, parent, node):
     with db.undo_group(tr("タスク「{name}」を編集", name=name)):
         try:
             db.update_workflow_task(node.workflow_task_id, name, team_id, days)
-        except DuplicateNameError as e:
+        except InvalidNameError as e:
             QMessageBox.warning(parent, tr("変更できません"), str(e))
             return
         colors = team_color_map(db.list_teams())

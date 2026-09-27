@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from gui.db import MAX_SUPPORTED_DATE
 from i18n import tr
 
 ROW_ID_ROLE = Qt.UserRole
@@ -204,10 +205,17 @@ class OptionalSpinBox(NoWheelSpinBox):
         self.setValue(self.minimum() if value is None else value)
 
 
+#: 日付欄に入力できる最後の日（gui/db.py の MAX_SUPPORTED_DATE）。QDateEdit の既定の
+#: 上限（9999-12-31）のままだと、スケジューラが扱えない日付（2262年以降）を入力でき、
+#: 計算が想定外のエラーで止まっていた。
+MAX_INPUT_DATE = QDate.fromString(MAX_SUPPORTED_DATE, "yyyy-MM-dd")
+
+
 class NoWheelDateEdit(_UndoSessionMixin, QDateEdit):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setFocusPolicy(Qt.StrongFocus)
+        self.setMaximumDate(MAX_INPUT_DATE)
 
     def wheelEvent(self, event):
         if self.hasFocus():
@@ -559,6 +567,29 @@ def confirm_and_repair_milestone_consistency(db, parent, trigger_label):
         return False
     db.apply_milestone_consistency_repair(plan)
     return True
+
+
+def apply_with_milestone_repair(db, parent, trigger_label, undo_label, change):
+    """change()（DBを変える処理）を実行し、その結果マイルストーンの整合性が崩れるなら
+    確認して再調整する。キャンセルされたら change() ごと取り消す。
+
+    変更・再調整・取り消しはすべて1つのUndo単位の中で行う（取り消した場合は差し引き
+    ゼロになり、Undoエントリも積まれない）。取り消しは変更前のスナップショットへ
+    戻すだけなので、削除のように逆の操作を組み立てにくい変更（マイルストーンの削除は
+    参照しているジョブ・タスク上書きを「未設定」に変える）にも使える。
+
+    ジョブの既定マイルストーンの変更・マイルストーンの削除は、締切日の変更・依存の
+    追加と同じく、タスク上書きを触らずに「先行タスクの締切 <= 後続タスクの締切」を
+    崩しうる（docs/architecture.md「マイルストーンの整合性」）。
+
+    Returns: 変更を確定したら True、キャンセルで取り消したら False。"""
+    with db.undo_group(undo_label):
+        before = db.serialize_state()
+        change()
+        if confirm_and_repair_milestone_consistency(db, parent, trigger_label):
+            return True
+        db.restore_state(before)
+        return False
 
 
 class CrudSection(QGroupBox):

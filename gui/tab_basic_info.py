@@ -35,11 +35,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.db import DuplicateNameError, ReferencedEntityError
+from gui.db import DuplicateNameError, InvalidNameError, ReferencedEntityError, normalize_name
 from gui.widgets_common import (
     CrudSection,
     NoWheelDateEdit,
     OptionalSpinBox,
+    apply_with_milestone_repair,
     auto_size_columns,
     bind_undo_session,
     capture_table_state,
@@ -345,7 +346,7 @@ class BasicInfoTab(QWidget):
             name, end_date = dialog.values()
             try:
                 new_id = self.db.add_milestone(name, end_date)
-            except DuplicateNameError as e:
+            except InvalidNameError as e:
                 QMessageBox.warning(self, tr("追加できません"), str(e))
                 continue
             break
@@ -358,7 +359,17 @@ class BasicInfoTab(QWidget):
         count = self.db.milestone_usage_count(ms_id)
         if not confirm_or_block_delete(self, count, tr("このマイルストーン"), hard_block=False):
             return
-        self.db.delete_milestone(ms_id)
+        milestone = self.db.get_milestone(ms_id)
+        # 削除したマイルストーンを参照していたジョブ・タスク上書きは「未設定」に
+        # なり、別の締切に変わる。そのせいで「先行タスクの締切 <= 後続タスクの
+        # 締切」が崩れるなら、締切日の変更と同じく確認して再調整する（キャンセル
+        # なら削除ごと取り消す）。
+        if apply_with_milestone_repair(
+            self.db, self, tr("マイルストーンの削除"),
+            tr("マイルストーン「{name}」を削除", name=milestone["name"] if milestone else "?"),
+            lambda: self.db.delete_milestone(ms_id),
+        ):
+            self._notify_jobs_changed()
         self.refresh_milestones()
 
     def _on_milestone_cell_changed(self, item):
@@ -373,7 +384,7 @@ class BasicInfoTab(QWidget):
         date_edit = table.cellWidget(item.row(), 1)
         try:
             self.db.update_milestone(ms_id, name, _to_iso(date_edit.date()), note)
-        except DuplicateNameError as e:
+        except InvalidNameError as e:
             QMessageBox.warning(self, tr("変更できません"), str(e))
             self.refresh_milestones()
             return
@@ -669,7 +680,7 @@ class BasicInfoTab(QWidget):
             name, max_lines = dialog.values()
             try:
                 new_id = self.db.add_team(name, max_lines)
-            except DuplicateNameError as e:
+            except InvalidNameError as e:
                 QMessageBox.warning(self, tr("追加できません"), str(e))
                 continue
             break
@@ -706,10 +717,16 @@ class BasicInfoTab(QWidget):
             return
         try:
             self.db.update_team(team_id, item.text(0), team["max_lines"])
-        except DuplicateNameError as e:
+        except InvalidNameError as e:
             QMessageBox.warning(self, tr("変更できません"), str(e))
             self.refresh_teams()
             return
+        # 名前の前後の空白は落として保存しているので、表示もそろえる
+        name = normalize_name(item.text(0))
+        if item.text(0) != name:
+            self.teams_tree.blockSignals(True)
+            item.setText(0, name)
+            self.teams_tree.blockSignals(False)
         self._notify_teams_changed()
 
     def _on_team_lines_changed(self, team_id, value):

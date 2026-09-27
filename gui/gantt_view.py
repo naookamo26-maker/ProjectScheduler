@@ -86,6 +86,13 @@ _WEEK_AUX_HIDE_MAX_MONTH_PX = 60
 _DAYS_PER_MONTH_AVG = 30.44
 # ヘッダー内の各段のY位置（TOP_MARGINからの差分。値が大きいほど上）。
 _MILESTONE_LABEL_OFFSET = 56
+# 見出しのマイルストーン名（「今日」を含む）同士の最小の間隔(px)
+_MILESTONE_LABEL_GAP_PX = 6
+# 見出しのラベルが重なるときに残す優先度（大きいほど優先）。締切（マイルストーン）が
+# 最も大事で、次に「今日」。開発開始日はチャートの左端にあり、線だけでも分かる。
+_LABEL_PRIORITY_MILESTONE = 2
+_LABEL_PRIORITY_TODAY = 1
+_LABEL_PRIORITY_PROJECT_START = 0
 _YEAR_LABEL_OFFSET = 38
 _TICK_LABEL_OFFSET = 22
 _GRID_TOP_OFFSET = 10
@@ -459,7 +466,10 @@ class GanttGraphicsView(QGraphicsView):
         if not self.edit_enabled or self.scene() is None:
             super().contextMenuEvent(event)
             return
-        item = self._bar_at(event.position().toPoint())
+        # QContextMenuEvent はマウスのイベント（QSinglePointEvent）と違い position() を
+        # 持たない（pos() だけ）。position() と書くと右クリックのたびに例外になり、
+        # メニューが一度も開かなかった。
+        item = self._bar_at(event.pos())
         if item is not None and not item.isSelected():
             self.scene().clearSelection()
             item.setSelected(True)
@@ -830,6 +840,32 @@ class FrozenGanttPane(QWidget):
         self._center_milestone_labels(sx)
         self._center_tick_labels(sx)
         self._center_task_labels(sx, sy)
+        self._layout_job_labels(sy)
+
+    def _layout_job_labels(self, sy):
+        """左列のジョブ名（と色見本）を、その行の中央に揃え、上の名前と重なるものを
+        隠す。
+
+        ジョブ名は等倍（一定ピクセル数）で描く一方、行の高さは縦の拡縮率（sy）で
+        変わる。全体表示などで縦に縮小すると行が文字より低くなり、名前同士が
+        重なって読めなくなっていた。上から順に、直前に表示した名前と重なるものを
+        隠す（拡大すれば、すべての名前が現れる）——日付軸の目盛りを縮小時に
+        間引くのと同じ考え方（_update_axis_density）。"""
+        scene = self.column.scene()
+        if scene is None or sy <= 0:
+            return
+        next_free_px = None
+        for label, swatch, center_y in getattr(scene, "gantt_job_labels", []):
+            height_px = label.boundingRect().height()
+            top_px = center_y * sy - height_px / 2
+            visible = next_free_px is None or top_px >= next_free_px
+            label.setVisible(visible)
+            swatch.setVisible(visible)
+            if not visible:
+                continue
+            next_free_px = top_px + height_px
+            label.setPos(label.x(), center_y - (height_px / 2) / sy)
+            swatch.setPos(swatch.x(), center_y - (swatch.rect().height() / 2) / sy)
 
     def _update_axis_density(self, sx):
         """現在の横方向の拡縮率（sx）に応じて、日付軸の見せ方を切り替える。
@@ -980,24 +1016,64 @@ class FrozenGanttPane(QWidget):
             label.setPos(center_x + (shift_px - width_px / 2) / sx, center_y - (height_px / 2) / sy)
 
     def _center_milestone_labels(self, sx):
-        """マイルストーンラベルを、その縦線を中心に左右均等になるよう配置
-        し直す。ItemIgnoresTransformationsを立てた項目のsetPos()はシーン座標
-        系のままなので、画面上で「中央揃え」を保つオフセット（ラベル幅の半分）
-        は、現在の横方向の拡縮率(sx)で割ってシーン座標に変換する必要がある。
-        また、軸の両端付近では中央揃えのままだとラベルがチャート外へはみ出す
-        ため、ヘッダーの表示範囲（gantt_header_rect）に収まるようクランプする。"""
+        """マイルストーン（開発開始日・「今日」を含む）のラベルを、その縦線を中心に
+        左右均等になるよう配置し直す。ItemIgnoresTransformationsを立てた項目の
+        setPos()はシーン座標系のままなので、画面上で「中央揃え」を保つオフセット
+        （ラベル幅の半分）は、現在の横方向の拡縮率(sx)で割ってシーン座標に変換する
+        必要がある。
+
+        あわせて次の2つを避ける。
+        - はみ出し: 軸の両端付近では中央揃えのままだとラベルがチャート外へ
+          はみ出すため、ヘッダーの表示範囲（gantt_header_rect）に収める。画面に
+          一部でもかかるラベルは、今見えている範囲にも収める——全体表示でも
+          本体は数十ピクセル横にスクロールできる（_clamp_scale）ため、チャート
+          全体の範囲に収めるだけでは右端のラベルが切れて見えていた。
+        - 重なり: 締切の近いマイルストーン同士や、開発開始日と「今日」は同じ高さに
+          並べると文字が重なって読めない（「プロジ今日ト開始」のように）。優先度の
+          高いもの（マイルストーン → 今日 → 開発開始日）から置き、既に置いたものと
+          重なるラベルは隣へずらす。ずらすと自分の縦線を指さなくなる（線がラベルの
+          幅から外れる）なら隠す（拡大すれば現れる）。"""
         scene = self.header.scene()
         if scene is None or sx <= 0:
             return
         header_rect = getattr(scene, "gantt_header_rect", None)
-        for label, line_x in getattr(scene, "gantt_milestone_labels", []):
-            width_px = label.boundingRect().width()
-            anchor = line_x - (width_px / 2) / sx
-            if header_rect is not None:
-                min_anchor = header_rect.left()
-                max_anchor = max(min_anchor, header_rect.right() - width_px / sx)
-                anchor = max(min_anchor, min(anchor, max_anchor))
-            label.setPos(anchor, label.y())
+        visible = self.header.mapToScene(self.header.viewport().rect()).boundingRect()
+        gap = _MILESTONE_LABEL_GAP_PX / sx
+        epsilon = 0.5 / sx
+        placed = []  # [(左端, 右端)]（シーン座標）
+
+        def overlaps(left, right):
+            return any(left < p_right + gap and right + gap > p_left for p_left, p_right in placed)
+
+        entries = sorted(getattr(scene, "gantt_milestone_labels", []), key=lambda e: (-e[2], e[1]))
+        for label, line_x, _priority in entries:
+            width = label.boundingRect().width() / sx
+            preferred = line_x - width / 2
+            low, high = (header_rect.left(), header_rect.right()) if header_rect is not None \
+                else (float("-inf"), float("inf"))
+            preferred = max(low, min(preferred, max(low, high - width)))
+            on_screen = preferred < visible.right() and preferred + width > visible.left()
+            if on_screen:
+                low, high = max(low, visible.left()), min(high, visible.right())
+                preferred = max(low, min(preferred, max(low, high - width)))
+            candidates = [preferred]
+            for p_left, p_right in placed:
+                candidates += [p_right + gap, p_left - gap - width]
+            chosen = None
+            for left in sorted(candidates, key=lambda c: abs(c - preferred)):
+                if left < low - epsilon or left + width > high + epsilon:
+                    continue
+                if left != preferred and not left - epsilon <= line_x <= left + width + epsilon:
+                    continue
+                if not overlaps(left, left + width):
+                    chosen = left
+                    break
+            if chosen is None:
+                label.setVisible(False)
+                continue
+            label.setVisible(True)
+            label.setPos(chosen, label.y())
+            placed.append((chosen, chosen + width))
 
     def _center_tick_labels(self, sx):
         """日付目盛りラベルを、その縦線を中心に左右均等になるよう配置し直す。
@@ -1277,7 +1353,9 @@ def build_gantt_scenes(df, display, color_by="team"):
             (x, TOP_MARGIN - _MILESTONE_LABEL_OFFSET),
             brush=QBrush(color), z_value=2,
         )
-        header_scene.gantt_milestone_labels.append((label, x))
+        # 重なるときにどれを残すかの優先度（FrozenGanttPane._center_milestone_labels）
+        priority = _LABEL_PRIORITY_PROJECT_START if marker_id == "PROJECT_START" else _LABEL_PRIORITY_MILESTONE
+        header_scene.gantt_milestone_labels.append((label, x, priority))
 
     # -- 「今日」を縦線で表示（表示範囲に含まれる場合のみ） --------------------------
     # マイルストーンとは違い対象データから独立した「現在時刻」由来の情報のため、
@@ -1298,7 +1376,7 @@ def build_gantt_scenes(df, display, color_by="team"):
             (x, TOP_MARGIN - _MILESTONE_LABEL_OFFSET),
             brush=QBrush(_TODAY_LINE_COLOR), z_value=2,
         )
-        header_scene.gantt_milestone_labels.append((label, x))
+        header_scene.gantt_milestone_labels.append((label, x, _LABEL_PRIORITY_TODAY))
 
     # -- ジョブ／タスクのバーを描画 ---------------------------------------------------
     team_names = display.get("team_names") or {}
@@ -1322,6 +1400,7 @@ def build_gantt_scenes(df, display, color_by="team"):
 
     job_metrics = QFontMetrics(job_font)
     swatch_height = job_metrics.height()
+    column_scene.gantt_job_labels = []
     for row_index, (job_id, job_name, job_workflow_id, y_top, y_bottom, task_lane_pairs) \
             in enumerate(job_blocks):
         if row_index % 2 == 1:
@@ -1351,12 +1430,16 @@ def build_gantt_scenes(df, display, color_by="team"):
         swatch.setPos(4, (y_top + y_bottom) / 2 - swatch_height / 2)
         swatch.setToolTip(tr("ワークフロー: {workflow}", workflow=workflow_names.get(job_workflow_id, job_workflow_id)))
 
-        _add_fixed_size_label(
+        job_label = _add_fixed_size_label(
             column_scene,
             _elide_text(job_name, job_font, LEFT_MARGIN - 12 - _JOB_SWATCH_WIDTH - _JOB_SWATCH_GAP),
             job_font,
             (4 + _JOB_SWATCH_WIDTH + _JOB_SWATCH_GAP, (y_top + y_bottom) / 2 - 8),
         )
+        # 縦に縮小して行が文字より低くなると、等倍描画のジョブ名同士が重なって
+        # 読めなくなる。表示倍率が分かるタイミング（FrozenGanttPane._sync_panes）で
+        # 行の中央へ揃え直し、重なる分を間引くため、参照を残しておく。
+        column_scene.gantt_job_labels.append((job_label, swatch, (y_top + y_bottom) / 2))
 
         for r, lane in task_lane_pairs:
             y = y_top + lane * ROW_HEIGHT

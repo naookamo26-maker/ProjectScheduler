@@ -84,13 +84,14 @@ def gantt(qapp, tmp_path):
     assert _wait(qapp, lambda: tab.cache.is_fresh() and tab.view.scene() is not None)
     _wait(qapp, lambda: False, timeout=0.1)  # fit_all（次のイベントループ）を済ませる
     yield w, tab, ids
-    if tab._editor is not None:
+    import shiboken6
+    tab = w.tab_gantt  # テストの中で別のプロジェクトを開いた場合は、そのタブ
+    if tab is not None and shiboken6.isValid(tab) and tab._editor is not None:
         tab._editor.close()
     w._shutdown_schedule_cache()
     w.db.on_change = None
     w.db.undo_manager = None
     w.db.close()
-    import shiboken6
     w.hide()
     shiboken6.delete(w)
     qapp.processEvents()
@@ -494,3 +495,204 @@ def test_header_and_job_column_stay_aligned_with_the_body_at_the_scroll_ends(qap
     assert _screen_x(pane.header, visible.right()) == _screen_x(body, visible.right())
     assert _screen_y(pane.column, visible.top()) == _screen_y(body, visible.top())
     assert _screen_y(pane.column, visible.bottom()) == _screen_y(body, visible.bottom())
+
+
+# -- 右クリック・編集ウィンドウの古い状態（操作中の不具合の回帰テスト） -----------------------
+
+
+def test_right_clicking_a_bar_opens_the_context_menu(qapp, gantt):
+    """回帰テスト: バーを右クリックすると contextMenuEvent が例外
+    （QContextMenuEvent に position() が無い）になり、メニューが一度も開かなかった。
+    既存のメニューのテストは _show_context_menu を直接呼んでいたため気付けなかった。
+    ここでは実際の右クリックと同じイベントを送る。"""
+    from PySide6.QtGui import QContextMenuEvent
+
+    w, tab, ids = gantt
+    key = _key(ids, "job1", "t2")
+    body = tab.view.body
+    bar = tab.view.bars()[key]
+    body.ensureVisible(bar.sceneBoundingRect())
+    qapp.processEvents()
+    pos = body.mapFromScene(bar.sceneBoundingRect().center())
+    shown = []
+    with patch.object(tab, "_exec_menu", lambda menu, _pos: shown.append(menu) or None):
+        event = QContextMenuEvent(QContextMenuEvent.Mouse, pos, body.viewport().mapToGlobal(pos))
+        QApplication.sendEvent(body.viewport(), event)
+    assert len(shown) == 1
+    assert tab.view.selected_keys() == [key]
+
+
+def test_editor_hides_with_the_tab_and_shows_current_values_when_back(qapp, gantt):
+    """回帰テスト: 編集ウィンドウは独立したウィンドウなので、他のタブへ移っても出た
+    ままになり、そこでの変更（同じタスクの日数・状態）が反映されない古い表示のまま
+    編集できていた。タブと一緒に隠し、戻ったときに最新の内容で出し直す。"""
+    w, tab, ids = gantt
+    key = _key(ids, "job1", "t1")
+    tab.view.select_keys([key])
+    tab.open_editor()
+    editor = tab._editor
+    assert editor.isVisible()
+
+    w.tabs.setCurrentWidget(w.tab_jobs)
+    qapp.processEvents()
+    assert not editor.isVisible()
+    with w.db.undo_group("タスク上書きを変更"):
+        w.db.upsert_job_task_override(ids["job1"], ids["t1"], override_days=7, status="done")
+
+    w.tabs.setCurrentWidget(tab)
+    qapp.processEvents()
+    assert editor.isVisible()
+    assert editor.days_spin.value() == 7
+    assert editor.status_combo.currentData() == "done"
+
+
+def test_editor_compares_with_current_values_not_the_displayed_ones(qapp, gantt):
+    """回帰テスト: 表示した後に値が変わっていると（Undo等）、表示時点の値と比べて
+    「変更なし」と判定され、入力が黙って無視されていた。書き込む直前の値と比べる。"""
+    w, tab, ids = gantt
+    key = _key(ids, "job1", "t1")
+    tab.view.select_keys([key])
+    tab.open_editor()
+    editor = tab._editor
+    assert editor.days_spin.value() == 0  # 既定
+    # 編集ウィンドウに反映される前に、DBの日数が変わった
+    with w.db.undo_group("タスク上書きを変更"):
+        w.db.upsert_job_task_override(ids["job1"], ids["t1"], override_days=7)
+    editor.days_spin.setValue(0)  # 「既定」に戻すつもりの入力
+    editor.days_spin.editingFinished.emit()
+    _wait_recomputed(qapp, tab)
+    assert _override(w.db, ids["job1"], ids["t1"])["override_days"] is None
+
+
+def test_editor_does_not_write_to_a_deleted_job(qapp, gantt):
+    """回帰テスト: 編集ウィンドウを開いたまま他のタブでそのジョブを削除し、編集ウィンドウで
+    値を変えると、存在しないジョブへの上書きを書こうとして外部キー制約の例外になっていた。"""
+    w, tab, ids = gantt
+    key = _key(ids, "job1", "t1")
+    tab.view.select_keys([key])
+    tab.open_editor()
+    editor = tab._editor
+    w.tabs.setCurrentWidget(w.tab_jobs)
+    qapp.processEvents()
+    w.db.delete_job(ids["job1"])
+    before = w.db.serialize_state()
+
+    tab.apply_task_fields([key], "タスクの状態を変更", {"status": "done"})  # 表示が古いまま書こうとしても
+    assert w.db.serialize_state() == before
+    assert not w.db._conn.in_transaction
+
+    w.tabs.setCurrentWidget(tab)
+    qapp.processEvents()
+    assert editor.pages.currentWidget() is editor.empty_page
+
+
+def test_editor_of_the_previous_project_does_not_outlive_it(qapp, gantt):
+    """回帰テスト: 別のプロジェクトを開いた後も、前のプロジェクトの編集ウィンドウが
+    表示されたまま残り、操作すると閉じたDBへ書こうとして変更が失われていた。
+    旧タブ（と、その子の編集ウィンドウ）ごと破棄する。"""
+    import shiboken6
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    w, tab, ids = gantt
+    tab.view.select_keys([_key(ids, "job1", "t1")])
+    tab.open_editor()
+    editor = tab._editor
+    old_db = w.db
+    w._open_database(ProjectDatabase.create_new())
+    assert not editor.isVisible()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    qapp.processEvents()
+    assert not shiboken6.isValid(editor)
+    assert not shiboken6.isValid(tab)
+    assert old_db is not w.db
+
+
+# -- 見出し・ジョブ名の重なり ------------------------------------------------------------------
+
+
+def _visible_label_rects(view, labels):
+    rects = []
+    for label in labels:
+        if label.isVisible():
+            top_left = view.mapFromScene(label.pos())
+            rect = label.boundingRect()
+            rects.append((top_left.x(), top_left.y(), top_left.x() + rect.width(), top_left.y() + rect.height()))
+    return rects
+
+
+def _overlaps(a, b):
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def test_job_names_do_not_overlap_when_the_chart_is_zoomed_out(qapp, gantt, tmp_path):
+    """回帰テスト: 全体表示で縦に縮小すると行が文字より低くなり、左列のジョブ名同士が
+    重なって読めなかった。重なる名前は隠し、拡大すれば全部現れる。"""
+    w, tab, _ids = gantt
+    path = tmp_path / "many.pschedule"
+    db = ProjectDatabase.create_new(str(path))
+    db.set_project("多数", "2026-04-06")
+    team = db.add_team("チームA", 50)
+    wf = db.add_workflow("WF")
+    db.add_workflow_task(wf, "作業", team, 3)
+    ms = db.add_milestone("リリース", "2026-12-25")
+    for i in range(60):
+        db.add_job(f"ジョブ{i:02d}", wf, ms)
+    db.save()
+    db.close()
+    w._open_database(ProjectDatabase.open_existing(str(path)))
+    w.tabs.setCurrentIndex(3)
+    tab = w.tab_gantt
+    assert _wait(qapp, lambda: tab.cache.is_fresh() and tab.view.scene() is not None)
+    _wait(qapp, lambda: False, timeout=0.1)
+
+    column = tab.view.column
+    labels = [label for label, _swatch, _y in column.scene().gantt_job_labels]
+    rects = _visible_label_rects(column, labels)
+    assert 0 < len(rects) < len(labels)  # 60行は収まらないので一部を隠している
+    for i, a in enumerate(rects):
+        for b in rects[i + 1:]:
+            assert not _overlaps(a, b)
+
+    tab.view.body.scale(1.0, 20.0)
+    tab.view._sync_panes()
+    assert all(label.isVisible() for label in labels)
+
+
+def test_header_labels_do_not_overlap_and_stay_inside_the_view(qapp, gantt, tmp_path):
+    """回帰テスト: 開発開始日と「今日」、締切の近いマイルストーン同士のラベルが重なって
+    読めなかった（「プロジ今日ト開始」）。右端のラベルは画面の外へはみ出して切れていた。"""
+    from datetime import timedelta
+
+    w, tab, _ids = gantt
+    path = tmp_path / "labels.pschedule"
+    db = ProjectDatabase.create_new(str(path))
+    start = date.today() - timedelta(days=3)
+    db.set_project("見出し", start.isoformat())
+    team = db.add_team("チームA", 2)
+    wf = db.add_workflow("WF")
+    db.add_workflow_task(wf, "作業", team, 200)
+    ms1 = db.add_milestone("アルファ版（コアアセット確定）", (start + timedelta(days=120)).isoformat())
+    db.add_milestone("ベータ版（全カットシーン組み込み）", (start + timedelta(days=125)).isoformat())
+    db.add_milestone("マスターアップ", (start + timedelta(days=400)).isoformat())
+    db.add_job("ジョブ1", wf, ms1)
+    db.save()
+    db.close()
+    w._open_database(ProjectDatabase.open_existing(str(path)))
+    w.tabs.setCurrentIndex(3)
+    tab = w.tab_gantt
+    assert _wait(qapp, lambda: tab.cache.is_fresh() and tab.view.scene() is not None)
+    _wait(qapp, lambda: False, timeout=0.1)
+
+    header = tab.view.header
+    entries = header.scene().gantt_milestone_labels
+    rects = _visible_label_rects(header, [label for label, _x, _p in entries])
+    for i, a in enumerate(rects):
+        for b in rects[i + 1:]:
+            assert not _overlaps(a, b)
+    viewport_width = header.viewport().width()
+    for left, _top, right, _bottom in rects:
+        assert left >= -1 and right <= viewport_width + 1
+    # 締切（マイルストーン）のラベルは残り、最後のマイルストーンも見えている
+    visible_texts = {label.text() for label, _x, _p in entries if label.isVisible()}
+    assert "マスターアップ" in visible_texts
+    assert "アルファ版（コアアセット確定）" in visible_texts
