@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 pytest.importorskip("PySide6")
 pytest.importorskip("pandas")
 
-from PySide6.QtCore import QEvent, QPointF, Qt  # noqa: E402
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt  # noqa: E402
 from PySide6.QtGui import QMouseEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -696,3 +696,32 @@ def test_header_labels_do_not_overlap_and_stay_inside_the_view(qapp, gantt, tmp_
     visible_texts = {label.text() for label, _x, _p in entries if label.isVisible()}
     assert "マスターアップ" in visible_texts
     assert "アルファ版（コアアセット確定）" in visible_texts
+
+
+@pytest.mark.parametrize("on_bar", [True, False], ids=["on_selected_bar", "on_empty_area"])
+def test_right_click_keeps_the_multi_selection(qapp, gantt, on_bar):
+    """回帰テスト: 複数選択してから右クリックすると、右ボタンの押下がラバーバンド選択の
+    開始として扱われて選択が解除され、メニューが1つのタスクにしか効かなかった。
+    実際の右クリックと同じく、押下→離す→コンテキストメニューの順にイベントを送る。"""
+    from PySide6.QtGui import QContextMenuEvent
+
+    w, tab, ids = gantt
+    keys = [_key(ids, "job1", "t1"), _key(ids, "job2", "t2")]
+    tab.view.select_keys(keys)
+    body = tab.view.body
+    bar = tab.view.bars()[keys[0]]
+    body.ensureVisible(bar.sceneBoundingRect())
+    qapp.processEvents()
+    if on_bar:
+        pos = body.mapFromScene(bar.sceneBoundingRect().center())
+    else:
+        pos = body.mapFromScene(bar.sceneBoundingRect().bottomRight()) + QPoint(5, 30)
+    viewport = body.viewport()
+    shown = []
+    with patch.object(tab, "_exec_menu", lambda menu, _pos: shown.append(menu) or None):
+        QTest.mousePress(viewport, Qt.RightButton, Qt.NoModifier, pos)
+        QTest.mouseRelease(viewport, Qt.RightButton, Qt.NoModifier, pos)
+        event = QContextMenuEvent(QContextMenuEvent.Mouse, pos, viewport.mapToGlobal(pos))
+        QApplication.sendEvent(viewport, event)
+    assert len(shown) == 1
+    assert sorted(tab.view.selected_keys()) == sorted(keys)

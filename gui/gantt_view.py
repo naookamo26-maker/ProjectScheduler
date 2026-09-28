@@ -414,6 +414,12 @@ class GanttGraphicsView(QGraphicsView):
             self.setCursor(Qt.ClosedHandCursor)
             event.accept()
             return
+        if event.button() == Qt.RightButton:
+            # QGraphicsView は右ボタンの押下でもラバーバンド選択を始めて選択を解除する
+            # ため、複数選択してから右クリックすると1つしか残らなかった。右クリックでの
+            # 選択の扱いは contextMenuEvent に任せ、押下はここで止める。
+            event.accept()
+            return
         if event.button() == Qt.LeftButton:
             self.pressed.emit()
             if self._try_start_drag(event):

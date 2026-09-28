@@ -338,6 +338,18 @@ class NoWheelListWidget(QListWidget):
             event.ignore()
 
 
+def is_dark_theme():
+    """アプリがダークモード（暗い背景）で表示されているか。
+
+    色を直接指定するウィジェット（スタイルシート・独自描画）は、ライトモードの色だけを
+    書くとダークモードで周りから浮いたり文字が読めなくなったりするため、これで
+    ライト／ダークの配色を切り替える。判定はアプリ全体のパレットで行う（ウィジェット
+    自身のパレットはスタイルシートで変わるため当てにならない）。起動後のテーマの
+    切り替えには ApplicationPaletteChange で追従する。スタイルシートを当てたウィジェットには
+    この通知が届かないため、QApplication にイベントフィルタを付けて拾う（gui/plan_band.py）。"""
+    return QApplication.palette().color(QPalette.Window).lightness() < 128
+
+
 def keep_selection_visible(view):
     """フォーカスが他のウィジェット（別テーブルのセルウィジェット等）に移っても、
     選択中の行がグレーアウトして見えなくならないようにする。
