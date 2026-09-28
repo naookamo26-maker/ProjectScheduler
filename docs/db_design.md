@@ -23,7 +23,7 @@ PySide6（Qt）に一切依存しないため、GUIを起動せずに単体で�
 | テーブル | 役割 |
 |---|---|
 | `schema_meta` | スキーマバージョン管理用。`ProjectDatabase.open_existing`が旧バージョンの`.pschedule`を検出すると`_migrate_schema`で自動的に不足カラム等を追加する（例: v1→v2で`workflows.sort_order`を追加）。`open_existing`はマイグレーションの前に`check_openable`（`gui/db_schema.py`）でこのテーブル・行の有無と`schema_version`がこのアプリの対応範囲内かを検証し、ProjectSchedulerのファイルとして扱えない場合は`ProjectDatabaseError`にして拒否する（詳細は`docs/architecture.md`「ファイルを開く際の検証」参照） |
-| `project` | プロジェクト名・開始日・`distribution_ratio`（ガントチャートタブの「配置コントロール」で調整する配置基準点、既定0.7。`project_scheduler.py`参照）（常に1行、`id=1`固定）。v17で計画の確定用に`replan_base_date`（確定行の無いタスクを置かない下限）・`replanned_at`（全面再計画の実行日）・`confirmed_at`（最後に確定した日時）・`confirmed_global_signature`（確定時の全体設定の指紋）を追加（`docs/roadmap.md` §8）。v18で`pending_replan_base_date`・`pending_replanned_at`（全面再計画を実行して、まだ確定していない間の基準日と実行日。「変更を確定」で`replan_base_date`・`replanned_at`へ移し、「変更を破棄」では確定時点のスナップショットに戻るので消える）を追加 |
+| `project` | プロジェクト名・開始日・`distribution_ratio`（ガントチャートタブの「配置」で調整する配置基準点、既定0.7。`project_scheduler.py`参照）（常に1行、`id=1`固定）。v17で計画の確定用に`replan_base_date`（確定行の無いタスクを置かない下限）・`replanned_at`（全面再計画の実行日）・`confirmed_at`（最後に確定した日時）・`confirmed_global_signature`（確定時の全体設定の指紋）を追加（`docs/roadmap.md` §8）。v18で`pending_replan_base_date`・`pending_replanned_at`（全面再計画を実行して、まだ確定していない間の基準日と実行日。「変更を確定」で`replan_base_date`・`replanned_at`へ移し、「変更を破棄」では確定時点のスナップショットに戻るので消える）を追加 |
 | `milestones` | マイルストーン（名前・締切日・備考） |
 | `teams` | チーム（名前・開発開始日からの既定の同時ライン数）。ライン数は3状態: NULL＝指定なし（上限を設けない。新規チームの既定）、0＝その期間は稼働なし、N＝N本 |
 | `team_capacity_changes` | チームの同時ライン数が期間の途中で変わる場合の変更点（適用開始日・その日以降のライン数、こちらも同じ3状態）。`teams.max_lines`はいつまでも「最初の期間」の値として残る |

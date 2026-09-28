@@ -39,7 +39,7 @@ GUIの文言とメッセージを英語・ベトナム語・中国語（簡体�
 | 締切 | deadline | hạn chót | 截止日期 |
 | 締切超過 | overrun | trễ hạn | 超期 |
 | 開始固定日 / 手動ピン | pinned start date / pin | ngày bắt đầu cố định / ghim | 固定开始日 / 固定 |
-| 配置コントロール | Placement control | Điều chỉnh bố trí | 排布控制 |
+| 配置 | Placement | Bố trí | 排布 |
 | 最速 / ギリギリ | Earliest / Latest | Sớm nhất / Muộn nhất | 最早 / 最晚 |
 | 違反 | violation | vi phạm | 冲突 |
 
@@ -80,7 +80,7 @@ GUIの文言とメッセージを英語・ベトナム語・中国語（簡体�
 | プロジェクト分析 | Project analysis | Phân tích dự án | 项目分析 |
 | 状態帯 | status bar | thanh trạng thái | 状态栏 |
 | 絞り込み | Filter | Lọc | 筛选 |
-| 行の並び（ガントのジョブの並び順） | Row order | Thứ tự hàng | 行顺序 |
+| 並び（ガントのジョブの並び順） | Order | Thứ tự | 顺序 |
 | 並べ直す | Re-sort | Sắp xếp lại | 重新排序 |
 | 昇順 / 降順 | Ascending / Descending | Tăng dần / Giảm dần | 升序 / 降序 |
 | 追加 / 複製 / 削除 | Add / Duplicate / Delete | Thêm / Nhân bản / Xóa | 添加 / 复制 / 删除 |

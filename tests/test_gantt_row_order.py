@@ -45,16 +45,17 @@ def _df(jobs):
     ])
 
 
+# 名前（Z〜W）は作った順（番号）と逆にしてあり、同点が名前ではなく作った順で決まることを確かめる
 JOBS = _df([
-    ("JOB_A", "A", "WF_001", 3, "MS_002", "2026-02-01", "2026-05-01"),
-    ("JOB_B", "B", "WF_002", 1, "MS_001", "2026-03-01", "2026-04-01"),
-    ("JOB_C", "C", "WF_001", 2, "", "2026-01-15", "2026-06-01"),
-    ("JOB_D", "D", "WF_002", 999, "MS_001", "2026-03-01", "2026-03-20"),
+    ("JOB_A", "Z", "WF_001", 3, "MS_002", "2026-02-01", "2026-05-01"),
+    ("JOB_B", "Y", "WF_002", 1, "MS_001", "2026-03-01", "2026-04-01"),
+    ("JOB_C", "X", "WF_001", 2, "", "2026-01-15", "2026-06-01"),
+    ("JOB_D", "W", "WF_002", 999, "MS_001", "2026-03-01", "2026-03-20"),
 ])
 
 
 @pytest.mark.parametrize("order, descending, expected", [
-    # 開始日が同じ B と D は、名前の順（降順でも名前は昇順のまま）
+    # 開始日が同じ B と D は、作った順（降順でも作った順のまま）
     (ORDER_START, False, ["JOB_C", "JOB_A", "JOB_B", "JOB_D"]),
     (ORDER_START, True, ["JOB_B", "JOB_D", "JOB_A", "JOB_C"]),
     (ORDER_END, False, ["JOB_D", "JOB_B", "JOB_A", "JOB_C"]),
@@ -82,7 +83,7 @@ def test_a_job_deadline_is_the_latest_among_its_tasks():
     df = pd.concat([
         JOBS[JOBS["Job_ID"] != "JOB_A"],
         _df([("JOB_A", "A", "WF_001", 3, "MS_001", "2026-02-01", "2026-05-01")]),
-        _df([("JOB_A", "A", "WF_001", 3, "", "2026-02-01", "2026-05-01")]),
+        _df([("JOB_A", "Z", "WF_001", 3, "", "2026-02-01", "2026-05-01")]),
     ])
     assert sort_job_ids(df, _DISPLAY, GROUP_ALL, ORDER_MILESTONE) == ["JOB_D", "JOB_B", "JOB_A", "JOB_C"]
 
@@ -95,3 +96,13 @@ def test_keep_order_keeps_known_rows_and_inserts_new_ones_next_to_their_neighbou
     assert keep_order(previous, ["JOB_B", "JOB_D", "JOB_A"]) == ["JOB_B", "JOB_D", "JOB_A"]
     assert keep_order(previous, ["JOB_E", "JOB_C"]) == ["JOB_E", "JOB_C"]
     assert keep_order([], ["JOB_A", "JOB_B"]) == ["JOB_A", "JOB_B"]
+
+
+def test_ties_follow_the_creation_order_by_number():
+    """同じ開始日のジョブは作った順。番号は数として比べる（JOB_1000 は JOB_999 の後）。"""
+    df = _df([
+        ("JOB_1000", "A", "WF_001", 1, "", "2026-02-01", "2026-03-01"),
+        ("JOB_999", "B", "WF_001", 1, "", "2026-02-01", "2026-03-01"),
+        ("JOB_002", "C", "WF_001", 1, "", "2026-02-01", "2026-03-01"),
+    ])
+    assert sort_job_ids(df, _DISPLAY) == ["JOB_002", "JOB_999", "JOB_1000"]

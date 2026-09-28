@@ -93,10 +93,9 @@ _NO_TAG_FILTER_KEY = None
 _NO_JOB_TAG_FILTER_LABEL = N_("（ジョブ タグなし）")
 _NO_TASK_TAG_FILTER_LABEL = N_("（タスク タグなし）")
 
-# 配置コントロール（画面上部、計算結果テキストの右隣に並べる操作パネル）の幅。
-# タイトル・ラベル・スライダー・スピンボックスを縦に積まず1行に収めるぶん、
-# 幅は広めに取る。
-_PLACEMENT_CONTROL_WIDTH = 420
+# 配置（画面上部、計算結果テキストの右隣に並べる操作パネル）のスライダーの幅。
+# パネル全体は中身の幅に合わせ、計算結果テキストに横幅を譲る。
+_PLACEMENT_SLIDER_WIDTH = 110
 
 # ジョブ名検索は1文字入力するたびに絞り込みを走らせず、入力が止まってから
 # まとめて反映する（デバウンス）。値はキー入力の間隔として自然に感じられる
@@ -223,7 +222,7 @@ class GanttTab(QWidget):
         # 以前は配置コントロールをチャート本体（self.view）の右下にフローティング
         # 表示していたが、チャートのバー・グリッド線が透けて見えてしまい操作
         # 対象が見づらかったため、チャートへの重ね描画をやめて上部のテキストの
-        # 横（右揃え）に置く（幅はフローティング時代と同じ _PLACEMENT_CONTROL_WIDTH）。
+        # 横（右揃え）に置く。幅は中身に合わせる（スライダーは _PLACEMENT_SLIDER_WIDTH）。
         top_row = QHBoxLayout()
 
         self.status_label = QLabel("")
@@ -234,11 +233,10 @@ class GanttTab(QWidget):
         # ため、タイトルは通常のQLabelとして枠内に置く（QGroupBoxはタイトル無しの
         # 単なる枠として使う）。
         self.placement_group = QGroupBox("")
-        self.placement_group.setFixedWidth(_PLACEMENT_CONTROL_WIDTH)
         # ガントチャートの縦方向を圧迫しないよう、タイトル・ラベル・スライダー・
         # スピンボックスを縦に積まず1行に収める（そのぶん幅を確保する）。
         placement_layout = QHBoxLayout(self.placement_group)
-        placement_layout.addWidget(QLabel(tr("配置コントロール")))
+        placement_layout.addWidget(QLabel(tr("配置")))
         placement_layout.addWidget(QLabel(tr("最速")))
         self.placement_slider = NoWheelSlider(Qt.Horizontal)
         self.placement_slider.setRange(0, 100)
@@ -246,7 +244,8 @@ class GanttTab(QWidget):
             tr("各タスクを、依存関係が満たされ次第の最速開始～締切から逆算した"
             "最遅開始の範囲内のどこに配置するかの基準点（distribution_ratio）。")
         )
-        placement_layout.addWidget(self.placement_slider, 1)
+        self.placement_slider.setFixedWidth(_PLACEMENT_SLIDER_WIDTH)
+        placement_layout.addWidget(self.placement_slider)
         placement_layout.addWidget(QLabel(tr("ギリギリ")))
         self.placement_spinbox = NoWheelSpinBox()
         self.placement_spinbox.setRange(0, 100)
@@ -259,7 +258,7 @@ class GanttTab(QWidget):
         # フォーカスの出入り単位で1つのUndoにまとめる（docs/architecture.md
         # 「Undo/Redo」参照）。スライダーはドラッグ中DBに書き込まず離した時に
         # 1回だけ書き込むため、これ自体で既に1操作1Undoになっており不要。
-        bind_undo_session(self.placement_spinbox, self.db, "配置コントロールを変更")
+        bind_undo_session(self.placement_spinbox, self.db, "配置を変更")
         placement_layout.addWidget(self.placement_spinbox)
         self._sync_placement_widgets(self._distribution_ratio)
 
@@ -345,7 +344,7 @@ class GanttTab(QWidget):
         画面の状態として覚える（プロジェクトの内容ではないので、Undoの対象にもしない）。"""
         group = QGroupBox("")
         row = QHBoxLayout(group)
-        row.addWidget(QLabel(tr("行の並び")))
+        row.addWidget(QLabel(tr("並び")))
         self.row_grouping_combo = NoWheelComboBox()
         for key in GROUPINGS:
             self.row_grouping_combo.addItem(tr(_GROUPING_LABELS[key]), key)

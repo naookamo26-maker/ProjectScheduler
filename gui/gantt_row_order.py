@@ -9,6 +9,8 @@
 編集の後は、対象のジョブを見失わないよう前回の並びを保つ（keep_order）。
 """
 
+import re
+
 import pandas as pd
 
 GROUP_ALL = "all"
@@ -23,7 +25,7 @@ ORDERS = (ORDER_START, ORDER_END, ORDER_MILESTONE, ORDER_PRIORITY)
 
 
 def _job_facts(df, display):
-    """ジョブごとの (開始, 終了, 締切 or None, 優先度, ワークフロー, 名前)。"""
+    """ジョブごとの (開始, 終了, 締切 or None, 優先度, ワークフロー)。"""
     deadlines = {mid: when for mid, _name, when in (display or {}).get("milestone_markers", ())}
     facts = {}
     for job_id, rows in df.groupby("Job_ID", sort=False):
@@ -39,9 +41,14 @@ def _job_facts(df, display):
             # として扱った値がそのまま入っている。並びでも同じく最低優先として扱う
             "priority": first["Priority"] if pd.notna(first["Priority"]) else float("inf"),
             "workflow": first["Workflow_ID"],
-            "name": str(first["Job_Name"]),
         }
     return facts
+
+
+def _creation_key(job_id):
+    """ジョブを作った順（Job_ID の番号順。JOB_999 の次の JOB_1000 も番号で比べる）。"""
+    match = re.search(r"(\d+)$", str(job_id))
+    return (int(match.group(1)) if match else float("inf"), str(job_id))
 
 
 def _sort_key(order):
@@ -58,8 +65,9 @@ def _sort_key(order):
 def sort_job_ids(df, display, grouping=GROUP_ALL, order=ORDER_START, descending=False):
     """df（スケジューリング結果。絞り込み後でよい）に含まれるジョブの並びを返す。
 
-    - 同じ値のジョブはジョブ名の順（計算し直すたびに入れ替わらないように）。
-      降順でもジョブ名は昇順のまま。
+    - 同じ値のジョブはジョブを作った順（計算し直すたびに入れ替わらないように）。
+      降順でも作った順のまま。この機能を入れる前の開始日順も、同じ開始日のジョブを
+      作った順に並べていたので、既定（全体・開始日順）の表示は以前と変わらない。
     - マイルストーン順で締切の無いジョブは、昇順・降順とも最後。
     - ワークフロー別では、ワークフロー設計タブの並び順（display["workflow_names"]
       の順）でまとめ、その中を上の並びで並べる。ワークフロー同士の順は降順でも変えない。
@@ -70,15 +78,15 @@ def sort_job_ids(df, display, grouping=GROUP_ALL, order=ORDER_START, descending=
     key = _sort_key(order)
 
     def ordered(job_ids):
-        # 名前順に並べてから主キーで安定ソートする（reverse=True でも安定なので、
-        # 同じ値のジョブは降順でも名前の昇順に残る）
-        by_name = sorted(job_ids, key=lambda j: (facts[j]["name"], j))
+        # 作った順に並べてから主キーで安定ソートする（reverse=True でも安定なので、
+        # 同じ値のジョブは降順でも作った順に残る）
+        created = sorted(job_ids, key=_creation_key)
         if order == ORDER_MILESTONE:
-            undated = [j for j in by_name if facts[j]["deadline"] is None]
-            by_name = [j for j in by_name if facts[j]["deadline"] is not None]
+            undated = [j for j in created if facts[j]["deadline"] is None]
+            created = [j for j in created if facts[j]["deadline"] is not None]
         else:
             undated = []
-        return sorted(by_name, key=lambda j: key(facts[j]), reverse=descending) + undated
+        return sorted(created, key=lambda j: key(facts[j]), reverse=descending) + undated
 
     if grouping != GROUP_WORKFLOW:
         return ordered(list(facts))
