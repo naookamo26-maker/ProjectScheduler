@@ -156,9 +156,9 @@ def _validate_distribution_ratio(value):
     try:
         value = float(value)
     except (TypeError, ValueError):
-        raise ProjectDatabaseError(tr("配置コントロールの値は数値で指定してください")) from None
+        raise ProjectDatabaseError(tr("配置の値は数値で指定してください")) from None
     if not 0.0 <= value <= 1.0:
-        raise ProjectDatabaseError(tr("配置コントロールの値は0.0〜1.0の範囲で指定してください"))
+        raise ProjectDatabaseError(tr("配置の値は0.0〜1.0の範囲で指定してください"))
     return value
 
 
@@ -621,7 +621,7 @@ class ProjectDatabase:
         )
         self._commit()
 
-    @undoable("配置コントロールを変更")
+    @undoable("配置を変更")
     def set_distribution_ratio(self, distribution_ratio):
         """ガントチャートタブの「配置コントロール」で調整する distribution_ratio
         （project_scheduler.py 参照）をプロジェクト設定として保存する。"""

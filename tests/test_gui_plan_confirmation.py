@@ -393,3 +393,48 @@ def test_generate_asks_which_schedule_only_during_a_draft(qapp, gantt, tmp_path)
             patch.object(QMessageBox, "information"):
         w.on_generate_gantt()
     assert "確定した日程" in html.read_text(encoding="utf-8")
+
+
+def test_band_height_does_not_change_with_the_buttons(qapp, gantt):
+    """ボタンはガントチャートタブでだけ出すが、その有無で帯の高さが変わらないこと。"""
+    w, _tab, _ids = gantt
+    assert _band_settled(qapp, w, UNCONFIRMED)
+    _wait(qapp, lambda: False, timeout=0.05)
+    with_buttons = w.plan_band.height()
+    w.tabs.setCurrentIndex(0)
+    assert _wait(qapp, lambda: not w.plan_band.confirm_button.isVisible())
+    _wait(qapp, lambda: False, timeout=0.05)
+    assert w.plan_band.height() == with_buttons
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_band_follows_the_light_and_dark_theme(qapp, dark):
+    """ダークモードでは暗い帯にし（明るい帯が浮かない）、ボタンの文字色も明示する
+    （スタイル任せだと Windows 11 で白文字になり読めない）。起動後の切り替えにも追従する。"""
+    from PySide6.QtGui import QColor, QPalette
+    from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
+
+    from gui.plan_band import _COLORS, PlanStatusBand
+
+    original = QApplication.palette()
+    # 親の中に置く（スタイルシートを当てた子にはアプリのパレット変更が届かないため、
+    # 単独のウィンドウで試すと実際の画面での不具合を見逃す）
+    parent = QWidget()
+    band = PlanStatusBand()
+    QVBoxLayout(parent).addWidget(band)
+    parent.show()
+    qapp.processEvents()
+    try:
+        palette = QPalette(original)
+        palette.setColor(QPalette.Window, QColor("#202020" if dark else "#f0f0f0"))
+        QApplication.setPalette(palette)
+        qapp.processEvents()
+        background, _border, text = _COLORS[dark][UNCONFIRMED]
+        sheet = band.styleSheet()
+        assert f"background: {background};" in sheet
+        assert "QPushButton {" in sheet and f"color: {text};" in sheet.split("QPushButton {", 1)[1]
+        assert (QColor(background).lightness() < 128) == dark
+    finally:
+        QApplication.setPalette(original)
+        parent.deleteLater()
+        qapp.processEvents()

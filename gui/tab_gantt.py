@@ -19,7 +19,11 @@ gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、ホイー
 表示件数を絞り込める（絞り込みはあくまで表示上のもので、スケジューリング
 自体はやり直さない）。
 
-ジョブはそのジョブの最初のタスクの開始日が早い順。マイルストーンは縦線として
+ジョブ（行）の並びは上部の「並び」で選ぶ（分類: 全体／ワークフロー別、並び:
+開始日・終了日・マイルストーン・優先度、昇順／降順。gui/gantt_row_order.py）。
+並びが変わるのは、並び順を選び直したときと「並べ直す」ボタンを押したときだけで、
+編集の後は対象のジョブを見失わないよう前回の並びを保つ（そのとき並びが選んだ順
+どおりでなくなっていれば、並べ直すボタンを目立たせる）。マイルストーンは縦線として
 表示する。
 
 タスクの編集（docs/roadmap.md §9）: バーを選んで、Shift（オプションで変更可）を
@@ -32,9 +36,10 @@ gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、ホイー
 
 from datetime import date, timedelta
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QFontMetrics
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QFontMetrics, QPalette
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QGroupBox,
@@ -45,6 +50,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSizePolicy,
     QSpacerItem,
+    QStyle,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -52,6 +59,18 @@ from PySide6.QtWidgets import (
 from gui.app_settings import AppSettings
 from gui.db import ProjectDatabaseError, parse_tags
 from gui.gantt_edit import WorkDayCalendar, format_entity_id, parse_entity_id
+from gui.gantt_row_order import (
+    GROUP_ALL,
+    GROUP_WORKFLOW,
+    GROUPINGS,
+    ORDER_END,
+    ORDER_MILESTONE,
+    ORDER_PRIORITY,
+    ORDER_START,
+    ORDERS,
+    keep_order,
+    sort_job_ids,
+)
 from gui.gantt_task_editor import TaskEditWindow
 from gui.gantt_view import FrozenGanttPane, build_gantt_scenes, set_bar_baseline
 from gui.plan_actions import confirm_all, confirm_selected, selected_targets
@@ -60,8 +79,10 @@ from gui.replan_dialog import ReplanDialog
 from gui.widgets_common import (
     ChoiceFilterGroup,
     CollapsibleSection,
+    NoWheelComboBox,
     NoWheelSlider,
     NoWheelSpinBox,
+    alert_style,
     bind_undo_session,
 )
 from i18n import N_, tr
@@ -73,15 +94,22 @@ _NO_TAG_FILTER_KEY = None
 _NO_JOB_TAG_FILTER_LABEL = N_("（ジョブ タグなし）")
 _NO_TASK_TAG_FILTER_LABEL = N_("（タスク タグなし）")
 
-# 配置コントロール（画面上部、計算結果テキストの右隣に並べる操作パネル）の幅。
-# タイトル・ラベル・スライダー・スピンボックスを縦に積まず1行に収めるぶん、
-# 幅は広めに取る。
-_PLACEMENT_CONTROL_WIDTH = 420
+# 配置（画面上部、計算結果テキストの右隣に並べる操作パネル）のスライダーの幅。
+# パネル全体は中身の幅に合わせ、計算結果テキストに横幅を譲る。
+_PLACEMENT_SLIDER_WIDTH = 110
 
 # ジョブ名検索は1文字入力するたびに絞り込みを走らせず、入力が止まってから
 # まとめて反映する（デバウンス）。値はキー入力の間隔として自然に感じられる
 # 程度（他の即時反映系UIとの一貫性より「打ち終わってから絞り込まれる」体感を優先）。
 _SEARCH_DEBOUNCE_MS = 300
+
+
+# 「並び」の選択肢（gui/gantt_row_order.py）
+_GROUPING_LABELS = {GROUP_ALL: N_("全体"), GROUP_WORKFLOW: N_("ワークフロー別")}
+_ORDER_LABELS = {
+    ORDER_START: N_("開始日順"), ORDER_END: N_("終了日順"),
+    ORDER_MILESTONE: N_("マイルストーン順"), ORDER_PRIORITY: N_("優先度順"),
+}
 
 
 # オプション（gui/app_settings.py の gantt_drag_modifier）の値 → Qtの修飾キー
@@ -129,6 +157,10 @@ class GanttTab(QWidget):
         # ここに持つのは表示用のキャッシュで、DB側が正——Undo/Redo等でDBの値が
         # 変わった場合は refresh_choices() の先頭で読み直して同期する。
         self._distribution_ratio = self.db.get_project()["distribution_ratio"]
+        # いま表示している行（ジョブ）の並び。None なら次の描画で選んだ並び順どおりに
+        # 並べる。編集・絞り込みの後は、この並びを保つ（gui/gantt_row_order.keep_order）。
+        self._row_order = None
+        self._row_order_stale = False
 
         layout = QVBoxLayout(self)
 
@@ -191,7 +223,7 @@ class GanttTab(QWidget):
         # 以前は配置コントロールをチャート本体（self.view）の右下にフローティング
         # 表示していたが、チャートのバー・グリッド線が透けて見えてしまい操作
         # 対象が見づらかったため、チャートへの重ね描画をやめて上部のテキストの
-        # 横（右揃え）に置く（幅はフローティング時代と同じ _PLACEMENT_CONTROL_WIDTH）。
+        # 横（右揃え）に置く。幅は中身に合わせる（スライダーは _PLACEMENT_SLIDER_WIDTH）。
         top_row = QHBoxLayout()
 
         self.status_label = QLabel("")
@@ -202,11 +234,10 @@ class GanttTab(QWidget):
         # ため、タイトルは通常のQLabelとして枠内に置く（QGroupBoxはタイトル無しの
         # 単なる枠として使う）。
         self.placement_group = QGroupBox("")
-        self.placement_group.setFixedWidth(_PLACEMENT_CONTROL_WIDTH)
         # ガントチャートの縦方向を圧迫しないよう、タイトル・ラベル・スライダー・
         # スピンボックスを縦に積まず1行に収める（そのぶん幅を確保する）。
         placement_layout = QHBoxLayout(self.placement_group)
-        placement_layout.addWidget(QLabel(tr("配置コントロール")))
+        placement_layout.addWidget(QLabel(tr("配置")))
         placement_layout.addWidget(QLabel(tr("最速")))
         self.placement_slider = NoWheelSlider(Qt.Horizontal)
         self.placement_slider.setRange(0, 100)
@@ -214,7 +245,8 @@ class GanttTab(QWidget):
             tr("各タスクを、依存関係が満たされ次第の最速開始～締切から逆算した"
             "最遅開始の範囲内のどこに配置するかの基準点（distribution_ratio）。")
         )
-        placement_layout.addWidget(self.placement_slider, 1)
+        self.placement_slider.setFixedWidth(_PLACEMENT_SLIDER_WIDTH)
+        placement_layout.addWidget(self.placement_slider)
         placement_layout.addWidget(QLabel(tr("ギリギリ")))
         self.placement_spinbox = NoWheelSpinBox()
         self.placement_spinbox.setRange(0, 100)
@@ -227,7 +259,7 @@ class GanttTab(QWidget):
         # フォーカスの出入り単位で1つのUndoにまとめる（docs/architecture.md
         # 「Undo/Redo」参照）。スライダーはドラッグ中DBに書き込まず離した時に
         # 1回だけ書き込むため、これ自体で既に1操作1Undoになっており不要。
-        bind_undo_session(self.placement_spinbox, self.db, "配置コントロールを変更")
+        bind_undo_session(self.placement_spinbox, self.db, "配置を変更")
         placement_layout.addWidget(self.placement_spinbox)
         self._sync_placement_widgets(self._distribution_ratio)
 
@@ -240,6 +272,7 @@ class GanttTab(QWidget):
         self.placement_spinbox.editingFinished.connect(
             self._on_placement_spinbox_editing_finished
         )
+        top_row.addWidget(self._build_row_order_group(), 0, Qt.AlignRight)
         top_row.addWidget(self.placement_group, 0, Qt.AlignRight)
         layout.addLayout(top_row)
 
@@ -304,6 +337,111 @@ class GanttTab(QWidget):
         self.placement_spinbox.blockSignals(True)
         self.placement_spinbox.setValue(value)
         self.placement_spinbox.blockSignals(False)
+
+    # -- 並び（gui/gantt_row_order.py） --------------------------------------------
+
+    def _build_row_order_group(self):
+        """「並び」: 分類・並び順・昇順／降順・並べ直すボタン。選んだ値は利用者ごとの
+        画面の状態として覚える（プロジェクトの内容ではないので、Undoの対象にもしない）。"""
+        group = QGroupBox("")
+        row = QHBoxLayout(group)
+        row.addWidget(QLabel(tr("並び")))
+        self.row_grouping_combo = NoWheelComboBox()
+        for key in GROUPINGS:
+            self.row_grouping_combo.addItem(tr(_GROUPING_LABELS[key]), key)
+        self.row_order_combo = NoWheelComboBox()
+        for key in ORDERS:
+            self.row_order_combo.addItem(tr(_ORDER_LABELS[key]), key)
+        self.row_descending_button = QToolButton()
+        self.row_descending_button.setCheckable(True)
+        self.row_resort_button = QToolButton()
+        self.row_resort_button.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        self.row_resort_button.setIconSize(QSize(18, 18))
+        for widget in (self.row_grouping_combo, self.row_order_combo,
+                       self.row_descending_button, self.row_resort_button):
+            row.addWidget(widget)
+
+        def saved(name, choices, default):
+            value = self.app_settings.get_ui_state(name)
+            return value if value in choices else default
+        self._select_combo(self.row_grouping_combo, saved("gantt_row_grouping", GROUPINGS, GROUP_ALL))
+        self._select_combo(self.row_order_combo, saved("gantt_row_order", ORDERS, ORDER_START))
+        self.row_descending_button.setChecked(saved("gantt_row_descending", ("0", "1"), "0") == "1")
+        self._update_descending_button()
+
+        self.row_grouping_combo.currentIndexChanged.connect(self._on_row_order_option_changed)
+        self.row_order_combo.currentIndexChanged.connect(self._on_row_order_option_changed)
+        self.row_descending_button.toggled.connect(self._on_row_order_option_changed)
+        self.row_resort_button.clicked.connect(self.resort_rows)
+        self._update_resort_button()
+        return group
+
+    @staticmethod
+    def _select_combo(combo, key):
+        combo.setCurrentIndex(max(0, combo.findData(key)))
+
+    def _update_descending_button(self):
+        descending = self.row_descending_button.isChecked()
+        self.row_descending_button.setArrowType(Qt.DownArrow if descending else Qt.UpArrow)
+        self.row_descending_button.setToolTip(tr("降順") if descending else tr("昇順"))
+
+    def _update_resort_button(self):
+        """並びが選んだ並び順どおりでなくなっていたら（編集で日付が変わった等）、
+        並べ直すボタンを枠と背景で目立たせる。色はアプリのパレットの強調色から取り、
+        ライト／ダークどちらでも周りから浮きすぎないよう背景は薄くする。"""
+        if self._row_order_stale:
+            accent = QApplication.palette().color(QPalette.Highlight)
+            self.row_resort_button.setStyleSheet(
+                f"QToolButton {{ border: 2px solid {accent.name()}; border-radius: 4px; "
+                f"background: rgba({accent.red()}, {accent.green()}, {accent.blue()}, 60); }}"
+            )
+            self.row_resort_button.setToolTip(
+                tr("編集などで、行が選んだ並び順どおりではなくなっています。押すと並べ直します。")
+            )
+        else:
+            self.row_resort_button.setStyleSheet("")
+            self.row_resort_button.setToolTip(tr("並べ直す"))
+
+    def changeEvent(self, event):
+        """起動後に OS のテーマが切り替わったら、並べ直すボタンの強調色とエラーの赤字も
+        追従させる。"""
+        super().changeEvent(event)
+        if event.type() in (QEvent.ApplicationPaletteChange, QEvent.PaletteChange):
+            self._update_resort_button()
+            self.status_label.setStyleSheet(alert_style(getattr(self, "_status_is_error", False)))
+
+    def row_order_options(self):
+        return (self.row_grouping_combo.currentData(), self.row_order_combo.currentData(),
+                self.row_descending_button.isChecked())
+
+    def _on_row_order_option_changed(self, *_args):
+        grouping, order, descending = self.row_order_options()
+        self.app_settings.set_ui_state("gantt_row_grouping", grouping)
+        self.app_settings.set_ui_state("gantt_row_order", order)
+        self.app_settings.set_ui_state("gantt_row_descending", "1" if descending else "0")
+        self._update_descending_button()
+        self.resort_rows()
+
+    def resort_rows(self):
+        """今の並び順で行を並べ直す（並べ直すボタン・並び順の選び直し）。表示位置と
+        選択は保つ。"""
+        self._row_order = None
+        if self.view.scene() is None:
+            return
+        self._pending_selection = self.view.selected_keys()
+        self._pending_view_state = self.view.view_state()
+        self._refresh_chart()
+
+    def _job_order_for(self, df):
+        """表示する行の並び。前回の並びがあればそれを保ち（新しく加わったジョブだけ
+        今の並び順の位置へ差し込む）、並びが選んだ順どおりかどうかを覚える。"""
+        grouping, order, descending = self.row_order_options()
+        fresh = sort_job_ids(df, self._display, grouping, order, descending)
+        job_order = fresh if self._row_order is None else keep_order(self._row_order, fresh)
+        self._row_order = job_order
+        self._row_order_stale = job_order != fresh
+        self._update_resort_button()
+        return job_order
 
     def refresh_choices(self):
         """このタブに切り替わるたびに gui/main.py の _on_tab_changed から呼ばれ、
@@ -486,8 +624,9 @@ class GanttTab(QWidget):
 
     def _set_status(self, message, is_error=False):
         """状況表示。エラーはダイアログを出さずここに表示するため、通常の
-        メッセージと見分けが付くよう色を変える。"""
-        self.status_label.setStyleSheet("color: #b3261e;" if is_error else "")
+        メッセージと見分けが付くよう色を変える（ライト／ダークで読める赤。alert_style）。"""
+        self._status_is_error = is_error
+        self.status_label.setStyleSheet(alert_style(is_error))
         self.status_label.setText(message)
 
     def _clear_chart_state(self, status_message, is_error=False):
@@ -615,7 +754,7 @@ class GanttTab(QWidget):
         self._pending_selection = None
         self._pending_view_state = None
 
-        scenes = build_gantt_scenes(df, self._display, color_by="team")
+        scenes = build_gantt_scenes(df, self._display, color_by="team", job_order=self._job_order_for(df))
         self.view.setScene(scenes)
         body = self.view.body
         body.edit_enabled = scenes is not None
@@ -626,8 +765,8 @@ class GanttTab(QWidget):
         self._decorate_plan(scenes.body)
         if view_state is not None:
             # 編集・Undo/Redo の後は、表示位置（縮尺・スクロール）を保つ。
-            # 行の並び（ジョブの最早開始日順）が変わりうるので、選択したバーが
-            # 見えるようにスクロールし直す。
+            # 行の並びは保つ（_job_order_for）が、日付が大きく動くと選択したバーが
+            # 横に外れうるので、見えるようにスクロールし直す。
             self.view.restore_view_state(view_state)
             self.view.select_keys(selection or [], ensure_visible=True)
             QTimer.singleShot(0, lambda: self._restore_view_after_layout(view_state, selection))

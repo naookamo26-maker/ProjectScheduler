@@ -9,7 +9,7 @@ Undo を確かめる。再計算はワーカースレッドで走るため、結
 import os
 import sys
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 pytest.importorskip("PySide6")
 pytest.importorskip("pandas")
 
-from PySide6.QtCore import QEvent, QPointF, Qt  # noqa: E402
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt  # noqa: E402
 from PySide6.QtGui import QMouseEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -696,3 +696,125 @@ def test_header_labels_do_not_overlap_and_stay_inside_the_view(qapp, gantt, tmp_
     visible_texts = {label.text() for label, _x, _p in entries if label.isVisible()}
     assert "マスターアップ" in visible_texts
     assert "アルファ版（コアアセット確定）" in visible_texts
+
+
+@pytest.mark.parametrize("on_bar", [True, False], ids=["on_selected_bar", "on_empty_area"])
+def test_right_click_keeps_the_multi_selection(qapp, gantt, on_bar):
+    """回帰テスト: 複数選択してから右クリックすると、右ボタンの押下がラバーバンド選択の
+    開始として扱われて選択が解除され、メニューが1つのタスクにしか効かなかった。
+    実際の右クリックと同じく、押下→離す→コンテキストメニューの順にイベントを送る。"""
+    from PySide6.QtGui import QContextMenuEvent
+
+    w, tab, ids = gantt
+    keys = [_key(ids, "job1", "t1"), _key(ids, "job2", "t2")]
+    tab.view.select_keys(keys)
+    body = tab.view.body
+    bar = tab.view.bars()[keys[0]]
+    body.ensureVisible(bar.sceneBoundingRect())
+    qapp.processEvents()
+    if on_bar:
+        pos = body.mapFromScene(bar.sceneBoundingRect().center())
+    else:
+        pos = body.mapFromScene(bar.sceneBoundingRect().bottomRight()) + QPoint(5, 30)
+    viewport = body.viewport()
+    shown = []
+    with patch.object(tab, "_exec_menu", lambda menu, _pos: shown.append(menu) or None):
+        QTest.mousePress(viewport, Qt.RightButton, Qt.NoModifier, pos)
+        QTest.mouseRelease(viewport, Qt.RightButton, Qt.NoModifier, pos)
+        event = QContextMenuEvent(QContextMenuEvent.Mouse, pos, viewport.mapToGlobal(pos))
+        QApplication.sendEvent(viewport, event)
+    assert len(shown) == 1
+    assert sorted(tab.view.selected_keys()) == sorted(keys)
+
+
+# -- 行の並び（gui/gantt_row_order.py） -----------------------------------------------
+
+
+def _row_jobs(tab):
+    return [job for _top, _bottom, job in tab.view.column.scene().gantt_job_rows]
+
+
+def test_rows_keep_their_order_after_an_edit_until_re_sorted(qapp, gantt):
+    """編集でジョブの開始日の順が入れ替わっても行は動かさず（対象を見失わないように）、
+    並べ直すボタンを目立たせる。押すと選んだ並び順どおりに並べ直す。"""
+    w, tab, ids = gantt
+    job1, job2 = (f"JOB_{ids['job1']:03d}", f"JOB_{ids['job2']:03d}")
+    assert _row_jobs(tab) == [job1, job2]
+    assert not tab._row_order_stale
+
+    # ジョブ2の最初のタスクを、ジョブ1より前へ固定する
+    key = _key(ids, "job2", "t1")
+    first_start = min(bar.start for bar in tab.view.bars().values())
+    tab.view.select_keys([key])
+    tab._on_move_requested([(key, first_start - timedelta(days=30))], -20)
+    _wait_recomputed(qapp, tab)
+    assert tab.view.bars()[key].start < tab.view.bars()[_key(ids, "job1", "t1")].start
+    assert _row_jobs(tab) == [job1, job2]
+    assert tab._row_order_stale
+    assert tab.row_resort_button.styleSheet() != ""
+    assert tab.view.selected_keys() == [key]
+
+    tab.row_resort_button.click()
+    qapp.processEvents()
+    assert _row_jobs(tab) == [job2, job1]
+    assert not tab._row_order_stale
+    assert tab.row_resort_button.styleSheet() == ""
+    assert tab.view.selected_keys() == [key]  # 並べ直しても選択は残る
+
+
+def test_choosing_a_row_order_re_sorts_and_is_remembered(qapp, gantt, tmp_path):
+    from gui.app_settings import AppSettings
+    from gui.gantt_row_order import ORDER_PRIORITY
+
+    w, tab, ids = gantt
+    job1, job2 = (f"JOB_{ids['job1']:03d}", f"JOB_{ids['job2']:03d}")
+    tab._select_combo(tab.row_order_combo, ORDER_PRIORITY)
+    tab.row_descending_button.click()  # 降順＝優先度の低い（数値の大きい）ジョブ2が先
+    qapp.processEvents()
+    assert _row_jobs(tab) == [job2, job1]
+    assert tab.row_descending_button.arrowType() == Qt.DownArrow
+
+    settings = AppSettings(str(tmp_path / "settings.ini"))
+    assert settings.get_ui_state("gantt_row_order") == ORDER_PRIORITY
+    assert settings.get_ui_state("gantt_row_descending") == "1"
+
+
+# -- ダークモードの赤字 ------------------------------------------------------------
+
+
+def test_error_text_is_readable_in_both_themes_and_follows_a_theme_switch(qapp, gantt):
+    """エラー・警告の赤字は、ダークでは明るめの赤にする（暗い赤は暗い背景に沈んで
+    読めなかった）。起動後にテーマを切り替えても、ガント・分析タブの赤字が追従する。"""
+    from PySide6.QtGui import QColor, QPalette
+    from PySide6.QtWidgets import QTableWidget, QTableWidgetItem
+
+    from gui.widgets_common import alert_text_color
+
+    w, tab, _ids = gantt
+    light, dark = alert_text_color(dark=False).name(), alert_text_color(dark=True).name()
+    assert QColor(light).lightness() < QColor(dark).lightness()
+    analysis = w.tab_analysis
+    tab._set_status("エラー", is_error=True)
+    analysis._show_status_only("エラー", is_error=True)  # 表は空になるので、この後に赤字の項目を置く
+    table = analysis.findChildren(QTableWidget)[0]
+    table.setRowCount(max(1, table.rowCount()))
+    table.setColumnCount(max(1, table.columnCount()))
+    item = QTableWidgetItem("超過")
+    item.setForeground(QColor(light))
+    table.setItem(0, 0, item)
+    assert light in tab.status_label.styleSheet()
+
+    original = QApplication.palette()
+    try:
+        palette = QPalette(original)
+        palette.setColor(QPalette.Window, QColor("#202020"))
+        QApplication.setPalette(palette)
+        qapp.processEvents()
+        assert dark in tab.status_label.styleSheet()
+        assert dark in analysis.status_label.styleSheet()
+        assert table.item(0, 0).foreground().color().name() == dark
+    finally:
+        QApplication.setPalette(original)
+        qapp.processEvents()
+    assert light in tab.status_label.styleSheet()
+    assert table.item(0, 0).foreground().color().name() == light

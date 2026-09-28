@@ -414,6 +414,12 @@ class GanttGraphicsView(QGraphicsView):
             self.setCursor(Qt.ClosedHandCursor)
             event.accept()
             return
+        if event.button() == Qt.RightButton:
+            # QGraphicsView は右ボタンの押下でもラバーバンド選択を始めて選択を解除する
+            # ため、複数選択してから右クリックすると1つしか残らなかった。右クリックでの
+            # 選択の扱いは contextMenuEvent に任せ、押下はここで止める。
+            event.accept()
+            return
         if event.button() == Qt.LeftButton:
             self.pressed.emit()
             if self._try_start_drag(event):
@@ -1146,7 +1152,7 @@ def _add_fixed_size_label(scene, text, font, pos, brush=None, z_value=None):
     return label
 
 
-def build_gantt_scenes(df, display, color_by="team"):
+def build_gantt_scenes(df, display, color_by="team", job_order=None):
     """df: result_df を表示対象（1ワークフロー分、または1チーム分）に絞り込んだ
     もの。display: compute_schedule()の2番目の戻り値。ヘッダー／左列／本体
     それぞれの担当分の項目だけを持つ3つの QGraphicsScene を GanttScenes に
@@ -1167,7 +1173,10 @@ def build_gantt_scenes(df, display, color_by="team"):
     ->x座標変換）を共有しているが、日付軸・マイルストーン・目盛り線の縦線
     などペインをまたいで見える要素は、各ペインが実際に描く区間だけを別々の
     アイテムとして両方のシーンに（境界がつながって見えるよう少し重ねて）
-    追加している。"""
+    追加している。
+
+    job_order: ジョブ（行）の並び（Job_ID のリスト。gui/gantt_row_order.py）。省略時は
+    ジョブの最も早い開始日の順。"""
     if df.empty:
         return None
 
@@ -1198,7 +1207,11 @@ def build_gantt_scenes(df, display, color_by="team"):
     job_font.setBold(True)
 
     # -- ジョブごとにレーン詰め、Y座標を決める --------------------------------------
-    job_order = df.groupby("Job_ID")["Start_Date"].min().sort_values().index.tolist()
+    if job_order is None:
+        job_order = df.groupby("Job_ID")["Start_Date"].min().sort_values().index.tolist()
+    else:
+        present = set(df["Job_ID"])
+        job_order = [job_id for job_id in job_order if job_id in present]
     y_cursor = TOP_MARGIN
     job_blocks = []  # (job_id, job_name, workflow_id, y_top, y_bottom, [(task_row, lane), ...])
     for job_id in job_order:
