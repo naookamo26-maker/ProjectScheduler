@@ -9,7 +9,7 @@ Undo を確かめる。再計算はワーカースレッドで走るため、結
 import os
 import sys
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -725,3 +725,55 @@ def test_right_click_keeps_the_multi_selection(qapp, gantt, on_bar):
         QApplication.sendEvent(viewport, event)
     assert len(shown) == 1
     assert sorted(tab.view.selected_keys()) == sorted(keys)
+
+
+# -- 行の並び（gui/gantt_row_order.py） -----------------------------------------------
+
+
+def _row_jobs(tab):
+    return [job for _top, _bottom, job in tab.view.column.scene().gantt_job_rows]
+
+
+def test_rows_keep_their_order_after_an_edit_until_re_sorted(qapp, gantt):
+    """編集でジョブの開始日の順が入れ替わっても行は動かさず（対象を見失わないように）、
+    並べ直すボタンを目立たせる。押すと選んだ並び順どおりに並べ直す。"""
+    w, tab, ids = gantt
+    job1, job2 = (f"JOB_{ids['job1']:03d}", f"JOB_{ids['job2']:03d}")
+    assert _row_jobs(tab) == [job1, job2]
+    assert not tab._row_order_stale
+
+    # ジョブ2の最初のタスクを、ジョブ1より前へ固定する
+    key = _key(ids, "job2", "t1")
+    first_start = min(bar.start for bar in tab.view.bars().values())
+    tab.view.select_keys([key])
+    tab._on_move_requested([(key, first_start - timedelta(days=30))], -20)
+    _wait_recomputed(qapp, tab)
+    assert tab.view.bars()[key].start < tab.view.bars()[_key(ids, "job1", "t1")].start
+    assert _row_jobs(tab) == [job1, job2]
+    assert tab._row_order_stale
+    assert tab.row_resort_button.styleSheet() != ""
+    assert tab.view.selected_keys() == [key]
+
+    tab.row_resort_button.click()
+    qapp.processEvents()
+    assert _row_jobs(tab) == [job2, job1]
+    assert not tab._row_order_stale
+    assert tab.row_resort_button.styleSheet() == ""
+    assert tab.view.selected_keys() == [key]  # 並べ直しても選択は残る
+
+
+def test_choosing_a_row_order_re_sorts_and_is_remembered(qapp, gantt, tmp_path):
+    from gui.app_settings import AppSettings
+    from gui.gantt_row_order import ORDER_PRIORITY
+
+    w, tab, ids = gantt
+    job1, job2 = (f"JOB_{ids['job1']:03d}", f"JOB_{ids['job2']:03d}")
+    tab._select_combo(tab.row_order_combo, ORDER_PRIORITY)
+    tab.row_descending_button.click()  # 降順＝優先度の低い（数値の大きい）ジョブ2が先
+    qapp.processEvents()
+    assert _row_jobs(tab) == [job2, job1]
+    assert tab.row_descending_button.arrowType() == Qt.DownArrow
+
+    settings = AppSettings(str(tmp_path / "settings.ini"))
+    assert settings.get_ui_state("gantt_row_order") == ORDER_PRIORITY
+    assert settings.get_ui_state("gantt_row_descending") == "1"
