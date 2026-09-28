@@ -1308,6 +1308,35 @@ def _job_ratio_jitter(job_id, amplitude=0.5):
     return ((h % 1000) / 1000.0 - 0.5) * amplitude
 
 
+def _calc_unpinned_dates(active_tasks, successors, scheduling_order, leveling_order,
+                         project_start_ord, cal, asap_dates, raw_dates):
+    """開始固定日が無いとした場合の (ASAP, ALAP) の理想日程。分散配置の基準点
+    （ジョブのずらし量と、それを足す起点）はこちらから決める。
+
+    固定したタスクは ASAP＝ALAP（動かす幅が0）なので、固定込みの日程から
+    ずらし量を決めると、固定を1つ含むだけでそのジョブのずらし量が0になり、
+    固定していないタスクがすべて最速（プロジェクト開始日の直後）へ寄っていた。
+    今の位置のまま固定しただけで同じジョブの他のタスクが大きく動くのは
+    直感に反する。固定は「置く場所の基準」ではなく「置ける範囲の制約」として
+    扱い、固定から来る範囲（前工程の実際の完了日・後工程の固定から逆算した
+    最遅開始）へのクリップは _run_leveling が行う。
+
+    固定が1つも無ければ、渡された日程をそのまま返す（結果は従来と変わらない）。
+    固定を外すと求められなくなる場合（固定が無い前提の締切から逆算できない等）も、
+    固定込みの日程に倒す。"""
+    if all(t["start_pin_ord"] is None for t in active_tasks.values()):
+        return asap_dates, raw_dates
+    unpinned = {
+        g_id: t if t["start_pin_ord"] is None else dict(t, start_pin_ord=None)
+        for g_id, t in active_tasks.items()
+    }
+    try:
+        return (_calc_asap_dates(unpinned, leveling_order, project_start_ord, cal),
+                _calc_raw_dates(unpinned, successors, scheduling_order, cal))
+    except SchedulingError:
+        return asap_dates, raw_dates
+
+
 def _calc_job_shift_days(active_tasks, asap_dates, raw_dates, distribution_ratio):
     """ジョブ単位で「鎖全体をどれだけ後ろにずらすか」を一度だけ決める。
 
@@ -1317,6 +1346,10 @@ def _calc_job_shift_days(active_tasks, asap_dates, raw_dates, distribution_ratio
     ゼロになってしまう（雪だるま式のシフト）。ジョブ内で最もタイトな経路
     （クリティカルパス）のスラック幅を基準に、ジョブ全体へ同一のシフト量を
     適用することでこれを防ぐ。
+
+    asap_dates / raw_dates には開始固定日が無いとした場合の日程を渡す
+    （_calc_unpinned_dates）。着手の下限（not_before_ord）のあるタスクはずらし量を
+    使わない（_run_leveling）ので、スラックの最小値にも数えない。
     """
     if not 0.0 < distribution_ratio < 1.0:
         return {}
@@ -1324,6 +1357,8 @@ def _calc_job_shift_days(active_tasks, asap_dates, raw_dates, distribution_ratio
     job_tasks = {}
     jitter_keys = {}
     for g_id, t_info in active_tasks.items():
+        if t_info.get("not_before_ord") is not None:
+            continue
         job_id = t_info.get("job_id", g_id)
         job_tasks.setdefault(job_id, []).append(g_id)
         jitter_keys.setdefault(job_id, t_info.get("jitter_key") or job_id)
@@ -1338,7 +1373,7 @@ def _calc_job_shift_days(active_tasks, asap_dates, raw_dates, distribution_ratio
 
 
 def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_start_ord,
-                   cal, asap_dates, raw_dates, distribution_ratio=1.0):
+                   cal, asap_dates, raw_dates, distribution_ratio=1.0, unpinned_dates=None):
     """
     リソース制約（チームのライン数・休日）を考慮して各タスクの日程を確定する。
 
@@ -1365,6 +1400,13 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
     基準点で空きが無い場合は、まず基準点から締切側（後ろ）へ、それでも無ければ
     基準点から着手可能日側（前）へと探索範囲を広げるため、間に合う日程が
     存在する限りは必ず見つかる。
+
+    基準点は開始固定日が無いとした場合の日程（unpinned_dates＝(ASAP, ALAP)。省略時は
+    asap_dates / raw_dates）から決め、固定から来る範囲 [実際の着手可能日, 固定込みの
+    最遅開始] に収める。今の位置のまま固定しても、同じジョブの他のタスクは動かない
+    （_calc_unpinned_dates）。着手の下限（not_before_ord。確定後の変更案で、影響範囲の
+    タスクに確定していた開始日を渡すもの）があるタスクは、ずらし量を足さずに着手可能日
+    （下限と前工程の完了の遅いほう）を基準にする——押されない限り確定の位置に留める。
 
     日付はすべて序数（int）で扱う。チームの使用ライン数も、序数を添字とする
     numpy配列（`usage`）として持ち、空き判定は「使用量 < 実効ライン数」の
@@ -1447,7 +1489,8 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
         lo, hi = start_ord - cal.base, end_ord - cal.base
         return bool(np.any(used[lo:hi] >= cap[lo:hi]))
 
-    job_shift_days = _calc_job_shift_days(active_tasks, asap_dates, raw_dates, distribution_ratio)
+    free_asap, free_raw = unpinned_dates or (asap_dates, raw_dates)
+    job_shift_days = _calc_job_shift_days(active_tasks, free_asap, free_raw, distribution_ratio)
 
     # === パス1: 固定（START_ON）タスクを先に予約する ==============================
     # トポロジカル順の1パスだけで回すと、固定タスクの番が来たときには既にその
@@ -1501,16 +1544,22 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
         # 締切から逆算した、このタスク自身の最遅開始日（鎖全体の残り所要日数を
         # 織り込み済みの静的な値）。依存元の実際の終了が想定より遅れた場合に
         # 備えて、下限（earliest_start）を下回らないようクリップする。
-        latest_start = max(raw_dates[g_id][0], earliest_start)
+        # 後工程の固定は上限を締める向きにだけ効かせる: 締切から逆算した最遅日より
+        # 後ろに固定した（リソース不足で押されていた位置のまま固定した等）場合に
+        # 上限が緩むと、前工程が固定前より後ろへ動いてしまうため。
+        latest_start = max(min(raw_dates[g_id][0], free_raw[g_id][0]), earliest_start)
 
         if distribution_ratio >= 1.0:
             target_start = latest_start
-        elif distribution_ratio <= 0.0 or job_id not in job_shift_days:
+        elif (distribution_ratio <= 0.0 or job_id not in job_shift_days
+              or t_info.get("not_before_ord") is not None):
             target_start = earliest_start
         else:
             # ジョブ単位で決めた一律のシフト量を、このタスクのASAP開始日に加える
             # （鎖全体が同じ量だけ後ろにずれるだけなので、内部の間隔は保たれる）。
-            static_target = asap_dates[g_id][0] + job_shift_days[job_id]
+            # 起点は固定が無いとした場合のASAP（同じジョブに固定があっても、固定の
+            # 無い場合と同じ位置を狙い、固定から来る範囲だけ下のクリップで守る）。
+            static_target = free_asap[g_id][0] + job_shift_days[job_id]
             # 実際の依存元完了（earliest_start）が静的な想定より遅れていた場合は
             # そちらを優先する（安全側のクリップ）。上限は締切から逆算した最遅開始日。
             target_start = min(max(static_target, earliest_start), latest_start)
@@ -2324,9 +2373,14 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
 
     raw_dates = _calc_raw_dates(active_tasks, successors, scheduling_order, cal)
     asap_dates = _calc_asap_dates(active_tasks, leveling_order, project_start_ord, cal)
+    unpinned_dates = _calc_unpinned_dates(
+        active_tasks, successors, scheduling_order, leveling_order, project_start_ord, cal,
+        asap_dates, raw_dates,
+    )
     scheduled, adjusted_flags, overbooked_pins = _run_leveling(
         active_tasks, leveling_order, team_capacity_schedule, project_start_ord, cal,
         asap_dates=asap_dates, raw_dates=raw_dates, distribution_ratio=distribution_ratio,
+        unpinned_dates=unpinned_dates,
     )
     constraint_violations = _check_constraint_violations(
         active_tasks, scheduled, cal, overbooked_pins)
