@@ -82,6 +82,7 @@ from gui.widgets_common import (
     NoWheelComboBox,
     NoWheelSlider,
     NoWheelSpinBox,
+    alert_style,
     bind_undo_session,
 )
 from i18n import N_, tr
@@ -402,10 +403,12 @@ class GanttTab(QWidget):
             self.row_resort_button.setToolTip(tr("並べ直す"))
 
     def changeEvent(self, event):
-        """起動後に OS のテーマが切り替わったら、並べ直すボタンの強調色も追従させる。"""
+        """起動後に OS のテーマが切り替わったら、並べ直すボタンの強調色とエラーの赤字も
+        追従させる。"""
         super().changeEvent(event)
         if event.type() in (QEvent.ApplicationPaletteChange, QEvent.PaletteChange):
             self._update_resort_button()
+            self.status_label.setStyleSheet(alert_style(getattr(self, "_status_is_error", False)))
 
     def row_order_options(self):
         return (self.row_grouping_combo.currentData(), self.row_order_combo.currentData(),
@@ -621,8 +624,9 @@ class GanttTab(QWidget):
 
     def _set_status(self, message, is_error=False):
         """状況表示。エラーはダイアログを出さずここに表示するため、通常の
-        メッセージと見分けが付くよう色を変える。"""
-        self.status_label.setStyleSheet("color: #b3261e;" if is_error else "")
+        メッセージと見分けが付くよう色を変える（ライト／ダークで読める赤。alert_style）。"""
+        self._status_is_error = is_error
+        self.status_label.setStyleSheet(alert_style(is_error))
         self.status_label.setText(message)
 
     def _clear_chart_state(self, status_message, is_error=False):

@@ -777,3 +777,44 @@ def test_choosing_a_row_order_re_sorts_and_is_remembered(qapp, gantt, tmp_path):
     settings = AppSettings(str(tmp_path / "settings.ini"))
     assert settings.get_ui_state("gantt_row_order") == ORDER_PRIORITY
     assert settings.get_ui_state("gantt_row_descending") == "1"
+
+
+# -- ダークモードの赤字 ------------------------------------------------------------
+
+
+def test_error_text_is_readable_in_both_themes_and_follows_a_theme_switch(qapp, gantt):
+    """エラー・警告の赤字は、ダークでは明るめの赤にする（暗い赤は暗い背景に沈んで
+    読めなかった）。起動後にテーマを切り替えても、ガント・分析タブの赤字が追従する。"""
+    from PySide6.QtGui import QColor, QPalette
+    from PySide6.QtWidgets import QTableWidget, QTableWidgetItem
+
+    from gui.widgets_common import alert_text_color
+
+    w, tab, _ids = gantt
+    light, dark = alert_text_color(dark=False).name(), alert_text_color(dark=True).name()
+    assert QColor(light).lightness() < QColor(dark).lightness()
+    analysis = w.tab_analysis
+    tab._set_status("エラー", is_error=True)
+    analysis._show_status_only("エラー", is_error=True)  # 表は空になるので、この後に赤字の項目を置く
+    table = analysis.findChildren(QTableWidget)[0]
+    table.setRowCount(max(1, table.rowCount()))
+    table.setColumnCount(max(1, table.columnCount()))
+    item = QTableWidgetItem("超過")
+    item.setForeground(QColor(light))
+    table.setItem(0, 0, item)
+    assert light in tab.status_label.styleSheet()
+
+    original = QApplication.palette()
+    try:
+        palette = QPalette(original)
+        palette.setColor(QPalette.Window, QColor("#202020"))
+        QApplication.setPalette(palette)
+        qapp.processEvents()
+        assert dark in tab.status_label.styleSheet()
+        assert dark in analysis.status_label.styleSheet()
+        assert table.item(0, 0).foreground().color().name() == dark
+    finally:
+        QApplication.setPalette(original)
+        qapp.processEvents()
+    assert light in tab.status_label.styleSheet()
+    assert table.item(0, 0).foreground().color().name() == light

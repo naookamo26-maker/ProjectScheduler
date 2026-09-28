@@ -13,8 +13,7 @@
 import html
 
 import pandas as pd
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -55,7 +54,13 @@ from gui.summary_metrics import (
     weekly_concurrency_by_team,
     weekly_peak_breakdown_by_team,
 )
-from gui.widgets_common import NoWheelComboBox, auto_size_columns
+from gui.widgets_common import (
+    NoWheelComboBox,
+    alert_style,
+    alert_text_color,
+    auto_size_columns,
+    is_dark_theme,
+)
 from i18n import N_, tr
 
 _BREAKDOWN_ALL = "all"
@@ -94,10 +99,6 @@ _GRANULARITY_LABELS = [
 # ホイールズーム・A/Fキーでの全体表示はそのまま効く。
 _DAILY_DEFAULT_PERIODS = 90
 
-# ガントチャートタブのエラー表示と同じ赤（gui/tab_gantt.py の _set_status 参照）。
-_ALERT_COLOR = QColor("#b3261e")
-
-
 def _fmt_date(ts):
     return "—" if ts is None else ts.strftime("%Y-%m-%d")
 
@@ -126,12 +127,32 @@ class _KpiTile(QGroupBox):
         layout.addStretch(1)
 
     def set_value(self, value_text, sub_text, alert=False):
+        self.alert = alert
         self.value_label.setText(value_text)
-        self.value_label.setStyleSheet("color: #b3261e;" if alert else "")
+        self.value_label.setStyleSheet(alert_style(alert))
         self.sub_label.setText(sub_text)
 
 
 class AnalysisTab(QWidget):
+    def changeEvent(self, event):
+        """起動後に OS のテーマ（ライト⇄ダーク）が切り替わったら、赤字（締切超過など）を
+        そのテーマで読める赤に塗り直す。表は描き直さず（選択を保つため）、前のテーマの
+        赤で塗った項目の色だけを差し替える。"""
+        super().changeEvent(event)
+        if event.type() not in (QEvent.ApplicationPaletteChange, QEvent.PaletteChange):
+            return
+        dark = is_dark_theme()
+        new, old = alert_text_color(dark), alert_text_color(not dark)
+        for table in self.findChildren(QTableWidget):
+            for row in range(table.rowCount()):
+                for column in range(table.columnCount()):
+                    item = table.item(row, column)
+                    if item is not None and item.foreground().color() == old:
+                        item.setForeground(new)
+        for tile in self.findChildren(_KpiTile):
+            tile.value_label.setStyleSheet(alert_style(getattr(tile, "alert", False)))
+        self.status_label.setStyleSheet(alert_style(getattr(self, "_status_is_error", False)))
+
     def __init__(self, db, schedule_cache, parent=None):
         super().__init__(parent)
         self.db = db
@@ -417,7 +438,8 @@ class AnalysisTab(QWidget):
     def _show_status_only(self, message, is_error):
         """結果がまだ無い（エラー／計算中）ときの表示。タイル・表・グラフを
         すべて空にし、状況表示だけを message に差し替える。"""
-        self.status_label.setStyleSheet("color: #b3261e;" if is_error else "")
+        self._status_is_error = is_error
+        self.status_label.setStyleSheet(alert_style(is_error))
         self.status_label.setText(message)
         for tile in (
             self.kpi_scale, self.kpi_period, self.kpi_status,
@@ -538,13 +560,13 @@ class AnalysisTab(QWidget):
             slack_text = "—" if slack is None else (tr("+{slack}日", slack=slack) if slack >= 0 else tr("{slack}日", slack=slack))
             slack_item = QTableWidgetItem(slack_text)
             if slack is not None and slack < 0:
-                slack_item.setForeground(_ALERT_COLOR)
+                slack_item.setForeground(alert_text_color())
             slack_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.milestone_table.setItem(row_index, 4, slack_item)
 
             overrun_item = QTableWidgetItem(_fmt_int(base["overrun_count"]) if base["overrun_count"] else "—")
             if base["overrun_count"]:
-                overrun_item.setForeground(_ALERT_COLOR)
+                overrun_item.setForeground(alert_text_color())
             overrun_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.milestone_table.setItem(row_index, 5, overrun_item)
 
@@ -594,7 +616,7 @@ class AnalysisTab(QWidget):
             )
             overrun_item = QTableWidgetItem(_fmt_int(row["overrun"]) if row["overrun"] else "—")
             if row["overrun"]:
-                overrun_item.setForeground(_ALERT_COLOR)
+                overrun_item.setForeground(alert_text_color())
             overrun_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.team_table.setItem(row_index, 6, overrun_item)
         auto_size_columns(self.team_table, stretch_last=False)
@@ -754,7 +776,7 @@ class AnalysisTab(QWidget):
             )
             overrun_item = QTableWidgetItem(_fmt_int(row["overrun"]) if row["overrun"] else "—")
             if row["overrun"]:
-                overrun_item.setForeground(_ALERT_COLOR)
+                overrun_item.setForeground(alert_text_color())
             overrun_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.workflow_table.setItem(row_index, 4, overrun_item)
         auto_size_columns(self.workflow_table, stretch_last=False)

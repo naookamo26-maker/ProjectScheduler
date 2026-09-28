@@ -10,7 +10,7 @@
 """
 
 from PySide6.QtCore import QDate, QEvent, Qt, QTimer, Signal
-from PySide6.QtGui import QPalette
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -348,6 +348,21 @@ def is_dark_theme():
     切り替えには ApplicationPaletteChange で追従する。スタイルシートを当てたウィジェットには
     この通知が届かないため、QApplication にイベントフィルタを付けて拾う（gui/plan_band.py）。"""
     return QApplication.palette().color(QPalette.Window).lightness() < 128
+
+
+# 警告・エラーの赤字（締切超過など）。ライトの暗めの赤はダークの背景に沈んで読めない
+# ため、ダークでは明るめの赤にする
+_ALERT_TEXT_COLORS = {False: "#b3261e", True: "#f28b82"}
+
+
+def alert_text_color(dark=None):
+    """警告・エラーの文字色（QColor）。dark を省略すると今のテーマ（is_dark_theme()）に合わせる。"""
+    return QColor(_ALERT_TEXT_COLORS[is_dark_theme() if dark is None else dark])
+
+
+def alert_style(alert):
+    """ラベルの setStyleSheet() に渡す文字色の指定。alert が偽なら空（既定の色）。"""
+    return f"color: {alert_text_color().name()};" if alert else ""
 
 
 def keep_selection_visible(view):
