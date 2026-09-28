@@ -19,7 +19,7 @@ gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、ホイー
 表示件数を絞り込める（絞り込みはあくまで表示上のもので、スケジューリング
 自体はやり直さない）。
 
-ジョブ（行）の並びは上部の「行の並び」で選ぶ（分類: 全体／ワークフロー別、並び:
+ジョブ（行）の並びは上部の「並び」で選ぶ（分類: 全体／ワークフロー別、並び:
 開始日・終了日・マイルストーン・優先度、昇順／降順。gui/gantt_row_order.py）。
 並びが変わるのは、並び順を選び直したときと「並べ直す」ボタンを押したときだけで、
 編集の後は対象のジョブを見失わないよう前回の並びを保つ（そのとき並びが選んだ順
@@ -103,7 +103,7 @@ _PLACEMENT_SLIDER_WIDTH = 110
 _SEARCH_DEBOUNCE_MS = 300
 
 
-# 「行の並び」の選択肢（gui/gantt_row_order.py）
+# 「並び」の選択肢（gui/gantt_row_order.py）
 _GROUPING_LABELS = {GROUP_ALL: N_("全体"), GROUP_WORKFLOW: N_("ワークフロー別")}
 _ORDER_LABELS = {
     ORDER_START: N_("開始日順"), ORDER_END: N_("終了日順"),
@@ -337,10 +337,10 @@ class GanttTab(QWidget):
         self.placement_spinbox.setValue(value)
         self.placement_spinbox.blockSignals(False)
 
-    # -- 行の並び（gui/gantt_row_order.py） ----------------------------------------
+    # -- 並び（gui/gantt_row_order.py） --------------------------------------------
 
     def _build_row_order_group(self):
-        """「行の並び」: 分類・並び・昇順／降順・並べ直すボタン。選んだ値は利用者ごとの
+        """「並び」: 分類・並び順・昇順／降順・並べ直すボタン。選んだ値は利用者ごとの
         画面の状態として覚える（プロジェクトの内容ではないので、Undoの対象にもしない）。"""
         group = QGroupBox("")
         row = QHBoxLayout(group)
@@ -761,8 +761,8 @@ class GanttTab(QWidget):
         self._decorate_plan(scenes.body)
         if view_state is not None:
             # 編集・Undo/Redo の後は、表示位置（縮尺・スクロール）を保つ。
-            # 行の並び（ジョブの最早開始日順）が変わりうるので、選択したバーが
-            # 見えるようにスクロールし直す。
+            # 行の並びは保つ（_job_order_for）が、日付が大きく動くと選択したバーが
+            # 横に外れうるので、見えるようにスクロールし直す。
             self.view.restore_view_state(view_state)
             self.view.select_keys(selection or [], ensure_visible=True)
             QTimer.singleShot(0, lambda: self._restore_view_after_layout(view_state, selection))
