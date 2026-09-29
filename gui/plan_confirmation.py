@@ -117,6 +117,8 @@ class PlanState:
     - started: 進行中・完了のタスク
     - draft_moves: {(job_id, workflow_task_id): 'YYYY-MM-DD'}
     - facts: 進行中・完了のタスクの確定行（未確定でも、その日程で固定して計算する）
+    - in_progress: 進行中のタスク（開始日だけ固定し、日数・チームは今の入力に従う）
+    - inputs: {(job_id, workflow_task_id): 指紋の材料（実効の日数・チーム等）}
     - pending_replan: 全面再計画を実行中なら (基準日 D, 実行日 T)、そうでなければ None
     - replan_released: 全面再計画で置き直す未着手タスク（確定開始日が T より前、
       または D 以降。T〜D の前日に始まる予定のものは確定のまま残す。§8-6）
@@ -138,9 +140,12 @@ class PlanState:
             if project["pending_replan_base_date"] else None
         )
         self.replan_released = set()
+        overrides = db.list_all_job_task_overrides()
         self.started = {
-            (r["job_id"], r["workflow_task_id"])
-            for r in db.list_all_job_task_overrides() if r["status"] in _STARTED
+            (r["job_id"], r["workflow_task_id"]) for r in overrides if r["status"] in _STARTED
+        }
+        self.in_progress = {
+            (r["job_id"], r["workflow_task_id"]) for r in overrides if r["status"] == "in_progress"
         }
         self.facts = {k: r for k, r in self.confirmed.items() if k in self.started}
         if not self.confirmed_at:
@@ -151,9 +156,10 @@ class PlanState:
             self.status = UNCONFIRMED
             self.changed = set()
             self.global_changed = False
-            self.active = _task_inputs(db)[1] if self.facts else {}
+            self.inputs, self.active = _task_inputs(db) if self.facts else ({}, {})
             return
         inputs, self.active = _task_inputs(db)
+        self.inputs = inputs
         signatures = {key: _digest(value) for key, value in inputs.items()}
         changed = set()
         for key, is_active in self.active.items():

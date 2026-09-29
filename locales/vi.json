@@ -498,7 +498,7 @@
  "本ジョブの後続タスク（{name}）": "Tác vụ sau của hạng mục này ({name})",
  "次の操作まで": "Đến thao tác tiếp theo",
  "消えるもの: 未着手のタスクの確定日程、変更案（ドラッグで動かした位置を含む）\n残るもの: 進行中・完了のタスクの日程、ジョブ・タスクの設定、手動ピン\n\n戻した後は、未着手のタスクを確定前と同じように計算し直します。": "Bị xóa: lịch đã chốt của các tác vụ chưa bắt đầu, bản nháp (kể cả vị trí đã kéo)\nĐược giữ: lịch của các tác vụ đang thực hiện và đã hoàn thành, thiết lập hạng mục và tác vụ, ghim\n\nSau đó, các tác vụ chưa bắt đầu sẽ được tính lại như trước khi chốt.",
- "消えるもの: 確定後の変更（ドラッグで動かした位置を含む）\n残るもの: タスクの進捗の更新": "Bị xóa: các thay đổi sau khi chốt (kể cả vị trí đã kéo)\nĐược giữ: cập nhật tiến độ tác vụ",
+ "消えるもの: 確定後の変更すべて（ドラッグで動かした位置、タスクの状態の変更を含む）\n残るもの: 「選択した変更を確定」で確定した分": "Bị xóa: mọi thay đổi sau khi chốt (kể cả vị trí đã kéo và thay đổi trạng thái tác vụ)\nĐược giữ: phần đã chốt bằng \"Chốt các thay đổi đã chọn\"",
  "無効にする": "Tắt",
  "無題（未保存）": "Chưa đặt tên (chưa lưu)",
  "状態": "Trạng thái",

@@ -6,6 +6,7 @@
 プロジェクトとウィンドウの用意は tests/test_gui_gantt_edit.py のものを使う。
 """
 
+from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
@@ -438,3 +439,26 @@ def test_band_follows_the_light_and_dark_theme(qapp, dark):
         QApplication.setPalette(original)
         parent.deleteLater()
         qapp.processEvents()
+
+
+def test_marking_a_moved_task_in_progress_keeps_it_where_it_is(qapp, gantt):
+    """回帰テスト: 変更案で動かしたタスクを右クリックで進行中にすると、確定した位置へ
+    飛び戻っていた。表示中の位置のまま止まる（gui/main.py が表示中の日程を渡す）。"""
+    from test_gui_gantt_edit import _choose_menu
+
+    w, tab, ids = gantt
+    _confirm(qapp, w)
+    key = _key(ids, "job1", "t1")
+    bar = tab.view.bars()[key]
+    w.db.set_draft_move(ids["job1"], ids["t1"], (bar.start + timedelta(days=14)).isoformat())
+    tab.refresh_choices()
+    assert _band_settled(qapp, w, DRAFT)
+    _wait_recomputed(qapp, tab)
+    moved = (tab.view.bars()[key].start, tab.view.bars()[key].end)
+
+    tab.view.select_keys([key])
+    with _choose_menu(tab, "進行中"):
+        tab._show_context_menu(None)
+    _wait_recomputed(qapp, tab)
+    assert (tab.view.bars()[key].start, tab.view.bars()[key].end) == moved
+    assert tab.view.bars()[key].status == "in_progress"
