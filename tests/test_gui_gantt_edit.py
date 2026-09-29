@@ -213,8 +213,9 @@ def _hover(qapp, view, pos, modifiers=Qt.NoModifier):
     qapp.processEvents()
 
 
-def test_the_right_edge_of_a_selected_bar_shows_a_resize_cursor_and_drags_without_a_key(qapp, gantt):
-    """選んだバーの右端にカーソルを乗せると↔になり、キーを押さずにドラッグで期間を伸縮できる。"""
+def test_the_right_edge_shows_a_resize_cursor_only_while_the_drag_key_is_held(qapp, gantt):
+    """バーの右端は、指定キー（Shift）を押しているときだけカーソルが↔になり、伸縮できる。
+    選んでいるバーでも、キーを押していなければ↔にも伸縮にもならない（移動と同じ）。"""
     w, tab, ids = gantt
     key = _key(ids, "job1", "t1")
     bar = tab.view.bars()[key]
@@ -223,26 +224,24 @@ def test_the_right_edge_of_a_selected_bar_shows_a_resize_cursor_and_drags_withou
     edge = body.mapFromScene(bar.bar_rect.right() - 0.5, bar.bar_rect.center().y())
     edge.setX(edge.x() - 1)
     middle = body.mapFromScene(bar.bar_rect.center())
+    tab.view.select_keys([key])
 
-    # 選んでいないバーの右端では↔にしない（キーなしのドラッグは従来どおり範囲選択）
     _hover(qapp, body, edge)
     assert body.viewport().cursor().shape() != Qt.SizeHorCursor
-    tab.view.select_keys([key])
-    _hover(qapp, body, edge)
+    _hover(qapp, body, edge, Qt.ShiftModifier)
     assert body.viewport().cursor().shape() == Qt.SizeHorCursor
-    _hover(qapp, body, middle)
+    _hover(qapp, body, middle, Qt.ShiftModifier)
     assert body.viewport().cursor().shape() == Qt.ArrowCursor
 
     end = body.mapFromScene(bar.bar_rect.right() + 7 * 10, bar.bar_rect.center().y())
     _drag(qapp, body, edge, end, modifiers=Qt.NoModifier)
-    _wait_recomputed(qapp, tab)
-    assert _override(w.db, ids["job1"], ids["t1"])["override_days"] == 10  # 5日 + 5営業日
-    assert _override(w.db, ids["job1"], ids["t1"])["start_pin_date"] is None
+    assert w.db.list_all_job_task_overrides() == []
+    assert tab._pending_edit is None
 
 
 def test_the_right_edge_can_be_grabbed_when_the_next_bar_touches_it(qapp, gantt):
-    """回帰テスト: 右端に次のバーが接していると、その位置では次のバーが見つかり、
-    選んだバーの右端でも↔にならず、掴めなかった。"""
+    """右端に次のバーが接していると、その位置で一番上にあるのは次のバーのことがある。
+    それでも選んだバーの右端を掴める（↔になる）。"""
     w, tab, ids = gantt
     key = _key(ids, "job2", "t1")
     bar = tab.view.bars()[key]
@@ -253,11 +252,11 @@ def test_the_right_edge_can_be_grabbed_when_the_next_bar_touches_it(qapp, gantt)
     body = tab.view.body
     edge = body.mapFromScene(bar.bar_rect.right() + 0.5, bar.bar_rect.center().y())
     edge.setX(edge.x() + 1)  # 次のバーの上（左端のすぐ内側）
-    _hover(qapp, body, edge)
+    _hover(qapp, body, edge, Qt.ShiftModifier)
     assert body.viewport().cursor().shape() == Qt.SizeHorCursor
 
     end = body.mapFromScene(bar.bar_rect.right() + 3 * 10, bar.bar_rect.center().y())
-    _drag(qapp, body, edge, end, modifiers=Qt.NoModifier)
+    _drag(qapp, body, edge, end)
     _wait_recomputed(qapp, tab)
     assert _override(w.db, ids["job2"], ids["t1"])["override_days"] is not None
     assert _override(w.db, ids["job2"], ids["t2"])["override_id"] is None

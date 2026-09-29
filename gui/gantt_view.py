@@ -33,6 +33,7 @@ from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
+    QCursor,
     QFont,
     QFontMetrics,
     QPainter,
@@ -602,6 +603,9 @@ class GanttGraphicsView(QGraphicsView):
 
     def keyPressEvent(self, event):
         key, ctrl = event.key(), bool(event.modifiers() & Qt.ControlModifier)
+        if key in (Qt.Key_Shift, Qt.Key_Alt):
+            # 指定キーを押した時点で、右端の上にあればカーソルを↔にする
+            self._update_hover_cursor()
         if key == Qt.Key_Escape:
             # ドラッグ中なら取りやめ（何も書き込まない）、そうでなければ選択を外す
             if self._drag is not None:
@@ -702,6 +706,11 @@ class GanttGraphicsView(QGraphicsView):
         self.setTransform(QTransform().scale(new_sx, new_sy))
         return True
 
+    def keyReleaseEvent(self, event):
+        if event.key() in (Qt.Key_Shift, Qt.Key_Alt):
+            self._update_hover_cursor()
+        super().keyReleaseEvent(event)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MiddleButton:
             self._panning = True
@@ -757,12 +766,9 @@ class GanttGraphicsView(QGraphicsView):
             if self._drag["started"]:
                 self._finish_drag()
             else:
-                # 動かさずに離した（Shift＋クリック）: 選択を外さずにそのバーを選択に加える。
-                # キーを押さずに右端を押しただけなら、ふつうのクリックと同じくそのバーだけを選ぶ
-                drag, self._drag = self._drag, None
-                anchor = drag["anchor"]
-                if not (drag["with_modifier"] or drag["add_to_selection"]):
-                    self.scene().clearSelection()
+                # 動かさずに離した（Shift＋クリック）: 選択を外さずにそのバーを選択に加える
+                anchor = self._drag["anchor"]
+                self._drag = None
                 anchor.setSelected(True)
             self._update_hover_cursor(event)
             event.accept()
@@ -917,10 +923,11 @@ class GanttGraphicsView(QGraphicsView):
         return None
 
     def _resize_handle_at(self, view_pos, modifiers):
-        """期間を伸縮できるバーの右端（_RESIZE_HANDLE_PX 以内）に view_pos があれば、
-        そのバーを返す。選んでいるバーならキーを押さなくても掴める（カーソルが↔に
-        なる）。選んでいないバーは、従来どおり指定キー（既定 Shift）を押しているときだけ。"""
+        """指定キー（既定 Shift）を押していて、バーの右端（_RESIZE_HANDLE_PX 以内）に
+        view_pos があれば、そのバーを返す（掴むと期間の伸縮。カーソルは↔になる）。"""
         if not self.edit_enabled or self.calendar is None:
+            return None
+        if not modifiers & self.drag_modifier:
             return None
         # 右端に隣のバーが接していると、その位置で一番上にあるのは隣のバーのことがある。
         # 前後の幅にあるバーをすべて見て、選んでいるバーの右端を優先する
@@ -928,8 +935,6 @@ class GanttGraphicsView(QGraphicsView):
         candidates = []
         for item in self.items(area):
             if not isinstance(item, TaskBarItem):
-                continue
-            if not (item.isSelected() or modifiers & self.drag_modifier):
                 continue
             right_edge = self.mapFromScene(item.bar_rect.topRight()).x()
             if abs(view_pos.x() - right_edge) <= _RESIZE_HANDLE_PX:
@@ -945,17 +950,23 @@ class GanttGraphicsView(QGraphicsView):
         else:
             self.viewport().setCursor(shape)
 
-    def _update_hover_cursor(self, event):
-        """ボタンを押していない間、伸縮できるバーの右端の上では↔にする。"""
+    def _update_hover_cursor(self, event=None):
+        """ボタンを押していない間、伸縮できるバーの右端の上では↔にする。event が無い
+        とき（キーを押した・離したとき）は、いまのマウスの位置とキーの状態で決める。"""
         if self._drag is not None or self._panning:
             return
-        on_handle = self._resize_handle_at(event.position().toPoint(), event.modifiers()) is not None
+        if event is None:
+            pos = self.viewport().mapFromGlobal(QCursor.pos())
+            modifiers = QApplication.keyboardModifiers()
+        else:
+            pos, modifiers = event.position().toPoint(), event.modifiers()
+        on_handle = self._resize_handle_at(pos, modifiers) is not None
         self._set_cursor(Qt.SizeHorCursor if on_handle else None)
 
     def _try_start_drag(self, event):
         """指定キー（既定 Shift）を押しながらバーを押したら、ドラッグの準備をする。
-        キーを押していなければ何もしない（クリックは従来どおり選択だけ）。ただし、
-        選んでいるバーの右端（カーソルが↔になる所）は、キーを押さなくても期間の伸縮になる。
+        キーを押していなければ何もしない（クリックは従来どおり選択だけ）。右端（カーソルが
+        ↔になる所）を押したら期間の伸縮になる。
 
         選択はまだ変えない。実際に動かし始めた時（_begin_drag）に、選ばれていないバーなら
         そのバーだけを選んで動かす。動かさずに離したら（Shift＋クリック）、今の選択を
@@ -964,9 +975,9 @@ class GanttGraphicsView(QGraphicsView):
         if not self.edit_enabled or self.calendar is None:
             return False
         pos = event.position().toPoint()
-        resize_bar = self._resize_handle_at(pos, event.modifiers())
-        if resize_bar is None and not (event.modifiers() & self.drag_modifier):
+        if not (event.modifiers() & self.drag_modifier):
             return False
+        resize_bar = self._resize_handle_at(pos, event.modifiers())
         anchor = resize_bar or self._bar_at(pos)
         if anchor is None:
             return False
@@ -975,7 +986,6 @@ class GanttGraphicsView(QGraphicsView):
             "started": False,
             "press_pos": pos,
             "add_to_selection": bool(event.modifiers() & Qt.ControlModifier),
-            "with_modifier": bool(event.modifiers() & self.drag_modifier),
             "resize": resize_bar is not None,
             "bars": [],
             "ghosts": {},
