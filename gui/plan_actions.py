@@ -21,27 +21,27 @@ from gui.plan_confirmation import (
     task_signatures,
 )
 
-_STARTED = ("in_progress", "done")
-
 
 def _now():
     return datetime.now().isoformat(timespec="seconds")
 
 
-def confirmed_rows_from_result(db, result_df, only_keys=None):
+def confirmed_rows_from_result(db, result_df, only_keys=None, keep_done_facts=True):
     """計算結果から確定行を作る。only_keys（(job_id, workflow_task_id) の集合）を
     渡すとそのタスクだけ。
 
-    日数・チームは実効の入力値を書く。ただし進行中・完了のタスクで既に確定行が
-    あるものは、確定行の日数・チームのまま残す（実施した事実なので、ワークフロー
-    側の値を直しても遡って変えない。§8-2）。"""
+    日数・チームは実効の入力値を書く。ただし完了のタスクで既に確定行があるものは、
+    確定行の日数・チームのまま残す（実施した事実なので、ワークフロー側の値を直しても
+    遡って変えない。§8-2）。進行中のタスクは日数・チームを今の入力に従わせる
+    （gui/gantt_generator.build_plan）ので残さない。keep_done_facts=False なら残さず、
+    表示中の値そのもの（状態を変えたときの実績の記録。ProjectDatabase._record_status_fact）。"""
     signatures = task_signatures(db)
     effective = effective_task_values(db)
     old = {(r["job_id"], r["workflow_task_id"]): r for r in db.list_confirmed_schedule()}
-    started = {
+    done = {
         (r["job_id"], r["workflow_task_id"])
-        for r in db.list_all_job_task_overrides() if r["status"] in _STARTED
-    }
+        for r in db.list_all_job_task_overrides() if r["status"] == "done"
+    } if keep_done_facts else set()
     rows = []
     for job_key, task_key, start, end, team_key in zip(
         result_df["Job_ID"], result_df["Task_ID"], result_df["Start_Date"],
@@ -54,7 +54,7 @@ def confirmed_rows_from_result(db, result_df, only_keys=None):
             continue
         days, _team = effective[key]
         team_id = parse_entity_id(team_key) if isinstance(team_key, str) and team_key else None
-        if key in started and key in old:
+        if key in done and key in old:
             days, team_id = old[key]["days"], old[key]["team_id"]
         rows.append({
             "job_id": key[0], "workflow_task_id": key[1],

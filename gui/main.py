@@ -36,6 +36,7 @@ from gui.gantt_generator import (
     generate_gantt,
     validate_for_generation,
 )
+from gui.plan_actions import confirmed_rows_from_result
 from gui.plan_confirmation import DRAFT, PlanState
 from gui.options_dialog import OptionsDialog
 from gui.plan_band import PlanStatusBand
@@ -570,6 +571,9 @@ class MainWindow(QMainWindow):
         db.sync_dependency_templates()
         self.db = db
         self.db.on_change = self._on_db_changed
+        # タスクを進行中・完了にしたとき、表示中の日程を実績として記録するための
+        # 材料（gui/db.py の _record_status_fact）。最後に計算した結果から取る。
+        self.db.displayed_rows_provider = self._displayed_task_rows
         self._rebuild_tabs()
         if previous is not None:
             previous.close()
@@ -593,6 +597,14 @@ class MainWindow(QMainWindow):
         self._update_undo_redo_actions()
         self._show_project_path()
         self._update_title()
+
+    def _displayed_task_rows(self, keys):
+        """keys（(job_id, workflow_task_id) の並び）の、表示中の日程（確定行と同じ形）。"""
+        cache = self.schedule_cache
+        result_df = cache.result_df if cache is not None else None
+        if result_df is None or result_df.empty:
+            return []
+        return confirmed_rows_from_result(self.db, result_df, only_keys=set(keys), keep_done_facts=False)
 
     def _show_project_path(self):
         self.project_path_label.setText(

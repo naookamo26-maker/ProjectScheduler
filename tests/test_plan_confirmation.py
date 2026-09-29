@@ -326,7 +326,9 @@ def test_draft_moves_move_the_task_without_a_manual_pin(tmp_path):
     assert db.list_draft_moves() == []
 
 
-def test_discarding_the_draft_restores_inputs_but_keeps_progress_updates(tmp_path):
+def test_discarding_the_draft_restores_everything_including_status_changes(tmp_path):
+    """「変更を破棄」は、最後に確定した時点へすべて戻す（タスクの状態の変更も戻す）。
+    以前は状態だけを残していたが、何が戻るのか分かりにくかった。"""
     from gui.plan_actions import confirm_all
     from gui.plan_confirmation import CONFIRMED, PlanState
 
@@ -342,10 +344,123 @@ def test_discarding_the_draft_restores_inputs_but_keeps_progress_updates(tmp_pat
 
     state = PlanState(db)
     assert state.status == CONFIRMED
-    rows = {(o["job_id"], o["workflow_task_id"]): o for o in db.list_all_job_task_overrides()}
-    assert (j0, ids["t1"]) not in rows  # 日数・タグの変更は戻る
-    assert rows[(j1, ids["t2"])]["status"] == "in_progress"  # 進捗は残る
+    assert db.list_all_job_task_overrides() == []  # 日数・タグも状態も戻る
     assert all(j["name"] != "追加ジョブ" for j in db.list_jobs())
+
+
+def _with_display(db):
+    """GUI（gui/main.py）と同じく、表示中の日程を最後の計算結果から返すようにする。"""
+    from gui.plan_actions import confirmed_rows_from_result
+
+    def provider(keys):
+        df, _, _ = _compute(db)
+        return confirmed_rows_from_result(db, df, only_keys=set(keys), keep_done_facts=False)
+    db.displayed_rows_provider = provider
+
+
+def test_changing_the_status_does_not_move_a_task_that_the_draft_moved(tmp_path):
+    """回帰テスト: 変更案で動いていたタスクを進行中・完了にすると、確定した位置へ
+    飛び戻っていた。状態を変えてもバーはその場から動かない。後続の変更案も崩れない。"""
+    from gui.plan_actions import confirm_all
+    from gui.plan_confirmation import DRAFT
+
+    db, ids = _plan_project(tmp_path)
+    _with_display(db)
+    confirm_all(db, _compute(db)[0])
+    j0 = ids["jobs"][0]
+    db.set_draft_move(j0, ids["t1"], "2026-04-20")
+    before = _positions(_compute(db)[0])
+
+    db.update_job_task_override_fields(j0, ids["t1"], status="in_progress")
+    after_df, state, _info = _compute(db)
+    assert _positions(after_df) == before
+    assert state.status == DRAFT and (j0, ids["t1"]) in state.changed  # 変更案のまま
+
+    db.update_job_task_override_fields(j0, ids["t1"], status="done")
+    assert _positions(_compute(db)[0]) == before
+
+
+def test_changing_the_status_does_not_move_a_task_pushed_by_its_predecessor(tmp_path):
+    """前のタスクの変更に押されて動いていたタスク（開始日は触っていない）も、状態を
+    変えたときに確定した位置へ戻らない。"""
+    from gui.plan_actions import confirm_all
+
+    db, ids = _plan_project(tmp_path)
+    _with_display(db)
+    confirm_all(db, _compute(db)[0])
+    confirmed = _positions(_compute(db)[0])
+    j0 = ids["jobs"][0]
+    db.update_job_task_override_fields(j0, ids["t1"], override_days=9)
+    before = _positions(_compute(db)[0])
+    assert before[_k(j0, ids["t2"])] != confirmed[_k(j0, ids["t2"])]  # 前提: 後続が押されて動いた
+
+    db.update_job_task_override_fields(j0, ids["t2"], status="in_progress")
+    assert _positions(_compute(db)[0]) == before
+
+
+def test_an_in_progress_task_can_be_extended_but_a_done_task_keeps_its_days(tmp_path):
+    """進行中のタスクは開始日だけを固定し、日数を延ばせる（後続も合わせて動く）。完了した
+    タスクは日数も実績のまま（ワークフロー側の日数を変えても伸び縮みしない）。進行中で
+    延ばした日数は、完了にしてもそのまま。"""
+    from gui.plan_actions import confirm_all
+
+    db, ids = _plan_project(tmp_path)
+    _with_display(db)
+    confirm_all(db, _compute(db)[0])
+    j0 = ids["jobs"][0]
+    db.update_job_task_override_fields(j0, ids["t1"], status="in_progress")
+    start, end = _positions(_compute(db)[0])[_k(j0, ids["t1"])]
+    db.update_job_task_override_fields(j0, ids["t1"], override_days=8)
+    pos = _positions(_compute(db)[0])
+    assert pos[_k(j0, ids["t1"])][0] == start
+    assert pos[_k(j0, ids["t1"])][1] > end  # 延びた
+    assert pos[_k(j0, ids["t2"])][0] >= pos[_k(j0, ids["t1"])][1]  # 後続も押される
+    extended = pos[_k(j0, ids["t1"])]
+
+    db.update_job_task_override_fields(j0, ids["t1"], status="done")
+    assert _positions(_compute(db)[0])[_k(j0, ids["t1"])] == extended
+    db.update_job_task_override_fields(j0, ids["t1"], override_days=3)  # 完了後は変えても動かない
+    assert _positions(_compute(db)[0])[_k(j0, ids["t1"])] == extended
+
+
+def test_status_changes_in_an_unconfirmed_plan_do_not_jump_to_old_dates(tmp_path):
+    """回帰テスト: 「未確定に戻す」の後に残った古い確定日程があると、完了にしたときに
+    その日付へ戻っていた。未確定の計画でも、状態を変えたときの表示中の日程で固定し、
+    未着手に戻したら固定を外す。"""
+    from gui.plan_actions import confirm_all
+
+    db, ids = _plan_project(tmp_path)
+    _with_display(db)
+    confirm_all(db, _compute(db)[0])
+    j0 = ids["jobs"][0]
+    db.update_job_task_override_fields(j0, ids["t1"], status="in_progress")
+    db.clear_confirmation()
+    db.update_job_task_override_fields(j0, ids["t1"], status=None)
+    db.update_job_task_override_fields(j0, ids["t1"], override_days=9)
+    before = _positions(_compute(db)[0])
+
+    db.update_job_task_override_fields(j0, ids["t1"], status="done")
+    assert _positions(_compute(db)[0]) == before
+    db.update_job_task_override_fields(j0, ids["t1"], status=None)
+    assert all((r["job_id"], r["workflow_task_id"]) != (j0, ids["t1"]) for r in db.list_confirmed_schedule())
+
+
+def test_discarding_also_reverts_the_dates_recorded_by_a_status_change(tmp_path):
+    """状態を変えたときに記録した日程も、「変更を破棄」で状態と一緒に確定した時点へ戻る。"""
+    from gui.plan_actions import confirm_all
+
+    db, ids = _plan_project(tmp_path)
+    _with_display(db)
+    confirm_all(db, _compute(db)[0])
+    confirmed = _positions(_compute(db)[0])
+    j0 = ids["jobs"][0]
+    db.set_draft_move(j0, ids["t1"], "2026-04-20")
+    db.update_job_task_override_fields(j0, ids["t1"], status="in_progress")
+
+    db.discard_draft()
+
+    assert db.list_all_job_task_overrides() == []
+    assert _positions(_compute(db)[0]) == confirmed
 
 
 def test_discarding_after_confirming_a_selection_reverts_later_edits_of_that_task(tmp_path):

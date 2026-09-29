@@ -231,12 +231,72 @@ def test_the_right_edge_shows_a_resize_cursor_only_while_the_drag_key_is_held(qa
     _hover(qapp, body, edge, Qt.ShiftModifier)
     assert body.viewport().cursor().shape() == Qt.SizeHorCursor
     _hover(qapp, body, middle, Qt.ShiftModifier)
-    assert body.viewport().cursor().shape() == Qt.ArrowCursor
+    assert body.viewport().cursor().shape() == Qt.OpenHandCursor  # 中ほどは移動
 
     end = body.mapFromScene(bar.bar_rect.right() + 7 * 10, bar.bar_rect.center().y())
     _drag(qapp, body, edge, end, modifiers=Qt.NoModifier)
     assert w.db.list_all_job_task_overrides() == []
     assert tab._pending_edit is None
+
+
+def test_the_cursor_shows_what_a_shift_drag_would_do(qapp, gantt):
+    """指定キーを押しているとき、動かせるバーの上は手、右端は↔、進行中・完了のバーは
+    禁止の印。キーを押していなければ変えない。"""
+    w, tab, ids = gantt
+    w.db.update_job_task_override_fields(ids["job2"], ids["t1"], status="in_progress")
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    bars = tab.view.bars()
+    free, done = bars[_key(ids, "job1", "t1")], bars[_key(ids, "job2", "t1")]
+    body = tab.view.body
+    _zoom_to(tab, free)
+    middle = body.mapFromScene(free.bar_rect.center())
+    _hover(qapp, body, middle)
+    assert body.viewport().cursor().shape() == Qt.ArrowCursor
+    _hover(qapp, body, middle, Qt.ShiftModifier)
+    assert body.viewport().cursor().shape() == Qt.OpenHandCursor
+    _zoom_to(tab, done)
+    middle = body.mapFromScene(done.bar_rect.center())
+    edge = body.mapFromScene(done.bar_rect.right() - 0.5, done.bar_rect.center().y())
+    edge.setX(edge.x() - 1)
+    _hover(qapp, body, middle, Qt.ShiftModifier)
+    assert body.viewport().cursor().shape() == Qt.ForbiddenCursor
+    _hover(qapp, body, edge, Qt.ShiftModifier)
+    assert body.viewport().cursor().shape() == Qt.ForbiddenCursor  # 伸縮もできない
+
+
+def test_tasks_in_progress_or_done_are_not_moved_by_a_drag(qapp, gantt):
+    """回帰テスト: 進行中・完了のタスクは、確定していない計画ではドラッグで動いてしまい
+    （実績を書き換える誤操作になる）、確定済みの計画では動かしても確定の日程に戻っていた。
+    どちらでも動かさない。一緒に選んだ未着手のタスクだけを動かす。"""
+    w, tab, ids = gantt
+    w.db.update_job_task_override_fields(ids["job1"], ids["t1"], status="done")
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    locked = tab.view.bars()[_key(ids, "job1", "t1")]
+    body = tab.view.body
+    _zoom_to(tab, locked)
+    start = body.mapFromScene(locked.bar_rect.center())
+    end = body.mapFromScene(locked.bar_rect.center().x() + 70, locked.bar_rect.center().y())
+    before = w.db.serialize_state()
+    _drag(qapp, body, start, end)
+    edge = body.mapFromScene(locked.bar_rect.right() - 0.5, locked.bar_rect.center().y())
+    edge.setX(edge.x() - 1)
+    _drag(qapp, body, edge, end)
+    assert tab._pending_edit is None
+    assert w.db.serialize_state() == before
+
+    # 未着手のタスクと一緒に選んで動かすと、未着手のタスクだけが動く
+    free_key = _key(ids, "job2", "t1")
+    tab.view.select_keys([_key(ids, "job1", "t1"), free_key])
+    free = tab.view.bars()[free_key]
+    _zoom_to(tab, free)
+    start = body.mapFromScene(free.bar_rect.center())
+    end = body.mapFromScene(free.bar_rect.center().x() + 70, free.bar_rect.center().y())
+    _drag(qapp, body, start, end)
+    _wait_recomputed(qapp, tab)
+    assert _override(w.db, ids["job2"], ids["t1"])["start_pin_date"] is not None
+    assert _override(w.db, ids["job1"], ids["t1"])["start_pin_date"] is None
 
 
 def test_the_right_edge_can_be_grabbed_when_the_next_bar_touches_it(qapp, gantt):
@@ -809,11 +869,21 @@ def test_job_names_do_not_overlap_when_the_chart_is_zoomed_out(qapp, gantt, tmp_
 
     column = tab.view.column
     labels = [label for label, _swatch, _y in column.scene().gantt_job_labels]
-    # 60行は収まらないので、全行とも隠している（一部だけ出すことはしない）
+    # 60行の全体表示でも、全行の名前がそろって縮小して現れ、重ならない
+    body = tab.view.body
+    assert all(label.isVisible() for label in labels)
+    assert len({round(label.scale(), 3) for label in labels}) == 1
+    rects = _visible_label_rects(column, labels)
+    for i, a in enumerate(rects):
+        for b in rects[i + 1:]:
+            assert not _overlaps(a, b)
+
+    # 下限（約6px）より小さくしないと収まらないほど縮めたら、全行とも隠す（一部だけ出さない）
+    body.scale(1.0, 0.2)
+    tab.view._sync_panes()
     assert not any(label.isVisible() for label in labels)
 
-    # 少し拡大すると、全行の名前がそろって縮小して現れ、重ならない
-    body = tab.view.body
+    # 拡大すると、全行の名前がそろって縮小して現れ、重ならない
     pitch = labels[0].boundingRect().height() * 0.8 / (column.scene().gantt_job_labels[1][2]
                                                         - column.scene().gantt_job_labels[0][2])
     body.scale(1.0, pitch / body.transform().m22())

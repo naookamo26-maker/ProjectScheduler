@@ -321,7 +321,7 @@ def test_discarding_after_partially_committing_a_task_that_uses_new_milestone_an
     assert override["override_milestone_id"] is None
     assert override["override_team_id"] is None
     assert override["override_days"] == 3        # 一部確定した入力は残る
-    assert override["status"] == "in_progress"   # 進捗は残る
+    assert override["status"] == "in_progress"   # 一部確定した時点の状態は残る
     confirmed = {(r["job_id"], r["workflow_task_id"]): r for r in db.list_confirmed_schedule()}
     assert confirmed[(ids["job1"], ids["a1"])]["input_signature"] == "sig2"
     assert confirmed[(ids["job1"], ids["a1"])]["team_id"] is None
@@ -329,10 +329,9 @@ def test_discarding_after_partially_committing_a_task_that_uses_new_milestone_an
 
 
 def test_a_discard_that_fails_midway_leaves_the_project_as_it_was(tmp_path):
-    """破棄は「最後に確定した時点」のスナップショットを読み込んでから、残すもの（一部
-    確定・進捗）を入れ直す。入れ直しの途中で失敗しても、半端に戻った状態を残さず、
-    破棄する前の状態に戻す（スナップショットの読み込みはトランザクションの巻き戻しでは
-    戻らない）。"""
+    """破棄は「最後に確定した時点」のスナップショットを読み込んでから、スナップショット
+    自身を入れ直す。その途中で失敗しても、半端に戻った状態を残さず、破棄する前の状態に
+    戻す（スナップショットの読み込みはトランザクションの巻き戻しでは戻らない）。"""
     from unittest.mock import patch
 
     db, ids = _project(tmp_path)

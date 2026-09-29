@@ -465,14 +465,20 @@ def build_plan(db, state):
     def key(k):
         return (_fmt("JOB", k[0]), _fmt("T", k[1]))
 
-    def fixed_value(row):
-        team = _fmt("TEAM", row["team_id"]) if row["team_id"] is not None else None
-        return (row["start_date"], row["days"], team)
+    def fixed_value(row, k=None):
+        # 進行中のタスクは開始日だけを実績として固定し、日数・チームは今の入力に
+        # 従う（遅れている進行中のタスクを延ばせるように）。完了のタスクは日数・
+        # チームも実績のまま（ワークフローの既定の日数を後で変えても伸び縮みしない）
+        team_id, days = row["team_id"], row["days"]
+        if k is not None and k in state.in_progress and k in state.inputs:
+            team_id, days = state.inputs[k]["team"], state.inputs[k]["days"]
+        team = _fmt("TEAM", team_id) if team_id is not None else None
+        return (row["start_date"], days, team)
 
     if state.status == UNCONFIRMED:
         # 未確定でも、進行中・完了のタスクは確定していた日程で固定する（「未確定に
         # 戻す」の後に残した実績）。それ以外は通常どおり自由に計算する
-        facts = {key(k): fixed_value(r) for k, r in state.facts.items() if state.active.get(k, False)}
+        facts = {key(k): fixed_value(r, k) for k, r in state.facts.items() if state.active.get(k, False)}
         if not facts:
             return None
         return {"fixed": facts, "not_before": {}, "released": set(), "started": set(facts),
@@ -484,7 +490,7 @@ def build_plan(db, state):
     for k, row in state.confirmed.items():
         if k in released_int or not state.active.get(k, False):
             continue
-        fixed[key(k)] = fixed_value(row)
+        fixed[key(k)] = fixed_value(row, k)
     lower_bound = max(
         (d for d in (state.replan_base_date, (state.confirmed_at or "")[:10]) if d), default=None,
     )
