@@ -18,7 +18,7 @@ CRUD本体（gui/db.py）から分離しているのは、この2つが「増え
 
 from i18n import tr
 
-SCHEMA_VERSION = "18"
+SCHEMA_VERSION = "19"
 
 
 class SchemaError(Exception):
@@ -265,6 +265,22 @@ CREATE TABLE draft_moves (
     job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
     start_date TEXT NOT NULL,
+    PRIMARY KEY (job_id, workflow_task_id)
+);
+
+-- 実績（v19）。進行中・完了にしたタスクの、実際の日程。状態を変えたときに表示中の
+-- 日程を記録し、タスクの編集ウィンドウで直せる。確定（confirmed_schedule）とは別に
+-- 持つ——確定は「合意した計画」、実績は「実際にこうだった」で、確定していない
+-- 計画・確定後に足したタスクでも記録でき、「変更を破棄」で計画だけを戻せるように
+-- するため。end_date は exclusive。進行中のタスクは開始日だけを使い（終了は今の日数
+-- から計算する）、完了のタスクは開始日〜終了日をそのまま使う（休業日でも動かさない）。
+CREATE TABLE task_facts (
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    days INTEGER NOT NULL,
+    team_id INTEGER REFERENCES teams(id) ON DELETE SET NULL,
     PRIMARY KEY (job_id, workflow_task_id)
 );
 """
@@ -697,6 +713,41 @@ def migrate(conn):
             if cols and column not in cols:
                 conn.execute(f"ALTER TABLE project ADD COLUMN {column} TEXT")
         version = "18"
+
+    if version == "18":
+        # v19: 実績（task_facts）を確定行（confirmed_schedule）から分ける。v18までは
+        # 進行中・完了のタスクの日程を確定行に書いていたので、それを写す。確定して
+        # いないファイル（confirmed_at が NULL）に残っている確定行は実績だけなので消す。
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS task_facts ("
+            "job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, "
+            "workflow_task_id INTEGER NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE, "
+            "start_date TEXT NOT NULL, end_date TEXT NOT NULL, days INTEGER NOT NULL, "
+            "team_id INTEGER REFERENCES teams(id) ON DELETE SET NULL, "
+            "PRIMARY KEY (job_id, workflow_task_id))"
+        )
+        override_cols = [r["name"] for r in conn.execute("PRAGMA table_info(job_task_overrides)").fetchall()]
+        confirmed_cols = [r["name"] for r in conn.execute("PRAGMA table_info(confirmed_schedule)").fetchall()]
+        project_cols = [r["name"] for r in conn.execute("PRAGMA table_info(project)").fetchall()]
+        if "status" in override_cols and confirmed_cols:
+            facts = conn.execute(
+                "SELECT c.job_id, c.workflow_task_id, c.start_date, c.end_date, c.days, c.team_id "
+                "FROM confirmed_schedule c JOIN job_task_overrides o "
+                "ON o.job_id = c.job_id AND o.workflow_task_id = c.workflow_task_id "
+                "WHERE o.status IN ('in_progress', 'done')"
+            ).fetchall()
+            if facts:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO task_facts(job_id, workflow_task_id, start_date, end_date, "
+                    "days, team_id) VALUES (?, ?, ?, ?, ?, ?)",
+                    [tuple(r) for r in facts],
+                )
+            has_rows = conn.execute("SELECT 1 FROM confirmed_schedule LIMIT 1").fetchone() is not None
+            if has_rows and "confirmed_at" in project_cols:
+                confirmed = conn.execute("SELECT confirmed_at FROM project WHERE id = 1").fetchone()
+                if confirmed is None or confirmed[0] is None:
+                    conn.execute("DELETE FROM confirmed_schedule")
+        version = "19"
 
     conn.execute(
         "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)

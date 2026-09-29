@@ -599,12 +599,15 @@ class MainWindow(QMainWindow):
         self._update_title()
 
     def _displayed_task_rows(self, keys):
-        """keys（(job_id, workflow_task_id) の並び）の、表示中の日程（確定行と同じ形）。"""
+        """keys（(job_id, workflow_task_id) の並び。None なら全タスク）の、今の日程
+        （確定行と同じ形）。最新の計算結果が無ければその場で計算する
+        （ScheduleCache.compute_now）。"""
         cache = self.schedule_cache
-        result_df = cache.result_df if cache is not None else None
+        result_df = cache.compute_now() if cache is not None else None
         if result_df is None or result_df.empty:
             return []
-        return confirmed_rows_from_result(self.db, result_df, only_keys=set(keys), keep_done_facts=False)
+        only = None if keys is None else set(keys)
+        return confirmed_rows_from_result(self.db, result_df, only_keys=only, keep_done_facts=False)
 
     def _show_project_path(self):
         self.project_path_label.setText(

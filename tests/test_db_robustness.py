@@ -298,7 +298,9 @@ def test_discarding_after_partially_committing_a_task_that_uses_new_milestone_an
     """回帰テスト: 確定した後に追加したマイルストーン・チームをタスクに使い、そのタスクだけ
     「選択した変更を確定」してから「変更を破棄」すると、最後に確定した時点（そのマイルス
     トーン・チームがまだ無い）へ戻した上に上書き・確定行を入れ直そうとして外部キー制約で
-    失敗し、破棄が途中で止まっていた。存在しない参照は「未設定」に戻して破棄を終える。"""
+    失敗し、破棄が途中で止まっていた。確定したタスクが使うマイルストーン・チームは
+    スナップショットにも写し、確定した入力のまま残す（「未設定」に戻すと、チームを変えて
+    確定したタスクが破棄の直後から「変更あり」になるため）。使っていないものは破棄する。"""
     db, ids = _project(tmp_path)
     db.add_milestone("M1", "2026-12-25")
     db.replace_confirmed_schedule(
@@ -307,24 +309,26 @@ def test_discarding_after_partially_committing_a_task_that_uses_new_milestone_an
     )
     new_ms = db.add_milestone("確定後の締切", "2027-03-31")
     new_team = db.add_team("確定後のチーム", 1)
+    db.add_milestone("確定後の使わない締切", "2027-06-30")
     db.upsert_job_task_override(ids["job1"], ids["a1"], milestone_id=new_ms, team_id=new_team,
                                 override_days=3, status="in_progress")
     db.update_confirmed_rows([_confirmed_row(ids["job1"], ids["a1"], new_team, "sig2")], [],
                              "2026-04-02T09:00:00")
 
-    db.discard_draft()
+    db.discard_draft(restore_statuses=True)
 
     assert not db._conn.in_transaction
-    assert [m["name"] for m in db.list_milestones()] == ["M1"]  # 確定後の追加は破棄された
+    assert [m["name"] for m in db.list_milestones()] == ["M1", "確定後の締切"]
+    assert "確定後のチーム" in [t["name"] for t in db.list_teams()]
     override = next(r for r in db.list_all_job_task_overrides()
                     if (r["job_id"], r["workflow_task_id"]) == (ids["job1"], ids["a1"]))
-    assert override["override_milestone_id"] is None
-    assert override["override_team_id"] is None
+    assert override["override_milestone_id"] == new_ms
+    assert override["override_team_id"] == new_team
     assert override["override_days"] == 3        # 一部確定した入力は残る
     assert override["status"] == "in_progress"   # 一部確定した時点の状態は残る
     confirmed = {(r["job_id"], r["workflow_task_id"]): r for r in db.list_confirmed_schedule()}
     assert confirmed[(ids["job1"], ids["a1"])]["input_signature"] == "sig2"
-    assert confirmed[(ids["job1"], ids["a1"])]["team_id"] is None
+    assert confirmed[(ids["job1"], ids["a1"])]["team_id"] == new_team
     db.close()
 
 

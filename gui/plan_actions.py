@@ -30,14 +30,14 @@ def confirmed_rows_from_result(db, result_df, only_keys=None, keep_done_facts=Tr
     """計算結果から確定行を作る。only_keys（(job_id, workflow_task_id) の集合）を
     渡すとそのタスクだけ。
 
-    日数・チームは実効の入力値を書く。ただし完了のタスクで既に確定行があるものは、
-    確定行の日数・チームのまま残す（実施した事実なので、ワークフロー側の値を直しても
+    日数・チームは実効の入力値を書く。ただし完了のタスクで実績（task_facts）がある
+    ものは、実績の日数・チームにする（実施した事実なので、ワークフロー側の値を直しても
     遡って変えない。§8-2）。進行中のタスクは日数・チームを今の入力に従わせる
-    （gui/gantt_generator.build_plan）ので残さない。keep_done_facts=False なら残さず、
-    表示中の値そのもの（状態を変えたときの実績の記録。ProjectDatabase._record_status_fact）。"""
+    （gui/gantt_generator.build_plan）ので実績の値を使わない。keep_done_facts=False
+    なら表示中の値そのもの（状態を変えたときの実績の記録。ProjectDatabase._record_status_fact）。"""
     signatures = task_signatures(db)
     effective = effective_task_values(db)
-    old = {(r["job_id"], r["workflow_task_id"]): r for r in db.list_confirmed_schedule()}
+    old = {(r["job_id"], r["workflow_task_id"]): r for r in db.list_task_facts()}
     done = {
         (r["job_id"], r["workflow_task_id"])
         for r in db.list_all_job_task_overrides() if r["status"] == "done"
@@ -87,13 +87,20 @@ def confirm_selected(db, result_df, keys, successors):
     """選んだタスクの変更と、その影響で動いた後続を確定する（selected_targets）。
     確定したタスクの数を返す。
 
-    successors は gui/plan_confirmation.successor_map(db) の戻り値。"""
-    from gui.plan_confirmation import PlanState
+    successors は gui/plan_confirmation.successor_map(db) の戻り値。
+
+    ジョブの優先度・ワークフロー内の依存の変更（ジョブ・ワークフロー全体で1つの入力）は、
+    その変更だけを受けた同じジョブ・ワークフローのタスクも一緒に確定する
+    （gui/plan_confirmation.shared_change_companions）。"""
+    from gui.plan_confirmation import PlanState, shared_change_companions
 
     state = PlanState(db)
     targets = selected_targets(state, keys, successors)
     if not targets:
         return 0
+    companions = shared_change_companions(db, state, targets, db.draft_base_shared_inputs())
+    if companions:
+        targets = selected_targets(state, set(keys) | companions, successors)
     rows = confirmed_rows_from_result(db, result_df, only_keys=targets)
     written = {(r["job_id"], r["workflow_task_id"]) for r in rows}
     # 結果に載っていない（無効にした・削除した）タスクの確定行は消す

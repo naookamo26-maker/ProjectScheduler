@@ -465,20 +465,30 @@ def build_plan(db, state):
     def key(k):
         return (_fmt("JOB", k[0]), _fmt("T", k[1]))
 
+    def team_str(team_id):
+        return _fmt("TEAM", team_id) if team_id is not None else None
+
     def fixed_value(row, k=None):
-        # 進行中のタスクは開始日だけを実績として固定し、日数・チームは今の入力に
-        # 従う（遅れている進行中のタスクを延ばせるように）。完了のタスクは日数・
-        # チームも実績のまま（ワークフローの既定の日数を後で変えても伸び縮みしない）
+        # 確定した位置: (開始, 日数, チーム, 実績か, 実績の終了日)。実績の記録が無い
+        # 進行中のタスク（v18 以前に記録できなかったもの）は、日数・チームを今の入力に従わせる
         team_id, days = row["team_id"], row["days"]
         if k is not None and k in state.in_progress and k in state.inputs:
             team_id, days = state.inputs[k]["team"], state.inputs[k]["days"]
-        team = _fmt("TEAM", team_id) if team_id is not None else None
-        return (row["start_date"], days, team)
+        return (row["start_date"], days, team_str(team_id), False, None)
 
+    def fact_value(k, fact):
+        # 実績は休業日でも動かさない。進行中のタスクは開始日だけを固定し、日数・
+        # チームは今の入力に従う（遅れている進行中のタスクを延ばせるように）。完了の
+        # タスクは開始日〜終了日をそのまま使う（休業日を足しても、ワークフローの既定の
+        # 日数を後で変えても伸び縮みしない）
+        if k in state.in_progress and k in state.inputs:
+            return (fact["start_date"], state.inputs[k]["days"], team_str(state.inputs[k]["team"]), True, None)
+        return (fact["start_date"], fact["days"], team_str(fact["team_id"]), True, fact["end_date"])
+
+    facts = {key(k): fact_value(k, f) for k, f in state.facts.items() if state.active.get(k, False)}
     if state.status == UNCONFIRMED:
-        # 未確定でも、進行中・完了のタスクは確定していた日程で固定する（「未確定に
-        # 戻す」の後に残した実績）。それ以外は通常どおり自由に計算する
-        facts = {key(k): fixed_value(r, k) for k, r in state.facts.items() if state.active.get(k, False)}
+        # 未確定でも、進行中・完了のタスクは実績で固定する。それ以外は通常どおり
+        # 自由に計算する
         if not facts:
             return None
         return {"fixed": facts, "not_before": {}, "released": set(), "started": set(facts),
@@ -488,9 +498,10 @@ def build_plan(db, state):
 
     fixed = {}
     for k, row in state.confirmed.items():
-        if k in released_int or not state.active.get(k, False):
+        if k in released_int or not state.active.get(k, False) or k in state.facts:
             continue
         fixed[key(k)] = fixed_value(row, k)
+    fixed.update(facts)
     lower_bound = max(
         (d for d in (state.replan_base_date, (state.confirmed_at or "")[:10]) if d), default=None,
     )
@@ -514,6 +525,9 @@ def build_plan(db, state):
         "successors": {key(k): [key(n) for n in v] for k, v in successors_int.items()},
         "lower_bound": lower_bound,
         "quiet_before": state.quiet_before,
+        # 違反による影響範囲の拡大の判定用（compute_schedule_with_plan）
+        "confirmed_end": {key(k): r["end_date"] for k, r in state.confirmed.items()},
+        "global_changed": state.global_changed,
     }
 
 
@@ -534,7 +548,7 @@ def build_confirmed_plan(state):
             exclude.add(key(k))
             continue
         team = _fmt("TEAM", row["team_id"]) if row["team_id"] is not None else None
-        fixed[key(k)] = (row["start_date"], row["days"], team)
+        fixed[key(k)] = (row["start_date"], row["days"], team, False, None)
     return {
         "fixed": fixed, "exclude": exclude, "not_before": {}, "released": set(),
         "started": set(fixed), "draft_moves": {}, "successors": {}, "lower_bound": None,
@@ -544,20 +558,29 @@ def build_confirmed_plan(state):
 
 def _apply_plan_to_frames(frames, fixed, plan):
     """確定の位置に固定するタスクを、開始固定日・日数・チームの上書きとして
-    job_tasks に書き込んだ frames の写しを返す（DBは変えない）。"""
+    job_tasks に書き込んだ frames の写しを返す（DBは変えない）。
+
+    fixed の値は (開始, 日数, チーム[, 実績か, 実績の終了日])。実績は休業日でも
+    次の稼働日へ送らず（Start_Pin_Exact）、終了日があればそのまま使う（Fixed_End_Date）。"""
     frames = dict(frames)
     columns = ["Job_ID", "Task_ID", "Is_Active", "Override_Days", "Milestone_ID", "Team_ID",
-               "Start_Pin_Date", "Not_Before"]
+               "Start_Pin_Date", "Not_Before", "Start_Pin_Exact", "Fixed_End_Date"]
     rows = {}
     if frames.get("job_tasks") is not None:
         for r in frames["job_tasks"].to_dict("records"):
             rows[(r["Job_ID"], r["Task_ID"])] = r
-    for k, (start, days, team) in fixed.items():
+    for k, value in fixed.items():
+        start, days, team = value[:3]
+        exact, end = (value[3], value[4]) if len(value) > 3 else (False, None)
         r = rows.setdefault(k, {"Job_ID": k[0], "Task_ID": k[1], "Is_Active": "Y"})
         r["Start_Pin_Date"] = start
         r["Override_Days"] = days
         if team is not None:
             r["Team_ID"] = team
+        if exact:
+            r["Start_Pin_Exact"] = "Y"
+        if end:
+            r["Fixed_End_Date"] = end
     for k in plan.get("exclude", ()):
         r = rows.setdefault(k, {"Job_ID": k[0], "Task_ID": k[1]})
         r["Is_Active"] = "N"
@@ -597,15 +620,54 @@ def _quiet_past_violations(result_df, quiet_before):
     return result_df
 
 
+def _is_newly_broken(key, violation_days, overbooked, plan, predecessors, ends):
+    """確定の位置に固定したタスク key の違反が、確定した後の変化で起きたものか
+    （compute_schedule_with_plan。影響範囲に加えて置き直すか）。
+
+    plan に confirmed_end が無い（確定の位置を持たない材料）ときは、これまでどおり
+    どの違反も置き直す。"""
+    confirmed_end = plan.get("confirmed_end")
+    if confirmed_end is None:
+        return True
+    if overbooked and plan.get("global_changed"):
+        return True
+    if violation_days <= 0:
+        return False
+
+    def late(k, seen):
+        for pred in predecessors.get(k, ()):
+            if pred in seen:
+                continue
+            seen.add(pred)
+            end = ends.get(pred)
+            if end is None:
+                # 無効のタスク（スケジューラは依存をその先行へ繋ぎ替える）
+                if late(pred, seen):
+                    return True
+                continue
+            planned = confirmed_end.get(pred)
+            if planned is None or end > planned:
+                return True
+        return False
+
+    return late(key, set())
+
+
 def compute_schedule_with_plan(frames, plan, **scheduler_kwargs):
     """確定を踏まえて計算する（ワーカースレッドから呼んでよい。DBに触れない）。
 
     影響範囲の外を確定の位置に固定して計算し、固定したタスクが固定どおりに
-    置けなくなった（全体の設定の変更で、固定同士がライン数や依存でぶつかった）
-    未着手のタスクがあれば、それとその後続を影響範囲に加えて計算し直す。
-    タスクの編集そのものからは違反は起きない（編集したタスクの後続は最初から
-    影響範囲にあり、影響範囲のタスクは空いているラインにしか置かれない）ので、
-    通常は2回で収まる。PLAN_MAX_RUNS 回で打ち切り、残った違反はそのまま返す。
+    置けなくなった未着手のタスクがあれば、それとその後続を影響範囲に加えて計算し
+    直す。PLAN_MAX_RUNS 回で打ち切り、残った違反はそのまま返す。
+
+    置けなくなった、とみなすのは次の場合だけ（_is_newly_broken）:
+    - 依存の違反で、先行タスクが確定した終了日より後ろへずれている（休業日を足して
+      延びた、進行中のタスクが遅れている等）
+    - ライン数の超過で、全体の設定（ライン数・休業日等）が確定から変わっている
+    確定した日程そのものが依存やライン数に反している（先行タスクより前へドラッグして
+    確定した、一部だけ確定した後に先行の変更を破棄した等）ときは、確定どおりに置いて
+    違反として見せる。以前はこれも影響範囲に加えていたため、確定した直後にタスクが
+    後ろへ飛び、「確定済み」なのに表示が確定した日程と違っていた。
 
     Returns: (result_df, info)。info は {"released": 影響範囲のキー集合, "runs": 計算回数}。
     """
@@ -615,6 +677,10 @@ def compute_schedule_with_plan(frames, plan, **scheduler_kwargs):
     plan = dict(plan, not_before=dict(plan.get("not_before", {})))
     released = set(plan["released"])
     started = plan["started"]
+    predecessors = {}
+    for pred, succs in plan["successors"].items():
+        for succ in succs:
+            predecessors.setdefault(succ, []).append(pred)
     runs = 0
     while True:
         runs += 1
@@ -625,8 +691,18 @@ def compute_schedule_with_plan(frames, plan, **scheduler_kwargs):
         if runs >= PLAN_MAX_RUNS or result_df.empty:
             break
         broken = result_df[result_df["Constraint_Violation"] != ""]
+        ends = {
+            k: end.date().isoformat()
+            for k, end in zip(zip(result_df["Job_ID"], result_df["Task_ID"]), result_df["End_Date"])
+        }
         violated = {
-            k for k in zip(broken["Job_ID"], broken["Task_ID"]) if k in fixed and k not in started
+            k for k, days, overbooked in zip(
+                zip(broken["Job_ID"], broken["Task_ID"]), broken["Constraint_Violation_Days"],
+                broken["Constraint_Overbooked"] if "Constraint_Overbooked" in broken.columns
+                else [False] * len(broken),
+            )
+            if k in fixed and k not in started
+            and _is_newly_broken(k, days, overbooked, plan, predecessors, ends)
         }
         if not violated:
             break

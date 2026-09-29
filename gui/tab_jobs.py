@@ -88,6 +88,8 @@ from PySide6.QtWidgets import (
 )
 
 from gui.db import InvalidNameError, ProjectDatabaseError, normalize_name, normalize_tags, parse_tags
+from gui.gantt_edit import WorkDayCalendar, format_entity_id
+from gui.gantt_generator import build_display
 from gui.plan_confirmation import (
     DRAFT,
     JOB_CHANGED,
@@ -138,6 +140,12 @@ _UNSPECIFIED_PRIORITY_LABEL = N_("（未指定）")
 # ChoiceFilterGroupなので、同じ値を使っても両者のキー空間は混ざらない）。
 _NO_MILESTONE_FILTER_KEY = None
 _NO_TAG_FILTER_KEY = None
+
+# 進行中・完了（実績の日付で置く状態）。タスク上書き表では、日程に効かない欄
+# （進行中・完了の開始固定日、完了の日数・チーム）を編集できなくする
+_STARTED = ("in_progress", "done")
+_STARTED_LOCK_TIP = N_("進行中・完了のタスクは実績の日付で置くので、この欄は使いません"
+                       "（実績の日付は、ガントチャートのタスクの編集ウィンドウで直せます）。")
 _NO_JOB_TAG_FILTER_LABEL = N_("（ジョブ タグなし）")
 _NO_TASK_TAG_FILTER_LABEL = N_("（タスク タグなし）")
 
@@ -301,6 +309,8 @@ class JobsTab(QWidget):
         super().__init__(parent)
         self.db = db
         self.current_job_id = None
+        # 開始固定日を編集したタスク（入力を終えたときに休業日かを見る。_snap_pin_to_working_day）
+        self._pins_edited = set()
         self._sort_column = 0
         self._sort_ascending = True
         # セルウィジェットの遅延生成用（モジュール冒頭の説明を参照）
@@ -969,9 +979,14 @@ class JobsTab(QWidget):
             pin_edit = OptionalDateEdit()
             pin_edit.set_value(r["start_pin_date"])
             pin_edit.dateChanged.connect(
-                lambda _date, tid=r["workflow_task_id"]: self._on_override_changed(tid)
+                lambda _date, tid=r["workflow_task_id"]: self._on_pin_changed(tid)
             )
-            bind_undo_session(pin_edit, self.db, "タスクの開始固定日を変更")
+            # 入力を終えたとき（フォーカスが外れる直前。同じUndo単位の中）に、休業日なら
+            # 次の稼働日へ直す。入力中に直すと、日付を打っている途中で書き換わってしまう
+            bind_undo_session(
+                pin_edit, self.db, "タスクの開始固定日を変更",
+                on_before_commit=lambda tid=r["workflow_task_id"]: self._snap_pin_to_working_day(tid),
+            )
             table.setCellWidget(row, 5, pin_edit)
 
             # 実際の進捗（ユーザーが手動で記録する。日付からの推測ではない
@@ -1029,6 +1044,63 @@ class JobsTab(QWidget):
         if workflow_task_id is None:
             return
         self._on_override_changed(workflow_task_id)
+
+    def _on_pin_changed(self, workflow_task_id):
+        self._pins_edited.add(workflow_task_id)
+        self._on_override_changed(workflow_task_id)
+
+    def _snap_pin_to_working_day(self, workflow_task_id):
+        """開始固定日を編集し終えたとき、休業日なら次の稼働日へ直して知らせる。
+
+        スケジューラも休業日の固定日は次の稼働日から始めるので、欄の値とガントの
+        バーの位置をそろえる（以前は何も言わずに翌稼働日から始まっていた）。"""
+        if workflow_task_id not in self._pins_edited or self.current_job_id is None:
+            return
+        self._pins_edited.discard(workflow_task_id)
+        row = next((r for r in self.db.list_job_tasks_with_overrides(self.current_job_id)
+                    if r["workflow_task_id"] == workflow_task_id), None)
+        if row is None or not row["start_pin_date"] or row["status"] in _STARTED:
+            return
+        day = date.fromisoformat(row["start_pin_date"])
+        team = row["override_team_id"] or row["default_team_id"]
+        calendar = WorkDayCalendar.from_display(build_display(self.db))
+        working = calendar.next_working(day, format_entity_id("TEAM", team))
+        if working == day:
+            return
+        self.db.update_job_task_override_fields(
+            self.current_job_id, workflow_task_id, start_pin_date=working.isoformat()
+        )
+        table = self.override_table
+        for r in range(table.rowCount()):
+            if row_id(table, r) == workflow_task_id:
+                edit = table.cellWidget(r, 5)
+                edit.blockSignals(True)
+                edit.set_value(working.isoformat())
+                edit.blockSignals(False)
+        message = tr("{day} は休業日のため、次の稼働日 {working} を開始固定日にしました。", day=day, working=working)
+        # フォーカスが移る途中なので、ダイアログは今のイベント処理の後に出す
+        QTimer.singleShot(0, lambda: QMessageBox.information(self, tr("開始固定日"), message))
+
+    def _apply_started_locks(self):
+        """進行中・完了のタスクの行で、日程に効かない欄を編集できなくする（進行中・
+        完了は開始固定日、完了は日数・チームも）。書いても実績の日付で置くので何も
+        起きず、未着手に戻した瞬間にまとめて効いてタスクが動いていたため。"""
+        table = self.override_table
+        tip = tr(_STARTED_LOCK_TIP)
+        for row in range(table.rowCount()):
+            status_combo = table.cellWidget(row, 6)
+            if status_combo is None:
+                continue
+            status = status_combo.currentData()
+            for column, locked in ((5, status in _STARTED), (2, status == "done"), (4, status == "done")):
+                widget = table.cellWidget(row, column)
+                widget.setEnabled(not locked)
+                if locked:
+                    if widget.toolTip() != tip:
+                        widget.setProperty("unlockedToolTip", widget.toolTip())
+                        widget.setToolTip(tip)
+                elif widget.toolTip() == tip:
+                    widget.setToolTip(widget.property("unlockedToolTip") or "")
 
     def _on_override_changed(self, workflow_task_id, milestone_changed=False):
         table = self.override_table
@@ -1147,7 +1219,15 @@ class JobsTab(QWidget):
         self._update_override_plan_marks()
 
     def _update_override_plan_marks(self):
-        """タスク上書き表の「確定日程」列と、確定時から変わった日数・チームの赤文字。"""
+        """タスク上書き表の「確定日程」列と、確定時から変わった日数・チームの赤文字。
+        あわせて、進行中・完了のタスクで使わない欄を編集できなくする（_apply_started_locks。
+        赤文字の説明より後に当てる）。"""
+        try:
+            self._update_override_plan_marks_inner()
+        finally:
+            self._apply_started_locks()
+
+    def _update_override_plan_marks_inner(self):
         table = self.override_table
         state = self._plan_state if self._plan_state is not None else PlanState(self.db)
         plan_on = state.status != UNCONFIRMED
@@ -1202,6 +1282,11 @@ class JobsTab(QWidget):
                 reasons.append(tr("確定後に無効にしました"))
             if key in state.draft_moves:
                 reasons.append(tr("ガントで移動: 開始 {start_date} → {value}", start_date=confirmed['start_date'], value=state.draft_moves[key]))
+            fact = state.facts.get(key)
+            if fact is not None and fact["start_date"] != confirmed["start_date"]:
+                reasons.append(tr("実績の開始日: {start_date} → {value}", start_date=confirmed['start_date'], value=fact["start_date"]))
+            elif fact is not None and key not in state.in_progress and fact["end_date"] != confirmed["end_date"]:
+                reasons.append(tr("実績の終了日が確定と違います"))
             if not reasons:
                 reasons.append(tr("確定後に開始固定日・依存などが変わりました"))
             item.setForeground(QColor(_PLAN_CHANGED_COLOR))
