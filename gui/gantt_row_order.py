@@ -1,7 +1,7 @@
 """
 ガントチャートタブの行（ジョブ）の並び順。
 
-分類（全体／ワークフロー別）と並び（開始日・終了日・マイルストーン・優先度）、
+分類（全体／ワークフロー別／依存のつながり）と並び（開始日・終了日・マイルストーン・優先度）、
 昇順／降順を組み合わせて、ジョブの並びを決める。画面（gui/tab_gantt.py）から
 切り離し、スケジューリング結果の DataFrame だけで計算できるようにしてある。
 
@@ -15,7 +15,8 @@ import pandas as pd
 
 GROUP_ALL = "all"
 GROUP_WORKFLOW = "workflow"
-GROUPINGS = (GROUP_ALL, GROUP_WORKFLOW)
+GROUP_DEPENDENCY = "dependency"
+GROUPINGS = (GROUP_ALL, GROUP_WORKFLOW, GROUP_DEPENDENCY)
 
 ORDER_START = "start"
 ORDER_END = "end"
@@ -62,7 +63,7 @@ def _sort_key(order):
     return lambda f: (f["start"],)
 
 
-def sort_job_ids(df, display, grouping=GROUP_ALL, order=ORDER_START, descending=False):
+def sort_job_ids(df, display, grouping=GROUP_ALL, order=ORDER_START, descending=False, job_links=()):
     """df（スケジューリング結果。絞り込み後でよい）に含まれるジョブの並びを返す。
 
     - 同じ値のジョブはジョブを作った順（計算し直すたびに入れ替わらないように）。
@@ -71,6 +72,9 @@ def sort_job_ids(df, display, grouping=GROUP_ALL, order=ORDER_START, descending=
     - マイルストーン順で締切の無いジョブは、昇順・降順とも最後。
     - ワークフロー別では、ワークフロー設計タブの並び順（display["workflow_names"]
       の順）でまとめ、その中を上の並びで並べる。ワークフロー同士の順は降順でも変えない。
+    - 依存のつながりでは、ジョブをまたぐ依存（job_links: [((前のJob_ID, …), (後のJob_ID, …), …)]。
+      スケジューリング結果の attrs["job_links"]）でつながったジョブをまとめ、依存される
+      ジョブのすぐ下に依存するジョブを並べる（_order_by_dependency）。
     """
     if df is None or df.empty:
         return []
@@ -88,6 +92,8 @@ def sort_job_ids(df, display, grouping=GROUP_ALL, order=ORDER_START, descending=
             undated = []
         return sorted(created, key=lambda j: key(facts[j]), reverse=descending) + undated
 
+    if grouping == GROUP_DEPENDENCY:
+        return _order_by_dependency(ordered(list(facts)), job_links)
     if grouping != GROUP_WORKFLOW:
         return ordered(list(facts))
     workflow_rank = {wf: i for i, wf in enumerate((display or {}).get("workflow_names", {}))}
@@ -97,6 +103,49 @@ def sort_job_ids(df, display, grouping=GROUP_ALL, order=ORDER_START, descending=
     result = []
     for wf in sorted(groups, key=lambda w: (workflow_rank.get(w, len(workflow_rank)), str(w))):
         result.extend(ordered(groups[wf]))
+    return result
+
+
+def _order_by_dependency(ordered_jobs, job_links):
+    """依存される側のジョブのすぐ下に、依存する側のジョブを並べる。
+
+    ordered_jobs（選んだ並び順で並べた全ジョブ）の順に、依存先を持たないジョブから
+    置いていき、置いたジョブに依存するジョブをその直下へ続ける（深さ優先）。複数の
+    ジョブに依存するジョブは、依存先がすべて置かれた時点で最後の依存先の下に置く。
+    同じ親の下の兄弟、まとまり同士の順は ordered_jobs の順。ジョブ単位では依存が
+    輪になることがある（A のタスク → B、B の別のタスク → A）ので、輪の中で置けずに
+    残ったジョブは ordered_jobs の順に置く。依存が長く続いても落ちないよう再帰は使わない。
+    """
+    present = set(ordered_jobs)
+    rank = {job_id: i for i, job_id in enumerate(ordered_jobs)}
+    children, parents = {}, {}
+    for (pred, *_p), (succ, *_s), *_rest in job_links:
+        if pred == succ or pred not in present or succ not in present:
+            continue
+        children.setdefault(pred, set()).add(succ)
+        parents.setdefault(succ, set()).add(pred)
+
+    result, placed = [], set()
+
+    def place_from(root):
+        stack = [root]
+        while stack:
+            job_id = stack.pop()
+            if job_id in placed:
+                continue
+            placed.add(job_id)
+            result.append(job_id)
+            ready = [c for c in children.get(job_id, ())
+                     if c not in placed and parents[c] <= placed]
+            # 先に置くものほど後から積む（スタックなので逆順）
+            stack.extend(sorted(ready, key=rank.get, reverse=True))
+
+    for job_id in ordered_jobs:
+        if job_id not in placed and parents.get(job_id, set()) <= placed:
+            place_from(job_id)
+    for job_id in ordered_jobs:  # 輪になっていて置けなかったもの
+        if job_id not in placed:
+            place_from(job_id)
     return result
 
 

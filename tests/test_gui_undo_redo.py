@@ -896,7 +896,7 @@ def test_gantt_tab_reports_validation_errors_without_a_modal(window, qapp):
     qapp.processEvents()
 
     assert window.tab_gantt._result_df is None
-    assert "解決してください" in window.tab_gantt.status_label.text()
+    assert "解決してください" in window.tab_gantt.error_label.text()
 
 
 def _add_many_jobs(db, count):
@@ -1079,12 +1079,12 @@ def test_gantt_tab_computes_schedule_in_background(window, qapp):
     window.tabs.setCurrentWidget(window.tab_gantt)
     # まだイベントを回していないので、この時点では結果は返ってきていない
     assert window.tab_gantt._result_df is None
-    assert "計算中" in window.tab_gantt.status_label.text()
+    assert "計算中" in window.schedule_summary_label.text()
 
     _wait_for_schedule(window, qapp)
     assert window.tab_gantt._result_df is not None
     assert len(window.tab_gantt._result_df) == 1
-    assert "件のタスクを生成しました" in window.tab_gantt.status_label.text()
+    assert "件のタスクを生成しました" in window.schedule_summary_label.text()
 
 
 def test_gantt_tab_reuses_result_until_the_db_changes(window, qapp):
@@ -1246,7 +1246,7 @@ def test_gantt_tab_reports_deadline_overrun_in_status(window, qapp):
     _wait_for_schedule(window, qapp)
 
     assert window.tab_gantt._result_df is not None  # 例外にせず結果は出す
-    assert "締切に間に合いません" in window.tab_gantt.status_label.text()
+    assert "締切に間に合いません" in window.tab_gantt.error_label.text()
 
 
 def test_hidden_gantt_tab_is_not_refreshed_during_undo(window, qapp):
@@ -2896,14 +2896,14 @@ def test_placement_spinbox_enter_commits_once_and_focus_out_does_not_repeat_it(w
 
 
 def test_placement_spinbox_loses_focus_when_clicking_elsewhere_in_the_tab(window, qapp):
-    """配置コントロールの外（状況表示テキスト・枠の余白・タブの空き領域）を
+    """配置コントロールの外（並びの枠・枠の余白・タブの空き領域）を
     クリックしたら、数値入力欄のアクティブ状態が外れること。以前はこれらが
     どれもフォーカスを受け取らないため、クリックしてもアクティブなままだった
     （チャート本体をクリックした場合だけ外れていた）。"""
     tab = window.tab_gantt
     spin = _focused_placement_spinbox(window, qapp)
 
-    for target in (tab.status_label, tab.placement_group, tab):
+    for target in (tab.row_resort_button.parentWidget(), tab.placement_group, tab):
         spin.setFocus()
         qapp.processEvents()
         assert spin.hasFocus()
@@ -2936,10 +2936,13 @@ def test_gantt_tab_reports_unsatisfiable_pin_in_the_status_line(window, qapp):
             break
         time.sleep(0.05)
 
-    message, is_error = window.tab_gantt._result_summary()
-    assert is_error
-    assert "開始固定日どおりに配置できません" in message
-    assert "依存タスクの着手可能日" in message
+    summary, errors = window.tab_gantt._result_summary()
+    assert "件のタスクを生成しました" in summary
+    # エラーはタブ内のエラーの段に出す（件数は画面下部）
+    assert "開始固定日どおりに配置できません" in errors
+    assert "依存タスクの着手可能日" in errors
+    assert window.tab_gantt.error_label.text() == errors
+    assert not window.tab_gantt.error_label.isHidden()
 
 
 # -- 名前を付けて保存：拡張子自動付与時の上書き確認（gui/main.py の on_save_as） ----------

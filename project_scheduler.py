@@ -2194,6 +2194,31 @@ def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, 
     )
 
 
+def _cross_job_links(active_tasks, scheduled, cal):
+    """ジョブをまたぐ依存（実際にスケジューリングに使ったもの）を
+    [(前のタスク, 後のタスク, 守られていないか), ...] で返す。タスクは (Job_ID, Task_ID)。
+
+    無効にしたタスクをまたぐ依存は手前のタスクへ繋ぎ替えられている（_build_active_tasks）
+    ので、入力の依存ではなく繋ぎ替えた後の deps を使う。「守られていない」は、後の
+    タスクが依存から決まる着手可能日より前に始まっていること（開始固定日で依存より前に
+    置いた場合に起きる）。ガントチャートタブの依存の矢印に使う（gui/gantt_view.py）。
+    """
+    links = []
+    for g_id, (start_ord, _end_ord) in scheduled.items():
+        t_info = active_tasks[g_id]
+        for d in t_info["deps"]:
+            pred = active_tasks.get(d)
+            if pred is None or d not in scheduled or pred["job_id"] == t_info["job_id"]:
+                continue
+            floor = _dep_lower_bounds(t_info, {d: scheduled[d]}, cal, t_info["team_id"], g_id)
+            floor = cal.next_working_day(floor[0], t_info["team_id"]) if floor else None
+            links.append((
+                (pred["job_id"], pred["task_id"]), (t_info["job_id"], t_info["task_id"]),
+                floor is not None and start_ord < floor,
+            ))
+    return links
+
+
 def _check_constraint_violations(active_tasks, scheduled, cal, overbooked_pins):
     """開始固定日が満たせなかったタスクを洗い出して {g_id: (超過日数, 説明)} で返す。
 
@@ -2416,6 +2441,8 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
         })
 
     result_df = pd.DataFrame(rows).sort_values(["Start_Date", "Job_ID", "Task_ID"]).reset_index(drop=True)
+    # 列ではなく付随情報として持たせる（HTML出力等、既存の列を使う処理を変えないため）
+    result_df.attrs["job_links"] = _cross_job_links(active_tasks, scheduled, cal)
 
     _warn_deadline_overruns(result_df)
     _warn_constraint_violations(result_df)
