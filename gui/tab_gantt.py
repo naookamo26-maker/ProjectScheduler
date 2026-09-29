@@ -61,6 +61,7 @@ from gui.db import ProjectDatabaseError, parse_tags
 from gui.gantt_edit import WorkDayCalendar, format_entity_id, parse_entity_id
 from gui.gantt_row_order import (
     GROUP_ALL,
+    GROUP_DEPENDENCY,
     GROUP_WORKFLOW,
     GROUPINGS,
     ORDER_END,
@@ -72,7 +73,15 @@ from gui.gantt_row_order import (
     sort_job_ids,
 )
 from gui.gantt_task_editor import TaskEditWindow
-from gui.gantt_view import FrozenGanttPane, build_gantt_scenes, set_bar_baseline
+from gui.gantt_view import (
+    DEPENDENCY_ALL,
+    DEPENDENCY_MODES,
+    DEPENDENCY_OFF,
+    DEPENDENCY_SELECTED,
+    FrozenGanttPane,
+    build_gantt_scenes,
+    set_bar_baseline,
+)
 from gui.plan_actions import confirm_all, confirm_selected, selected_targets
 from gui.plan_confirmation import CONFIRMED, DRAFT, UNCONFIRMED, PlanState, successor_map
 from gui.replan_dialog import ReplanDialog
@@ -105,7 +114,13 @@ _SEARCH_DEBOUNCE_MS = 300
 
 
 # 「並び」の選択肢（gui/gantt_row_order.py）
-_GROUPING_LABELS = {GROUP_ALL: N_("全体"), GROUP_WORKFLOW: N_("ワークフロー別")}
+_GROUPING_LABELS = {
+    GROUP_ALL: N_("全体"), GROUP_WORKFLOW: N_("ワークフロー別"), GROUP_DEPENDENCY: N_("依存のつながり"),
+}
+# 「依存の矢印」の選択肢（gui/gantt_view.py の DependencyArrows 相当の描画）
+_DEPENDENCY_LABELS = {
+    DEPENDENCY_OFF: N_("表示しない"), DEPENDENCY_SELECTED: N_("選択中のみ"), DEPENDENCY_ALL: N_("すべて"),
+}
 _ORDER_LABELS = {
     ORDER_START: N_("開始日順"), ORDER_END: N_("終了日順"),
     ORDER_MILESTONE: N_("マイルストーン順"), ORDER_PRIORITY: N_("優先度順"),
@@ -119,6 +134,9 @@ _DRAG_MODIFIER_KEYS = {"shift": Qt.ShiftModifier, "alt": Qt.AltModifier}
 class GanttTab(QWidget):
     # 選択が変わった（状態帯の「選択した変更を確定」を押せるかが変わりうる）
     planSelectionChanged = Signal()
+    # 問題が無いときの計算結果の文言（「◯件のタスクを生成しました。」など）。
+    # 画面下部のファイル名の横に出す（gui/main.py）。エラーはタブ内のエラーの段に出す
+    summaryChanged = Signal(str)
     def __init__(self, db, schedule_cache, app_settings=None, parent=None):
         super().__init__(parent)
         self.db = db
@@ -219,16 +237,19 @@ class GanttTab(QWidget):
         search_toolbar.addStretch(1)
         self.filters_section.content_layout.addLayout(search_toolbar)
 
-        # 計算結果テキスト（status_label）と配置コントロールを同じ行に並べる。
+        # 上部の段には操作の部品（並び・依存の矢印・配置）だけを右寄せで並べる。
         # 以前は配置コントロールをチャート本体（self.view）の右下にフローティング
         # 表示していたが、チャートのバー・グリッド線が透けて見えてしまい操作
         # 対象が見づらかったため、チャートへの重ね描画をやめて上部のテキストの
         # 横（右揃え）に置く。幅は中身に合わせる（スライダーは _PLACEMENT_SLIDER_WIDTH）。
         top_row = QHBoxLayout()
-
-        self.status_label = QLabel("")
-        self.status_label.setWordWrap(True)
-        top_row.addWidget(self.status_label, 1)
+        top_row.addStretch(1)
+        # 問題が無いときの文言は画面下部（summaryChanged）、エラーだけは部品の段の下に
+        # 別の段を設けて全幅で出す（部品の段を狭めないように）。
+        self.summary_text = ""
+        self.error_label = QLabel("")
+        self.error_label.setWordWrap(True)
+        self.error_label.setVisible(False)
 
         # QGroupBoxのネイティブタイトルは枠線をまたぐ固定位置にしか描画できない
         # ため、タイトルは通常のQLabelとして枠内に置く（QGroupBoxはタイトル無しの
@@ -273,8 +294,10 @@ class GanttTab(QWidget):
             self._on_placement_spinbox_editing_finished
         )
         top_row.addWidget(self._build_row_order_group(), 0, Qt.AlignRight)
+        top_row.addWidget(self._build_dependency_group(), 0, Qt.AlignRight)
         top_row.addWidget(self.placement_group, 0, Qt.AlignRight)
         layout.addLayout(top_row)
+        layout.addWidget(self.error_label)
 
         # 配置コントロールの外側——状況表示テキスト・枠の余白・タブの空き領域
         # ——をクリックしたときにも、数値入力欄のフォーカスが外れる（＝その
@@ -376,6 +399,32 @@ class GanttTab(QWidget):
         self._update_resort_button()
         return group
 
+    def _build_dependency_group(self):
+        """「依存の矢印」: ジョブ間の依存を矢印で描くか（表示しない／選択中のみ／すべて。
+        既定は選択中のみ）。選んだ値は利用者ごとの画面の状態として覚える。"""
+        group = QGroupBox("")
+        row = QHBoxLayout(group)
+        row.addWidget(QLabel(tr("依存の矢印")))
+        self.dependency_combo = NoWheelComboBox()
+        for key in DEPENDENCY_MODES:
+            self.dependency_combo.addItem(tr(_DEPENDENCY_LABELS[key]), key)
+        saved = self.app_settings.get_ui_state("gantt_dependency_arrows")
+        self._select_combo(self.dependency_combo, saved if saved in DEPENDENCY_MODES else DEPENDENCY_SELECTED)
+        self.dependency_combo.currentIndexChanged.connect(self._on_dependency_mode_changed)
+        row.addWidget(self.dependency_combo)
+        return group
+
+    def _on_dependency_mode_changed(self, *_args):
+        mode = self.dependency_combo.currentData()
+        self.app_settings.set_ui_state("gantt_dependency_arrows", mode)
+        self.view.body.set_dependency_mode(mode)
+
+    def _dependency_links(self):
+        """スケジューラが実際に使ったジョブ間の依存（project_scheduler._cross_job_links）。"""
+        if self._result_df is None:
+            return []
+        return self._result_df.attrs.get("job_links", [])
+
     @staticmethod
     def _select_combo(combo, key):
         combo.setCurrentIndex(max(0, combo.findData(key)))
@@ -408,7 +457,7 @@ class GanttTab(QWidget):
         super().changeEvent(event)
         if event.type() in (QEvent.ApplicationPaletteChange, QEvent.PaletteChange):
             self._update_resort_button()
-            self.status_label.setStyleSheet(alert_style(getattr(self, "_status_is_error", False)))
+            self.error_label.setStyleSheet(alert_style(True))
 
     def row_order_options(self):
         return (self.row_grouping_combo.currentData(), self.row_order_combo.currentData(),
@@ -436,7 +485,8 @@ class GanttTab(QWidget):
         """表示する行の並び。前回の並びがあればそれを保ち（新しく加わったジョブだけ
         今の並び順の位置へ差し込む）、並びが選んだ順どおりかどうかを覚える。"""
         grouping, order, descending = self.row_order_options()
-        fresh = sort_job_ids(df, self._display, grouping, order, descending)
+        fresh = sort_job_ids(df, self._display, grouping, order, descending,
+                             job_links=self._dependency_links())
         job_order = fresh if self._row_order is None else keep_order(self._row_order, fresh)
         self._row_order = job_order
         self._row_order_stale = job_order != fresh
@@ -460,7 +510,7 @@ class GanttTab(QWidget):
            画面は操作でき、途中で内容を変えれば新しい要求が古い要求を追い越す
            （古い結果は通し番号で判定して捨てる）。
 
-        失敗した場合はダイアログを出さず、タブ内の status_label に表示するだけに
+        失敗した場合はダイアログを出さず、タブ内のエラーの段（error_label）に表示するだけに
         留める。このメソッドはユーザーの明示的な操作ではなく「タブが表示される
         たび」「Undo/Redoで表示を作り直すたび」に自動的に呼ばれるため、
         ダイアログにすると、プロジェクトが未完成な間ずっと操作のたびに
@@ -496,7 +546,7 @@ class GanttTab(QWidget):
             self._clear_chart_state(self.cache.error_message, is_error=True)
             return
         if not self.cache.is_fresh():
-            self._set_status(tr("スケジューリングを計算中です..."))
+            self._set_summary(tr("スケジューリングを計算中です..."))
             return
         self._result_df = self.cache.result_df
         self._display = self.cache.display
@@ -581,19 +631,20 @@ class GanttTab(QWidget):
         self._refresh_chart()
         self._pending_edit = None
         self._set_highlight(moved)
-        message, is_error = self._result_summary()
-        self._set_status(message + self._moved_note, is_error)
+        summary, errors = self._result_summary()
+        self._set_summary(summary + self._moved_note)
+        self._set_errors(errors)
         if self._editor is not None and self._editor.isVisible():
             self._editor.reload()
 
     def _result_summary(self):
-        """状況表示に出す文言と、エラー扱いにするかどうかを返す。
+        """(画面下部に出す文言, エラーの段に出す文言。問題が無ければ "") を返す。
 
         締切に間に合わないタスクはエラーではなく結果として返ってくるため
         （project_scheduler.py の Deadline_Overrun_Days を参照）、件数を
         ここで明示しないと気付かないまま見過ごされてしまう。"""
         if self._result_df is None or self._result_df.empty:
-            return tr("有効なタスクがありません。"), False
+            return tr("有効なタスクがありません。"), ""
         total = len(self._result_df)
         notes = []
         overruns = self._result_df[self._result_df["Deadline_Overrun_Days"] > 0]
@@ -601,7 +652,7 @@ class GanttTab(QWidget):
             worst = int(overruns["Deadline_Overrun_Days"].max())
             notes.append(
                 tr(
-                    "うち{n}件がマイルストーンの締切に間に合いません（最大{worst}日超過）。"
+                    "{n}件のタスクがマイルストーンの締切に間に合いません（最大{worst}日超過）。"
                     "チームのライン数・依存関係・締切を見直してください。",
                     n=len(overruns), worst=worst,
                 )
@@ -613,21 +664,24 @@ class GanttTab(QWidget):
         if not broken.empty:
             notes.append(
                 tr(
-                    "うち{n}件が開始固定日どおりに配置できません（例: {task} — {violation}）。",
+                    "{n}件のタスクが開始固定日どおりに配置できません（例: {task} — {violation}）。",
                     n=len(broken), task=broken.iloc[0]["Task_Name"],
                     violation=broken.iloc[0]["Constraint_Violation"],
                 )
             )
-        if not notes:
-            return tr("{total}件のタスクを生成しました。", total=total), False
-        return tr("{total}件のタスクを生成しました。", total=total) + "".join(notes), True
+        return tr("{total}件のタスクを生成しました。", total=total), "".join(notes)
 
-    def _set_status(self, message, is_error=False):
-        """状況表示。エラーはダイアログを出さずここに表示するため、通常の
-        メッセージと見分けが付くよう色を変える（ライト／ダークで読める赤。alert_style）。"""
-        self._status_is_error = is_error
-        self.status_label.setStyleSheet(alert_style(is_error))
-        self.status_label.setText(message)
+    def _set_summary(self, text):
+        """問題が無いときの文言。画面下部のファイル名の横に出す（gui/main.py）。"""
+        self.summary_text = text
+        self.summaryChanged.emit(text)
+
+    def _set_errors(self, text):
+        """エラーの段。エラーがあるときだけ、部品の段の下に全幅で出す（ダイアログは出さない）。
+        赤はライト／ダークで読める色（alert_style）。"""
+        self.error_label.setStyleSheet(alert_style(True))
+        self.error_label.setText(text)
+        self.error_label.setVisible(bool(text))
 
     def _clear_chart_state(self, status_message, is_error=False):
         """スケジューリングに失敗した場合に、前回の生成結果（チャート・絞り込み
@@ -640,7 +694,8 @@ class GanttTab(QWidget):
         self._task_positions = {}
         self.view.setScene(None)
         self._rebuild_filters()
-        self._set_status(status_message, is_error=is_error)
+        self._set_summary("" if is_error else status_message)
+        self._set_errors(status_message if is_error else "")
 
     # -- ワークフロー／チーム／ジョブ タグ／タスク タグの絞り込み ----------------------------
 
@@ -763,6 +818,13 @@ class GanttTab(QWidget):
             return
         scenes.body.selectionChanged.connect(self._on_selection_changed)
         self._decorate_plan(scenes.body)
+        result = self._result_df
+        names = {
+            (j, t): f"{jn} / {tn}"
+            for j, t, jn, tn in zip(result["Job_ID"], result["Task_ID"], result["Job_Name"], result["Task_Name"])
+        }
+        body.set_dependency_mode(self.dependency_combo.currentData())
+        body.set_dependencies(self._dependency_links(), names)
         if view_state is not None:
             # 編集・Undo/Redo の後は、表示位置（縮尺・スクロール）を保つ。
             # 行の並びは保つ（_job_order_for）が、日付が大きく動くと選択したバーが

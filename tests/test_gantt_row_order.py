@@ -106,3 +106,51 @@ def test_ties_follow_the_creation_order_by_number():
         ("JOB_002", "C", "WF_001", 1, "", "2026-02-01", "2026-03-01"),
     ])
     assert sort_job_ids(df, _DISPLAY) == ["JOB_002", "JOB_999", "JOB_1000"]
+
+
+# -- 依存のつながり ------------------------------------------------------------------
+
+
+def _links(*pairs):
+    """[(前のJob_ID, 後のJob_ID), ...] を job_links の形（タスクまで含む）に。"""
+    return [((p, "T_001"), (s, "T_001"), False) for p, s in pairs]
+
+
+def test_dependency_grouping_puts_dependents_right_below_what_they_wait_for():
+    from gui.gantt_row_order import GROUP_DEPENDENCY
+
+    # 開始日順: C, A, B, D。B は C を、D は A を待つ
+    links = _links(("JOB_C", "JOB_B"), ("JOB_A", "JOB_D"))
+    assert sort_job_ids(JOBS, _DISPLAY, GROUP_DEPENDENCY, ORDER_START, job_links=links) == \
+        ["JOB_C", "JOB_B", "JOB_A", "JOB_D"]
+    # 降順ではまとまり同士・兄弟の順が逆になるが、依存される側が上なのは変わらない
+    assert sort_job_ids(JOBS, _DISPLAY, GROUP_DEPENDENCY, ORDER_START, True, job_links=links) == \
+        ["JOB_A", "JOB_D", "JOB_C", "JOB_B"]
+    # 依存が無ければ選んだ並び順のまま
+    assert sort_job_ids(JOBS, _DISPLAY, GROUP_DEPENDENCY, ORDER_START) == \
+        sort_job_ids(JOBS, _DISPLAY, GROUP_ALL, ORDER_START)
+
+
+def test_dependency_grouping_places_a_job_with_two_parents_after_the_last_one():
+    from gui.gantt_row_order import GROUP_DEPENDENCY
+
+    # D は C と A の両方を待つ → 後から置かれる A の下
+    links = _links(("JOB_C", "JOB_D"), ("JOB_A", "JOB_D"))
+    assert sort_job_ids(JOBS, _DISPLAY, GROUP_DEPENDENCY, ORDER_START, job_links=links) == \
+        ["JOB_C", "JOB_A", "JOB_D", "JOB_B"]
+
+
+def test_dependency_grouping_survives_cycles_long_chains_and_hidden_jobs():
+    from gui.gantt_row_order import GROUP_DEPENDENCY, _order_by_dependency
+
+    # ジョブ単位の輪（A → B → A）でも全ジョブが1回ずつ並ぶ
+    order = sort_job_ids(JOBS, _DISPLAY, GROUP_DEPENDENCY, ORDER_START,
+                         job_links=_links(("JOB_A", "JOB_B"), ("JOB_B", "JOB_A")))
+    assert sorted(order) == ["JOB_A", "JOB_B", "JOB_C", "JOB_D"]
+    # 絞り込みで隠れたジョブへの依存は無視する
+    assert sort_job_ids(JOBS, _DISPLAY, GROUP_DEPENDENCY, ORDER_START,
+                        job_links=_links(("JOB_X", "JOB_B"))) == sort_job_ids(JOBS, _DISPLAY)
+    # 長い鎖（再帰の上限を超える長さ）でも落ちない
+    jobs = [f"JOB_{i:04d}" for i in range(3000)]
+    chain = _links(*zip(jobs, jobs[1:]))
+    assert _order_by_dependency(list(reversed(jobs)), chain) == jobs

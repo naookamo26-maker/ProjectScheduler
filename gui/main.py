@@ -101,6 +101,12 @@ class MainWindow(QMainWindow):
         self._build_empty_state_tabs()
 
         self._build_menu()
+        # ガントチャートの計算結果の文言（「◯件のタスクを生成しました。」など）を、
+        # ファイル名（左側の一時的なメッセージ）と並べて右端に常に出す。保存時の
+        # 「保存しました」に上書きされないよう、別の常設の表示にする。
+        self.schedule_summary_label = QLabel("")
+        self.schedule_summary_label.setContentsMargins(0, 0, 8, 0)
+        self.statusBar().addPermanentWidget(self.schedule_summary_label)
         self.statusBar().showMessage(tr("プロジェクトファイルを新規作成するか、開いてください"))
 
     def dragEnterEvent(self, event):
@@ -209,6 +215,7 @@ class MainWindow(QMainWindow):
                 pass  # 既にQt側で破棄済み
             self.schedule_cache = None
         self.tab_gantt = None
+        self.schedule_summary_label.setText("")
 
     def _rebuild_tabs(self):
         """DBオープン後、実際に機能するタブへ差し替える。"""
@@ -235,6 +242,7 @@ class MainWindow(QMainWindow):
         self.tab_gantt = GanttTab(self.db, self.schedule_cache, self.app_settings)
         self.tabs.addTab(self.tab_gantt, tr("ガントチャート"))
         self.tab_gantt.planSelectionChanged.connect(self._plan_band_timer.start)
+        self.tab_gantt.summaryChanged.connect(self.schedule_summary_label.setText)
 
         self.tab_analysis = AnalysisTab(self.db, self.schedule_cache)
         self.tabs.addTab(self.tab_analysis, tr("プロジェクト分析"))

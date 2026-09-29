@@ -58,6 +58,8 @@ GUIの文言とメッセージを英語・ベトナム語・中国語（簡体�
 | 先行タスク / 後続タスク | predecessor / successor | tác vụ trước / tác vụ sau | 前置任务 / 后续任务 |
 | 依存先ジョブ | depended-on job | hạng mục phụ thuộc | 依赖的作业 |
 | 依存テンプレート | dependency template | mẫu phụ thuộc | 依赖模板 |
+| 依存の矢印（ガントでジョブ間の依存を示す線） | dependency arrows | mũi tên phụ thuộc | 依赖箭头 |
+| 依存のつながり（依存でつながったジョブのまとまり） | dependency chain | chuỗi phụ thuộc | 依赖链 |
 | ラグ | lag | độ trễ | 滞后 |
 | タスク対応（依存先ジョブの先行→本ジョブの後続） | task mapping | ánh xạ tác vụ | 任务对应 |
 | 変動点（同時ライン数の変更点） | change point | điểm thay đổi | 变更点 |

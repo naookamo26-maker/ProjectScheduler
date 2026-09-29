@@ -271,7 +271,8 @@ def test_moved_note_and_highlight_show_other_tasks_that_moved(qapp, gantt):
     tab._on_move_requested([(design, new_start)], 10)
     _wait_recomputed(qapp, tab)
 
-    assert "他に" in tab.status_label.text()
+    # 問題の無い文言は画面下部（ファイル名の横）に出す
+    assert "他に" in w.schedule_summary_label.text()
     assert impl in tab._highlighted_keys
     assert design not in tab._highlighted_keys
     assert tab.view.bars()[impl].highlighted
@@ -794,7 +795,7 @@ def test_error_text_is_readable_in_both_themes_and_follows_a_theme_switch(qapp, 
     light, dark = alert_text_color(dark=False).name(), alert_text_color(dark=True).name()
     assert QColor(light).lightness() < QColor(dark).lightness()
     analysis = w.tab_analysis
-    tab._set_status("エラー", is_error=True)
+    tab._set_errors("エラー")
     analysis._show_status_only("エラー", is_error=True)  # 表は空になるので、この後に赤字の項目を置く
     table = analysis.findChildren(QTableWidget)[0]
     table.setRowCount(max(1, table.rowCount()))
@@ -802,7 +803,7 @@ def test_error_text_is_readable_in_both_themes_and_follows_a_theme_switch(qapp, 
     item = QTableWidgetItem("超過")
     item.setForeground(QColor(light))
     table.setItem(0, 0, item)
-    assert light in tab.status_label.styleSheet()
+    assert light in tab.error_label.styleSheet()
 
     original = QApplication.palette()
     try:
@@ -810,11 +811,133 @@ def test_error_text_is_readable_in_both_themes_and_follows_a_theme_switch(qapp, 
         palette.setColor(QPalette.Window, QColor("#202020"))
         QApplication.setPalette(palette)
         qapp.processEvents()
-        assert dark in tab.status_label.styleSheet()
+        assert dark in tab.error_label.styleSheet()
         assert dark in analysis.status_label.styleSheet()
         assert table.item(0, 0).foreground().color().name() == dark
     finally:
         QApplication.setPalette(original)
         qapp.processEvents()
-    assert light in tab.status_label.styleSheet()
+    assert light in tab.error_label.styleSheet()
     assert table.item(0, 0).foreground().color().name() == light
+
+
+# -- ジョブ間の依存の矢印 ------------------------------------------------------------
+
+
+def _with_cross_job_dependency(qapp, w, tab, ids):
+    """ジョブ2の設計（t1）が、ジョブ1の実装（t2）を待つ依存を足して計算し直す。"""
+    w.db.add_external_dependency(ids["job2"], ids["t1"], ids["job1"], ids["t2"])
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    return _key(ids, "job1", "t2"), _key(ids, "job2", "t1")
+
+
+def _dep_paths(tab):
+    """今描いている矢印の線（QPainterPath）と色。"""
+    return [(path, color) for path, color, *_rest in tab.view.body.dependency_arrows()]
+
+
+def test_dependency_arrows_follow_the_mode_and_either_end_of_the_selection(qapp, gantt):
+    from PySide6.QtWidgets import QGraphicsItem
+
+    from gui.gantt_view import DEPENDENCY_ALL, DEPENDENCY_OFF
+
+    w, tab, ids = gantt
+    pred, succ = _with_cross_job_dependency(qapp, w, tab, ids)
+    assert tab.dependency_combo.currentData() == "selected"  # 既定は選択中のみ
+    tab.view.select_keys([])
+    qapp.processEvents()
+    assert _dep_paths(tab) == []
+    for key in (pred, succ):  # 依存される側・する側のどちらを選んでも出る
+        tab.view.select_keys([key])
+        qapp.processEvents()
+        assert len(_dep_paths(tab)) == 1
+    tab._select_combo(tab.dependency_combo, DEPENDENCY_OFF)
+    assert _dep_paths(tab) == []
+    tab.view.select_keys([])
+    tab._select_combo(tab.dependency_combo, DEPENDENCY_ALL)
+    assert len(_dep_paths(tab)) == 1
+    # 矢印はクリック・範囲選択・ツールチップを奪わない（形を持たない1つの部品で描く）
+    body = tab.view.body
+    layer = body._dep_layer
+    assert layer.acceptedMouseButtons() == Qt.NoButton and not layer.flags() & QGraphicsItem.ItemIsSelectable
+    assert layer.shape().isEmpty()
+    bar = tab.view.bars()[succ]
+    assert body._bar_at(body.mapFromScene(bar.bar_rect.center())) is bar
+
+
+def test_dependency_arrow_path_leaves_and_enters_the_bars_at_their_middle(qapp, gantt):
+    from gui.gantt_view import DEPENDENCY_ALL
+
+    w, tab, ids = gantt
+    pred, succ = _with_cross_job_dependency(qapp, w, tab, ids)
+    tab._select_combo(tab.dependency_combo, DEPENDENCY_ALL)
+    a, b = tab.view.bars()[pred].bar_rect, tab.view.bars()[succ].bar_rect
+    path = _dep_paths(tab)[0][0]
+    start, end = path.elementAt(0), path.elementAt(path.elementCount() - 1)
+    assert (start.x, start.y) == (a.right(), a.center().y())
+    assert (end.x, end.y) == (b.left(), b.center().y())
+
+
+def test_a_hidden_partner_is_shown_as_a_short_line_and_a_dot(qapp, gantt):
+    from PySide6.QtWidgets import QGraphicsEllipseItem
+
+    from gui.gantt_view import BAR_MARGIN, DEPENDENCY_ALL
+
+    w, tab, ids = gantt
+    pred, succ = _with_cross_job_dependency(qapp, w, tab, ids)
+    tab._select_combo(tab.dependency_combo, DEPENDENCY_ALL)
+    tab.search_edit.setText("ジョブ2")  # ジョブ1（待たれている側）を絞り込みで隠す
+    tab._refresh_chart()
+    assert pred not in tab.view.bars()
+    dots = [i for i in tab.view.body.dependency_items() if isinstance(i, QGraphicsEllipseItem)]
+    assert len(dots) == 1 and "ジョブ1" in dots[0].toolTip()
+    # 丸はバーのすぐ上の段の隙間（上のジョブには入らない）
+    rect = tab.view.bars()[succ].bar_rect
+    assert dots[0].pos().y() == rect.top() - BAR_MARGIN
+
+
+def test_a_broken_dependency_is_drawn_in_red(qapp, gantt):
+    from gui.gantt_view import DEPENDENCY_ALL, _DEP_BROKEN_COLOR
+
+    w, tab, ids = gantt
+    pred, succ = _with_cross_job_dependency(qapp, w, tab, ids)
+    # ジョブ2の設計を、ジョブ1の実装がどうやっても終わらない日（プロジェクト開始日）に固定する
+    # （少し前に固定するだけなら、待たれている側が固定の手前へ寄って破綻しない）
+    w.db.update_job_task_override_fields(ids["job2"], ids["t1"], start_pin_date="2026-04-06")
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    tab._select_combo(tab.dependency_combo, DEPENDENCY_ALL)
+    assert _dep_paths(tab)[0][1] == _DEP_BROKEN_COLOR
+    assert tab.error_label.isVisible() and "開始固定日" in tab.error_label.text()
+
+
+def test_dependency_arrows_follow_a_drag_and_are_redrawn_after_the_edit(qapp, gantt):
+    w, tab, ids = gantt
+    pred, succ = _with_cross_job_dependency(qapp, w, tab, ids)
+    body = tab.view.body
+    bar = tab.view.bars()[pred]
+    _zoom_to(tab, bar)
+    tab.view.select_keys([pred])
+    qapp.processEvents()
+    viewport = body.viewport()
+    start = body.mapFromScene(bar.bar_rect.center())
+    end = start + QPoint(80, 0)
+    QTest.mousePress(viewport, Qt.LeftButton, Qt.ShiftModifier, start)
+    move = QMouseEvent(QEvent.MouseMove, QPointF(end), QPointF(viewport.mapToGlobal(end)),
+                       Qt.NoButton, Qt.LeftButton, Qt.ShiftModifier)
+    QApplication.sendEvent(viewport, move)
+    ghost = body._drag["ghosts"][pred].path().boundingRect()
+    first = _dep_paths(tab)[0][0].elementAt(0)
+    assert first.x == ghost.right()  # 影の右端から出ている（置いて行かれない）
+    QTest.mouseRelease(viewport, Qt.LeftButton, Qt.ShiftModifier, end)
+    _wait_recomputed(qapp, tab)
+    new_bar = tab.view.bars()[pred]
+    assert tab.view.body._dep_layer.scene() is tab.view.body.scene()
+    assert _dep_paths(tab)[0][0].elementAt(0).x == new_bar.bar_rect.right()
+
+
+def test_messages_without_problems_go_to_the_status_bar(qapp, gantt):
+    w, tab, _ids = gantt
+    assert "件のタスクを生成しました" in w.schedule_summary_label.text()
+    assert tab.error_label.isHidden()

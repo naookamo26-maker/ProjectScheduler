@@ -38,9 +38,11 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QPen,
+    QPolygonF,
     QTransform,
 )
 from PySide6.QtWidgets import (
+    QGraphicsEllipseItem,
     QGraphicsItem,
     QGraphicsPathItem,
     QGraphicsScene,
@@ -185,6 +187,21 @@ _GHOST_BORDER_COLOR = QColor("#1f3b8c")
 _GHOST_Z = 100
 # バーの右端をこの幅（画面px）以内で掴むと、移動ではなく期間の伸縮になる。
 _RESIZE_HANDLE_PX = 6
+# ジョブ間の依存の矢印（DependencyArrows）。キャンバスはテーマに関わらず常に明るい
+# 背景（_PANE_BG）なので、色はライト／ダークで共通。
+DEPENDENCY_OFF = "off"
+DEPENDENCY_SELECTED = "selected"
+DEPENDENCY_ALL = "all"
+DEPENDENCY_MODES = (DEPENDENCY_OFF, DEPENDENCY_SELECTED, DEPENDENCY_ALL)
+_DEP_COLOR = QColor(55, 65, 85, 220)
+_DEP_FOCUS_COLOR = QColor("#1a5fd0")    # 選んでいるタスクにつながる依存
+_DEP_BROKEN_COLOR = QColor("#d93025")   # 後のタスクが依存より前に始まっている
+_DEP_WIDTH = 1.8
+_DEP_FOCUS_WIDTH = 2.2
+_DEP_STEP_PX = 6        # バーの端から横に出る長さ（画面px）
+_DEP_HEAD_PX = 8        # 矢じりの長さ（画面px）
+_DEP_DOT_PX = 7         # 相手が絞り込みで隠れているときの白い丸の直径（画面px）
+_DEP_Z = _GHOST_Z - 2   # バーより前、確定位置の細線・ドラッグ中の影より後ろ
 # 確定済みのファイルで、まだ確定していないタスク（確定後に足したジョブ等）の斜線。
 # 下端の細い帯（全体の3割）にはチームの色をそのまま残す。
 _UNCONFIRMED_VEIL = QColor(255, 255, 255, 165)
@@ -286,6 +303,141 @@ def set_bar_baseline(scene, bar, start, end):
     return item
 
 
+def _dependency_pen(color, width, dashed=False):
+    pen = QPen(color, width)
+    pen.setCosmetic(True)
+    pen.setJoinStyle(Qt.RoundJoin)
+    if dashed:
+        pen.setStyle(Qt.DashLine)
+    return pen
+
+
+def _passive(item, z):
+    """矢印の部品はマウス操作を受け取らない（クリック・範囲選択・バーのツールチップは
+    下のバーに届く）。"""
+    item.setAcceptedMouseButtons(Qt.NoButton)
+    item.setAcceptHoverEvents(False)
+    item.setZValue(z)
+    return item
+
+
+def dependency_path(a, b, step_x):
+    """前のバー a の右端の中央から、後のバー b の左端の中央へ向かう矢印の線（QPainterPath）。
+
+    a, b はバーの本来の形（輪郭線を含まない bar_rect）。step_x はバーの端から横に出る
+    長さ（シーン座標）。後のバーが右にあれば「出る横線 → 縦線 → 入る横線」の2回だけ
+    折れる。前へ戻る必要があるとき（依存が守られていない等）だけ中間の横線を1本引き、
+    それを後のバーの段のすぐ上（または下）の隙間の中央に通す（バーの枠線と重ならない）。"""
+    ya, yb = a.center().y(), b.center().y()
+    x1 = a.right() + step_x
+    path = QPainterPath(QPointF(a.right(), ya))
+    path.lineTo(x1, ya)
+    if b.left() - step_x >= x1:
+        path.lineTo(x1, yb)
+    else:
+        gap = b.top() - BAR_MARGIN if yb >= ya else b.bottom() + BAR_MARGIN
+        x2 = b.left() - step_x
+        path.lineTo(x1, gap)
+        path.lineTo(x2, gap)
+        path.lineTo(x2, yb)
+    path.lineTo(b.left(), yb)
+    return path
+
+
+def dependency_stub_path(rect, outgoing, step_x):
+    """相手が絞り込みで隠れているときの L 字の線と、白い丸を置く位置。バーの横から
+    出入りし、縦線はバーのすぐ上の段の隙間の中央で止める（上のジョブに入らない）。"""
+    y = rect.center().y()
+    gap = rect.top() - BAR_MARGIN
+    if outgoing:
+        x = rect.right() + step_x
+        path = QPainterPath(QPointF(rect.right(), y))
+        path.lineTo(x, y)
+        path.lineTo(x, gap)
+    else:
+        x = rect.left() - step_x
+        path = QPainterPath(QPointF(x, gap))
+        path.lineTo(x, y)
+        path.lineTo(rect.left(), y)
+    return path, QPointF(x, gap)
+
+
+class _DependencyLayer(QGraphicsItem):
+    """依存の矢印（線と矢じり）をまとめて描く部品。形（shape）を持たないので、
+    クリック・範囲選択・ツールチップの対象にならない（下のバーに届く）。
+    矢じりは画面上で一定の大きさで描く。"""
+
+    def __init__(self):
+        super().__init__()
+        self.arrows = []
+        self._bounds = QRectF()
+        self.setAcceptedMouseButtons(Qt.NoButton)
+        self.setAcceptHoverEvents(False)
+        self.setZValue(_DEP_Z)
+        # paint() で exposedRect（描き直す範囲）を使うため
+        self.setFlag(QGraphicsItem.ItemUsesExtendedStyleOption)
+
+    def set_arrows(self, arrows, margin_x, margin_y):
+        """margin_x/y: 矢じり・線の太さが線の外にはみ出すぶん（シーン座標。縮尺しだい）。
+
+        描き直すのは、前回から変わった矢印の範囲だけにする（選択を変えて色が変わった
+        数本のために、チャート全体を描き直さない。大きな計画で選択が重くなるため）。"""
+        bounds = QRectF()
+        for path, _color, _width, _dashed, _head in arrows:
+            bounds = bounds.united(path.boundingRect())
+        bounds = bounds.adjusted(-margin_x, -margin_y, margin_x, margin_y) if arrows else QRectF()
+
+        def signature(arrow):
+            path, color, width, dashed, head = arrow
+            r = path.boundingRect()
+            return (r.x(), r.y(), r.width(), r.height(), path.elementCount(), color.rgba(), width, dashed,
+                    None if head is None else (head.x(), head.y()))
+
+        before = {signature(a): a for a in self.arrows}
+        after = {signature(a): a for a in arrows}
+        changed = [before[k] for k in before.keys() - after.keys()] + [after[k] for k in after.keys() - before.keys()]
+        self.arrows = arrows
+        if bounds != self._bounds:
+            self.prepareGeometryChange()
+            self._bounds = bounds
+            self.update()
+            return
+        for path, *_rest in changed:
+            self.update(path.boundingRect().adjusted(-margin_x, -margin_y, margin_x, margin_y))
+
+    def boundingRect(self):
+        return self._bounds
+
+    def shape(self):
+        return QPainterPath()
+
+    def paint(self, painter, option, widget=None):
+        # 線は縦・横だけなのでアンチエイリアスは要らない（数百本あると描画が重くなる）。
+        # 画面に見えている範囲（exposedRect）に掛からない線は描かない。
+        exposed = option.exposedRect
+        half = _DEP_HEAD_PX / 2
+        head = QPolygonF([QPointF(0, 0), QPointF(-_DEP_HEAD_PX, -half), QPointF(-_DEP_HEAD_PX, half)])
+        painter.setBrush(Qt.NoBrush)
+        heads = []
+        for path, color, width, dashed, head_at in self.arrows:
+            if not path.boundingRect().adjusted(-1, -1, 1, 1).intersects(exposed):
+                continue
+            painter.setPen(_dependency_pen(color, width, dashed))
+            painter.drawPath(path)
+            if head_at is not None:
+                heads.append((painter.worldTransform().map(head_at), color))
+        if not heads:
+            return
+        painter.save()
+        painter.resetTransform()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        for device, color in heads:
+            painter.setBrush(QBrush(color))
+            painter.drawPolygon(head.translated(device))
+        painter.restore()
+
+
 def _scene_x_of(scene, d):
     """本体シーンの x 座標（build_gantt_scenes の x_of と同じ変換）。"""
     return LEFT_MARGIN + (d - scene.gantt_axis_start).days * DAY_WIDTH
@@ -348,10 +500,21 @@ class GanttGraphicsView(QGraphicsView):
         self.calendar = None            # gui/gantt_edit.WorkDayCalendar
         self.move_hint_provider = None  # (key, 新しい開始日) -> 注意書き or None
         self._drag = None
+        # ジョブ間の依存の矢印（set_dependencies）。[(前のキー, 後のキー, 守られていないか)]
+        self._dep_links = []
+        self._dep_names = {}   # キー -> 「ジョブ名 / タスク名」（隠れた相手のツールチップ）
+        self._dep_mode = DEPENDENCY_SELECTED
+        self._dep_items = []    # 相手が隠れているときの白い丸
+        self._dep_layer = None  # 線と矢じりをまとめて描く部品（_DependencyLayer）
+        self._dep_scene = None  # 上の部品を載せたシーン（作り直した後は古い部品に触らない）
+        self._dep_scale = None
         h_bar = self.horizontalScrollBar()
         v_bar = self.verticalScrollBar()
         h_bar.valueChanged.connect(self.transformChanged)
         v_bar.valueChanged.connect(self.transformChanged)
+        # 矢印の横に出る長さ・矢じりは画面上の大きさで決めるので、縮尺が変わったら描き直す
+        # （スクロールだけなら描き直さない）
+        self.transformChanged.connect(self._on_transform_for_dependencies)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_A:
@@ -482,6 +645,119 @@ class GanttGraphicsView(QGraphicsView):
         self.contextMenuRequested.emit(event.globalPos())
         event.accept()
 
+    # -- ジョブ間の依存の矢印 -----------------------------------------------------------
+
+    def set_dependencies(self, links, names):
+        """links: [(前のキー, 後のキー, 守られていないか)]（スケジューリング結果の
+        attrs["job_links"]）。names: キー -> 「ジョブ名 / タスク名」。シーンを差し替えた
+        後に呼ぶ（矢印はシーンに載るので、シーンごとに描き直す）。"""
+        self._dep_links = list(links)
+        self._dep_names = dict(names)
+        self.refresh_dependencies()
+
+    def set_dependency_mode(self, mode):
+        self._dep_mode = mode if mode in DEPENDENCY_MODES else DEPENDENCY_SELECTED
+        self.refresh_dependencies()
+
+    def dependency_mode(self):
+        return self._dep_mode
+
+    def dependency_items(self):
+        """相手が隠れているときの白い丸（テスト・確認用）。"""
+        return list(self._dep_items)
+
+    def _on_transform_for_dependencies(self):
+        scale = (self.transform().m11(), self.transform().m22())
+        if scale != self._dep_scale:
+            self.refresh_dependencies()
+
+    def refresh_dependencies(self, overrides=None):
+        """矢印を描き直す。overrides: {キー: QRectF} はドラッグ中の影の位置（その位置から
+        矢印を出す。動かしているバーに矢印が置いて行かれないように）。
+
+        矢印の線と矢じりは1つの部品（_DependencyLayer）がまとめて描く。依存が数百件
+        あっても、選択の変更・拡大縮小のたびに部品を作り直さずに済むように（部品を
+        1本ずつ作ると、大きな計画で選択を変えるたびに1秒以上かかった）。相手が
+        隠れているときの白い丸だけは、ツールチップを出すため個別の部品にする。"""
+        scene = self.scene()
+        if scene is not self._dep_scene:
+            # 作り直したシーンでは、古い部品（古いシーンと一緒に消える）に触らない
+            self._dep_items = []
+            self._dep_layer = None
+            self._dep_scene = scene
+        for item in self._dep_items:
+            scene.removeItem(item)
+        self._dep_items = []
+        self._dep_scale = (self.transform().m11(), self.transform().m22())
+        if scene is None:
+            return
+        if self._dep_layer is None:
+            self._dep_layer = _DependencyLayer()
+            scene.addItem(self._dep_layer)
+        arrows = []
+        if self._dep_mode != DEPENDENCY_OFF and self._dep_links:
+            arrows = self._dependency_arrows(scene, overrides or {})
+        sx, sy = (abs(v) or 1.0 for v in self._dep_scale)
+        self._dep_layer.set_arrows(arrows, 2 * _DEP_HEAD_PX / sx, 2 * _DEP_HEAD_PX / sy)
+
+    def _dependency_arrows(self, scene, overrides):
+        """描く矢印の一覧 [(線, 色, 太さ, 破線か, 矢じりの位置 or None)]。目立たせたいもの
+        （選んでいるタスクにつながる・守られていない）を後に並べて前面に描く。"""
+        bars = getattr(scene, "gantt_bars", {})
+        selected = {bar.key for bar in _task_bars(scene)}
+        step_x = _DEP_STEP_PX / (self._dep_scale[0] or 1.0)
+
+        def rect_of(key):
+            override = overrides.get(key)
+            return override if override is not None else bars[key].bar_rect
+
+        normal, emphasized = [], []
+        for pred, succ, broken in self._dep_links:
+            focused = pred in selected or succ in selected
+            if self._dep_mode == DEPENDENCY_SELECTED and not focused:
+                continue
+            if pred not in bars and succ not in bars:
+                continue
+            if broken:
+                color, width = _DEP_BROKEN_COLOR, _DEP_FOCUS_WIDTH + 0.4
+            elif focused:
+                color, width = _DEP_FOCUS_COLOR, _DEP_FOCUS_WIDTH
+            else:
+                color, width = _DEP_COLOR, _DEP_WIDTH
+            target = emphasized if focused or broken else normal
+            if pred in bars and succ in bars:
+                a, b = rect_of(pred), rect_of(succ)
+                target.append((dependency_path(a, b, step_x), color, width, False,
+                               QPointF(b.left(), b.center().y())))
+                continue
+            outgoing = pred in bars
+            key, other = (pred, succ) if outgoing else (succ, pred)
+            rect = rect_of(key)
+            path, dot_at = dependency_stub_path(rect, outgoing, step_x)
+            head = None if outgoing else QPointF(rect.left(), rect.center().y())
+            target.append((path, color, width, True, head))
+            name = self._dep_names.get(other, "")
+            tip = (tr("このタスクを待っているタスク: {name}（絞り込みで非表示）", name=name) if outgoing
+                   else tr("このタスクが待っているタスク: {name}（絞り込みで非表示）", name=name))
+            self._add_dep_dot(scene, dot_at, color, width, _DEP_Z + 1, tip)
+        return normal + emphasized
+
+    def dependency_arrows(self):
+        """今描いている矢印（テスト・確認用）。[(線, 色, 太さ, 破線か, 矢じりの位置)]"""
+        return list(self._dep_layer.arrows) if self._dep_layer is not None else []
+
+    def _add_dep_dot(self, scene, point, color, width, z, tooltip):
+        r = _DEP_DOT_PX / 2
+        item = QGraphicsEllipseItem(QRectF(-r, -r, 2 * r, 2 * r))
+        item.setPen(_dependency_pen(color, width))
+        item.setBrush(QBrush(QColor("white")))
+        item.setPos(point)
+        item.setFlag(QGraphicsItem.ItemIgnoresTransformations)
+        item.setToolTip(tooltip)
+        _passive(item, z)
+        scene.addItem(item)
+        self._dep_items.append(item)
+
     # -- ドラッグでの移動・伸縮 -------------------------------------------------------
 
     def _bar_at(self, view_pos):
@@ -547,6 +823,7 @@ class GanttGraphicsView(QGraphicsView):
             drag["new_days"] = new_days
             new_end = cal.end_exclusive(anchor.start, new_days, anchor.team_key)
             self._place_ghost(drag["ghosts"][anchor.key], anchor, anchor.start, new_end)
+            self._refresh_dependencies_for_ghosts(drag)
             text = tr("{new_days}営業日（{end:%m/%d} まで）", new_days=new_days, end=new_end - timedelta(days=1))
         else:
             shift = cal.diff(anchor.start, anchor.start + timedelta(days=dx_days), anchor.team_key)
@@ -558,6 +835,7 @@ class GanttGraphicsView(QGraphicsView):
                 targets[bar.key] = new_start
                 self._place_ghost(drag["ghosts"][bar.key], bar, new_start, new_end)
             drag["targets"] = targets
+            self._refresh_dependencies_for_ghosts(drag)
             sign = "+" if shift >= 0 else "−"
             if len(drag["bars"]) == 1:
                 text = tr(
@@ -573,6 +851,11 @@ class GanttGraphicsView(QGraphicsView):
         QToolTip.showText(event.globalPosition().toPoint(), text, self)
         scene.update()
 
+    def _refresh_dependencies_for_ghosts(self, drag):
+        """ドラッグ中は、動かしているバーの矢印を影の位置から出す。"""
+        overrides = {key: ghost.path().boundingRect() for key, ghost in drag["ghosts"].items()}
+        self.refresh_dependencies(overrides)
+
     def _place_ghost(self, ghost, bar, new_start, new_end):
         scene = self.scene()
         x0 = _scene_x_of(scene, new_start)
@@ -587,6 +870,8 @@ class GanttGraphicsView(QGraphicsView):
         scene = self.scene()
         for ghost in drag["ghosts"].values():
             scene.removeItem(ghost)
+        # 離した直後は元の位置に戻す（書き込み→再計算の後、新しい位置で描き直される）
+        self.refresh_dependencies()
         QToolTip.hideText()
         self.setCursor(Qt.ArrowCursor)
         anchor = drag["anchor"]
@@ -704,6 +989,8 @@ class FrozenGanttPane(QWidget):
         self.header.setScene(scenes.header)
         self.column.setScene(scenes.column)
         self.body.setScene(scenes.body)
+        # 選んでいるタスクにつながる矢印を出す（依存の矢印の「選択中のみ」）
+        scenes.body.selectionChanged.connect(self.body.refresh_dependencies)
         header_rect = getattr(scenes.header, "gantt_header_rect", None)
         column_rect = getattr(scenes.column, "gantt_column_rect", None)
         body_rect = getattr(scenes.body, "gantt_body_rect", None)
