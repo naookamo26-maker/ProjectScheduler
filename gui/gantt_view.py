@@ -77,7 +77,10 @@ _JOB_SWATCH_WIDTH = 10
 _JOB_SWATCH_GAP = 4
 # 縦に縮小して行が文字より低くなったら、左列のジョブ名（と色見本）を全行そろって
 # 縮小する。この倍率を下回るほど縮めないと収まらないときは、読めないので全行とも隠す。
-_JOB_LABEL_MIN_SCALE = 0.6
+# できる限り表示しておきたいので、文字の形がかろうじて分かる大きさ（約6px）まで縮める。
+# 収まる大きさを決めるのは隣り合う行の間隔の最小（レーン1本のジョブ同士）なので、
+# 行の高さを揃えても、これ以上の行数は重ならずには表示できない。
+_JOB_LABEL_MIN_SCALE = 0.35
 # ヘッダーは上から (1)マイルストーン名 (2)年 (3)月日 の3段構成のため、
 # 目盛り1段のみだった頃より高さが必要。
 TOP_MARGIN = 58
@@ -305,6 +308,13 @@ class TaskBarItem(QGraphicsPathItem):
     @property
     def key(self):
         return (self.job_key, self.task_key)
+
+    @property
+    def locked(self):
+        """進行中・完了のタスク。日程は実績なので、ガントのドラッグでは動かさない
+        （確定済みの計画では確定した日程に固定され、動かしても戻ってしまう。確定して
+        いない計画でも、うっかり動かして実績を書き換えないように揃える）。"""
+        return self.status is not None
 
     def marker_layout(self, width_px, height_px):
         """画面上のバーの大きさから、印の描き方を決める（描画とラベルの配置で揃える）。
@@ -1057,7 +1067,7 @@ class GanttGraphicsView(QGraphicsView):
         area = QRect(view_pos.x() - _RESIZE_HANDLE_PX, view_pos.y(), 2 * _RESIZE_HANDLE_PX + 1, 1)
         candidates = []
         for item in self.items(area):
-            if not isinstance(item, TaskBarItem):
+            if not isinstance(item, TaskBarItem) or item.locked:
                 continue
             right_edge = self.mapFromScene(item.bar_rect.topRight()).x()
             if abs(view_pos.x() - right_edge) <= _RESIZE_HANDLE_PX:
@@ -1083,8 +1093,20 @@ class GanttGraphicsView(QGraphicsView):
             modifiers = QApplication.keyboardModifiers()
         else:
             pos, modifiers = event.position().toPoint(), event.modifiers()
-        on_handle = self._resize_handle_at(pos, modifiers) is not None
-        self._set_cursor(Qt.SizeHorCursor if on_handle else None)
+        self._set_cursor(self._hover_cursor_shape(pos, modifiers))
+
+    def _hover_cursor_shape(self, pos, modifiers):
+        """指定キーを押しているときの、バーの上のカーソル。右端は↔（期間の伸縮）、
+        動かせるバーは手（掴んで移動）、進行中・完了のバーは禁止の印。キーを
+        押していなければ何もしない（None＝既定の矢印）。"""
+        if not self.edit_enabled or self.calendar is None or not modifiers & self.drag_modifier:
+            return None
+        if self._resize_handle_at(pos, modifiers) is not None:
+            return Qt.SizeHorCursor
+        bar = self._bar_at(pos)
+        if bar is None:
+            return None
+        return Qt.ForbiddenCursor if bar.locked else Qt.OpenHandCursor
 
     def _try_start_drag(self, event):
         """指定キー（既定 Shift）を押しながらバーを押したら、ドラッグの準備をする。
@@ -1129,7 +1151,16 @@ class GanttGraphicsView(QGraphicsView):
             if not drag["add_to_selection"]:
                 scene.clearSelection()
             anchor.setSelected(True)
+        if anchor.locked:
+            # 進行中・完了のタスクは動かさない（離しても何も書き込まない）
+            drag["started"] = True
+            drag["locked"] = True
+            self._set_cursor(Qt.ForbiddenCursor)
+            return
         bars = [anchor] if drag["resize"] else _task_bars(scene)
+        # 一緒に選んでいる進行中・完了のタスクは動かさない
+        drag["skipped"] = sum(1 for bar in bars if bar.locked)
+        bars = [bar for bar in bars if not bar.locked]
         for bar in bars:
             color = QColor(bar.brush().color())
             color.setAlpha(_GHOST_FILL_ALPHA)
@@ -1162,6 +1193,12 @@ class GanttGraphicsView(QGraphicsView):
 
     def _update_drag(self, event):
         drag = self._drag
+        if drag.get("locked"):
+            QToolTip.showText(
+                event.globalPosition().toPoint(),
+                tr("進行中・完了のタスクは動かせません（状態を未着手に戻すと動かせます）"), self,
+            )
+            return
         cal = self.calendar
         anchor = drag["anchor"]
         scene = self.scene()
@@ -1193,6 +1230,8 @@ class GanttGraphicsView(QGraphicsView):
                 )
             else:
                 text = tr("{n}件を {sign}{days}営業日", n=len(drag["bars"]), sign=sign, days=abs(shift))
+            if drag.get("skipped"):
+                text += tr("\n（進行中・完了の{n}件は動かしません）", n=drag["skipped"])
             if self.move_hint_provider is not None:
                 hints = [h for h in (self.move_hint_provider(k, d) for k, d in targets.items()) if h]
                 if hints:
@@ -1224,6 +1263,8 @@ class GanttGraphicsView(QGraphicsView):
         QToolTip.hideText()
         self._set_cursor(None)
         anchor = drag["anchor"]
+        if drag.get("locked"):
+            return
         if drag["resize"]:
             original = drag["days"][anchor.key]
             if drag["new_days"] is not None and drag["new_days"] != original:
