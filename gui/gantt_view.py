@@ -229,10 +229,13 @@ DEPENDENCY_OFF = "off"
 DEPENDENCY_SELECTED = "selected"
 DEPENDENCY_ALL = "all"
 DEPENDENCY_MODES = (DEPENDENCY_OFF, DEPENDENCY_SELECTED, DEPENDENCY_ALL)
-_DEP_COLOR = QColor(55, 65, 85, 220)
+# 選んでいるタスクにつながらない依存（「すべて」のとき）。半透明・細めにして、
+# 選んだタスクの矢印（青）や守られていない依存（赤）より目立たせない。点線は
+# 「相手が絞り込みで隠れている」の意味に使っているので使わない
+_DEP_COLOR = QColor(55, 65, 85, 110)
 _DEP_FOCUS_COLOR = QColor("#1a5fd0")    # 選んでいるタスクにつながる依存
 _DEP_BROKEN_COLOR = QColor("#d93025")   # 後のタスクが依存より前に始まっている
-_DEP_WIDTH = 1.8
+_DEP_WIDTH = 1.3
 _DEP_FOCUS_WIDTH = 2.2
 _DEP_STEP_PX = 6        # バーの端から横に出る長さ（画面px）
 _DEP_HEAD_PX = 8        # 矢じりの長さ（画面px）

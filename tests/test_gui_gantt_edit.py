@@ -364,6 +364,55 @@ def _choose_menu(tab, text):
     return patch.object(tab, "_exec_menu", fake_exec)
 
 
+def test_context_menu_changes_days_by_a_delta_and_resets_them(qapp, gantt):
+    """右クリックの「日数を増減…」は、各タスクの今の日数から±で増減する（固定値ではない）。
+    「既定の日数に戻す」で上書きを外す。どちらも1回のUndoで戻る。"""
+    w, tab, ids = gantt
+    k1, k2 = _key(ids, "job1", "t1"), _key(ids, "job2", "t1")
+    w.db.update_job_task_override_fields(ids["job2"], ids["t1"], override_days=8)
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    tab.view.select_keys([k1, k2])
+
+    asked = []
+    with _choose_menu(tab, "日数を増減…"), \
+            patch.object(tab, "_exec_dialog", lambda d: asked.append(d.labelText()) or d.setIntValue(3) or True):
+        tab._show_context_menu(None)
+    _wait_recomputed(qapp, tab)
+    assert "2件" in asked[0]
+    assert _override(w.db, ids["job1"], ids["t1"])["override_days"] == 8   # 既定5 + 3
+    assert _override(w.db, ids["job2"], ids["t1"])["override_days"] == 11  # 上書き8 + 3
+    assert w.undo_manager.undo_label() == "タスクの日数を増減"
+
+    # 減らして既定と同じになったら上書きを外す。1日未満にはしない
+    tab.view.select_keys([k1])
+    with _choose_menu(tab, "日数を増減…"), patch.object(tab, "_exec_dialog", lambda d: d.setIntValue(-3) or True):
+        tab._show_context_menu(None)
+    _wait_recomputed(qapp, tab)
+    assert _override(w.db, ids["job1"], ids["t1"])["override_days"] is None
+    tab.view.select_keys([k1])
+    with _choose_menu(tab, "日数を増減…"), patch.object(tab, "_exec_dialog", lambda d: d.setIntValue(-99) or True):
+        tab._show_context_menu(None)
+    _wait_recomputed(qapp, tab)
+    assert _override(w.db, ids["job1"], ids["t1"])["override_days"] == 1
+
+    # 取りやめたら何もしない
+    before = w.db.serialize_state()
+    tab.view.select_keys([k1])
+    with _choose_menu(tab, "日数を増減…"), patch.object(tab, "_exec_dialog", lambda d: False):
+        tab._show_context_menu(None)
+    assert w.db.serialize_state() == before
+
+    tab.view.select_keys([k1, k2])
+    with _choose_menu(tab, "既定の日数に戻す"):
+        tab._show_context_menu(None)
+    _wait_recomputed(qapp, tab)
+    assert _override(w.db, ids["job1"], ids["t1"])["override_days"] is None
+    assert _override(w.db, ids["job2"], ids["t1"])["override_days"] is None
+    w.undo_manager.undo()
+    assert _override(w.db, ids["job2"], ids["t1"])["override_days"] == 11
+
+
 def test_context_menu_pins_sets_status_and_team(qapp, gantt):
     w, tab, ids = gantt
     key = _key(ids, "job1", "t2")
