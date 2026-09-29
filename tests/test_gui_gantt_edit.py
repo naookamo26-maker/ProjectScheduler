@@ -364,6 +364,36 @@ def _choose_menu(tab, text):
     return patch.object(tab, "_exec_menu", fake_exec)
 
 
+def test_bars_show_the_task_status_in_a_segment_at_the_right_end(qapp, gantt):
+    """完了・進行中のタスクは、バーの右端を区切った灰色の区画に ✔／▶ を描く（未着手は
+    区切らない）。バーが短いときは記号を省いて細い帯だけにし、タスク名は区画を避ける。"""
+    from gui.gantt_view import STATUS_DONE, STATUS_IN_PROGRESS
+
+    w, tab, ids = gantt
+    w.db.update_job_task_override_fields(ids["job1"], ids["t1"], status="done")
+    w.db.update_job_task_override_fields(ids["job1"], ids["t2"], status="in_progress")
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    bars = tab.view.bars()
+    done, doing = bars[_key(ids, "job1", "t1")], bars[_key(ids, "job1", "t2")]
+    assert done.status == STATUS_DONE and doing.status == STATUS_IN_PROGRESS
+    assert bars[_key(ids, "job2", "t1")].status is None
+    assert "✔ 完了" in done.toolTip() and "▶ 進行中" in doing.toolTip()
+
+    assert done.status_segment_px(100, 20) == 16    # 記号を入れる区画
+    assert done.status_segment_px(20, 20) == 4      # 短いバーは細い帯だけ
+    assert done.status_segment_px(4, 20) == 0       # ごく細いバーには描かない
+    assert bars[_key(ids, "job2", "t1")].status_segment_px(100, 20) == 0
+
+    # 拡大して描いても（区画・記号・枠線の描き直し）落ちない。タスク名は区画を避けて左に寄る
+    _zoom_to(tab, done)
+    tab.view.grab()
+    label = next(l for l, _cx, _cy, _w, _h, _t, _f, b in tab.view.body.scene().gantt_task_labels if b is done)
+    right_px = tab.view.body.mapFromScene(done.bar_rect.right(), 0).x()
+    label_right = label.deviceTransform(tab.view.body.viewportTransform()).mapRect(label.boundingRect()).right()
+    assert label_right <= right_px - 16
+
+
 def test_context_menu_changes_days_by_a_delta_and_resets_them(qapp, gantt):
     """右クリックの「日数を増減…」は、各タスクの今の日数から±で増減する（固定値ではない）。
     「既定の日数に戻す」で上書きを外す。どちらも1回のUndoで戻る。"""

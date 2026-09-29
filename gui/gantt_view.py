@@ -255,6 +255,20 @@ _UNCONFIRMED_TEAM_BAND_RATIO = 0.3
 # 変更案で、確定していた位置を示す細線（バーの下）。
 _BASELINE_COLOR = QColor("#6f6f6f")
 _BASELINE_HEIGHT = 3
+# タスクの状態（進捗）。バーの右端を高さいっぱいで区切り、灰色の区画に白い記号を
+# 描く（完了 ✔、進行中 ▶。未着手は区切らない）。チームの色は利用者が自由に
+# 選べるようにする予定なので、区画は無彩色にする（赤・青・橙・黄は別の意味で
+# 使っている）。バーの色・枠線・斜線（未確定）・確定位置の細線（バーの下）・📍
+# （左上）のどれとも場所が重ならない。
+STATUS_IN_PROGRESS = "in_progress"
+STATUS_DONE = "done"
+_STATUS_SEGMENT_COLOR = QColor("#6e6e6e")
+_STATUS_MARK_COLOR = QColor("#ffffff")
+_STATUS_SEGMENT_PX = 16         # 記号を入れる区画の幅（画面px）
+_STATUS_MARK_MIN_BAR_PX = 32    # バーがこの幅に満たなければ記号を省き、細い帯だけにする
+_STATUS_MARK_MIN_HEIGHT_PX = 10  # バーがこの高さに満たなければ記号を省く
+_STATUS_STRIP_PX = 4            # 記号を省いたときの帯の幅（画面px）
+_STATUS_MIN_BAR_PX = 6          # バーがこの幅に満たなければ何も描かない
 
 
 class TaskBarItem(QGraphicsPathItem):
@@ -270,7 +284,7 @@ class TaskBarItem(QGraphicsPathItem):
     外になり、再描画で消え残るため）。"""
 
     def __init__(self, path, bar_rect, job_key, task_key, team_key, start, end,
-                 pinned=False, emphasized=False, emphasis_width=0):
+                 pinned=False, emphasized=False, emphasis_width=0, status=None):
         super().__init__(path)
         self.bar_rect = bar_rect
         self.job_key = job_key
@@ -284,6 +298,8 @@ class TaskBarItem(QGraphicsPathItem):
         self.highlighted = False
         # 確定済みのファイルで、まだ確定行を持たないタスク（§8-9）
         self.unconfirmed = False
+        # タスクの状態（STATUS_IN_PROGRESS / STATUS_DONE / None＝未着手）
+        self.status = status if status in (STATUS_IN_PROGRESS, STATUS_DONE) else None
 
     @property
     def key(self):
@@ -292,6 +308,61 @@ class TaskBarItem(QGraphicsPathItem):
     def shows_pin(self, width_px, height_px):
         """画面上のバーの大きさで、📍の印を描くかどうか（ラベルの配置と揃える）。"""
         return self.pinned and width_px >= _PIN_MARKER_PX and height_px >= _PIN_MARKER_PX
+
+    def status_segment_px(self, width_px, height_px):
+        """画面上のバーの大きさで、状態の区画をどの幅（画面px）で描くか（0 なら描かない）。
+        ラベルの配置と揃える。"""
+        if self.status is None or width_px < _STATUS_MIN_BAR_PX:
+            return 0
+        if width_px >= _STATUS_MARK_MIN_BAR_PX and height_px >= _STATUS_MARK_MIN_HEIGHT_PX:
+            return _STATUS_SEGMENT_PX
+        return _STATUS_STRIP_PX
+
+    def _paint_status(self, painter, rect, border_drawn):
+        """状態の区画（画面座標で描く）。バーの丸い角に沿って切り取り、区切りの線と
+        記号を描き、枠線を区画の上から描き直す（区画で枠線が途切れないように）。"""
+        seg_px = self.status_segment_px(rect.width(), rect.height())
+        if seg_px == 0:
+            return
+        device_path = painter.worldTransform().map(self.path())
+        seg = QRectF(rect.right() - seg_px, rect.top(), seg_px, rect.height())
+        painter.save()
+        painter.resetTransform()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        clip = QPainterPath()
+        clip.addRect(seg.adjusted(0, -1, 1, 1))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(_STATUS_SEGMENT_COLOR))
+        painter.drawPath(device_path.intersected(clip))
+        if border_drawn:
+            divider = QPen(_NORMAL_BORDER_COLOR, 1)
+            divider.setCosmetic(True)
+            painter.setPen(divider)
+            painter.drawLine(QPointF(seg.left(), seg.top()), QPointF(seg.left(), seg.bottom()))
+            painter.save()
+            painter.setClipPath(clip)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(self.pen())
+            painter.drawPath(device_path)
+            painter.restore()
+        if seg_px == _STATUS_SEGMENT_PX:
+            c = seg.center()
+            painter.setBrush(Qt.NoBrush)
+            if self.status == STATUS_DONE:
+                mark = QPen(_STATUS_MARK_COLOR, 2)
+                mark.setCapStyle(Qt.RoundCap)
+                mark.setJoinStyle(Qt.RoundJoin)
+                painter.setPen(mark)
+                painter.drawPolyline(QPolygonF([
+                    QPointF(c.x() - 4, c.y()), QPointF(c.x() - 1.2, c.y() + 3), QPointF(c.x() + 4, c.y() - 3.5),
+                ]))
+            else:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(_STATUS_MARK_COLOR))
+                painter.drawPolygon(QPolygonF([
+                    QPointF(c.x() - 3, c.y() - 4), QPointF(c.x() - 3, c.y() + 4), QPointF(c.x() + 4, c.y()),
+                ]))
+        painter.restore()
 
     def set_highlighted(self, value):
         if self.highlighted != value:
@@ -303,7 +374,8 @@ class TaskBarItem(QGraphicsPathItem):
         plain = QStyleOptionGraphicsItem(option)
         plain.state &= ~QStyle.State_Selected
         rect = painter.worldTransform().mapRect(self.bar_rect)
-        if not self.emphasized and (rect.width() < _BORDER_MIN_PX or rect.height() < _BORDER_MIN_PX):
+        border_drawn = self.emphasized or not (rect.width() < _BORDER_MIN_PX or rect.height() < _BORDER_MIN_PX)
+        if not border_drawn:
             painter.save()
             painter.setPen(Qt.NoPen)
             painter.setBrush(self.brush())
@@ -312,7 +384,8 @@ class TaskBarItem(QGraphicsPathItem):
         else:
             super().paint(painter, plain, widget)
         selected = self.isSelected()
-        if not (self.pinned or self.emphasized or self.highlighted or self.unconfirmed or selected):
+        if not (self.pinned or self.emphasized or self.highlighted or self.unconfirmed or selected
+                or self.status):
             return
         painter.save()
         painter.resetTransform()
@@ -321,6 +394,11 @@ class TaskBarItem(QGraphicsPathItem):
             veiled.setHeight(rect.height() * (1 - _UNCONFIRMED_TEAM_BAND_RATIO))
             painter.fillRect(veiled, _UNCONFIRMED_VEIL)
             painter.fillRect(veiled, QBrush(_UNCONFIRMED_HATCH, Qt.BDiagPattern))
+        painter.restore()
+        # 状態の区画は斜線（未確定）の上、強調・選択の枠の下に描く
+        self._paint_status(painter, rect, border_drawn)
+        painter.save()
+        painter.resetTransform()
         painter.setBrush(Qt.NoBrush)
         if self.emphasized:
             inset = self._emphasis_width / 2 + _EMPHASIS_INNER_WIDTH / 2
@@ -1661,6 +1739,11 @@ class FrozenGanttPane(QWidget):
                 if (bar_h_px - text_h_max) / 2 < _PIN_BOTTOM_PX:
                     avail_w -= _PIN_LABEL_RESERVE_PX
                     shift_px = _PIN_LABEL_RESERVE_PX / 2
+            # 状態の区画（右端）を描くバーは、その分だけ右を空ける
+            if bar is not None:
+                status_px = bar.status_segment_px(bar_width * sx, bar_h_px)
+                avail_w -= status_px
+                shift_px -= status_px / 2
 
             if avail_w < metrics.averageCharWidth() or avail_h < line_height:
                 label.setVisible(False)
@@ -1899,6 +1982,7 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
     body_scene.gantt_bars = {}
     column_scene.gantt_job_rows = []  # (y_top, y_bottom, Job_ID) ジョブ名クリックでの選択用
     start_pins = display.get("start_pins") or {}
+    task_status = display.get("task_status") or {}
 
     task_font = QFont()
     task_font.setPointSize(9)
@@ -2195,6 +2279,7 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
                 start=to_date(r["Start_Date"]), end=to_date(r["End_Date"]),
                 pinned=key in start_pins,
                 emphasized=emphasis_width > 0, emphasis_width=emphasis_width,
+                status=task_status.get(key),
             )
             body_scene.gantt_bars[key] = rect
             rect.setBrush(QBrush(QColor(color_hex)))
@@ -2231,6 +2316,7 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
                 + (f'\n⚠ {constraint_violation}' if constraint_violation else "")
                 + (tr("\n※リソース制約により前倒し") if r["Resource_Adjusted"] else "")
                 + (tr("\n📍 開始固定日: {date:%Y-%m-%d}", date=start_pins[key]) if key in start_pins else "")
+                + {STATUS_DONE: tr("\n✔ 完了"), STATUS_IN_PROGRESS: tr("\n▶ 進行中")}.get(rect.status, "")
             )
             body_scene.addItem(rect)
 

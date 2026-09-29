@@ -288,6 +288,8 @@ Delete キーで固定を外せます。
 | <span class="swatch"><img src="images/swatch_overrun.png" alt=""></span><br>赤い太枠 | 締切（マイルストーン）に間に合わないタスク | 「日程の決まり方」の章の「締切に間に合わないとき」 |
 | <span class="swatch"><img src="images/swatch_pin_conflict.png" alt=""></span><br>オレンジの破線の枠 | 開始固定日が依存やライン数と矛盾しているタスク | 「日程の決まり方」の章の「開始固定日が矛盾しているとき」 |
 | <span class="swatch"><img src="images/swatch_pinned.png" alt=""></span><br>左上の赤いピン | 開始固定日が設定されているタスク | この章のジョブ作成の「タスク上書き」 |
+| <span class="swatch"><img src="images/swatch_done.png" alt=""></span><br>右端の灰色の区画に ✔ | 完了と記録したタスク（バーが短いときは記号の無い灰色の帯） | この章のジョブ作成の「状態」 |
+| <span class="swatch"><img src="images/swatch_in_progress.png" alt=""></span><br>右端の灰色の区画に ▶ | 進行中と記録したタスク（同上）。「今日」の線をまたいでいるのに ▶ が無いタスクは、まだ着手していません | 同上 |
 
 </div>
 
