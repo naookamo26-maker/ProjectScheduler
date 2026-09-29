@@ -29,10 +29,11 @@ QGraphicsView は setSceneRect() だけでは実際の描画をクリップし�
 from collections import namedtuple
 from datetime import date, timedelta
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
+    QCursor,
     QFont,
     QFontMetrics,
     QPainter,
@@ -74,6 +75,9 @@ LEFT_MARGIN = 190
 # 一目で分かるようにするため。
 _JOB_SWATCH_WIDTH = 10
 _JOB_SWATCH_GAP = 4
+# 縦に縮小して行が文字より低くなったら、左列のジョブ名（と色見本）を全行そろって
+# 縮小する。この倍率を下回るほど縮めないと収まらないときは、読めないので全行とも隠す。
+_JOB_LABEL_MIN_SCALE = 0.6
 # ヘッダーは上から (1)マイルストーン名 (2)年 (3)月日 の3段構成のため、
 # 目盛り1段のみだった頃より高さが必要。
 TOP_MARGIN = 58
@@ -199,7 +203,8 @@ _PIN_HEAD_BORDER = QColor("#7a1712")
 _PIN_NEEDLE_COLOR = QColor("#3c4043")
 _PIN_HEAD_RADIUS_PX = 4.5
 _PIN_NEEDLE_PX = 5
-_PIN_MARKER_PX = 12  # この大きさ（幅・高さ）に満たないバーには描かない
+_PIN_MARKER_PX = 12  # この大きさ（幅・高さ）に満たないバーには、ピンの代わりに左端の細い帯を描く
+_PIN_STRIP_PX = 3    # ピンを描けないほど小さいバーの左端に描く、ピンの色の帯の幅（画面px）
 # 📍を描いたバーでは、タスク名をこの幅（画面px）だけ右に避けて置く（重ならないように）
 _PIN_LABEL_RESERVE_PX = 3 + _PIN_HEAD_RADIUS_PX * 2 + 3
 # 📍の下端（バー上端からの画面px）。バーの縦に余裕があり、中央に置いた文字がこれより
@@ -225,10 +230,13 @@ DEPENDENCY_OFF = "off"
 DEPENDENCY_SELECTED = "selected"
 DEPENDENCY_ALL = "all"
 DEPENDENCY_MODES = (DEPENDENCY_OFF, DEPENDENCY_SELECTED, DEPENDENCY_ALL)
-_DEP_COLOR = QColor(55, 65, 85, 220)
+# 選んでいるタスクにつながらない依存（「すべて」のとき）。半透明・細めにして、
+# 選んだタスクの矢印（青）や守られていない依存（赤）より目立たせない。点線は
+# 「相手が絞り込みで隠れている」の意味に使っているので使わない
+_DEP_COLOR = QColor(55, 65, 85, 110)
 _DEP_FOCUS_COLOR = QColor("#1a5fd0")    # 選んでいるタスクにつながる依存
 _DEP_BROKEN_COLOR = QColor("#d93025")   # 後のタスクが依存より前に始まっている
-_DEP_WIDTH = 1.8
+_DEP_WIDTH = 1.3
 _DEP_FOCUS_WIDTH = 2.2
 _DEP_STEP_PX = 6        # バーの端から横に出る長さ（画面px）
 _DEP_HEAD_PX = 8        # 矢じりの長さ（画面px）
@@ -248,6 +256,20 @@ _UNCONFIRMED_TEAM_BAND_RATIO = 0.3
 # 変更案で、確定していた位置を示す細線（バーの下）。
 _BASELINE_COLOR = QColor("#6f6f6f")
 _BASELINE_HEIGHT = 3
+# タスクの状態（進捗）。バーの右端を高さいっぱいで区切り、灰色の区画に白い記号を
+# 描く（完了 ✔、進行中 ▶。未着手は区切らない）。チームの色は利用者が自由に
+# 選べるようにする予定なので、区画は無彩色にする（赤・青・橙・黄は別の意味で
+# 使っている）。バーの色・枠線・斜線（未確定）・確定位置の細線（バーの下）・📍
+# （左上）のどれとも場所が重ならない。
+STATUS_IN_PROGRESS = "in_progress"
+STATUS_DONE = "done"
+_STATUS_SEGMENT_COLOR = QColor("#6e6e6e")
+_STATUS_MARK_COLOR = QColor("#ffffff")
+_STATUS_SEGMENT_PX = 16         # 記号を入れる区画の幅（画面px）
+_STATUS_MARK_MIN_BAR_PX = 32    # バーがこの幅に満たなければ記号を省き、細い帯だけにする
+_STATUS_MARK_MIN_HEIGHT_PX = 10  # バーがこの高さに満たなければ記号を省く
+_STATUS_STRIP_PX = 4            # 記号を省いたときの帯の幅（画面px）
+_STATUS_MIN_BAR_PX = 6          # バーがこの幅に満たなければ何も描かない
 
 
 class TaskBarItem(QGraphicsPathItem):
@@ -263,7 +285,7 @@ class TaskBarItem(QGraphicsPathItem):
     外になり、再描画で消え残るため）。"""
 
     def __init__(self, path, bar_rect, job_key, task_key, team_key, start, end,
-                 pinned=False, emphasized=False, emphasis_width=0):
+                 pinned=False, emphasized=False, emphasis_width=0, status=None):
         super().__init__(path)
         self.bar_rect = bar_rect
         self.job_key = job_key
@@ -277,14 +299,108 @@ class TaskBarItem(QGraphicsPathItem):
         self.highlighted = False
         # 確定済みのファイルで、まだ確定行を持たないタスク（§8-9）
         self.unconfirmed = False
+        # タスクの状態（STATUS_IN_PROGRESS / STATUS_DONE / None＝未着手）
+        self.status = status if status in (STATUS_IN_PROGRESS, STATUS_DONE) else None
 
     @property
     def key(self):
         return (self.job_key, self.task_key)
 
+    def marker_layout(self, width_px, height_px):
+        """画面上のバーの大きさから、印の描き方を決める（描画とラベルの配置で揃える）。
+        戻り値は (📍を描くか, 左端のピンの帯の幅, 右端の状態の区画・帯の幅)。
+
+        期間の短いタスクでは、📍と状態の区画を両方そのままの大きさで描くと重なり、
+        タスク名も入らない。狭いときは、まず状態を細い帯にし、それでも📍と重なるなら
+        📍も左端の細い帯にする。ごく細いバーでは、帯をバーの幅の1/4までに抑えて
+        チームの色を残す。"""
+        if width_px < _STATUS_MIN_BAR_PX or not (self.pinned or self.status):
+            return False, 0, 0
+        pin = self.pinned and width_px >= _PIN_MARKER_PX and height_px >= _PIN_MARKER_PX
+        status_px = 0
+        if self.status:
+            full_width = _STATUS_MARK_MIN_BAR_PX + (_PIN_LABEL_RESERVE_PX if pin else 0)
+            if width_px >= full_width and height_px >= _STATUS_MARK_MIN_HEIGHT_PX:
+                status_px = _STATUS_SEGMENT_PX
+            else:
+                status_px = min(_STATUS_STRIP_PX, width_px / 4)
+            if pin and width_px < _PIN_LABEL_RESERVE_PX + status_px + 2:
+                pin = False
+        pin_strip_px = min(_PIN_STRIP_PX, width_px / 4) if self.pinned and not pin else 0
+        return pin, pin_strip_px, status_px
+
     def shows_pin(self, width_px, height_px):
         """画面上のバーの大きさで、📍の印を描くかどうか（ラベルの配置と揃える）。"""
-        return self.pinned and width_px >= _PIN_MARKER_PX and height_px >= _PIN_MARKER_PX
+        return self.marker_layout(width_px, height_px)[0]
+
+    def shows_pin_strip(self, width_px, height_px):
+        """ピンを描けないほど小さいバーで、代わりに左端の細い帯を描くか。状態の帯
+        （status_segment_px）と同じく、全体表示でも開始固定日のタスクが分かるようにする
+        （状態だけ見えて📍が消えると、固定したタスクが分からなくなる）。"""
+        return self.marker_layout(width_px, height_px)[1] > 0
+
+    def _paint_edge_strip(self, painter, rect, x, width, color):
+        """バーの丸い角に沿って切り取った、高さいっぱいの帯を描く（画面座標）。"""
+        clip = QPainterPath()
+        clip.addRect(QRectF(x, rect.top() - 1, width, rect.height() + 2))
+        painter.save()
+        painter.resetTransform()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(color))
+        painter.drawPath(self._device_path.intersected(clip))
+        painter.restore()
+
+    def status_segment_px(self, width_px, height_px):
+        """画面上のバーの大きさで、状態の区画をどの幅（画面px）で描くか（0 なら描かない。
+        _STATUS_SEGMENT_PX のときだけ記号を入れる）。ラベルの配置と揃える。"""
+        return self.marker_layout(width_px, height_px)[2]
+
+    def _paint_status(self, painter, rect, border_drawn):
+        """状態の区画（画面座標で描く）。バーの丸い角に沿って切り取り、区切りの線と
+        記号を描き、枠線を区画の上から描き直す（区画で枠線が途切れないように）。"""
+        seg_px = self.status_segment_px(rect.width(), rect.height())
+        if seg_px == 0:
+            return
+        device_path = painter.worldTransform().map(self.path())
+        seg = QRectF(rect.right() - seg_px, rect.top(), seg_px, rect.height())
+        painter.save()
+        painter.resetTransform()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        clip = QPainterPath()
+        clip.addRect(seg.adjusted(0, -1, 1, 1))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(_STATUS_SEGMENT_COLOR))
+        painter.drawPath(device_path.intersected(clip))
+        if border_drawn:
+            divider = QPen(_NORMAL_BORDER_COLOR, 1)
+            divider.setCosmetic(True)
+            painter.setPen(divider)
+            painter.drawLine(QPointF(seg.left(), seg.top()), QPointF(seg.left(), seg.bottom()))
+            painter.save()
+            painter.setClipPath(clip)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(self.pen())
+            painter.drawPath(device_path)
+            painter.restore()
+        if seg_px == _STATUS_SEGMENT_PX:
+            c = seg.center()
+            painter.setBrush(Qt.NoBrush)
+            if self.status == STATUS_DONE:
+                mark = QPen(_STATUS_MARK_COLOR, 2)
+                mark.setCapStyle(Qt.RoundCap)
+                mark.setJoinStyle(Qt.RoundJoin)
+                painter.setPen(mark)
+                painter.drawPolyline(QPolygonF([
+                    QPointF(c.x() - 4, c.y()), QPointF(c.x() - 1.2, c.y() + 3), QPointF(c.x() + 4, c.y() - 3.5),
+                ]))
+            else:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(_STATUS_MARK_COLOR))
+                painter.drawPolygon(QPolygonF([
+                    QPointF(c.x() - 3, c.y() - 4), QPointF(c.x() - 3, c.y() + 4), QPointF(c.x() + 4, c.y()),
+                ]))
+        painter.restore()
 
     def set_highlighted(self, value):
         if self.highlighted != value:
@@ -296,7 +412,8 @@ class TaskBarItem(QGraphicsPathItem):
         plain = QStyleOptionGraphicsItem(option)
         plain.state &= ~QStyle.State_Selected
         rect = painter.worldTransform().mapRect(self.bar_rect)
-        if not self.emphasized and (rect.width() < _BORDER_MIN_PX or rect.height() < _BORDER_MIN_PX):
+        border_drawn = self.emphasized or not (rect.width() < _BORDER_MIN_PX or rect.height() < _BORDER_MIN_PX)
+        if not border_drawn:
             painter.save()
             painter.setPen(Qt.NoPen)
             painter.setBrush(self.brush())
@@ -305,7 +422,8 @@ class TaskBarItem(QGraphicsPathItem):
         else:
             super().paint(painter, plain, widget)
         selected = self.isSelected()
-        if not (self.pinned or self.emphasized or self.highlighted or self.unconfirmed or selected):
+        if not (self.pinned or self.emphasized or self.highlighted or self.unconfirmed or selected
+                or self.status):
             return
         painter.save()
         painter.resetTransform()
@@ -314,6 +432,15 @@ class TaskBarItem(QGraphicsPathItem):
             veiled.setHeight(rect.height() * (1 - _UNCONFIRMED_TEAM_BAND_RATIO))
             painter.fillRect(veiled, _UNCONFIRMED_VEIL)
             painter.fillRect(veiled, QBrush(_UNCONFIRMED_HATCH, Qt.BDiagPattern))
+        painter.restore()
+        # 状態の区画・小さいバーのピンの帯は斜線（未確定）の上、強調・選択の枠の下に描く
+        self._device_path = painter.worldTransform().map(self.path())
+        self._paint_status(painter, rect, border_drawn)
+        pin_strip_px = self.marker_layout(rect.width(), rect.height())[1]
+        if pin_strip_px:
+            self._paint_edge_strip(painter, rect, rect.left() - 1, pin_strip_px + 1, _PIN_HEAD_COLOR)
+        painter.save()
+        painter.resetTransform()
         painter.setBrush(Qt.NoBrush)
         if self.emphasized:
             inset = self._emphasis_width / 2 + _EMPHASIS_INNER_WIDTH / 2
@@ -564,6 +691,8 @@ class GanttGraphicsView(QGraphicsView):
         # 背景で描くようにし、文字色との組み合わせを固定して視認性を保つ。
         self.setBackgroundBrush(QBrush(_PANE_BG))
         self.setDragMode(QGraphicsView.RubberBandDrag)
+        # ボタンを押していない間の移動も受け取り、伸縮できるバーの右端でカーソルを↔にする
+        self.viewport().setMouseTracking(True)
         # QGraphicsViewは既定でacceptDrops()がTrueになっており、プロジェクト
         # ファイル（.pschedule）をこのビュー上にドラッグ&ドロップしても
         # シーンが受け取らないまま素通りせず、MainWindow.dropEvent（ウィンドウ
@@ -597,6 +726,9 @@ class GanttGraphicsView(QGraphicsView):
 
     def keyPressEvent(self, event):
         key, ctrl = event.key(), bool(event.modifiers() & Qt.ControlModifier)
+        if key in (Qt.Key_Shift, Qt.Key_Alt):
+            # 指定キーを押した時点で、右端の上にあればカーソルを↔にする
+            self._update_hover_cursor()
         if key == Qt.Key_Escape:
             # ドラッグ中なら取りやめ（何も書き込まない）、そうでなければ選択を外す
             if self._drag is not None:
@@ -697,11 +829,16 @@ class GanttGraphicsView(QGraphicsView):
         self.setTransform(QTransform().scale(new_sx, new_sy))
         return True
 
+    def keyReleaseEvent(self, event):
+        if event.key() in (Qt.Key_Shift, Qt.Key_Alt):
+            self._update_hover_cursor()
+        super().keyReleaseEvent(event)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MiddleButton:
             self._panning = True
             self._pan_last_pos = event.pos()
-            self.setCursor(Qt.ClosedHandCursor)
+            self._set_cursor(Qt.ClosedHandCursor)
             event.accept()
             return
         if event.button() == Qt.RightButton:
@@ -737,13 +874,15 @@ class GanttGraphicsView(QGraphicsView):
             self._update_drag(event)
             event.accept()
             return
+        if event.buttons() == Qt.NoButton:
+            self._update_hover_cursor(event)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MiddleButton and self._panning:
             self._panning = False
             self._pan_last_pos = None
-            self.setCursor(Qt.ArrowCursor)
+            self._update_hover_cursor(event)
             event.accept()
             return
         if event.button() == Qt.LeftButton and self._drag is not None:
@@ -754,9 +893,11 @@ class GanttGraphicsView(QGraphicsView):
                 anchor = self._drag["anchor"]
                 self._drag = None
                 anchor.setSelected(True)
+            self._update_hover_cursor(event)
             event.accept()
             return
         super().mouseReleaseEvent(event)
+        self._update_hover_cursor(event)
 
     def mouseDoubleClickEvent(self, event):
         if self.edit_enabled and event.button() == Qt.LeftButton:
@@ -904,9 +1045,51 @@ class GanttGraphicsView(QGraphicsView):
                 return item
         return None
 
+    def _resize_handle_at(self, view_pos, modifiers):
+        """指定キー（既定 Shift）を押していて、バーの右端（_RESIZE_HANDLE_PX 以内）に
+        view_pos があれば、そのバーを返す（掴むと期間の伸縮。カーソルは↔になる）。"""
+        if not self.edit_enabled or self.calendar is None:
+            return None
+        if not modifiers & self.drag_modifier:
+            return None
+        # 右端に隣のバーが接していると、その位置で一番上にあるのは隣のバーのことがある。
+        # 前後の幅にあるバーをすべて見て、選んでいるバーの右端を優先する
+        area = QRect(view_pos.x() - _RESIZE_HANDLE_PX, view_pos.y(), 2 * _RESIZE_HANDLE_PX + 1, 1)
+        candidates = []
+        for item in self.items(area):
+            if not isinstance(item, TaskBarItem):
+                continue
+            right_edge = self.mapFromScene(item.bar_rect.topRight()).x()
+            if abs(view_pos.x() - right_edge) <= _RESIZE_HANDLE_PX:
+                candidates.append((not item.isSelected(), abs(view_pos.x() - right_edge), item))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda c: c[:2])[2]
+
+    def _set_cursor(self, shape):
+        """チャート部分のカーソルを変える（None で既定の矢印に戻す）。"""
+        if shape is None:
+            self.viewport().unsetCursor()
+        else:
+            self.viewport().setCursor(shape)
+
+    def _update_hover_cursor(self, event=None):
+        """ボタンを押していない間、伸縮できるバーの右端の上では↔にする。event が無い
+        とき（キーを押した・離したとき）は、いまのマウスの位置とキーの状態で決める。"""
+        if self._drag is not None or self._panning:
+            return
+        if event is None:
+            pos = self.viewport().mapFromGlobal(QCursor.pos())
+            modifiers = QApplication.keyboardModifiers()
+        else:
+            pos, modifiers = event.position().toPoint(), event.modifiers()
+        on_handle = self._resize_handle_at(pos, modifiers) is not None
+        self._set_cursor(Qt.SizeHorCursor if on_handle else None)
+
     def _try_start_drag(self, event):
         """指定キー（既定 Shift）を押しながらバーを押したら、ドラッグの準備をする。
-        キーを押していなければ何もしない（クリックは従来どおり選択だけ）。
+        キーを押していなければ何もしない（クリックは従来どおり選択だけ）。右端（カーソルが
+        ↔になる所）を押したら期間の伸縮になる。
 
         選択はまだ変えない。実際に動かし始めた時（_begin_drag）に、選ばれていないバーなら
         そのバーだけを選んで動かす。動かさずに離したら（Shift＋クリック）、今の選択を
@@ -914,19 +1097,19 @@ class GanttGraphicsView(QGraphicsView):
         選んでから Shift＋クリックすると1件に戻っていた）。"""
         if not self.edit_enabled or self.calendar is None:
             return False
+        pos = event.position().toPoint()
         if not (event.modifiers() & self.drag_modifier):
             return False
-        pos = event.position().toPoint()
-        anchor = self._bar_at(pos)
+        resize_bar = self._resize_handle_at(pos, event.modifiers())
+        anchor = resize_bar or self._bar_at(pos)
         if anchor is None:
             return False
-        right_edge = self.mapFromScene(anchor.bar_rect.topRight()).x()
         self._drag = {
             "anchor": anchor,
             "started": False,
             "press_pos": pos,
             "add_to_selection": bool(event.modifiers() & Qt.ControlModifier),
-            "resize": abs(pos.x() - right_edge) <= _RESIZE_HANDLE_PX,
+            "resize": resize_bar is not None,
             "bars": [],
             "ghosts": {},
             "press_x": self.mapToScene(pos).x(),
@@ -962,7 +1145,7 @@ class GanttGraphicsView(QGraphicsView):
         # 各バーの長さ（営業日）。移動してもこの日数を保つ
         drag["days"] = {b.key: max(1, self.calendar.count(b.start, b.end, b.team_key)) for b in bars}
         drag["started"] = True
-        self.setCursor(Qt.SizeHorCursor if drag["resize"] else Qt.ClosedHandCursor)
+        self._set_cursor(Qt.SizeHorCursor if drag["resize"] else Qt.ClosedHandCursor)
 
     def _cancel_drag(self):
         """ドラッグを取りやめる（Esc）。影を消し、何も書き込まない。"""
@@ -975,7 +1158,7 @@ class GanttGraphicsView(QGraphicsView):
                 scene.removeItem(ghost)
         self.refresh_dependencies()
         QToolTip.hideText()
-        self.setCursor(Qt.ArrowCursor)
+        self._set_cursor(None)
 
     def _update_drag(self, event):
         drag = self._drag
@@ -1039,7 +1222,7 @@ class GanttGraphicsView(QGraphicsView):
         # 離した直後は元の位置に戻す（書き込み→再計算の後、新しい位置で描き直される）
         self.refresh_dependencies()
         QToolTip.hideText()
-        self.setCursor(Qt.ArrowCursor)
+        self._set_cursor(None)
         anchor = drag["anchor"]
         if drag["resize"]:
             original = drag["days"][anchor.key]
@@ -1440,29 +1623,38 @@ class FrozenGanttPane(QWidget):
         self._layout_job_labels(sy)
 
     def _layout_job_labels(self, sy):
-        """左列のジョブ名（と色見本）を、その行の中央に揃え、上の名前と重なるものを
-        隠す。
+        """左列のジョブ名（と色見本）を、その行の中央に揃える。
 
         ジョブ名は等倍（一定ピクセル数）で描く一方、行の高さは縦の拡縮率（sy）で
         変わる。全体表示などで縦に縮小すると行が文字より低くなり、名前同士が
-        重なって読めなくなっていた。上から順に、直前に表示した名前と重なるものを
-        隠す（拡大すれば、すべての名前が現れる）——日付軸の目盛りを縮小時に
-        間引くのと同じ考え方（_update_axis_density）。"""
+        重なって読めなくなる。そのときは全行の名前を同じ倍率で縮小し、それでも
+        _JOB_LABEL_MIN_SCALE を下回るほど低いなら全行とも隠す（拡大すれば現れる）。
+
+        以前は上から順に、直前に表示した名前と重なるものだけを隠していた。行の高さ
+        （レーンの数）はジョブごとに違うため、名前の出る行と出ない行が不規則に混ざり、
+        見た目が分かりにくかった。"""
         scene = self.column.scene()
         if scene is None or sy <= 0:
             return
-        next_free_px = None
-        for label, swatch, center_y in getattr(scene, "gantt_job_labels", []):
-            height_px = label.boundingRect().height()
-            top_px = center_y * sy - height_px / 2
-            visible = next_free_px is None or top_px >= next_free_px
+        entries = getattr(scene, "gantt_job_labels", [])
+        if not entries:
+            return
+        height_px = max(label.boundingRect().height() for label, _swatch, _y in entries)
+        # 隣り合う行の中央の間隔が、名前を重ならずに置ける高さの上限
+        pitch_px = min(
+            ((b[2] - a[2]) * sy for a, b in zip(entries, entries[1:])), default=height_px,
+        )
+        scale = min(1.0, pitch_px / height_px) if height_px > 0 else 1.0
+        visible = scale >= _JOB_LABEL_MIN_SCALE
+        for label, swatch, center_y in entries:
             label.setVisible(visible)
             swatch.setVisible(visible)
             if not visible:
                 continue
-            next_free_px = top_px + height_px
-            label.setPos(label.x(), center_y - (height_px / 2) / sy)
-            swatch.setPos(swatch.x(), center_y - (swatch.rect().height() / 2) / sy)
+            for item, item_h in ((label, label.boundingRect().height()), (swatch, swatch.rect().height())):
+                if item.scale() != scale:
+                    item.setScale(scale)
+                item.setPos(item.x(), center_y - (item_h * scale / 2) / sy)
 
     def _update_axis_density(self, sx):
         """現在の横方向の拡縮率（sx）に応じて、日付軸の見せ方を切り替える。
@@ -1589,6 +1781,11 @@ class FrozenGanttPane(QWidget):
                 if (bar_h_px - text_h_max) / 2 < _PIN_BOTTOM_PX:
                     avail_w -= _PIN_LABEL_RESERVE_PX
                     shift_px = _PIN_LABEL_RESERVE_PX / 2
+            # 状態の区画（右端）を描くバーは、その分だけ右を空ける
+            if bar is not None:
+                status_px = bar.status_segment_px(bar_width * sx, bar_h_px)
+                avail_w -= status_px
+                shift_px -= status_px / 2
 
             if avail_w < metrics.averageCharWidth() or avail_h < line_height:
                 label.setVisible(False)
@@ -1827,6 +2024,7 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
     body_scene.gantt_bars = {}
     column_scene.gantt_job_rows = []  # (y_top, y_bottom, Job_ID) ジョブ名クリックでの選択用
     start_pins = display.get("start_pins") or {}
+    task_status = display.get("task_status") or {}
 
     task_font = QFont()
     task_font.setPointSize(9)
@@ -2123,6 +2321,7 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
                 start=to_date(r["Start_Date"]), end=to_date(r["End_Date"]),
                 pinned=key in start_pins,
                 emphasized=emphasis_width > 0, emphasis_width=emphasis_width,
+                status=task_status.get(key),
             )
             body_scene.gantt_bars[key] = rect
             rect.setBrush(QBrush(QColor(color_hex)))
@@ -2159,6 +2358,7 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
                 + (f'\n⚠ {constraint_violation}' if constraint_violation else "")
                 + (tr("\n※リソース制約により前倒し") if r["Resource_Adjusted"] else "")
                 + (tr("\n📍 開始固定日: {date:%Y-%m-%d}", date=start_pins[key]) if key in start_pins else "")
+                + {STATUS_DONE: tr("\n✔ 完了"), STATUS_IN_PROGRESS: tr("\n▶ 進行中")}.get(rect.status, "")
             )
             body_scene.addItem(rect)
 

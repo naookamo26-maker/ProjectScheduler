@@ -205,6 +205,63 @@ def test_dragging_the_right_edge_changes_the_duration(qapp, gantt):
     assert w.undo_manager.undo_label() == "ガントでタスクの期間を変更"
 
 
+def _hover(qapp, view, pos, modifiers=Qt.NoModifier):
+    viewport = view.viewport()
+    move = QMouseEvent(QEvent.MouseMove, QPointF(pos), QPointF(viewport.mapToGlobal(pos)),
+                       Qt.NoButton, Qt.NoButton, modifiers)
+    QApplication.sendEvent(viewport, move)
+    qapp.processEvents()
+
+
+def test_the_right_edge_shows_a_resize_cursor_only_while_the_drag_key_is_held(qapp, gantt):
+    """バーの右端は、指定キー（Shift）を押しているときだけカーソルが↔になり、伸縮できる。
+    選んでいるバーでも、キーを押していなければ↔にも伸縮にもならない（移動と同じ）。"""
+    w, tab, ids = gantt
+    key = _key(ids, "job1", "t1")
+    bar = tab.view.bars()[key]
+    _zoom_to(tab, bar)
+    body = tab.view.body
+    edge = body.mapFromScene(bar.bar_rect.right() - 0.5, bar.bar_rect.center().y())
+    edge.setX(edge.x() - 1)
+    middle = body.mapFromScene(bar.bar_rect.center())
+    tab.view.select_keys([key])
+
+    _hover(qapp, body, edge)
+    assert body.viewport().cursor().shape() != Qt.SizeHorCursor
+    _hover(qapp, body, edge, Qt.ShiftModifier)
+    assert body.viewport().cursor().shape() == Qt.SizeHorCursor
+    _hover(qapp, body, middle, Qt.ShiftModifier)
+    assert body.viewport().cursor().shape() == Qt.ArrowCursor
+
+    end = body.mapFromScene(bar.bar_rect.right() + 7 * 10, bar.bar_rect.center().y())
+    _drag(qapp, body, edge, end, modifiers=Qt.NoModifier)
+    assert w.db.list_all_job_task_overrides() == []
+    assert tab._pending_edit is None
+
+
+def test_the_right_edge_can_be_grabbed_when_the_next_bar_touches_it(qapp, gantt):
+    """右端に次のバーが接していると、その位置で一番上にあるのは次のバーのことがある。
+    それでも選んだバーの右端を掴める（↔になる）。"""
+    w, tab, ids = gantt
+    key = _key(ids, "job2", "t1")
+    bar = tab.view.bars()[key]
+    neighbor = tab.view.bars()[_key(ids, "job2", "t2")]
+    assert neighbor.bar_rect.left() == bar.bar_rect.right()  # 前提: 次のバーが接している
+    _zoom_to(tab, bar)
+    tab.view.select_keys([key])
+    body = tab.view.body
+    edge = body.mapFromScene(bar.bar_rect.right() + 0.5, bar.bar_rect.center().y())
+    edge.setX(edge.x() + 1)  # 次のバーの上（左端のすぐ内側）
+    _hover(qapp, body, edge, Qt.ShiftModifier)
+    assert body.viewport().cursor().shape() == Qt.SizeHorCursor
+
+    end = body.mapFromScene(bar.bar_rect.right() + 3 * 10, bar.bar_rect.center().y())
+    _drag(qapp, body, edge, end)
+    _wait_recomputed(qapp, tab)
+    assert _override(w.db, ids["job2"], ids["t1"])["override_days"] is not None
+    assert _override(w.db, ids["job2"], ids["t2"])["override_id"] is None
+
+
 def test_resizing_back_to_the_default_duration_removes_the_override(qapp, gantt):
     w, tab, ids = gantt
     key = _key(ids, "job1", "t1")
@@ -305,6 +362,108 @@ def _choose_menu(tab, text):
             return None
         return find(menu)
     return patch.object(tab, "_exec_menu", fake_exec)
+
+
+def test_bars_show_the_task_status_in_a_segment_at_the_right_end(qapp, gantt):
+    """完了・進行中のタスクは、バーの右端を区切った灰色の区画に ✔／▶ を描く（未着手は
+    区切らない）。バーが短いときは記号を省いて細い帯だけにし、タスク名は区画を避ける。"""
+    from gui.gantt_view import STATUS_DONE, STATUS_IN_PROGRESS
+
+    w, tab, ids = gantt
+    w.db.update_job_task_override_fields(ids["job1"], ids["t1"], status="done")
+    w.db.update_job_task_override_fields(ids["job1"], ids["t2"], status="in_progress")
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    bars = tab.view.bars()
+    done, doing = bars[_key(ids, "job1", "t1")], bars[_key(ids, "job1", "t2")]
+    assert done.status == STATUS_DONE and doing.status == STATUS_IN_PROGRESS
+    assert bars[_key(ids, "job2", "t1")].status is None
+    assert "✔ 完了" in done.toolTip() and "▶ 進行中" in doing.toolTip()
+
+    assert done.status_segment_px(100, 20) == 16    # 記号を入れる区画
+    assert done.status_segment_px(20, 20) == 4      # 短いバーは細い帯だけ
+    assert done.status_segment_px(4, 20) == 0       # ごく細いバーには描かない
+    assert bars[_key(ids, "job2", "t1")].status_segment_px(100, 20) == 0
+
+    # 拡大して描いても（区画・記号・枠線の描き直し）落ちない。タスク名は区画を避けて左に寄る
+    _zoom_to(tab, done)
+    tab.view.grab()
+    label = next(l for l, _cx, _cy, _w, _h, _t, _f, b in tab.view.body.scene().gantt_task_labels if b is done)
+    right_px = tab.view.body.mapFromScene(done.bar_rect.right(), 0).x()
+    label_right = label.deviceTransform(tab.view.body.viewportTransform()).mapRect(label.boundingRect()).right()
+    assert label_right <= right_px - 16
+
+
+def test_small_pinned_bars_keep_a_pin_strip_like_the_status_strip(qapp, gantt):
+    """回帰テスト: 全体表示などでバーが小さいと、状態は細い帯で残るのに📍だけ消えていた。
+    📍を描けない大きさのバーには、左端にピンの色の細い帯を描く。"""
+    w, tab, ids = gantt
+    w.db.update_job_task_override_fields(ids["job1"], ids["t1"], start_pin_date="2026-04-06", status="done")
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    bar = tab.view.bars()[_key(ids, "job1", "t1")]
+    assert bar.pinned
+    assert bar.shows_pin(40, 20) and not bar.shows_pin_strip(40, 20)
+    assert not bar.shows_pin(20, 8) and bar.shows_pin_strip(20, 8)
+    assert bar.status_segment_px(20, 8) > 0  # 状態の帯と同じ大きさまで残る
+    assert not bar.shows_pin_strip(4, 8)
+    # 期間の短いタスク: 📍と状態が重ならないよう、まず状態を帯に、それでも狭ければ📍も帯にする
+    assert bar.marker_layout(60, 20) == (True, 0, 16)    # 📍＋✔の区画
+    assert bar.marker_layout(40, 20) == (True, 0, 4)     # 📍＋状態の帯
+    assert bar.marker_layout(20, 20) == (False, 3, 4)    # ピンの帯＋状態の帯
+    assert bar.marker_layout(8, 20) == (False, 2, 2)     # ごく細いバーは帯を1/4までに抑える
+    assert not tab.view.bars()[_key(ids, "job2", "t1")].shows_pin_strip(20, 8)
+    tab.view.fit_all()
+    tab.view.grab()
+
+
+def test_context_menu_changes_days_by_a_delta_and_resets_them(qapp, gantt):
+    """右クリックの「日数を増減…」は、各タスクの今の日数から±で増減する（固定値ではない）。
+    「既定の日数に戻す」で上書きを外す。どちらも1回のUndoで戻る。"""
+    w, tab, ids = gantt
+    k1, k2 = _key(ids, "job1", "t1"), _key(ids, "job2", "t1")
+    w.db.update_job_task_override_fields(ids["job2"], ids["t1"], override_days=8)
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    tab.view.select_keys([k1, k2])
+
+    asked = []
+    with _choose_menu(tab, "日数を増減…"), \
+            patch.object(tab, "_exec_dialog", lambda d: asked.append(d.labelText()) or d.setIntValue(3) or True):
+        tab._show_context_menu(None)
+    _wait_recomputed(qapp, tab)
+    assert "2件" in asked[0]
+    assert _override(w.db, ids["job1"], ids["t1"])["override_days"] == 8   # 既定5 + 3
+    assert _override(w.db, ids["job2"], ids["t1"])["override_days"] == 11  # 上書き8 + 3
+    assert w.undo_manager.undo_label() == "タスクの日数を増減"
+
+    # 減らして既定と同じになったら上書きを外す。1日未満にはしない
+    tab.view.select_keys([k1])
+    with _choose_menu(tab, "日数を増減…"), patch.object(tab, "_exec_dialog", lambda d: d.setIntValue(-3) or True):
+        tab._show_context_menu(None)
+    _wait_recomputed(qapp, tab)
+    assert _override(w.db, ids["job1"], ids["t1"])["override_days"] is None
+    tab.view.select_keys([k1])
+    with _choose_menu(tab, "日数を増減…"), patch.object(tab, "_exec_dialog", lambda d: d.setIntValue(-99) or True):
+        tab._show_context_menu(None)
+    _wait_recomputed(qapp, tab)
+    assert _override(w.db, ids["job1"], ids["t1"])["override_days"] == 1
+
+    # 取りやめたら何もしない
+    before = w.db.serialize_state()
+    tab.view.select_keys([k1])
+    with _choose_menu(tab, "日数を増減…"), patch.object(tab, "_exec_dialog", lambda d: False):
+        tab._show_context_menu(None)
+    assert w.db.serialize_state() == before
+
+    tab.view.select_keys([k1, k2])
+    with _choose_menu(tab, "既定の日数に戻す"):
+        tab._show_context_menu(None)
+    _wait_recomputed(qapp, tab)
+    assert _override(w.db, ids["job1"], ids["t1"])["override_days"] is None
+    assert _override(w.db, ids["job2"], ids["t1"])["override_days"] is None
+    w.undo_manager.undo()
+    assert _override(w.db, ids["job2"], ids["t1"])["override_days"] == 11
 
 
 def test_context_menu_pins_sets_status_and_team(qapp, gantt):
@@ -615,9 +774,10 @@ def _visible_label_rects(view, labels):
     rects = []
     for label in labels:
         if label.isVisible():
-            top_left = view.mapFromScene(label.pos())
-            rect = label.boundingRect()
-            rects.append((top_left.x(), top_left.y(), top_left.x() + rect.width(), top_left.y() + rect.height()))
+            # 画面上の矩形（縮小した名前は、その倍率も含めて）
+            rect = label.deviceTransform(view.viewportTransform()).mapRect(label.boundingRect())
+            # （ちょうど接している名前を、計算誤差で重なりと見なさないよう丸める）
+            rects.append(tuple(round(v, 2) for v in (rect.left(), rect.top(), rect.right(), rect.bottom())))
     return rects
 
 
@@ -627,7 +787,8 @@ def _overlaps(a, b):
 
 def test_job_names_do_not_overlap_when_the_chart_is_zoomed_out(qapp, gantt, tmp_path):
     """回帰テスト: 全体表示で縦に縮小すると行が文字より低くなり、左列のジョブ名同士が
-    重なって読めなかった。重なる名前は隠し、拡大すれば全部現れる。"""
+    重なって読めなかった。重なるときは全行の名前をそろって縮小し、それでも読めないほど
+    低いなら全行とも隠す（行によって出たり出なかったりしない）。拡大すれば全部現れる。"""
     w, tab, _ids = gantt
     path = tmp_path / "many.pschedule"
     db = ProjectDatabase.create_new(str(path))
@@ -648,15 +809,25 @@ def test_job_names_do_not_overlap_when_the_chart_is_zoomed_out(qapp, gantt, tmp_
 
     column = tab.view.column
     labels = [label for label, _swatch, _y in column.scene().gantt_job_labels]
+    # 60行は収まらないので、全行とも隠している（一部だけ出すことはしない）
+    assert not any(label.isVisible() for label in labels)
+
+    # 少し拡大すると、全行の名前がそろって縮小して現れ、重ならない
+    body = tab.view.body
+    pitch = labels[0].boundingRect().height() * 0.8 / (column.scene().gantt_job_labels[1][2]
+                                                        - column.scene().gantt_job_labels[0][2])
+    body.scale(1.0, pitch / body.transform().m22())
+    tab.view._sync_panes()
+    assert all(label.isVisible() for label in labels)
+    assert {round(label.scale(), 3) for label in labels} == {0.8}
     rects = _visible_label_rects(column, labels)
-    assert 0 < len(rects) < len(labels)  # 60行は収まらないので一部を隠している
     for i, a in enumerate(rects):
         for b in rects[i + 1:]:
             assert not _overlaps(a, b)
 
-    tab.view.body.scale(1.0, 20.0)
+    body.scale(1.0, 20.0)
     tab.view._sync_panes()
-    assert all(label.isVisible() for label in labels)
+    assert all(label.isVisible() and label.scale() == 1.0 for label in labels)
 
 
 def test_header_labels_do_not_overlap_and_stay_inside_the_view(qapp, gantt, tmp_path):

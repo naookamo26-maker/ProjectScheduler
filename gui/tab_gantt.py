@@ -27,7 +27,8 @@ gui/node_canvas.py と同じQGraphicsView/QGraphicsSceneベースで、ホイー
 表示する。
 
 タスクの編集（docs/roadmap.md §9）: バーを選んで、Shift（オプションで変更可）を
-押しながらドラッグすると開始日の移動（右端なら期間の伸縮）、ダブルクリックで
+押しながらドラッグすると開始日の移動（右端なら期間の伸縮。キーを押して右端に
+乗せるとカーソルが↔になる）、ダブルクリックで
 編集ウィンドウ（gui/gantt_task_editor.py）、右クリックでメニュー。書き込み先は
 タスク上書き（開始日は手動ピン＝start_pin_date、期間は日数上書き）で、1回の
 操作が1つのUndo単位。書き込んだ後は再計算し、表示位置と選択を保ったまま、
@@ -44,6 +45,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMenu,
@@ -51,6 +53,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpacerItem,
+    QSpinBox,
     QStyle,
     QToolButton,
     QVBoxLayout,
@@ -1190,6 +1193,9 @@ class GanttTab(QWidget):
         pin_action = menu.addAction(tr("開始日を固定"))
         unpin_action = menu.addAction(tr("固定を解除"))
         unpin_action.setEnabled(any(bars[k].pinned for k in keys if k in bars))
+        days_action = menu.addAction(tr("日数を増減…"))
+        reset_days_action = menu.addAction(tr("既定の日数に戻す"))
+        reset_days_action.setEnabled(any(r["override_days"] is not None for r in rows))
         status_menu = menu.addMenu(tr("状態"))
         status_actions = {
             status_menu.addAction(label): value
@@ -1219,12 +1225,48 @@ class GanttTab(QWidget):
             )
         elif chosen is unpin_action:
             self.apply_task_fields(keys, tr("タスクの開始日の固定を解除"), {"start_pin_date": None})
+        elif chosen is days_action:
+            n = self._ask_days_delta(len(rows))
+            if n:
+                self.change_task_days(keys, n)
+        elif chosen is reset_days_action:
+            self.apply_task_fields(keys, tr("タスクの日数を既定に戻す"), {"override_days": None})
         elif chosen in status_actions:
             self.apply_task_fields(keys, tr("タスクの状態を変更"), {"status": status_actions[chosen]})
         elif chosen in team_actions:
             self.apply_task_fields(keys, tr("タスクのチームを変更"), {"team_id": team_actions[chosen]})
         elif chosen is disable_action:
             self.apply_task_fields(keys, tr("タスクを無効にする"), {"is_active": False})
+
+    def change_task_days(self, keys, n):
+        """keys の各タスクの日数（営業日）を、今の日数から n 日増減する（1日未満には
+        しない）。既定の日数と同じになったら上書きを外す（差分のみ保持）。"""
+        def fields(r):
+            days = max(1, (r["override_days"] or r["default_days"]) + n)
+            return {"override_days": None if days == r["default_days"] else days}
+        self.apply_task_fields(keys, tr("タスクの日数を増減"), fields)
+
+    def _ask_days_delta(self, count):
+        """右クリックの「日数を増減…」で、増減する営業日数を尋ねる。取りやめたら None。"""
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle(tr("日数を増減"))
+        dialog.setLabelText(
+            tr("日数を何営業日増やしますか（マイナスで減らします）:") if count <= 1
+            else tr("選んだ{n}件のタスクの日数を、それぞれ何営業日増やしますか（マイナスで減らします）:", n=count)
+        )
+        dialog.setInputMode(QInputDialog.IntInput)
+        dialog.setIntRange(-999, 999)
+        dialog.setIntValue(0)
+        spin = dialog.findChild(QSpinBox)
+        if spin is not None:
+            spin.setSuffix(tr(" 営業日"))
+        if not self._exec_dialog(dialog):
+            return None
+        return dialog.intValue()
+
+    def _exec_dialog(self, dialog):
+        """ダイアログを出して、OK なら真を返す（テストで差し替えられるよう分けてある）。"""
+        return dialog.exec() == QDialog.Accepted
 
     @staticmethod
     def _check_current(actions, values):

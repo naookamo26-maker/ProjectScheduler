@@ -770,6 +770,10 @@ def _set_windows_app_id():
 def main():
     _set_windows_app_id()
     app = QApplication(sys.argv)
+    # リスト（コンボボックス）の▼で選択肢を開くとき、Windows の設定に従って Qt が
+    # 巻き出すアニメーションを付ける。この効果は一覧を一度画像にしてから描き直すため、
+    # 開いた瞬間に一覧が一度消えてちらつくように見えていた。アニメーションせずにすぐ出す。
+    QApplication.setEffectEnabled(Qt.UI_AnimateCombo, False)
     # 利用者ごとの設定フォルダ（QStandardPaths.AppConfigLocation）の名前になる。
     app.setApplicationName("ProjectScheduler")
     app.setApplicationVersion(APP_VERSION)
