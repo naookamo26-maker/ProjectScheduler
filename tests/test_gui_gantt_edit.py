@@ -394,6 +394,24 @@ def test_bars_show_the_task_status_in_a_segment_at_the_right_end(qapp, gantt):
     assert label_right <= right_px - 16
 
 
+def test_small_pinned_bars_keep_a_pin_strip_like_the_status_strip(qapp, gantt):
+    """回帰テスト: 全体表示などでバーが小さいと、状態は細い帯で残るのに📍だけ消えていた。
+    📍を描けない大きさのバーには、左端にピンの色の細い帯を描く。"""
+    w, tab, ids = gantt
+    w.db.update_job_task_override_fields(ids["job1"], ids["t1"], start_pin_date="2026-04-06", status="done")
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    bar = tab.view.bars()[_key(ids, "job1", "t1")]
+    assert bar.pinned
+    assert bar.shows_pin(40, 20) and not bar.shows_pin_strip(40, 20)
+    assert not bar.shows_pin(20, 8) and bar.shows_pin_strip(20, 8)
+    assert bar.status_segment_px(20, 8) > 0  # 状態の帯と同じ大きさまで残る
+    assert not bar.shows_pin_strip(4, 8)
+    assert not tab.view.bars()[_key(ids, "job2", "t1")].shows_pin_strip(20, 8)
+    tab.view.fit_all()
+    tab.view.grab()
+
+
 def test_context_menu_changes_days_by_a_delta_and_resets_them(qapp, gantt):
     """右クリックの「日数を増減…」は、各タスクの今の日数から±で増減する（固定値ではない）。
     「既定の日数に戻す」で上書きを外す。どちらも1回のUndoで戻る。"""

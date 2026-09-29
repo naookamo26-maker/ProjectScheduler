@@ -203,7 +203,8 @@ _PIN_HEAD_BORDER = QColor("#7a1712")
 _PIN_NEEDLE_COLOR = QColor("#3c4043")
 _PIN_HEAD_RADIUS_PX = 4.5
 _PIN_NEEDLE_PX = 5
-_PIN_MARKER_PX = 12  # この大きさ（幅・高さ）に満たないバーには描かない
+_PIN_MARKER_PX = 12  # この大きさ（幅・高さ）に満たないバーには、ピンの代わりに左端の細い帯を描く
+_PIN_STRIP_PX = 3    # ピンを描けないほど小さいバーの左端に描く、ピンの色の帯の幅（画面px）
 # 📍を描いたバーでは、タスク名をこの幅（画面px）だけ右に避けて置く（重ならないように）
 _PIN_LABEL_RESERVE_PX = 3 + _PIN_HEAD_RADIUS_PX * 2 + 3
 # 📍の下端（バー上端からの画面px）。バーの縦に余裕があり、中央に置いた文字がこれより
@@ -309,6 +310,25 @@ class TaskBarItem(QGraphicsPathItem):
         """画面上のバーの大きさで、📍の印を描くかどうか（ラベルの配置と揃える）。"""
         return self.pinned and width_px >= _PIN_MARKER_PX and height_px >= _PIN_MARKER_PX
 
+    def shows_pin_strip(self, width_px, height_px):
+        """ピンを描けないほど小さいバーで、代わりに左端の細い帯を描くか。状態の帯
+        （status_segment_px）と同じく、全体表示でも開始固定日のタスクが分かるようにする
+        （状態だけ見えて📍が消えると、固定したタスクが分からなくなる）。"""
+        return (self.pinned and not self.shows_pin(width_px, height_px)
+                and width_px >= _STATUS_MIN_BAR_PX)
+
+    def _paint_edge_strip(self, painter, rect, x, width, color):
+        """バーの丸い角に沿って切り取った、高さいっぱいの帯を描く（画面座標）。"""
+        clip = QPainterPath()
+        clip.addRect(QRectF(x, rect.top() - 1, width, rect.height() + 2))
+        painter.save()
+        painter.resetTransform()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(color))
+        painter.drawPath(self._device_path.intersected(clip))
+        painter.restore()
+
     def status_segment_px(self, width_px, height_px):
         """画面上のバーの大きさで、状態の区画をどの幅（画面px）で描くか（0 なら描かない）。
         ラベルの配置と揃える。"""
@@ -395,8 +415,11 @@ class TaskBarItem(QGraphicsPathItem):
             painter.fillRect(veiled, _UNCONFIRMED_VEIL)
             painter.fillRect(veiled, QBrush(_UNCONFIRMED_HATCH, Qt.BDiagPattern))
         painter.restore()
-        # 状態の区画は斜線（未確定）の上、強調・選択の枠の下に描く
+        # 状態の区画・小さいバーのピンの帯は斜線（未確定）の上、強調・選択の枠の下に描く
+        self._device_path = painter.worldTransform().map(self.path())
         self._paint_status(painter, rect, border_drawn)
+        if self.shows_pin_strip(rect.width(), rect.height()):
+            self._paint_edge_strip(painter, rect, rect.left() - 1, _PIN_STRIP_PX + 1, _PIN_HEAD_COLOR)
         painter.save()
         painter.resetTransform()
         painter.setBrush(Qt.NoBrush)
