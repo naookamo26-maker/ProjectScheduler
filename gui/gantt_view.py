@@ -29,7 +29,7 @@ QGraphicsView は setSceneRect() だけでは実際の描画をクリップし�
 from collections import namedtuple
 from datetime import date, timedelta
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -74,6 +74,9 @@ LEFT_MARGIN = 190
 # 一目で分かるようにするため。
 _JOB_SWATCH_WIDTH = 10
 _JOB_SWATCH_GAP = 4
+# 縦に縮小して行が文字より低くなったら、左列のジョブ名（と色見本）を全行そろって
+# 縮小する。この倍率を下回るほど縮めないと収まらないときは、読めないので全行とも隠す。
+_JOB_LABEL_MIN_SCALE = 0.6
 # ヘッダーは上から (1)マイルストーン名 (2)年 (3)月日 の3段構成のため、
 # 目盛り1段のみだった頃より高さが必要。
 TOP_MARGIN = 58
@@ -564,6 +567,8 @@ class GanttGraphicsView(QGraphicsView):
         # 背景で描くようにし、文字色との組み合わせを固定して視認性を保つ。
         self.setBackgroundBrush(QBrush(_PANE_BG))
         self.setDragMode(QGraphicsView.RubberBandDrag)
+        # ボタンを押していない間の移動も受け取り、伸縮できるバーの右端でカーソルを↔にする
+        self.viewport().setMouseTracking(True)
         # QGraphicsViewは既定でacceptDrops()がTrueになっており、プロジェクト
         # ファイル（.pschedule）をこのビュー上にドラッグ&ドロップしても
         # シーンが受け取らないまま素通りせず、MainWindow.dropEvent（ウィンドウ
@@ -701,7 +706,7 @@ class GanttGraphicsView(QGraphicsView):
         if event.button() == Qt.MiddleButton:
             self._panning = True
             self._pan_last_pos = event.pos()
-            self.setCursor(Qt.ClosedHandCursor)
+            self._set_cursor(Qt.ClosedHandCursor)
             event.accept()
             return
         if event.button() == Qt.RightButton:
@@ -737,26 +742,33 @@ class GanttGraphicsView(QGraphicsView):
             self._update_drag(event)
             event.accept()
             return
+        if event.buttons() == Qt.NoButton:
+            self._update_hover_cursor(event)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MiddleButton and self._panning:
             self._panning = False
             self._pan_last_pos = None
-            self.setCursor(Qt.ArrowCursor)
+            self._update_hover_cursor(event)
             event.accept()
             return
         if event.button() == Qt.LeftButton and self._drag is not None:
             if self._drag["started"]:
                 self._finish_drag()
             else:
-                # 動かさずに離した（Shift＋クリック）: 選択を外さずにそのバーを選択に加える
-                anchor = self._drag["anchor"]
-                self._drag = None
+                # 動かさずに離した（Shift＋クリック）: 選択を外さずにそのバーを選択に加える。
+                # キーを押さずに右端を押しただけなら、ふつうのクリックと同じくそのバーだけを選ぶ
+                drag, self._drag = self._drag, None
+                anchor = drag["anchor"]
+                if not (drag["with_modifier"] or drag["add_to_selection"]):
+                    self.scene().clearSelection()
                 anchor.setSelected(True)
+            self._update_hover_cursor(event)
             event.accept()
             return
         super().mouseReleaseEvent(event)
+        self._update_hover_cursor(event)
 
     def mouseDoubleClickEvent(self, event):
         if self.edit_enabled and event.button() == Qt.LeftButton:
@@ -904,9 +916,46 @@ class GanttGraphicsView(QGraphicsView):
                 return item
         return None
 
+    def _resize_handle_at(self, view_pos, modifiers):
+        """期間を伸縮できるバーの右端（_RESIZE_HANDLE_PX 以内）に view_pos があれば、
+        そのバーを返す。選んでいるバーならキーを押さなくても掴める（カーソルが↔に
+        なる）。選んでいないバーは、従来どおり指定キー（既定 Shift）を押しているときだけ。"""
+        if not self.edit_enabled or self.calendar is None:
+            return None
+        # 右端に隣のバーが接していると、その位置で一番上にあるのは隣のバーのことがある。
+        # 前後の幅にあるバーをすべて見て、選んでいるバーの右端を優先する
+        area = QRect(view_pos.x() - _RESIZE_HANDLE_PX, view_pos.y(), 2 * _RESIZE_HANDLE_PX + 1, 1)
+        candidates = []
+        for item in self.items(area):
+            if not isinstance(item, TaskBarItem):
+                continue
+            if not (item.isSelected() or modifiers & self.drag_modifier):
+                continue
+            right_edge = self.mapFromScene(item.bar_rect.topRight()).x()
+            if abs(view_pos.x() - right_edge) <= _RESIZE_HANDLE_PX:
+                candidates.append((not item.isSelected(), abs(view_pos.x() - right_edge), item))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda c: c[:2])[2]
+
+    def _set_cursor(self, shape):
+        """チャート部分のカーソルを変える（None で既定の矢印に戻す）。"""
+        if shape is None:
+            self.viewport().unsetCursor()
+        else:
+            self.viewport().setCursor(shape)
+
+    def _update_hover_cursor(self, event):
+        """ボタンを押していない間、伸縮できるバーの右端の上では↔にする。"""
+        if self._drag is not None or self._panning:
+            return
+        on_handle = self._resize_handle_at(event.position().toPoint(), event.modifiers()) is not None
+        self._set_cursor(Qt.SizeHorCursor if on_handle else None)
+
     def _try_start_drag(self, event):
         """指定キー（既定 Shift）を押しながらバーを押したら、ドラッグの準備をする。
-        キーを押していなければ何もしない（クリックは従来どおり選択だけ）。
+        キーを押していなければ何もしない（クリックは従来どおり選択だけ）。ただし、
+        選んでいるバーの右端（カーソルが↔になる所）は、キーを押さなくても期間の伸縮になる。
 
         選択はまだ変えない。実際に動かし始めた時（_begin_drag）に、選ばれていないバーなら
         そのバーだけを選んで動かす。動かさずに離したら（Shift＋クリック）、今の選択を
@@ -914,19 +963,20 @@ class GanttGraphicsView(QGraphicsView):
         選んでから Shift＋クリックすると1件に戻っていた）。"""
         if not self.edit_enabled or self.calendar is None:
             return False
-        if not (event.modifiers() & self.drag_modifier):
-            return False
         pos = event.position().toPoint()
-        anchor = self._bar_at(pos)
+        resize_bar = self._resize_handle_at(pos, event.modifiers())
+        if resize_bar is None and not (event.modifiers() & self.drag_modifier):
+            return False
+        anchor = resize_bar or self._bar_at(pos)
         if anchor is None:
             return False
-        right_edge = self.mapFromScene(anchor.bar_rect.topRight()).x()
         self._drag = {
             "anchor": anchor,
             "started": False,
             "press_pos": pos,
             "add_to_selection": bool(event.modifiers() & Qt.ControlModifier),
-            "resize": abs(pos.x() - right_edge) <= _RESIZE_HANDLE_PX,
+            "with_modifier": bool(event.modifiers() & self.drag_modifier),
+            "resize": resize_bar is not None,
             "bars": [],
             "ghosts": {},
             "press_x": self.mapToScene(pos).x(),
@@ -962,7 +1012,7 @@ class GanttGraphicsView(QGraphicsView):
         # 各バーの長さ（営業日）。移動してもこの日数を保つ
         drag["days"] = {b.key: max(1, self.calendar.count(b.start, b.end, b.team_key)) for b in bars}
         drag["started"] = True
-        self.setCursor(Qt.SizeHorCursor if drag["resize"] else Qt.ClosedHandCursor)
+        self._set_cursor(Qt.SizeHorCursor if drag["resize"] else Qt.ClosedHandCursor)
 
     def _cancel_drag(self):
         """ドラッグを取りやめる（Esc）。影を消し、何も書き込まない。"""
@@ -975,7 +1025,7 @@ class GanttGraphicsView(QGraphicsView):
                 scene.removeItem(ghost)
         self.refresh_dependencies()
         QToolTip.hideText()
-        self.setCursor(Qt.ArrowCursor)
+        self._set_cursor(None)
 
     def _update_drag(self, event):
         drag = self._drag
@@ -1039,7 +1089,7 @@ class GanttGraphicsView(QGraphicsView):
         # 離した直後は元の位置に戻す（書き込み→再計算の後、新しい位置で描き直される）
         self.refresh_dependencies()
         QToolTip.hideText()
-        self.setCursor(Qt.ArrowCursor)
+        self._set_cursor(None)
         anchor = drag["anchor"]
         if drag["resize"]:
             original = drag["days"][anchor.key]
@@ -1440,29 +1490,38 @@ class FrozenGanttPane(QWidget):
         self._layout_job_labels(sy)
 
     def _layout_job_labels(self, sy):
-        """左列のジョブ名（と色見本）を、その行の中央に揃え、上の名前と重なるものを
-        隠す。
+        """左列のジョブ名（と色見本）を、その行の中央に揃える。
 
         ジョブ名は等倍（一定ピクセル数）で描く一方、行の高さは縦の拡縮率（sy）で
         変わる。全体表示などで縦に縮小すると行が文字より低くなり、名前同士が
-        重なって読めなくなっていた。上から順に、直前に表示した名前と重なるものを
-        隠す（拡大すれば、すべての名前が現れる）——日付軸の目盛りを縮小時に
-        間引くのと同じ考え方（_update_axis_density）。"""
+        重なって読めなくなる。そのときは全行の名前を同じ倍率で縮小し、それでも
+        _JOB_LABEL_MIN_SCALE を下回るほど低いなら全行とも隠す（拡大すれば現れる）。
+
+        以前は上から順に、直前に表示した名前と重なるものだけを隠していた。行の高さ
+        （レーンの数）はジョブごとに違うため、名前の出る行と出ない行が不規則に混ざり、
+        見た目が分かりにくかった。"""
         scene = self.column.scene()
         if scene is None or sy <= 0:
             return
-        next_free_px = None
-        for label, swatch, center_y in getattr(scene, "gantt_job_labels", []):
-            height_px = label.boundingRect().height()
-            top_px = center_y * sy - height_px / 2
-            visible = next_free_px is None or top_px >= next_free_px
+        entries = getattr(scene, "gantt_job_labels", [])
+        if not entries:
+            return
+        height_px = max(label.boundingRect().height() for label, _swatch, _y in entries)
+        # 隣り合う行の中央の間隔が、名前を重ならずに置ける高さの上限
+        pitch_px = min(
+            ((b[2] - a[2]) * sy for a, b in zip(entries, entries[1:])), default=height_px,
+        )
+        scale = min(1.0, pitch_px / height_px) if height_px > 0 else 1.0
+        visible = scale >= _JOB_LABEL_MIN_SCALE
+        for label, swatch, center_y in entries:
             label.setVisible(visible)
             swatch.setVisible(visible)
             if not visible:
                 continue
-            next_free_px = top_px + height_px
-            label.setPos(label.x(), center_y - (height_px / 2) / sy)
-            swatch.setPos(swatch.x(), center_y - (swatch.rect().height() / 2) / sy)
+            for item, item_h in ((label, label.boundingRect().height()), (swatch, swatch.rect().height())):
+                if item.scale() != scale:
+                    item.setScale(scale)
+                item.setPos(item.x(), center_y - (item_h * scale / 2) / sy)
 
     def _update_axis_density(self, sx):
         """現在の横方向の拡縮率（sx）に応じて、日付軸の見せ方を切り替える。

@@ -205,6 +205,64 @@ def test_dragging_the_right_edge_changes_the_duration(qapp, gantt):
     assert w.undo_manager.undo_label() == "ガントでタスクの期間を変更"
 
 
+def _hover(qapp, view, pos, modifiers=Qt.NoModifier):
+    viewport = view.viewport()
+    move = QMouseEvent(QEvent.MouseMove, QPointF(pos), QPointF(viewport.mapToGlobal(pos)),
+                       Qt.NoButton, Qt.NoButton, modifiers)
+    QApplication.sendEvent(viewport, move)
+    qapp.processEvents()
+
+
+def test_the_right_edge_of_a_selected_bar_shows_a_resize_cursor_and_drags_without_a_key(qapp, gantt):
+    """選んだバーの右端にカーソルを乗せると↔になり、キーを押さずにドラッグで期間を伸縮できる。"""
+    w, tab, ids = gantt
+    key = _key(ids, "job1", "t1")
+    bar = tab.view.bars()[key]
+    _zoom_to(tab, bar)
+    body = tab.view.body
+    edge = body.mapFromScene(bar.bar_rect.right() - 0.5, bar.bar_rect.center().y())
+    edge.setX(edge.x() - 1)
+    middle = body.mapFromScene(bar.bar_rect.center())
+
+    # 選んでいないバーの右端では↔にしない（キーなしのドラッグは従来どおり範囲選択）
+    _hover(qapp, body, edge)
+    assert body.viewport().cursor().shape() != Qt.SizeHorCursor
+    tab.view.select_keys([key])
+    _hover(qapp, body, edge)
+    assert body.viewport().cursor().shape() == Qt.SizeHorCursor
+    _hover(qapp, body, middle)
+    assert body.viewport().cursor().shape() == Qt.ArrowCursor
+
+    end = body.mapFromScene(bar.bar_rect.right() + 7 * 10, bar.bar_rect.center().y())
+    _drag(qapp, body, edge, end, modifiers=Qt.NoModifier)
+    _wait_recomputed(qapp, tab)
+    assert _override(w.db, ids["job1"], ids["t1"])["override_days"] == 10  # 5日 + 5営業日
+    assert _override(w.db, ids["job1"], ids["t1"])["start_pin_date"] is None
+
+
+def test_the_right_edge_can_be_grabbed_when_the_next_bar_touches_it(qapp, gantt):
+    """回帰テスト: 右端に次のバーが接していると、その位置では次のバーが見つかり、
+    選んだバーの右端でも↔にならず、掴めなかった。"""
+    w, tab, ids = gantt
+    key = _key(ids, "job2", "t1")
+    bar = tab.view.bars()[key]
+    neighbor = tab.view.bars()[_key(ids, "job2", "t2")]
+    assert neighbor.bar_rect.left() == bar.bar_rect.right()  # 前提: 次のバーが接している
+    _zoom_to(tab, bar)
+    tab.view.select_keys([key])
+    body = tab.view.body
+    edge = body.mapFromScene(bar.bar_rect.right() + 0.5, bar.bar_rect.center().y())
+    edge.setX(edge.x() + 1)  # 次のバーの上（左端のすぐ内側）
+    _hover(qapp, body, edge)
+    assert body.viewport().cursor().shape() == Qt.SizeHorCursor
+
+    end = body.mapFromScene(bar.bar_rect.right() + 3 * 10, bar.bar_rect.center().y())
+    _drag(qapp, body, edge, end, modifiers=Qt.NoModifier)
+    _wait_recomputed(qapp, tab)
+    assert _override(w.db, ids["job2"], ids["t1"])["override_days"] is not None
+    assert _override(w.db, ids["job2"], ids["t2"])["override_id"] is None
+
+
 def test_resizing_back_to_the_default_duration_removes_the_override(qapp, gantt):
     w, tab, ids = gantt
     key = _key(ids, "job1", "t1")
@@ -615,9 +673,10 @@ def _visible_label_rects(view, labels):
     rects = []
     for label in labels:
         if label.isVisible():
-            top_left = view.mapFromScene(label.pos())
-            rect = label.boundingRect()
-            rects.append((top_left.x(), top_left.y(), top_left.x() + rect.width(), top_left.y() + rect.height()))
+            # 画面上の矩形（縮小した名前は、その倍率も含めて）
+            rect = label.deviceTransform(view.viewportTransform()).mapRect(label.boundingRect())
+            # （ちょうど接している名前を、計算誤差で重なりと見なさないよう丸める）
+            rects.append(tuple(round(v, 2) for v in (rect.left(), rect.top(), rect.right(), rect.bottom())))
     return rects
 
 
@@ -627,7 +686,8 @@ def _overlaps(a, b):
 
 def test_job_names_do_not_overlap_when_the_chart_is_zoomed_out(qapp, gantt, tmp_path):
     """回帰テスト: 全体表示で縦に縮小すると行が文字より低くなり、左列のジョブ名同士が
-    重なって読めなかった。重なる名前は隠し、拡大すれば全部現れる。"""
+    重なって読めなかった。重なるときは全行の名前をそろって縮小し、それでも読めないほど
+    低いなら全行とも隠す（行によって出たり出なかったりしない）。拡大すれば全部現れる。"""
     w, tab, _ids = gantt
     path = tmp_path / "many.pschedule"
     db = ProjectDatabase.create_new(str(path))
@@ -648,15 +708,25 @@ def test_job_names_do_not_overlap_when_the_chart_is_zoomed_out(qapp, gantt, tmp_
 
     column = tab.view.column
     labels = [label for label, _swatch, _y in column.scene().gantt_job_labels]
+    # 60行は収まらないので、全行とも隠している（一部だけ出すことはしない）
+    assert not any(label.isVisible() for label in labels)
+
+    # 少し拡大すると、全行の名前がそろって縮小して現れ、重ならない
+    body = tab.view.body
+    pitch = labels[0].boundingRect().height() * 0.8 / (column.scene().gantt_job_labels[1][2]
+                                                        - column.scene().gantt_job_labels[0][2])
+    body.scale(1.0, pitch / body.transform().m22())
+    tab.view._sync_panes()
+    assert all(label.isVisible() for label in labels)
+    assert {round(label.scale(), 3) for label in labels} == {0.8}
     rects = _visible_label_rects(column, labels)
-    assert 0 < len(rects) < len(labels)  # 60行は収まらないので一部を隠している
     for i, a in enumerate(rects):
         for b in rects[i + 1:]:
             assert not _overlaps(a, b)
 
-    tab.view.body.scale(1.0, 20.0)
+    body.scale(1.0, 20.0)
     tab.view._sync_panes()
-    assert all(label.isVisible() for label in labels)
+    assert all(label.isVisible() and label.scale() == 1.0 for label in labels)
 
 
 def test_header_labels_do_not_overlap_and_stay_inside_the_view(qapp, gantt, tmp_path):

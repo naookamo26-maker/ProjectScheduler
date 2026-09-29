@@ -1486,7 +1486,8 @@ class ProjectDatabase:
         remove_keys（(job_id, workflow_task_id) の並び。無効にしたタスク等）の行を
         消す。対象タスクの変更案の記録（draft_moves）も消す。global_signature を
         渡したとき（全体設定の変更も含めて確定する場合）だけ更新する。"""
-        for key in list(remove_keys) + [(r["job_id"], r["workflow_task_id"]) for r in rows]:
+        keys = list(remove_keys) + [(r["job_id"], r["workflow_task_id"]) for r in rows]
+        for key in keys:
             self._conn.execute(
                 "DELETE FROM confirmed_schedule WHERE job_id = ? AND workflow_task_id = ?", key
             )
@@ -1501,7 +1502,85 @@ class ProjectDatabase:
                 "UPDATE project SET confirmed_at = ?, confirmed_global_signature = ? WHERE id = 1",
                 (confirmed_at, global_signature),
             )
+        self._merge_into_draft_base(keys)
         self._commit()
+
+    def _merge_into_draft_base(self, keys):
+        """「選択した変更を確定」した分（keys のタスクの確定行と入力＝上書き行）を、
+        破棄用のスナップショット（draft_base）にも書き込む。
+
+        スナップショットは「最後に確定した時点の状態」なので、一部だけ確定したら
+        その分も含めておく。以前は破棄の時点の上書き行を入れ直していたため、一部
+        確定した後に同じタスクをさらに編集（チームの変更など）してから「変更を破棄」
+        しても、その編集が戻らなかった。"""
+        row = self._conn.execute("SELECT started_on, snapshot FROM draft_base WHERE id = 1").fetchone()
+        if row is None:
+            return
+        base = sqlite3.connect(":memory:")
+        try:
+            base.row_factory = sqlite3.Row
+            base.deserialize(zlib.decompress(row["snapshot"]))
+            teams = {r["id"] for r in base.execute("SELECT id FROM teams").fetchall()}
+            milestones = {r["id"] for r in base.execute("SELECT id FROM milestones").fetchall()}
+            tasks = {
+                (r["job_id"], r["workflow_task_id"])
+                for r in base.execute(
+                    "SELECT j.id AS job_id, wt.id AS workflow_task_id FROM jobs j "
+                    "JOIN workflow_tasks wt ON wt.workflow_id = j.workflow_id"
+                ).fetchall()
+            }
+            for key in set(keys):
+                if key not in tasks:
+                    continue  # 確定した後に足したジョブ等。最後に確定した時点には無い
+                base.execute(
+                    "DELETE FROM confirmed_schedule WHERE job_id = ? AND workflow_task_id = ?", key
+                )
+                confirmed = self._conn.execute(
+                    "SELECT * FROM confirmed_schedule WHERE job_id = ? AND workflow_task_id = ?", key
+                ).fetchone()
+                if confirmed is not None:
+                    confirmed = dict(confirmed)
+                    if confirmed["team_id"] not in teams:
+                        confirmed["team_id"] = None
+                    base.execute(
+                        "INSERT INTO confirmed_schedule(job_id, workflow_task_id, start_date, "
+                        "end_date, days, team_id, input_signature) VALUES (:job_id, "
+                        ":workflow_task_id, :start_date, :end_date, :days, :team_id, "
+                        ":input_signature)",
+                        confirmed,
+                    )
+                base.execute(
+                    "DELETE FROM job_task_overrides WHERE job_id = ? AND workflow_task_id = ?", key
+                )
+                o = self._conn.execute(
+                    "SELECT * FROM job_task_overrides WHERE job_id = ? AND workflow_task_id = ?", key
+                ).fetchone()
+                if o is not None:
+                    # 最後に確定した後に足したマイルストーン・チームは、スナップショットには
+                    # 無い。指したままだと破棄で外部キー制約に反するので「未設定」にする
+                    base.execute(
+                        "INSERT INTO job_task_overrides(job_id, workflow_task_id, is_active, "
+                        "override_days, milestone_id, team_id, start_pin_date, tags, status) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (o["job_id"], o["workflow_task_id"], o["is_active"], o["override_days"],
+                         o["milestone_id"] if o["milestone_id"] in milestones else None,
+                         o["team_id"] if o["team_id"] in teams else None,
+                         o["start_pin_date"], o["tags"], o["status"]),
+                    )
+            project = self._conn.execute(
+                "SELECT confirmed_at, confirmed_global_signature FROM project WHERE id = 1"
+            ).fetchone()
+            base.execute(
+                "UPDATE project SET confirmed_at = ?, confirmed_global_signature = ? WHERE id = 1",
+                (project["confirmed_at"], project["confirmed_global_signature"]),
+            )
+            base.commit()
+            snapshot = zlib.compress(base.serialize(), 6)
+        finally:
+            base.close()
+        self._conn.execute(
+            "UPDATE draft_base SET snapshot = ? WHERE id = 1", (snapshot,)
+        )
 
     def _insert_confirmed_rows(self, rows):
         self._conn.executemany(
@@ -1646,7 +1725,13 @@ class ProjectDatabase:
         # 変わったタスクは、確定時から変わったタスクとして表示される。
         existing_teams = {r["id"] for r in self._conn.execute("SELECT id FROM teams").fetchall()}
         existing_milestones = {r["id"] for r in self._conn.execute("SELECT id FROM milestones").fetchall()}
-        partially = [k for k, r in confirmed_now.items() if confirmed_base.get(k) != r]
+        # 一部だけ確定した分は、確定した時点でスナップショットにも書き込んである
+        # （_merge_into_draft_base）。ここで入れ直すのは、それ以前の版で一部確定した
+        # ファイルの分だけ（確定後に足したチームは、書き込む際に「未設定」にしてある）
+        partially = [
+            k for k, r in confirmed_now.items()
+            if confirmed_base.get(k) != dict(r, team_id=r["team_id"] if r["team_id"] in existing_teams else None)
+        ]
         existing_tasks = {
             (r["job_id"], r["workflow_task_id"])
             for r in self._conn.execute(

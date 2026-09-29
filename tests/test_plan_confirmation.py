@@ -348,6 +348,32 @@ def test_discarding_the_draft_restores_inputs_but_keeps_progress_updates(tmp_pat
     assert all(j["name"] != "追加ジョブ" for j in db.list_jobs())
 
 
+def test_discarding_after_confirming_a_selection_reverts_later_edits_of_that_task(tmp_path):
+    """「選択した変更を確定」したタスクをさらに編集してから破棄すると、確定した
+    時点の入力に戻る。以前は破棄の時点の入力（後の編集）がそのまま残っていた。"""
+    from gui.plan_actions import confirm_all, confirm_selected
+    from gui.plan_confirmation import CONFIRMED, PlanState, successor_map
+
+    db, ids = _plan_project(tmp_path)
+    team_b = db.add_team("チームB", 1)
+    df, _, _ = _compute(db)
+    confirm_all(db, df)
+    j0 = ids["jobs"][0]
+    db.update_job_task_override_fields(j0, ids["t1"], team_id=team_b)
+    df, _, _ = _compute(db)
+    confirm_selected(db, df, {(j0, ids["t1"])}, successor_map(db))
+    team_c = db.add_team("チームC", 1)
+    db.update_job_task_override_fields(j0, ids["t1"], team_id=team_c, override_days=9)
+
+    db.discard_draft()
+
+    rows = {(o["job_id"], o["workflow_task_id"]): o for o in db.list_all_job_task_overrides()}
+    assert rows[(j0, ids["t1"])]["override_team_id"] == team_b  # 確定したチームに戻る
+    assert rows[(j0, ids["t1"])]["override_days"] is None
+    assert all(t["name"] != "チームC" for t in db.list_teams())
+    assert PlanState(db).status == CONFIRMED
+
+
 def test_clearing_the_confirmation_returns_to_free_simulation(tmp_path):
     from gui.plan_actions import confirm_all
     from gui.plan_confirmation import UNCONFIRMED, PlanState
