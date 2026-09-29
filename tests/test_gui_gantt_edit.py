@@ -407,6 +407,11 @@ def test_small_pinned_bars_keep_a_pin_strip_like_the_status_strip(qapp, gantt):
     assert not bar.shows_pin(20, 8) and bar.shows_pin_strip(20, 8)
     assert bar.status_segment_px(20, 8) > 0  # 状態の帯と同じ大きさまで残る
     assert not bar.shows_pin_strip(4, 8)
+    # 期間の短いタスク: 📍と状態が重ならないよう、まず状態を帯に、それでも狭ければ📍も帯にする
+    assert bar.marker_layout(60, 20) == (True, 0, 16)    # 📍＋✔の区画
+    assert bar.marker_layout(40, 20) == (True, 0, 4)     # 📍＋状態の帯
+    assert bar.marker_layout(20, 20) == (False, 3, 4)    # ピンの帯＋状態の帯
+    assert bar.marker_layout(8, 20) == (False, 2, 2)     # ごく細いバーは帯を1/4までに抑える
     assert not tab.view.bars()[_key(ids, "job2", "t1")].shows_pin_strip(20, 8)
     tab.view.fit_all()
     tab.view.grab()

@@ -306,16 +306,38 @@ class TaskBarItem(QGraphicsPathItem):
     def key(self):
         return (self.job_key, self.task_key)
 
+    def marker_layout(self, width_px, height_px):
+        """画面上のバーの大きさから、印の描き方を決める（描画とラベルの配置で揃える）。
+        戻り値は (📍を描くか, 左端のピンの帯の幅, 右端の状態の区画・帯の幅)。
+
+        期間の短いタスクでは、📍と状態の区画を両方そのままの大きさで描くと重なり、
+        タスク名も入らない。狭いときは、まず状態を細い帯にし、それでも📍と重なるなら
+        📍も左端の細い帯にする。ごく細いバーでは、帯をバーの幅の1/4までに抑えて
+        チームの色を残す。"""
+        if width_px < _STATUS_MIN_BAR_PX or not (self.pinned or self.status):
+            return False, 0, 0
+        pin = self.pinned and width_px >= _PIN_MARKER_PX and height_px >= _PIN_MARKER_PX
+        status_px = 0
+        if self.status:
+            full_width = _STATUS_MARK_MIN_BAR_PX + (_PIN_LABEL_RESERVE_PX if pin else 0)
+            if width_px >= full_width and height_px >= _STATUS_MARK_MIN_HEIGHT_PX:
+                status_px = _STATUS_SEGMENT_PX
+            else:
+                status_px = min(_STATUS_STRIP_PX, width_px / 4)
+            if pin and width_px < _PIN_LABEL_RESERVE_PX + status_px + 2:
+                pin = False
+        pin_strip_px = min(_PIN_STRIP_PX, width_px / 4) if self.pinned and not pin else 0
+        return pin, pin_strip_px, status_px
+
     def shows_pin(self, width_px, height_px):
         """画面上のバーの大きさで、📍の印を描くかどうか（ラベルの配置と揃える）。"""
-        return self.pinned and width_px >= _PIN_MARKER_PX and height_px >= _PIN_MARKER_PX
+        return self.marker_layout(width_px, height_px)[0]
 
     def shows_pin_strip(self, width_px, height_px):
         """ピンを描けないほど小さいバーで、代わりに左端の細い帯を描くか。状態の帯
         （status_segment_px）と同じく、全体表示でも開始固定日のタスクが分かるようにする
         （状態だけ見えて📍が消えると、固定したタスクが分からなくなる）。"""
-        return (self.pinned and not self.shows_pin(width_px, height_px)
-                and width_px >= _STATUS_MIN_BAR_PX)
+        return self.marker_layout(width_px, height_px)[1] > 0
 
     def _paint_edge_strip(self, painter, rect, x, width, color):
         """バーの丸い角に沿って切り取った、高さいっぱいの帯を描く（画面座標）。"""
@@ -330,13 +352,9 @@ class TaskBarItem(QGraphicsPathItem):
         painter.restore()
 
     def status_segment_px(self, width_px, height_px):
-        """画面上のバーの大きさで、状態の区画をどの幅（画面px）で描くか（0 なら描かない）。
-        ラベルの配置と揃える。"""
-        if self.status is None or width_px < _STATUS_MIN_BAR_PX:
-            return 0
-        if width_px >= _STATUS_MARK_MIN_BAR_PX and height_px >= _STATUS_MARK_MIN_HEIGHT_PX:
-            return _STATUS_SEGMENT_PX
-        return _STATUS_STRIP_PX
+        """画面上のバーの大きさで、状態の区画をどの幅（画面px）で描くか（0 なら描かない。
+        _STATUS_SEGMENT_PX のときだけ記号を入れる）。ラベルの配置と揃える。"""
+        return self.marker_layout(width_px, height_px)[2]
 
     def _paint_status(self, painter, rect, border_drawn):
         """状態の区画（画面座標で描く）。バーの丸い角に沿って切り取り、区切りの線と
@@ -418,8 +436,9 @@ class TaskBarItem(QGraphicsPathItem):
         # 状態の区画・小さいバーのピンの帯は斜線（未確定）の上、強調・選択の枠の下に描く
         self._device_path = painter.worldTransform().map(self.path())
         self._paint_status(painter, rect, border_drawn)
-        if self.shows_pin_strip(rect.width(), rect.height()):
-            self._paint_edge_strip(painter, rect, rect.left() - 1, _PIN_STRIP_PX + 1, _PIN_HEAD_COLOR)
+        pin_strip_px = self.marker_layout(rect.width(), rect.height())[1]
+        if pin_strip_px:
+            self._paint_edge_strip(painter, rect, rect.left() - 1, pin_strip_px + 1, _PIN_HEAD_COLOR)
         painter.save()
         painter.resetTransform()
         painter.setBrush(Qt.NoBrush)
