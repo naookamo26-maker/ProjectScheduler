@@ -69,3 +69,26 @@ def test_a_dependency_on_a_disabled_task_follows_the_rewired_predecessor(sample_
     succ = (f"JOB_{e['job_id']:03d}", f"T_{e['workflow_task_id']:03d}")
     preds = [p for p, s, _b in links if s == succ]
     assert preds and all(p[0] == f"JOB_{pred_job:03d}" and p[1] != f"T_{pred_task:03d}" for p in preds)
+
+
+def test_links_are_not_copied_when_the_result_is_sliced(sample_db):
+    """回帰テスト: 依存の一覧を list のまま attrs に載せていたため、pandas が行の取り出し・
+    絞り込みのたびに deepcopy し、大きな計画（依存558件・16,230行）ではガントの描画1回に
+    3分かかっていた。中身は変えないので、コピーを求められても同じものを返す。"""
+    import copy
+    import pickle
+
+    from project_scheduler import JobLinks
+
+    from gui.gantt_generator import build_frames, compute_schedule_from_frames
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        df = compute_schedule_from_frames(build_frames(sample_db), verbose=False,
+                                          distribution_ratio=sample_db.get_project()["distribution_ratio"])
+    links = df.attrs["job_links"]
+    assert isinstance(links, JobLinks) and len(links) > 0
+    assert copy.deepcopy(links) is links
+    assert df.iloc[:3].attrs["job_links"] is links
+    assert df[df["Job_ID"] == df["Job_ID"].iloc[0]].attrs["job_links"] is links
+    assert next(df.iterrows())[1].attrs["job_links"] is links
+    assert list(pickle.loads(pickle.dumps(links))) == list(links)  # ワーカースレッドとの受け渡し等でも壊れない

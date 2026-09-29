@@ -46,6 +46,7 @@ from gui.tab_gantt import GanttTab
 from gui.tab_jobs import JobsTab
 from gui.tab_workflows import WorkflowsTab
 from gui.undo_manager import UndoManager
+from gui.widgets_common import ElidedLabel
 from project_scheduler import SchedulingError
 
 FILE_FILTER = "Project Scheduler Files (*.pschedule);;All Files (*)"
@@ -105,9 +106,14 @@ class MainWindow(QMainWindow):
         # ファイル名（左側の一時的なメッセージ）と並べて右端に常に出す。保存時の
         # 「保存しました」に上書きされないよう、別の常設の表示にする。
         self.schedule_summary_label = QLabel("")
-        self.schedule_summary_label.setContentsMargins(0, 0, 8, 0)
+        self.schedule_summary_label.setContentsMargins(12, 0, 8, 0)
         self.statusBar().addPermanentWidget(self.schedule_summary_label)
-        self.statusBar().showMessage(tr("プロジェクトファイルを新規作成するか、開いてください"))
+        # 開いているファイルのパスは、幅に収まらなければ中央を省略する（全文はツールチップ）。
+        # 以前は一時メッセージとして出していたため、右の計算結果の文言が長いとパスが途中で
+        # 切れ、区切りなく文言とつながって見えた。保存時の「保存しました」は従来どおり
+        # 一時メッセージで、出ている間だけこの表示を覆う。
+        self.project_path_label = ElidedLabel(tr("プロジェクトファイルを新規作成するか、開いてください"))
+        self.statusBar().addWidget(self.project_path_label, 1)
 
     def dragEnterEvent(self, event):
         if self._pschedule_path_from_mime(event.mimeData()) is not None:
@@ -437,6 +443,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, tr("エラー"), tr("保存できませんでした:\n{e}", e=e))
             return False
         self._update_title()
+        self._show_project_path()
         self.statusBar().showMessage(tr("保存しました: {path}", path=self.db.path), 5000)
         return True
 
@@ -584,8 +591,13 @@ class MainWindow(QMainWindow):
         if opened_clean:
             self.undo_manager.mark_clean()
         self._update_undo_redo_actions()
-        self.statusBar().showMessage(tr("開いているプロジェクト: {path}", path=db.path or tr("無題（未保存）")))
+        self._show_project_path()
         self._update_title()
+
+    def _show_project_path(self):
+        self.project_path_label.setText(
+            tr("開いているプロジェクト: {path}", path=self.db.path or tr("無題（未保存）"))
+        )
 
     # -- Undo/Redo -----------------------------------------------------------
     #

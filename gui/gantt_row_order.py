@@ -28,20 +28,26 @@ ORDERS = (ORDER_START, ORDER_END, ORDER_MILESTONE, ORDER_PRIORITY)
 def _job_facts(df, display):
     """ジョブごとの (開始, 終了, 締切 or None, 優先度, ワークフロー)。"""
     deadlines = {mid: when for mid, _name, when in (display or {}).get("milestone_markers", ())}
+    # ジョブごとの集計は groupby の集計でまとめて行う（ジョブごとに DataFrame を取り出すと、
+    # 大きな計画で並べ替えだけで数秒かかる）
+    grouped = df.groupby("Job_ID", sort=False)
+    starts = grouped["Start_Date"].min()
+    ends = grouped["End_Date"].max()
+    # タスクごとにマイルストーンを上書きできるので、ジョブ全体が終わるべき
+    # 締切＝タスクの締切のうち最も遅いものをジョブの締切とする
+    job_deadlines = df["Milestone_ID"].map(deadlines).groupby(df["Job_ID"], sort=False).max()
+    firsts = df.drop_duplicates("Job_ID").set_index("Job_ID")
     facts = {}
-    for job_id, rows in df.groupby("Job_ID", sort=False):
-        # タスクごとにマイルストーンを上書きできるので、ジョブ全体が終わるべき
-        # 締切＝タスクの締切のうち最も遅いものをジョブの締切とする
-        job_deadlines = [deadlines[m] for m in rows["Milestone_ID"] if m in deadlines]
-        first = rows.iloc[0]
+    for job_id, first in zip(firsts.index, firsts.itertuples(index=False)):
+        deadline = job_deadlines.get(job_id)
         facts[job_id] = {
-            "start": rows["Start_Date"].min(),
-            "end": rows["End_Date"].max(),
-            "deadline": max(job_deadlines) if job_deadlines else None,
+            "start": starts[job_id],
+            "end": ends[job_id],
+            "deadline": None if pd.isna(deadline) else deadline,
             # 未設定の優先度は、スケジューラが最低優先（project_scheduler.DEFAULT_LOW_PRIORITY）
             # として扱った値がそのまま入っている。並びでも同じく最低優先として扱う
-            "priority": first["Priority"] if pd.notna(first["Priority"]) else float("inf"),
-            "workflow": first["Workflow_ID"],
+            "priority": first.Priority if pd.notna(first.Priority) else float("inf"),
+            "workflow": first.Workflow_ID,
         }
     return facts
 

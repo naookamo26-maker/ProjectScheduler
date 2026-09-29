@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QSizePolicy,
+    QSlider,
     QSpacerItem,
     QStyle,
     QToolButton,
@@ -111,6 +112,8 @@ _PLACEMENT_SLIDER_WIDTH = 110
 # まとめて反映する（デバウンス）。値はキー入力の間隔として自然に感じられる
 # 程度（他の即時反映系UIとの一貫性より「打ち終わってから絞り込まれる」体感を優先）。
 _SEARCH_DEBOUNCE_MS = 300
+# 配置スライダーを溝のクリック・キーで動かしたとき、操作が止まってから確定するまでの待ち
+_PLACEMENT_COMMIT_DELAY_MS = 400
 
 
 # 「並び」の選択肢（gui/gantt_row_order.py）
@@ -179,6 +182,16 @@ class GanttTab(QWidget):
         # 並べる。編集・絞り込みの後は、この並びを保つ（gui/gantt_row_order.keep_order）。
         self._row_order = None
         self._row_order_stale = False
+        # 今の並び順で並べた全ジョブ（絞り込み前）。並びの判定は絞り込み前の全体で行う
+        # （_job_order_for）。どの結果・どの並び順で作ったものかを一緒に覚える。
+        self._full_order = []
+        self._full_order_source = None
+        self._full_order_options = None
+        # 画面下部に出す計算結果の文言（絞り込みの件数を足す前のもの。_update_summary）
+        self._base_summary = ""
+        self._filter_note = ""
+        # 最後にチャートへ反映したジョブ名の検索文字列（同じ文字列で作り直さないため）
+        self._applied_search = ""
 
         layout = QVBoxLayout(self)
 
@@ -220,12 +233,13 @@ class GanttTab(QWidget):
         self._search_debounce_timer = QTimer(self)
         self._search_debounce_timer.setSingleShot(True)
         self._search_debounce_timer.setInterval(_SEARCH_DEBOUNCE_MS)
-        self._search_debounce_timer.timeout.connect(self._refresh_chart)
+        self._search_debounce_timer.timeout.connect(self._apply_search)
         self.search_edit.textChanged.connect(self._search_debounce_timer.start)
-        # クリアボタンなど即座に反映したい操作もあるため、編集完了時
-        # （Enter/フォーカスアウト）は待たずに即反映する。
+        # 編集完了時（Enter/フォーカスアウト）は待たずに即反映する。ただし入力が止まって
+        # 既に反映済みなら何もしない（以前は、絞り込まれた後にチャートをクリックして
+        # フォーカスが外れるたびにチャートを作り直し、表示位置が全体表示に戻っていた）。
         self.search_edit.editingFinished.connect(self._search_debounce_timer.stop)
-        self.search_edit.editingFinished.connect(self._refresh_chart)
+        self.search_edit.editingFinished.connect(self._apply_search)
         # 20文字程度が入る幅に固定する（addWidget(..., 1)で親の幅いっぱいに
         # 伸びてしまうと、他の絞り込みチェックボックスと並べたときに長すぎるため）。
         search_edit_width = QFontMetrics(self.search_edit.font()).horizontalAdvance(chr(0x3042) * 20)  # 全角20文字ぶん（翻訳しない） + 24
@@ -286,6 +300,15 @@ class GanttTab(QWidget):
 
         self.placement_slider.valueChanged.connect(self._on_placement_slider_value_changed)
         self.placement_slider.sliderReleased.connect(self._on_placement_slider_released)
+        # つまみのドラッグ以外（溝のクリック、←→・PageUp/Down キー）で動かしたときは、
+        # sliderReleased が来ない。以前はこの場合に表示だけ変わって確定されず、スライダーの
+        # 値と実際のチャートが食い違ったままになっていた。操作が止まってから1回だけ確定する
+        # （キーを押し続けても、再計算とUndoが1回で済むように）。
+        self._placement_commit_timer = QTimer(self)
+        self._placement_commit_timer.setSingleShot(True)
+        self._placement_commit_timer.setInterval(_PLACEMENT_COMMIT_DELAY_MS)
+        self._placement_commit_timer.timeout.connect(self._on_placement_slider_released)
+        self.placement_slider.actionTriggered.connect(self._on_placement_slider_action)
         self.placement_spinbox.valueChanged.connect(self._on_placement_spinbox_value_changed)
         # 確定（＝DB書き込みと再計算）はここだけで行う。editingFinished は
         # Enterでの確定時とフォーカスを失った時の両方で飛ぶ
@@ -483,10 +506,21 @@ class GanttTab(QWidget):
 
     def _job_order_for(self, df):
         """表示する行の並び。前回の並びがあればそれを保ち（新しく加わったジョブだけ
-        今の並び順の位置へ差し込む）、並びが選んだ順どおりかどうかを覚える。"""
-        grouping, order, descending = self.row_order_options()
-        fresh = sort_job_ids(df, self._display, grouping, order, descending,
-                             job_links=self._dependency_links())
+        今の並び順の位置へ差し込む）、並びが選んだ順どおりかどうかを覚える。
+
+        並び順は絞り込み前の全体（全タスク）で決め、表示するジョブだけを取り出す。
+        絞り込んだ後の一部で並べ直すと、依存のつながり（隠れた親の下にいた子が上へ
+        移る）や、一部のタスクを隠したジョブの開始日が変わって順が入れ替わり、編集して
+        いないのに並べ直すボタンが「選んだ順どおりではない」と目立っていた。"""
+        options = self.row_order_options()
+        if self._full_order_source is not self._result_df or self._full_order_options != options:
+            grouping, order, descending = options
+            self._full_order = sort_job_ids(self._result_df, self._display, grouping, order, descending,
+                                            job_links=self._dependency_links())
+            self._full_order_source = self._result_df
+            self._full_order_options = options
+        visible = set(df["Job_ID"])
+        fresh = [job_id for job_id in self._full_order if job_id in visible]
         job_order = fresh if self._row_order is None else keep_order(self._row_order, fresh)
         self._row_order = job_order
         self._row_order_stale = job_order != fresh
@@ -532,10 +566,16 @@ class GanttTab(QWidget):
     def _on_cache_updated(self):
         """ScheduleCache の結果・エラーが更新されるたびに呼ばれる。
 
-        自分が非表示の間は反映を後回しにする——次にこのタブへ切り替わった際、
-        refresh_choices() の中で _sync_from_cache() が同期的に最新の内容を
-        反映するため、ここで無駄にチャートを再構築する必要がない。"""
+        自分が非表示の間はチャートの反映を後回しにする——次にこのタブへ切り替わった際、
+        refresh_choices() の中で _sync_from_cache() が同期的に最新の内容を反映するため、
+        ここで無駄にチャートを再構築する必要がない。ただし画面下部の文言はどのタブでも
+        見えるので、隠れている間も最新にする（編集の直後に他のタブへ移ると、計算が
+        終わっても「計算中です...」のまま残っていた）。"""
         if not self.isVisible():
+            if self.cache.error_message is not None:
+                self._set_summary("")
+            elif self.cache.is_fresh():
+                self._set_summary(self._result_summary(self.cache.result_df)[0])
             return
         self._sync_from_cache()
 
@@ -547,6 +587,14 @@ class GanttTab(QWidget):
             return
         if not self.cache.is_fresh():
             self._set_summary(tr("スケジューリングを計算中です..."))
+            if self.view.scene() is None:
+                self.view.set_placeholder(tr("スケジューリングを計算中です..."))
+            return
+        if (self.cache.result_df is self._result_df and self.view.scene() is not None
+                and self._pending_edit is None and self._pending_view_state is None):
+            # 表示中のチャートと同じ結果（タブを行き来しただけ等）。作り直さない
+            # （以前は毎回作り直して表示位置が全体表示に戻り、大きな計画では毎回数秒固まっていた）
+            self._update_summary()
             return
         self._result_df = self.cache.result_df
         self._display = self.cache.display
@@ -561,7 +609,14 @@ class GanttTab(QWidget):
         self.placement_spinbox.blockSignals(False)
 
     def _on_placement_slider_released(self):
+        self._placement_commit_timer.stop()
         self._commit_distribution_ratio(self.placement_slider.value() / 100.0)
+
+    def _on_placement_slider_action(self, action):
+        """つまみのドラッグ（SliderMove。離した時に確定する）以外の操作で動いたら、
+        操作が止まるのを待って確定する。"""
+        if action != QSlider.SliderMove and not self.placement_slider.isSliderDown():
+            self._placement_commit_timer.start()
 
     def _on_placement_spinbox_value_changed(self, value):
         """▲▼ボタン・キー操作・入力の確定で値が変わるたびに呼ばれる。
@@ -627,27 +682,31 @@ class GanttTab(QWidget):
                 self._moved_note += self._pending_edit["note"]
         else:
             self._moved_note = ""
+        summary, errors = self._result_summary(self._result_df)
+        self._base_summary = summary + self._moved_note
         self._rebuild_filters()
         self._refresh_chart()
         self._pending_edit = None
         self._set_highlight(moved)
-        summary, errors = self._result_summary()
-        self._set_summary(summary + self._moved_note)
+        self._update_summary()
         self._set_errors(errors)
         if self._editor is not None and self._editor.isVisible():
             self._editor.reload()
 
-    def _result_summary(self):
+    def _result_summary(self, result_df=None):
         """(画面下部に出す文言, エラーの段に出す文言。問題が無ければ "") を返す。
+        result_df を省略すると、表示中の結果について返す。
 
         締切に間に合わないタスクはエラーではなく結果として返ってくるため
         （project_scheduler.py の Deadline_Overrun_Days を参照）、件数を
         ここで明示しないと気付かないまま見過ごされてしまう。"""
-        if self._result_df is None or self._result_df.empty:
+        if result_df is None:
+            result_df = self._result_df
+        if result_df is None or result_df.empty:
             return tr("有効なタスクがありません。"), ""
-        total = len(self._result_df)
+        total = len(result_df)
         notes = []
-        overruns = self._result_df[self._result_df["Deadline_Overrun_Days"] > 0]
+        overruns = result_df[result_df["Deadline_Overrun_Days"] > 0]
         if not overruns.empty:
             worst = int(overruns["Deadline_Overrun_Days"].max())
             notes.append(
@@ -660,7 +719,7 @@ class GanttTab(QWidget):
         # 満たせない開始固定日も、締切超過と同じく例外ではなく結果として返って
         # くる（固定を動かして辻褄を合わせず、矛盾はデータを書き換えて解消
         # しない）。ここで件数を出さないと気付けない。
-        broken = self._result_df[self._result_df["Constraint_Violation"] != ""]
+        broken = result_df[result_df["Constraint_Violation"] != ""]
         if not broken.empty:
             notes.append(
                 tr(
@@ -675,6 +734,10 @@ class GanttTab(QWidget):
         """問題が無いときの文言。画面下部のファイル名の横に出す（gui/main.py）。"""
         self.summary_text = text
         self.summaryChanged.emit(text)
+
+    def _update_summary(self):
+        """計算結果の文言に、絞り込みで表示している件数を添えて画面下部に出す。"""
+        self._set_summary(self._base_summary + self._filter_note)
 
     def _set_errors(self, text):
         """エラーの段。エラーがあるときだけ、部品の段の下に全幅で出す（ダイアログは出さない）。
@@ -692,12 +755,17 @@ class GanttTab(QWidget):
         self._display = None
         self._pending_edit = None
         self._task_positions = {}
+        self._base_summary = ""
+        self._filter_note = ""
+        self.view.set_placeholder(
+            tr("スケジューリングできないため、チャートを表示できません。上の赤字の内容を確認してください。")
+            if is_error else status_message
+        )
         self.view.setScene(None)
         self._rebuild_filters()
+        self._update_filter_indicator(0, 0)
         self._set_summary("" if is_error else status_message)
         self._set_errors(status_message if is_error else "")
-
-    # -- ワークフロー／チーム／ジョブ タグ／タスク タグの絞り込み ----------------------------
 
     def _job_tag_keys(self, job_id):
         """絞り込み判定に使う、ジョブが持つジョブ タグのキー集合。ジョブ タグが
@@ -770,6 +838,28 @@ class GanttTab(QWidget):
             task_tag_items.append((_NO_TAG_FILTER_KEY, tr(_NO_TASK_TAG_FILTER_LABEL)))
         self.task_tag_filter.rebuild(task_tag_items)
 
+    def _apply_search(self):
+        """ジョブ名の検索を反映する。反映済みの文字列と同じなら作り直さない。"""
+        if self.search_edit.text().strip() != self._applied_search:
+            self._refresh_chart()
+
+    def _is_filtering(self):
+        """絞り込みの条件が1つでも効いているか（チェックを外した項目・検索・間に合わないジョブのみ）。"""
+        groups = (self.workflow_filter, self.team_filter, self.tag_filter, self.task_tag_filter)
+        return (any(g.visible_keys() != g.all_keys() for g in groups)
+                or bool(self.search_edit.text().strip()) or self.overrun_only_checkbox.isChecked())
+
+    def _update_filter_indicator(self, shown, total):
+        """絞り込み中であることを、畳んだ見出しと画面下部の文言でも分かるようにする
+        （以前は畳むと何も出ず、件数も絞り込み前の総数のままで、タスクが消えたように見えた）。"""
+        if total and self._is_filtering():
+            self.filters_section.set_title(tr("絞り込み（{total}件中{shown}件のタスクを表示）", total=total, shown=shown))
+            self._filter_note = tr("絞り込みで{shown}件を表示しています。", shown=shown)
+        else:
+            self.filters_section.set_title(tr("絞り込み"))
+            self._filter_note = ""
+        self._update_summary()
+
     def _refresh_chart(self):
         if self._result_df is None:
             self.view.setScene(None)
@@ -780,6 +870,7 @@ class GanttTab(QWidget):
         df = df[df["Team_ID"].isin(self.team_filter.visible_keys())]
 
         search_text = self.search_edit.text().strip()
+        self._applied_search = search_text
         if search_text:
             df = df[df["Job_Name"].str.contains(search_text, case=False, na=False, regex=False)]
 
@@ -801,14 +892,25 @@ class GanttTab(QWidget):
             )
             df = df[df["Job_ID"].isin(overrun_job_ids)]
 
+        # 表示位置と選択は、編集・Undo/Redo の後なら覚えておいたもの、それ以外（絞り込み・
+        # 並べ直し・他のタブでの変更・配置の変更による再計算）なら今の表示のものを保つ。
+        # 全体表示は、初めて描くとき（前のチャートが無いとき）と A キーだけ。
+        had_scene = self.view.scene() is not None
         selection = self._pending_selection
         view_state = self._pending_view_state
-        if selection is None and self.view.scene() is not None:
-            # 絞り込みの変更などで描き直すときも、表示中のバーの選択は保つ
+        reveal_selection = view_state is not None
+        if selection is None and had_scene:
             selection = self.view.selected_keys()
+        if view_state is None and had_scene:
+            view_state = self.view.view_state()
         self._pending_selection = None
         self._pending_view_state = None
 
+        self._update_filter_indicator(len(df), len(self._result_df))
+        self.view.set_placeholder(
+            tr("絞り込みの条件に合うタスクがありません。「絞り込み」の条件を見直してください。")
+            if self._is_filtering() else tr("有効なタスクがありません。")
+        )
         scenes = build_gantt_scenes(df, self._display, color_by="team", job_order=self._job_order_for(df))
         self.view.setScene(scenes)
         body = self.view.body
@@ -826,12 +928,11 @@ class GanttTab(QWidget):
         body.set_dependency_mode(self.dependency_combo.currentData())
         body.set_dependencies(self._dependency_links(), names)
         if view_state is not None:
-            # 編集・Undo/Redo の後は、表示位置（縮尺・スクロール）を保つ。
-            # 行の並びは保つ（_job_order_for）が、日付が大きく動くと選択したバーが
-            # 横に外れうるので、見えるようにスクロールし直す。
+            # 行の並びは保つ（_job_order_for）が、編集で日付が大きく動くと選択したバーが
+            # 横に外れうるので、編集・Undo/Redo の後は見えるようにスクロールし直す。
             self.view.restore_view_state(view_state)
-            self.view.select_keys(selection or [], ensure_visible=True)
-            QTimer.singleShot(0, lambda: self._restore_view_after_layout(view_state, selection))
+            self.view.select_keys(selection or [], ensure_visible=reveal_selection)
+            QTimer.singleShot(0, lambda: self._restore_view_after_layout(view_state, selection, reveal_selection))
         else:
             if selection:
                 self.view.select_keys(selection)
@@ -843,11 +944,11 @@ class GanttTab(QWidget):
     def _fit_chart_view(self):
         self.view.fit_all()
 
-    def _restore_view_after_layout(self, view_state, selection):
+    def _restore_view_after_layout(self, view_state, selection, reveal_selection=True):
         if self.view.scene() is None:
             return
         self.view.restore_view_state(view_state)
-        if selection:
+        if selection and reveal_selection:
             self.view.select_keys(selection, ensure_visible=True)
 
     # -- タスクの編集（docs/roadmap.md §9） -------------------------------------------
@@ -1074,7 +1175,16 @@ class GanttTab(QWidget):
         if not keys:
             return
         bars = self.view.bars()
+        rows = self.editor_task_rows(keys)
         menu = QMenu(self)
+        # 先頭に、メニューが何に効くかを出す（何も無い所を右クリックしたときも、画面の外に
+        # あるかもしれない選択中のタスクに効くことが分かるように）
+        if len(keys) == 1 and rows:
+            title = f'{rows[0]["job_name"]} / {rows[0]["task_name"]}'
+        else:
+            title = tr("選択中の{n}件のタスク", n=len(keys))
+        menu.addAction(title).setEnabled(False)
+        menu.addSeparator()
         edit_action = menu.addAction(tr("編集…"))
         menu.addSeparator()
         pin_action = menu.addAction(tr("開始日を固定"))
@@ -1090,6 +1200,9 @@ class GanttTab(QWidget):
         team_menu.addSeparator()
         for team_id, name in self.team_options():
             team_actions[team_menu.addAction(name)] = team_id
+        # 選んだタスクの今の値に印を付ける（値が揃っていないときは付けない）
+        self._check_current(status_actions, {r["status"] for r in rows})
+        self._check_current(team_actions, {r["override_team_id"] for r in rows})
         menu.addSeparator()
         disable_action = menu.addAction(tr("無効にする"))
 
@@ -1112,6 +1225,15 @@ class GanttTab(QWidget):
             self.apply_task_fields(keys, tr("タスクのチームを変更"), {"team_id": team_actions[chosen]})
         elif chosen is disable_action:
             self.apply_task_fields(keys, tr("タスクを無効にする"), {"is_active": False})
+
+    @staticmethod
+    def _check_current(actions, values):
+        """{アクション: 値} のうち、values（選んだタスクの今の値の集合）が1つに揃っていれば
+        その値のアクションに印を付ける。"""
+        current = next(iter(values)) if len(values) == 1 else object()
+        for action, value in actions.items():
+            action.setCheckable(True)
+            action.setChecked(value == current)
 
     def _exec_menu(self, menu, global_pos):
         """メニューを出して選ばれたアクションを返す（テストで差し替えられるよう分けてある）。"""

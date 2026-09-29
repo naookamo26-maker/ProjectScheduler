@@ -9,7 +9,7 @@
   それらをまとめて畳める折りたたみセクション（ジョブ・ガントチャートタブ共通）。
 """
 
-from PySide6.QtCore import QDate, QEvent, Qt, QTimer, Signal
+from PySide6.QtCore import QDate, QEvent, QPoint, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -22,9 +22,11 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QListWidget,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QTableWidget,
@@ -712,9 +714,109 @@ class CrudSection(QGroupBox):
 # という同じ構造を使うため、ここに共通化してある。
 
 
+class ElidedLabel(QLabel):
+    """幅に収まらない文字を省略記号で詰めて出すラベル（既定は中央を省略。ファイルの
+    パスのように、先頭と末尾のファイル名が大事な文字に向く）。省略したときは全文を
+    ツールチップに出す。幅を文字の長さに合わせて主張しないので、隣の表示を押し出さない。"""
+
+    def __init__(self, text="", mode=Qt.ElideMiddle, parent=None):
+        super().__init__(parent)
+        self._full_text = ""
+        self._mode = mode
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setText(text)
+
+    def setText(self, text):
+        self._full_text = text
+        self._refresh()
+
+    def full_text(self):
+        return self._full_text
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh()
+
+    def minimumSizeHint(self):
+        return QSize(0, super().minimumSizeHint().height())
+
+    def _refresh(self):
+        shown = self.fontMetrics().elidedText(self._full_text, self._mode, max(0, self.width()))
+        super().setText(shown)
+        self.setToolTip(self._full_text if shown != self._full_text else "")
+
+
+class FlowLayout(QLayout):
+    """中身を左から並べ、幅が足りなければ次の行へ折り返すレイアウト（Qt の Flow Layout の例と
+    同じ考え方）。絞り込みのチェックボックスのように数が決まっていない並びに使う。"""
+
+    def __init__(self, parent=None, spacing=6):
+        super().__init__(parent)
+        self._items = []
+        self.setContentsMargins(0, 0, 0, 0)
+        self.setSpacing(spacing)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientations()
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, apply=True)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        # 折り返せるので、最小の幅はいちばん広い1項目ぶんだけ（項目の数だけ横に伸びない）
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        left, top, right, bottom = self.getContentsMargins()
+        return size + QSize(left + right, top + bottom)
+
+    def _do_layout(self, rect, apply):
+        left, top, right, bottom = self.getContentsMargins()
+        area = rect.adjusted(left, top, -right, -bottom)
+        x, y, line_height = area.x(), area.y(), 0
+        spacing = self.spacing()
+        for item in self._items:
+            hint = item.sizeHint()
+            if x + hint.width() > area.right() + 1 and line_height > 0:
+                x = area.x()
+                y += line_height + spacing
+                line_height = 0
+            if apply:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x += hint.width() + spacing
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + bottom
+
+
 class ChoiceFilterGroup(QGroupBox):
     """チェックボックス一覧による絞り込み（OR条件）。「すべて表示」「すべて解除」
-    ボタンと、rebuild()で渡した項目ぶんのチェックボックスを横並びで持つ。"""
+    ボタンと、rebuild()で渡した項目ぶんのチェックボックスを持つ。
+
+    チェックボックスは横に並べ、幅が足りなければ折り返す（FlowLayout）。以前は1行に
+    並べていたため、チームが多いと最小幅がその分だけ伸び（15チームで約2,000px）、
+    絞り込みを開くとウィンドウが画面からはみ出していた。"""
 
     changed = Signal()
 
@@ -726,12 +828,15 @@ class ChoiceFilterGroup(QGroupBox):
         select_all_btn.clicked.connect(lambda: self.set_all(True))
         select_none_btn = QPushButton(tr("すべて解除"))
         select_none_btn.clicked.connect(lambda: self.set_all(False))
-        layout.addWidget(select_all_btn)
-        layout.addWidget(select_none_btn)
+        layout.addWidget(select_all_btn, 0, Qt.AlignTop)
+        layout.addWidget(select_none_btn, 0, Qt.AlignTop)
         layout.addSpacing(16)
-        self._checks_layout = QHBoxLayout()
-        layout.addLayout(self._checks_layout)
-        layout.addStretch(1)
+        checks_area = QWidget()
+        policy = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        policy.setHeightForWidth(True)
+        checks_area.setSizePolicy(policy)
+        self._checks_layout = FlowLayout(checks_area, spacing=10)
+        layout.addWidget(checks_area, 1)
 
     def rebuild(self, items, colors=None):
         """items: [(key, label), ...]。既存のチェック状態はキーで可能な限り
@@ -746,20 +851,29 @@ class ChoiceFilterGroup(QGroupBox):
         while self._checks_layout.count():
             item = self._checks_layout.takeAt(0)
             if item.widget():
+                item.widget().hide()
                 item.widget().deleteLater()
         self._checks = {}
         for key, label in items:
             checked = key not in previous_unchecked or key in previous_checked
+            # 色スペースとチェックボックスは折り返しで離れないよう、1つの部品にまとめる
+            entry = QWidget()
+            entry_layout = QHBoxLayout(entry)
+            entry_layout.setContentsMargins(0, 0, 0, 0)
+            entry_layout.setSpacing(4)
             if key in colors:
                 swatch = QLabel("　")
                 swatch.setFixedWidth(14)
                 swatch.setStyleSheet(f"background-color: {colors[key]}; border: 1px solid #0b0b0b;")
-                self._checks_layout.addWidget(swatch)
+                entry_layout.addWidget(swatch)
             checkbox = QCheckBox(label)
             checkbox.setChecked(checked)  # connect前に設定し、構築時のstateChangedを発火させない
             checkbox.stateChanged.connect(lambda _state: self.changed.emit())
-            self._checks_layout.addWidget(checkbox)
+            entry_layout.addWidget(checkbox)
+            self._checks_layout.addWidget(entry)
             self._checks[key] = checkbox
+        self._checks_layout.invalidate()
+        self.updateGeometry()
 
     def set_all(self, checked):
         # 一括変更中に途中でchanged経由のrebuildが走るとループ中のウィジェットが
@@ -772,6 +886,9 @@ class ChoiceFilterGroup(QGroupBox):
 
     def visible_keys(self):
         return {k for k, cb in self._checks.items() if cb.isChecked()}
+
+    def all_keys(self):
+        return set(self._checks)
 
 
 class CollapsibleSection(QWidget):
@@ -831,3 +948,7 @@ class CollapsibleSection(QWidget):
     def _on_toggled(self, checked):
         self._toggle_btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
         self.content.setVisible(checked)
+
+    def set_title(self, title):
+        """見出しの文言を変える（絞り込み中の件数を、畳んだままでも見えるように出す等）。"""
+        self._toggle_btn.setText(title)
