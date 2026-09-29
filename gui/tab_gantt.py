@@ -138,12 +138,14 @@ _DRAG_MODIFIER_KEYS = {"shift": Qt.ShiftModifier, "alt": Qt.AltModifier}
 
 # 進行中・完了（実績の日付で置く状態）
 _STARTED = ("in_progress", "done")
-# 進行中・完了のタスクでは日程に効かない上書き。進行中は開始日が実績で決まり、完了は
-# 開始日〜終了日が実績で決まる（日数・チームも使わない）。まとめて編集するときは
+# 進行中・完了のタスクでは変えられない上書き。進行中は開始日が実績で決まり、完了は
+# 開始日〜終了日が実績で決まる（日数・チームも使わない）。有効／無効（「このタスクを
+# 実行する」）も、実行中・実行済みのタスクを「実行しない」にするのは矛盾するので変え
+# させない（実行しないことにするときは、先に未着手に戻す）。まとめて編集するときは
 # 該当するタスクに書き込まない（apply_task_fields）。
 _INEFFECTIVE_WHEN_STARTED = {
-    "in_progress": frozenset({"start_pin_date"}),
-    "done": frozenset({"start_pin_date", "override_days", "team_id"}),
+    "in_progress": frozenset({"start_pin_date", "is_active"}),
+    "done": frozenset({"start_pin_date", "override_days", "team_id", "is_active"}),
 }
 
 
@@ -1314,6 +1316,7 @@ class GanttTab(QWidget):
         self._check_current(team_actions, {r["override_team_id"] for r in rows})
         menu.addSeparator()
         disable_action = menu.addAction(tr("無効にする"))
+        disable_action.setEnabled(bool(not_started))
 
         chosen = self._exec_menu(menu, global_pos)
         if chosen is None:

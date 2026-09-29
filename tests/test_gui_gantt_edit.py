@@ -572,10 +572,11 @@ def test_context_menu_pins_sets_status_and_team(qapp, gantt):
 
     # 完了のタスクは実績の日付で置くので、日程に効かない項目は押せない（押しても何も
     # 起きず、未着手に戻した瞬間にまとめて効いてタスクが動いていたため）
+    # 実行済みのタスクを「実行しない」にするのも矛盾するので、無効にもできない
     enabled = _menu_enabled(tab)
-    for text in ("開始日を固定", "固定を解除", "日数を増減…", "既定の日数に戻す", "チーム"):
+    for text in ("開始日を固定", "固定を解除", "日数を増減…", "既定の日数に戻す", "チーム", "無効にする"):
         assert enabled[text] is False, text
-    assert enabled["状態"] and enabled["無効にする"] and enabled["編集…"]
+    assert enabled["状態"] and enabled["編集…"]
 
 
 def test_context_menu_skips_started_tasks_in_a_mixed_selection(qapp, gantt):

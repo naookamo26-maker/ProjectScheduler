@@ -291,6 +291,11 @@ class TaskEditWindow(QWidget):
         self.pin_now_button.setEnabled(not started and r["start"] is not None)
         self.days_spin.setEnabled(not done)
         self.team_combo.setEnabled(not done)
+        # 実行中・実行済みのタスクを「実行しない」にはできない（先に未着手に戻す）
+        self.active_check.setEnabled(not started)
+        self.active_check.setToolTip(
+            tr("進行中・完了のタスクは無効にできません（実行しないことにするときは、先に状態を未着手に戻してください）。")
+            if started else "")
         self._single_form.setRowVisible(self.fact_start_edit, started)
         self._single_form.setRowVisible(self.fact_end_edit, done)
         self._single_form.setRowVisible(self.started_note, started)
@@ -333,12 +338,13 @@ class TaskEditWindow(QWidget):
         self.shift_button.setEnabled(bool(not_started))
         self.shift_spin.setEnabled(bool(not_started))
         self.multi_team_combo.setEnabled(bool(not_done))
+        self.multi_active_check.setEnabled(bool(not_started))
         started = len(rows) - len(not_started)
         self._multi_form.setRowVisible(self.multi_started_note, bool(started))
         if started:
             self.multi_started_note.setText(tr(
-                "進行中・完了のタスク（{n}件）は実績の日付で置くので、ずらす・固定の解除は"
-                "適用しません（完了のタスクはチームも変えません）。", n=started))
+                "進行中・完了のタスク（{n}件）には、ずらす・固定の解除・有効／無効は適用しません"
+                "（実績の日付で置くため。完了のタスクはチームも変えません）。", n=started))
         self._fill_combo(self.multi_team_combo, [(None, tr("（既定を使用）"))] + self.tab.team_options(),
                          self._common(rows, "override_team_id"))
         self._fill_combo(self.multi_milestone_combo,

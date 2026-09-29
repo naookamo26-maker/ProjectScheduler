@@ -524,15 +524,17 @@ def test_editor_shows_the_actual_dates_and_locks_the_fields_a_started_task_does_
     editor = tab._editor
     form = editor._single_form
     assert not form.isRowVisible(editor.fact_start_edit)
-    assert editor.pin_edit.isEnabled() and editor.days_spin.isEnabled()
+    assert editor.pin_edit.isEnabled() and editor.days_spin.isEnabled() and editor.active_check.isEnabled()
 
-    # 進行中: 実績の開始日だけ。開始固定日は使わないが、日数・チームは今の値が効く
+    # 進行中: 実績の開始日だけ。開始固定日は使わないが、日数・チームは今の値が効く。
+    # 実行中のタスクを「実行しない」にはできない
     editor.status_combo.setCurrentIndex(editor.status_combo.findData("in_progress"))
     editor.status_combo.activated.emit(editor.status_combo.currentIndex())
     _wait_recomputed(qapp, tab)
     assert form.isRowVisible(editor.fact_start_edit) and not form.isRowVisible(editor.fact_end_edit)
     assert not editor.pin_edit.isEnabled() and not editor.pin_now_button.isEnabled()
     assert editor.days_spin.isEnabled() and editor.team_combo.isEnabled()
+    assert not editor.active_check.isEnabled()
     start = tab.view.bars()[key].start
 
     # 完了: 実績の開始日・終了日。日数・チームも使わない
@@ -609,29 +611,51 @@ def test_dragging_a_pinned_task_after_confirming_moves_its_pin(qapp, gantt):
 
 
 def test_jobs_tab_locks_the_fields_a_started_task_does_not_use(qapp, gantt):
-    from gui.tab_jobs import _STARTED_LOCK_TIP
+    from gui.tab_jobs import _INACTIVE_STATUS_LOCK_TIP, _STARTED_ACTIVE_LOCK_TIP, _STARTED_LOCK_TIP
 
     w, _tab, ids = gantt
     jobs = _open_jobs_tab(qapp, w, ids["job1"])
     row = _override_row(jobs, ids["t1"])
     table = jobs.override_table
-    pin, days, team, status = (table.cellWidget(row, c) for c in (5, 2, 4, 6))
+    active, pin, days, team, status = (table.cellWidget(row, c) for c in (1, 5, 2, 4, 6))
     pin_tip = pin.toolTip()
-    assert pin.isEnabled() and days.isEnabled() and team.isEnabled()
+    assert pin.isEnabled() and days.isEnabled() and team.isEnabled() and active.isEnabled()
 
     status.setCurrentIndex(status.findData("in_progress"))
     _wait(qapp, lambda: False, timeout=0.1)
     assert not pin.isEnabled() and pin.toolTip() == _STARTED_LOCK_TIP
     assert days.isEnabled() and team.isEnabled()
+    # 実行中のタスクを「実行しない」にはできない
+    assert not active.isEnabled() and active.toolTip() == _STARTED_ACTIVE_LOCK_TIP
 
     status.setCurrentIndex(status.findData("done"))
     _wait(qapp, lambda: False, timeout=0.1)
-    assert not days.isEnabled() and not team.isEnabled()
+    assert not days.isEnabled() and not team.isEnabled() and not active.isEnabled()
 
     status.setCurrentIndex(status.findData(None))
     _wait(qapp, lambda: False, timeout=0.1)
-    assert pin.isEnabled() and days.isEnabled() and team.isEnabled()
+    assert pin.isEnabled() and days.isEnabled() and team.isEnabled() and active.isEnabled()
     assert pin.toolTip() == pin_tip  # 元の説明に戻る
+
+    # 無効（実行しない）のタスクは、進行中・完了にできない
+    active.setChecked(False)
+    _wait(qapp, lambda: False, timeout=0.1)
+    assert not status.isEnabled() and status.toolTip() == _INACTIVE_STATUS_LOCK_TIP
+    active.setChecked(True)
+    _wait(qapp, lambda: False, timeout=0.1)
+    assert status.isEnabled()
+
+
+def test_jobs_tab_lets_an_inactive_started_task_be_fixed_either_way(qapp, gantt):
+    """既に食い違っている行（古いファイルで、無効なのに完了）は、有効に戻すことも、
+    未着手に戻すこともできる（身動きが取れなくならない）。"""
+    w, _tab, ids = gantt
+    w.db.update_job_task_override_fields(ids["job1"], ids["t2"], status="done")
+    w.db.update_job_task_override_fields(ids["job1"], ids["t2"], is_active=False)
+    jobs = _open_jobs_tab(qapp, w, ids["job1"])
+    row = _override_row(jobs, ids["t2"])
+    active, status = (jobs.override_table.cellWidget(row, c) for c in (1, 6))
+    assert active.isEnabled() and status.isEnabled()
 
 
 def test_jobs_tab_moves_a_pin_on_a_holiday_to_the_next_working_day(qapp, gantt):

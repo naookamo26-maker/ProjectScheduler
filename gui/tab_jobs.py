@@ -146,6 +146,9 @@ _NO_TAG_FILTER_KEY = None
 _STARTED = ("in_progress", "done")
 _STARTED_LOCK_TIP = N_("進行中・完了のタスクは実績の日付で置くので、この欄は使いません"
                        "（実績の日付は、ガントチャートのタスクの編集ウィンドウで直せます）。")
+_STARTED_ACTIVE_LOCK_TIP = N_("進行中・完了のタスクは無効にできません"
+                              "（実行しないことにするときは、先に状態を未着手に戻してください）。")
+_INACTIVE_STATUS_LOCK_TIP = N_("無効のタスクは進行中・完了にできません（先に有効にしてください）。")
 _NO_JOB_TAG_FILTER_LABEL = N_("（ジョブ タグなし）")
 _NO_TASK_TAG_FILTER_LABEL = N_("（タスク タグなし）")
 
@@ -1082,18 +1085,33 @@ class JobsTab(QWidget):
         QTimer.singleShot(0, lambda: QMessageBox.information(self, tr("開始固定日"), message))
 
     def _apply_started_locks(self):
-        """進行中・完了のタスクの行で、日程に効かない欄を編集できなくする（進行中・
-        完了は開始固定日、完了は日数・チームも）。書いても実績の日付で置くので何も
-        起きず、未着手に戻した瞬間にまとめて効いてタスクが動いていたため。"""
+        """状態と食い違う欄を編集できなくする。
+
+        - 進行中・完了のタスク: 日程に効かない欄（進行中・完了は開始固定日、完了は
+          日数・チームも）。書いても実績の日付で置くので何も起きず、未着手に戻した瞬間に
+          まとめて効いてタスクが動いていたため
+        - 進行中・完了で有効なタスク: 「有効」（無効にできない）。実行中・実行済みの
+          タスクを「実行しない」にするのは矛盾する（先に未着手に戻す）
+        - 無効で未着手のタスク: 「状態」（進行中・完了にできない。先に有効にする）
+        既に食い違っている行（無効なのに進行中等）は、有効に戻す・未着手に戻すことは
+        できるようにしておく（身動きが取れなくならないように）。"""
         table = self.override_table
-        tip = tr(_STARTED_LOCK_TIP)
         for row in range(table.rowCount()):
             status_combo = table.cellWidget(row, 6)
-            if status_combo is None:
+            active_check = table.cellWidget(row, 1)
+            if status_combo is None or active_check is None:
                 continue
             status = status_combo.currentData()
-            for column, locked in ((5, status in _STARTED), (2, status == "done"), (4, status == "done")):
+            active = active_check.isChecked()
+            for column, locked, tip in (
+                (5, status in _STARTED, _STARTED_LOCK_TIP),
+                (2, status == "done", _STARTED_LOCK_TIP),
+                (4, status == "done", _STARTED_LOCK_TIP),
+                (1, status in _STARTED and active, _STARTED_ACTIVE_LOCK_TIP),
+                (6, not active and status is None, _INACTIVE_STATUS_LOCK_TIP),
+            ):
                 widget = table.cellWidget(row, column)
+                tip = tr(tip)
                 widget.setEnabled(not locked)
                 if locked:
                     if widget.toolTip() != tip:
