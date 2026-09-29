@@ -2194,9 +2194,26 @@ def run_resource_constrained_scheduler_from_frames(df_project, df_teams, df_ms, 
     )
 
 
+class JobLinks(tuple):
+    """結果の DataFrame の attrs["job_links"] に載せる、ジョブ間の依存の一覧（読み取り専用）。
+
+    pandas は attrs が空でないと、行の取り出し・絞り込み・groupby 等で DataFrame／Series を
+    作るたびに attrs を deepcopy する。依存の一覧をそのまま list で載せると、大きな計画
+    （依存558件・16,230行）ではガントの描画1回に3分かかっていた。中身は作った後に変えない
+    ので、コピーを求められても自分自身を返す。"""
+
+    __slots__ = ()
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+
 def _cross_job_links(active_tasks, scheduled, cal):
     """ジョブをまたぐ依存（実際にスケジューリングに使ったもの）を
-    [(前のタスク, 後のタスク, 守られていないか), ...] で返す。タスクは (Job_ID, Task_ID)。
+    JobLinks((前のタスク, 後のタスク, 守られていないか), ...) で返す。タスクは (Job_ID, Task_ID)。
 
     無効にしたタスクをまたぐ依存は手前のタスクへ繋ぎ替えられている（_build_active_tasks）
     ので、入力の依存ではなく繋ぎ替えた後の deps を使う。「守られていない」は、後の
@@ -2216,7 +2233,7 @@ def _cross_job_links(active_tasks, scheduled, cal):
                 (pred["job_id"], pred["task_id"]), (t_info["job_id"], t_info["task_id"]),
                 floor is not None and start_ord < floor,
             ))
-    return links
+    return JobLinks(links)
 
 
 def _check_constraint_violations(active_tasks, scheduled, cal, overbooked_pins):

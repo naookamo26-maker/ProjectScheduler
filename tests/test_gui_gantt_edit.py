@@ -22,8 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 pytest.importorskip("PySide6")
 pytest.importorskip("pandas")
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, Qt  # noqa: E402
-from PySide6.QtGui import QMouseEvent  # noqa: E402
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt  # noqa: E402
+from PySide6.QtGui import QColor, QMouseEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -941,3 +941,426 @@ def test_messages_without_problems_go_to_the_status_bar(qapp, gantt):
     w, tab, _ids = gantt
     assert "件のタスクを生成しました" in w.schedule_summary_label.text()
     assert tab.error_label.isHidden()
+
+
+# -- 利用者視点の調査で見つかった問題の回帰テスト --------------------------------------
+
+
+def test_switching_tabs_keeps_the_chart_and_its_view(qapp, gantt):
+    """回帰テスト: タブを行き来しただけ（データの変更なし）でもチャートを作り直し、
+    表示位置が全体表示に戻っていた（大きな計画では毎回数秒固まっていた）。"""
+    w, tab, ids = gantt
+    _zoom_to(tab, tab.view.bars()[_key(ids, "job1", "t1")])
+    tab.view.body._clamp_scale()  # 操作でズームしたときと同じく、縮尺の下限を効かせておく
+    tab.view._sync_panes()
+    before, scene = tab.view.view_state(), tab.view.scene()
+    w.tabs.setCurrentIndex(2)
+    qapp.processEvents()
+    w.tabs.setCurrentIndex(3)
+    _wait(qapp, lambda: False, timeout=0.1)
+    assert tab.view.scene() is scene
+    assert tuple(tab.view.view_state())[:4] == tuple(before)[:4]
+
+
+def test_a_recalculation_keeps_the_zoom_and_the_visible_dates(qapp, gantt):
+    """回帰テスト: 配置の変更・他のタブでの変更による再計算で、表示位置が全体表示に戻っていた。"""
+    w, tab, ids = gantt
+    _zoom_to(tab, tab.view.bars()[_key(ids, "job1", "t1")])
+    before = tab.view.view_state()
+    assert not before.fit_x
+    w.db.set_distribution_ratio(0.3)
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    after = tab.view.view_state()
+    assert after.sx == pytest.approx(before.sx)
+    assert after.left_day == pytest.approx(before.left_day, abs=0.5)
+
+
+def test_leaving_the_search_box_after_it_was_applied_does_not_rebuild_the_chart(qapp, gantt):
+    """回帰テスト: 検索で絞り込まれた後にチャートをクリックしてフォーカスが外れると、
+    同じ文字列でチャートを作り直し、表示位置が全体表示に戻っていた。"""
+    _w, tab, _ids = gantt
+    tab.search_edit.setText("ジョブ1")
+    tab._apply_search()
+    scene = tab.view.scene()
+    tab.search_edit.editingFinished.emit()
+    assert tab.view.scene() is scene
+
+
+def test_a_filter_keeps_the_whole_chart_in_view_when_it_was_fitted(qapp, gantt):
+    """全体表示のままなら、絞り込みで行が増減しても全体表示のまま（行が増えて見切れない）。"""
+    _w, tab, _ids = gantt
+    tab.view.fit_all()
+    tab.search_edit.setText("ジョブ1")
+    tab._apply_search()
+    tab.search_edit.setText("")
+    tab._apply_search()
+    _wait(qapp, lambda: False, timeout=0.05)
+    state = tab.view.view_state()
+    assert state.fit_x and state.fit_y
+
+
+def test_the_status_line_is_updated_while_the_tab_is_hidden(qapp, gantt):
+    """回帰テスト: 編集の直後に他のタブへ移ると、計算が終わっても画面下部が
+    「計算中です...」のまま残っていた。"""
+    w, tab, ids = gantt
+    key = _key(ids, "job1", "t1")
+    tab.view.select_keys([key])
+    tab.shift_tasks([key], 2)
+    assert "計算中" in w.schedule_summary_label.text()
+    w.tabs.setCurrentIndex(2)
+    assert _wait(qapp, lambda: tab.cache.is_fresh())
+    qapp.processEvents()
+    assert "件のタスクを生成しました" in w.schedule_summary_label.text()
+
+
+def _wheel(qapp, view, pos, dy=120, dx=0, modifiers=Qt.NoModifier):
+    from PySide6.QtGui import QWheelEvent
+
+    viewport = view.viewport()
+    event = QWheelEvent(QPointF(pos), QPointF(viewport.mapToGlobal(pos)), QPoint(0, 0), QPoint(dx, dy),
+                        Qt.NoButton, modifiers, Qt.NoScrollPhase, False)
+    QApplication.sendEvent(viewport, event)
+    qapp.processEvents()
+
+
+def test_the_wheel_over_the_job_column_keeps_names_aligned_with_the_rows(qapp, gantt):
+    """回帰テスト: 左列（ジョブ名）の上でホイールを回すと左列だけがスクロールして、
+    ジョブ名が本体の別の行の横に並んでいた。見出し・左列の上でも本体と同じ操作にする。"""
+    _w, tab, ids = gantt
+    body, column, header = tab.view.body, tab.view.column, tab.view.header
+    _zoom_to(tab, tab.view.bars()[_key(ids, "job1", "t1")])
+    for view in (column, header):
+        _wheel(qapp, view, QPoint(20, 20), dy=-120)
+        assert column.verticalScrollBar().value() == body.verticalScrollBar().value()
+        assert column.transform().m22() == pytest.approx(body.transform().m22())
+        assert header.horizontalScrollBar().value() == body.horizontalScrollBar().value()
+        assert header.transform().m11() == pytest.approx(body.transform().m11())
+
+
+def test_the_wheel_zooms_under_the_cursor_in_proportion_and_a_sideways_wheel_scrolls(qapp, gantt):
+    """回帰テスト: 横ホイール（チルト・横スワイプ）で縮小していた。タッチパッドの細かい
+    スクロールでも1回ごとに1ノッチ分拡大して、少し動かすだけで何倍にもなっていた。"""
+    _w, tab, ids = gantt
+    body = tab.view.body
+    _zoom_to(tab, tab.view.bars()[_key(ids, "job1", "t1")])
+    sx = body.transform().m11()
+    h = body.horizontalScrollBar().value()
+    _wheel(qapp, body, QPoint(100, 100), dy=0, dx=-120)
+    assert body.transform().m11() == pytest.approx(sx)
+    assert body.horizontalScrollBar().value() != h
+    # 細かいスクロール15回（合わせて1ノッチ）でも拡大は1ノッチ分だけ
+    sx = body.transform().m11()
+    for _ in range(15):
+        _wheel(qapp, body, QPoint(100, 100), dy=8)
+    assert body.transform().m11() == pytest.approx(sx * 1.15, rel=0.02)
+    # マウスの下の日付・行は動かない
+    point = QPoint(body.viewport().width() - 80, body.viewport().height() // 2)
+    anchor = body.mapToScene(point)
+    _wheel(qapp, body, point, dy=120)
+    after = body.mapToScene(point)
+    assert abs(after.x() - anchor.x()) < 2 / body.transform().m11()
+    assert abs(after.y() - anchor.y()) < 2 / body.transform().m22()
+
+
+def test_the_placement_slider_moved_with_keys_is_committed(qapp, gantt):
+    """回帰テスト: 配置スライダーを溝のクリックやキーで動かすと、表示だけ変わって確定されず、
+    スライダーの値と実際のチャートが食い違ったままになっていた。"""
+    w, tab, _ids = gantt
+    slider = tab.placement_slider
+    start = slider.value()
+    slider.setFocus()
+    QTest.keyClick(slider, Qt.Key_Left)
+    QTest.keyClick(slider, Qt.Key_Left)
+    assert _wait(qapp, lambda: w.db.get_project()["distribution_ratio"] == pytest.approx((start - 2) / 100))
+    assert w.undo_manager.undo_label() == "配置を変更"
+
+
+def test_an_empty_filter_explains_why_the_chart_is_empty(qapp, gantt):
+    """回帰テスト: 絞り込みで0件になると、理由が出ずに空白になり、前のチャートのスクロール
+    バーが残っていた。ダークモードでは本体だけ暗く、明るい見出し・左列とL字に食い違っていた。"""
+    from PySide6.QtGui import QPalette
+
+    from gui.gantt_view import _PANE_BG
+
+    w, tab, _ids = gantt
+    tab.search_edit.setText("該当しないジョブ名")
+    tab._apply_search()
+    view = tab.view
+    assert view.scene() is None
+    assert view.placeholder.isVisible() and "絞り込み" in view.placeholder.text()
+    assert view.body.horizontalScrollBar().maximum() == 0 and view.body.verticalScrollBar().maximum() == 0
+    viewport = view.body.viewport()
+    assert viewport.autoFillBackground()
+    assert viewport.palette().color(viewport.backgroundRole()) == _PANE_BG
+    assert viewport.palette().color(QPalette.Base) == _PANE_BG
+    # 畳んだ見出しと画面下部にも、絞り込みで何件出ているかを出す
+    assert "0件" in tab.filters_section._toggle_btn.text()
+    assert "絞り込みで0件" in w.schedule_summary_label.text()
+    tab.search_edit.setText("")
+    tab._apply_search()
+    assert view.scene() is not None and not view.placeholder.isVisible()
+    assert tab.filters_section._toggle_btn.text() == "絞り込み"
+
+
+def test_filter_check_boxes_wrap_instead_of_widening_the_window(qapp):
+    """回帰テスト: チェックボックスを1行に並べていたため、チームが多いと絞り込みを開いた
+    ときの最小幅が伸び（15チームで約2,000px）、ウィンドウが画面からはみ出していた。"""
+    from gui.widgets_common import ChoiceFilterGroup
+
+    group = ChoiceFilterGroup("チーム")
+    group.rebuild([(i, f"チーム{i:02d}") for i in range(30)], colors={i: "#888888" for i in range(30)})
+    assert group.minimumSizeHint().width() < 600
+    layout = group.layout()
+    assert layout.hasHeightForWidth()
+    assert layout.heightForWidth(500) > layout.heightForWidth(4000)
+
+
+def _render_bar(bar, width_px, height_px):
+    """bar（シーンに載せたもの）を、その形がちょうど width_px × height_px になる縮尺で描く。"""
+    from PySide6.QtGui import QImage, QPainter
+
+    image = QImage(width_px, height_px, QImage.Format_ARGB32)
+    image.fill(QColor("white"))
+    painter = QPainter(image)
+    bar.scene().render(painter, QRectF(0, 0, width_px, height_px), bar.bar_rect, Qt.IgnoreAspectRatio)
+    painter.end()
+    return image
+
+
+def _bar_in_scene(color="#ff0000"):
+    """(シーン, 枠線が黒1pxのバー)。シーンは呼び出し側で持っておく（捨てるとバーも消える）。"""
+    from datetime import date as _date
+
+    from PySide6.QtGui import QBrush, QPainterPath, QPen
+    from PySide6.QtWidgets import QGraphicsItem, QGraphicsScene
+
+    from gui.gantt_view import TaskBarItem
+
+    rect = QRectF(0, 0, 100, 20)
+    path = QPainterPath()
+    path.addRect(rect)
+    bar = TaskBarItem(path, rect, "JOB_001", "T_001", "TEAM_001", _date(2026, 4, 6), _date(2026, 4, 10))
+    bar.setBrush(QBrush(QColor(color)))
+    pen = QPen(QColor("#0b0b0b"), 1)
+    pen.setCosmetic(True)
+    bar.setPen(pen)
+    bar.setFlag(QGraphicsItem.ItemIsSelectable, True)
+    scene = QGraphicsScene()
+    scene.addItem(bar)
+    return scene, bar
+
+
+def test_small_bars_are_drawn_without_the_black_border(qapp):
+    """回帰テスト: 大きな計画を全体表示すると、1pxの黒い枠線がバーの塗りを覆って
+    チャートが真っ黒になり、チームの色分けが見えなかった。"""
+    _scene, bar = _bar_in_scene()
+    image = _render_bar(bar, 100, 2)  # 高さ2pxまで縮めたバー
+    for y in range(2):
+        pixel = QColor(image.pixel(50, y))
+        assert pixel.red() > 200 and pixel.green() < 60  # 黒い枠ではなく、バーの赤が見える
+
+
+def test_a_selected_bar_is_drawn_with_a_blue_frame(qapp):
+    """回帰テスト: 選択の印が Qt 既定の細い点線だけで、全体表示ではほとんど見分けられなかった。"""
+    from gui.gantt_view import _SELECTION_COLOR
+
+    _scene, bar = _bar_in_scene("#ffffff")
+    image = _render_bar(bar, 200, 40)
+    assert QColor(image.pixel(100, 2)).name() == "#ffffff"  # 未選択は白いまま
+    bar.setSelected(True)
+    image = _render_bar(bar, 200, 40)
+    edge = QColor(image.pixel(100, 2))
+    assert abs(edge.red() - _SELECTION_COLOR.red()) < 40 and abs(edge.blue() - _SELECTION_COLOR.blue()) < 40
+    # 小さいバーは、選択するとバー全体が青くなる
+    image = _render_bar(bar, 100, 3)
+    assert QColor(image.pixel(50, 1)).red() < 120
+
+
+def test_the_year_stays_visible_when_zoomed_into_the_middle_of_a_year(qapp, gantt):
+    """回帰テスト: 年のラベルを年の中央に固定していたため、拡大して年の途中を見ていると
+    年がどこにも出ず、何年か分からなかった。"""
+    _w, tab, ids = gantt
+    _zoom_to(tab, tab.view.bars()[_key(ids, "job1", "t2")])
+    header = tab.view.header
+    sx = header.transform().m11()
+    visible = header.mapToScene(header.viewport().rect()).boundingRect()
+    shown = [label for label, _l, _r in header.scene().gantt_year_labels if label.isVisible()]
+    assert any(visible.left() <= label.x() and label.x() + label.boundingRect().width() / sx <= visible.right()
+               for label in shown)
+
+
+def test_date_tick_labels_neither_overlap_nor_get_cut_at_the_left_edge(qapp, gantt):
+    """回帰テスト: 軸の左端の目盛りラベルが半分切れ、月初めが続くと隣と重なっていた（「8 9」）。"""
+    _w, tab, _ids = gantt
+    tab.view.fit_all()
+    header = tab.view.header
+    sx = header.transform().m11()
+    left_limit = header.scene().gantt_header_rect.left()
+    spans = sorted(
+        (label.x(), label.x() + label.boundingRect().width() / sx)
+        for label, _x in header.scene().gantt_tick_labels if label.isVisible()
+    )
+    assert spans and spans[0][0] >= left_limit - 1e-6
+    for (_l1, r1), (l2, _r2) in zip(spans, spans[1:]):
+        assert r1 <= l2
+
+
+def test_a_dependency_arrow_enters_from_above_when_there_is_no_room_on_the_left(qapp):
+    """回帰テスト: 後のタスクが前のタスクの終わった直後に始まる（依存でいちばん多い）と、
+    後のバーの手前へ戻る小さなS字の折れになり、矢じりが線より長く窮屈に見えていた。"""
+    from gui.gantt_view import HEAD_DOWN, HEAD_RIGHT, HEAD_UP, dependency_path
+
+    a = QRectF(0, 0, 100, 20)
+    path, head, direction = dependency_path(a, QRectF(100, 60, 80, 20), 6)
+    assert direction == HEAD_DOWN and (head.x(), head.y()) == (106, 60)
+    assert path.elementCount() == 3  # 出る横線 → 縦線 の1回だけ折れる
+    _path, head, direction = dependency_path(a, QRectF(100, -60, 80, 20), 6)
+    assert direction == HEAD_UP and (head.x(), head.y()) == (106, -40)
+    # 十分右にあれば従来どおり左端の中央へ横から入る
+    _path, head, direction = dependency_path(a, QRectF(200, 60, 80, 20), 6)
+    assert direction == HEAD_RIGHT and (head.x(), head.y()) == (200, 70)
+    # 後のバーが短すぎて縦にも入れないときだけ、手前へ戻る
+    _path, head, direction = dependency_path(a, QRectF(96, 60, 8, 20), 6)
+    assert direction == HEAD_RIGHT and (head.x(), head.y()) == (96, 70)
+
+
+def test_dependency_arrows_are_drawn_under_the_task_names(qapp):
+    """回帰テスト: 矢印の線がタスク名の上を横切り、文字が読めなくなっていた。"""
+    from gui.gantt_view import _DEP_Z, _OVERRUN_BAR_Z, _TASK_LABEL_Z
+
+    assert _OVERRUN_BAR_Z < _DEP_Z < _TASK_LABEL_Z
+
+
+def test_filtering_does_not_mark_the_rows_as_out_of_order(qapp, gantt):
+    """回帰テスト: 「依存のつながり」で絞り込むだけで、編集していないのに並べ直すボタンが
+    「選んだ順どおりではない」と目立っていた（絞り込んだ一部で並べ直していたため）。"""
+    from gui.gantt_row_order import GROUP_DEPENDENCY
+
+    w, tab, ids = gantt
+    job1 = next(j for j in w.db.list_jobs() if j["id"] == ids["job1"])
+    w.db.update_job(job1["id"], job1["name"], job1["workflow_id"], job1["default_milestone_id"],
+                    job1["priority"], "隠す")
+    job3 = w.db.add_job("ジョブ3", job1["workflow_id"], job1["default_milestone_id"], 3)
+    w.db.add_external_dependency(job3, ids["t1"], ids["job1"], ids["t2"])
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    tab._select_combo(tab.row_grouping_combo, GROUP_DEPENDENCY)
+    assert _row_jobs(tab) == ["JOB_001", f"JOB_{job3:03d}", "JOB_002"]
+    tab.tag_filter._checks["隠す"].setChecked(False)  # ジョブ1（待たれている側）を隠す
+    assert _row_jobs(tab) == [f"JOB_{job3:03d}", "JOB_002"]
+    assert not tab._row_order_stale
+
+
+def test_escape_cancels_a_drag_and_otherwise_clears_the_selection(qapp, gantt):
+    w, tab, ids = gantt
+    key = _key(ids, "job1", "t1")
+    bar = tab.view.bars()[key]
+    _zoom_to(tab, bar)
+    body = tab.view.body
+    viewport = body.viewport()
+    start = body.mapFromScene(bar.bar_rect.center())
+    end = start + QPoint(70, 0)
+    QTest.mousePress(viewport, Qt.LeftButton, Qt.ShiftModifier, start)
+    QApplication.sendEvent(viewport, QMouseEvent(QEvent.MouseMove, QPointF(end), QPointF(viewport.mapToGlobal(end)),
+                                                 Qt.NoButton, Qt.LeftButton, Qt.ShiftModifier))
+    assert body._drag is not None and body._drag["started"]
+    QTest.keyClick(viewport, Qt.Key_Escape)
+    QTest.keyClick(body, Qt.Key_Escape, Qt.ShiftModifier)
+    QTest.mouseRelease(viewport, Qt.LeftButton, Qt.ShiftModifier, end)
+    qapp.processEvents()
+    assert body._drag is None and tab.cache.is_fresh()
+    assert _override(w.db, ids["job1"], ids["t1"])["start_pin_date"] is None
+    tab.view.select_keys([key])
+    QTest.keyClick(body, Qt.Key_Escape)
+    assert tab.view.selected_keys() == []
+
+
+def test_ctrl_a_selects_every_task_and_a_alone_still_fits(qapp, gantt):
+    _w, tab, _ids = gantt
+    body = tab.view.body
+    QTest.keyClick(body, Qt.Key_A, Qt.ControlModifier)
+    assert sorted(tab.view.selected_keys()) == sorted(tab.view.bars())
+
+
+def test_shift_click_adds_the_bar_to_the_selection(qapp, gantt):
+    """回帰テスト: 複数選んでから Shift＋クリックすると、押した瞬間に選択を外して1件に戻っていた。"""
+    _w, tab, ids = gantt
+    keys = [_key(ids, "job1", "t1"), _key(ids, "job2", "t1")]
+    tab.view.select_keys(keys)
+    body = tab.view.body
+    other = tab.view.bars()[_key(ids, "job1", "t2")]
+    body.ensureVisible(other.sceneBoundingRect())
+    qapp.processEvents()
+    pos = body.mapFromScene(other.bar_rect.center())
+    QTest.mouseClick(body.viewport(), Qt.LeftButton, Qt.ShiftModifier, pos)
+    qapp.processEvents()
+    assert sorted(tab.view.selected_keys()) == sorted(keys + [other.key])
+    assert tab.cache.is_fresh()  # 動かしていないので書き込まない
+
+
+def test_ctrl_clicking_a_selected_job_name_deselects_it_and_the_chart_keeps_the_focus(qapp, gantt):
+    w, tab, _ids = gantt
+    column = tab.view.column
+    rows = column.scene().gantt_job_rows
+    y_top, y_bottom, job = rows[0]
+    pos = column.mapFromScene(50, (y_top + y_bottom) / 2)
+    QTest.mouseClick(column.viewport(), Qt.LeftButton, Qt.NoModifier, pos)
+    assert {k[0] for k in tab.view.selected_keys()} == {job}
+    # 左列はフォーカスを取らず、本体に渡す（ジョブを選んだ直後に F・A が効くように）
+    assert column.focusPolicy() == Qt.NoFocus
+    assert w.focusWidget() is tab.view.body
+    QTest.mouseClick(column.viewport(), Qt.LeftButton, Qt.ControlModifier, pos)
+    assert tab.view.selected_keys() == []
+
+
+def test_the_context_menu_names_its_target_and_checks_the_current_values(qapp, gantt):
+    w, tab, ids = gantt
+    key = _key(ids, "job1", "t1")
+    w.db.update_job_task_override_fields(ids["job1"], ids["t1"], status="in_progress", team_id=ids["team_b"])
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    shown = []
+
+    def fake_exec(menu, _pos):
+        shown.append(menu)
+        return None
+
+    with patch.object(tab, "_exec_menu", fake_exec):
+        tab.view.select_keys([key])
+        tab._show_context_menu(QPoint(0, 0))
+        tab.view.select_keys([key, _key(ids, "job2", "t1")])
+        tab._show_context_menu(QPoint(0, 0))
+    single, multi = shown
+    title = single.actions()[0]
+    assert title.text() == "ジョブ1 / 設計" and not title.isEnabled()
+    assert multi.actions()[0].text() == "選択中の2件のタスク"
+
+    def checked(menu, name):
+        sub = next(a.menu() for a in menu.actions() if a.menu() is not None and a.text() == name)
+        return [a.text() for a in sub.actions() if a.isChecked()]
+    assert checked(single, "状態") == ["進行中"]
+    assert checked(single, "チーム") == ["チームB"]
+    assert checked(multi, "状態") == []  # 値が揃っていなければ印を付けない
+
+
+def test_a_shortened_job_name_shows_the_full_name_as_a_tooltip(qapp, gantt):
+    w, tab, ids = gantt
+    job1 = next(j for j in w.db.list_jobs() if j["id"] == ids["job1"])
+    long_name = "とても長いジョブの名前" * 4
+    w.db.update_job(job1["id"], long_name, job1["workflow_id"], job1["default_milestone_id"],
+                    job1["priority"], job1["tags"])
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    label = next(label for label, _s, _y in tab.view.column.scene().gantt_job_labels if label.text().endswith("…"))
+    assert label.toolTip() == long_name
+
+
+def test_the_project_path_in_the_status_bar_is_shortened_in_the_middle(qapp, gantt):
+    """回帰テスト: パスが途中で切れ、右の計算結果の文言と区切りなくつながって見えていた。"""
+    w, _tab, _ids = gantt
+    label = w.project_path_label
+    full = label.full_text()
+    assert str(w.db.path) in full
+    label.resize(120, label.height())
+    assert "…" in label.text() and label.toolTip() == full

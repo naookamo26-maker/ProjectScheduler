@@ -532,7 +532,8 @@ def _open_sample(app, window, sample, tmp):
     window._open_database(ProjectDatabase.open_existing(str(project)))
     # ステータスバーには開いたファイルのパスが出る。一時フォルダのパスが
     # 写り込まないよう、ファイル名だけにする。
-    window.statusBar().showMessage(window.statusBar().currentMessage().replace(str(project), project.name))
+    label = window.project_path_label
+    label.setText(label.full_text().replace(str(project), project.name))
     _settle(app)
 
 

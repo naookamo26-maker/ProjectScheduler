@@ -37,11 +37,14 @@ from PySide6.QtGui import (
     QFontMetrics,
     QPainter,
     QPainterPath,
+    QPalette,
     QPen,
     QPolygonF,
     QTransform,
+    QWheelEvent,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QGraphicsEllipseItem,
     QGraphicsItem,
     QGraphicsPathItem,
@@ -49,6 +52,9 @@ from PySide6.QtWidgets import (
     QGraphicsSimpleTextItem,
     QGraphicsView,
     QGridLayout,
+    QLabel,
+    QStyle,
+    QStyleOptionGraphicsItem,
     QToolTip,
     QWidget,
 )
@@ -115,6 +121,19 @@ _TASK_LABEL_LINE_GAP_PX = 2
 # 出入りするラベルがパンのたびに省略表示とフル表示を行き来してちらつかない
 # ようにする（実際に見えている範囲より少しだけ広く処理対象にする）。
 _TASK_LABEL_VIEWPORT_MARGIN_PX = 64
+# 日付の目盛りラベル同士の最小の間隔(px)。これより詰まるラベルは隠す（月初めが続く
+# 軸の左端などで「8 9」のように重ならないように）。
+_TICK_LABEL_GAP_PX = 4
+# ホイール1ノッチ（angleDelta 120）あたりの拡大率。タッチパッドの細かいスクロール
+# （1回あたり数単位）は、その量に比例して拡大する（1回ごとに1ノッチ分拡大すると、
+# 指を少し動かしただけで何倍にもなっていた）。
+_WHEEL_ZOOM_STEP = 1.15
+_WHEEL_NOTCH = 120
+# 横ホイール（チルト・横スワイプ）1ノッチあたりの横スクロール量(px)
+_WHEEL_SCROLL_PX = 60
+# 「全体表示のまま」とみなす、見えている範囲と内容の幅・高さの差(px)。全体表示の
+# 縮尺でも、内容はビューポートより _SCALE_FLOOR_MARGIN_PX だけ大きくしてある。
+_FIT_TOLERANCE_PX = 8
 
 _GRID_COLOR = QColor("#e1e0d9")
 # 日単位の補助線・間引かれた週の目盛り線用。主線（_GRID_COLOR）よりさらに
@@ -146,6 +165,15 @@ _CONSTRAINT_BORDER_COLOR = QColor("#b26a00")
 _CONSTRAINT_BORDER_WIDTH = 3
 _NORMAL_BORDER_COLOR = QColor("#0b0b0b")
 _NORMAL_BORDER_WIDTH = 1
+# 画面上のバーの幅か高さがこれ(px)に満たないときは、通常の黒い枠線を描かない。
+# 大きな計画を全体表示すると、1pxの枠線がバーの塗りを覆ってチャートが真っ黒になり、
+# チームの色分けが見えなくなっていた（締切超過などの強調枠はそのまま描く）。
+_BORDER_MIN_PX = 5
+# 選択中のバーの印（バーの内側に沿う青い枠。キャンバスは常に明るいのでライト／ダーク
+# 共通）。以前は Qt 既定の細い点線だけで、全体表示ではほとんど見分けられなかった。
+# バーが小さいときは枠がバー全体を埋め、バーが青く塗られて見える。
+_SELECTION_COLOR = QColor("#1a5fd0")
+_SELECTION_WIDTH = 2.5
 # 本体シーンの重ね順: 1行飛ばしの行背景(-5) < 日単位の補助線(-3) <
 # 週の目盛り・区切り線(-2〜-1) < 通常のバー(0) < 締切超過のバー(1) <
 # タスク名ラベル(2)
@@ -157,6 +185,10 @@ _PANE_BG = QColor("#fdfcf9")
 # build_gantt_scenes() の戻り値。header/column/body はそれぞれの担当分だけの
 # 項目を持つ独立した QGraphicsScene（FrozenGanttPane.setScene()参照）。
 GanttScenes = namedtuple("GanttScenes", ["header", "column", "body"])
+# FrozenGanttPane.view_state() の戻り値。sx/sy は縮尺、h/v はスクロール量、fit_x/fit_y は
+# 横／縦が全体表示のままか、left_day は左端の日付（序数。小数あり）、top_job/top_offset は
+# 一番上に見えているジョブとその行の上端からのずれ（画面px）。
+ViewState = namedtuple("ViewState", ["sx", "sy", "h", "v", "fit_x", "fit_y", "left_day", "top_job", "top_offset"])
 
 # -- タスクの編集（docs/roadmap.md §9）用の見た目 ----------------------------------
 # 手動ピン（開始固定日）の印。バー左上に置く、📍と同じ形のピン（赤い丸の頭と針。
@@ -201,7 +233,13 @@ _DEP_FOCUS_WIDTH = 2.2
 _DEP_STEP_PX = 6        # バーの端から横に出る長さ（画面px）
 _DEP_HEAD_PX = 8        # 矢じりの長さ（画面px）
 _DEP_DOT_PX = 7         # 相手が絞り込みで隠れているときの白い丸の直径（画面px）
-_DEP_Z = _GHOST_Z - 2   # バーより前、確定位置の細線・ドラッグ中の影より後ろ
+# バー（締切超過のバーを含む）より前、タスク名より後ろ（線がタスク名の上を横切って
+# 読めなくならないように）。確定位置の細線・ドラッグ中の影はさらに前。
+_DEP_Z = (_OVERRUN_BAR_Z + _TASK_LABEL_Z) / 2
+# 矢じりの向き（dependency_path が返す）
+HEAD_RIGHT = "right"
+HEAD_DOWN = "down"
+HEAD_UP = "up"
 # 確定済みのファイルで、まだ確定していないタスク（確定後に足したジョブ等）の斜線。
 # 下端の細い帯（全体の3割）にはチームの色をそのまま残す。
 _UNCONFIRMED_VEIL = QColor(255, 255, 255, 165)
@@ -254,11 +292,22 @@ class TaskBarItem(QGraphicsPathItem):
             self.update()
 
     def paint(self, painter, option, widget=None):
-        super().paint(painter, option, widget)
-        if not (self.pinned or self.emphasized or self.highlighted or self.unconfirmed):
+        # 選択の印は Qt 既定の細い点線ではなく、下で青い枠として描く
+        plain = QStyleOptionGraphicsItem(option)
+        plain.state &= ~QStyle.State_Selected
+        rect = painter.worldTransform().mapRect(self.bar_rect)
+        if not self.emphasized and (rect.width() < _BORDER_MIN_PX or rect.height() < _BORDER_MIN_PX):
+            painter.save()
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(self.brush())
+            painter.drawPath(self.path())
+            painter.restore()
+        else:
+            super().paint(painter, plain, widget)
+        selected = self.isSelected()
+        if not (self.pinned or self.emphasized or self.highlighted or self.unconfirmed or selected):
             return
         painter.save()
-        rect = painter.worldTransform().mapRect(self.bar_rect)
         painter.resetTransform()
         if self.unconfirmed:
             veiled = QRectF(rect)
@@ -272,10 +321,19 @@ class TaskBarItem(QGraphicsPathItem):
             if inner.width() > 2 and inner.height() > 2:
                 painter.setPen(QPen(_EMPHASIS_INNER_COLOR, _EMPHASIS_INNER_WIDTH))
                 painter.drawRect(inner)
-        if self.highlighted:
-            inset = _MOVED_HIGHLIGHT_WIDTH / 2
-            painter.setPen(QPen(_MOVED_HIGHLIGHT_COLOR, _MOVED_HIGHLIGHT_WIDTH))
+        # 選択の枠はバーの縁、動いたバーの強調（黄色）はその内側に描く（両方のときも見える）
+        edge = 0.0
+        if selected:
+            inset = min(_SELECTION_WIDTH / 2, rect.width() / 4, rect.height() / 4)
+            painter.setPen(QPen(_SELECTION_COLOR, min(_SELECTION_WIDTH, rect.width() / 2, rect.height() / 2)))
             painter.drawRect(rect.adjusted(inset, inset, -inset, -inset))
+            edge = _SELECTION_WIDTH
+        if self.highlighted:
+            inset = edge + _MOVED_HIGHLIGHT_WIDTH / 2
+            highlight = rect.adjusted(inset, inset, -inset, -inset)
+            if highlight.width() > 0 and highlight.height() > 0:
+                painter.setPen(QPen(_MOVED_HIGHLIGHT_COLOR, _MOVED_HIGHLIGHT_WIDTH))
+                painter.drawRect(highlight)
         if self.shows_pin(rect.width(), rect.height()):
             cx = rect.left() + 3 + _PIN_HEAD_RADIUS_PX
             cy = rect.top() + 2 + _PIN_HEAD_RADIUS_PX
@@ -322,26 +380,42 @@ def _passive(item, z):
 
 
 def dependency_path(a, b, step_x):
-    """前のバー a の右端の中央から、後のバー b の左端の中央へ向かう矢印の線（QPainterPath）。
+    """前のバー a の右端の中央から、後のバー b へ向かう矢印の線。
+    Returns: (QPainterPath, 矢じりの先の位置, 矢じりの向き HEAD_RIGHT/HEAD_DOWN/HEAD_UP)。
 
     a, b はバーの本来の形（輪郭線を含まない bar_rect）。step_x はバーの端から横に出る
-    長さ（シーン座標）。後のバーが右にあれば「出る横線 → 縦線 → 入る横線」の2回だけ
-    折れる。前へ戻る必要があるとき（依存が守られていない等）だけ中間の横線を1本引き、
-    それを後のバーの段のすぐ上（または下）の隙間の中央に通す（バーの枠線と重ならない）。"""
+    長さ（シーン座標）。
+    - 後のバーが十分右にあれば「出る横線 → 縦線 → 入る横線」の2回だけ折れ、b の左端の
+      中央に横から入る。
+    - 後のバーが前のバーの終わりのすぐ後（依存でいちばん多い、終わった翌日に始まる
+      場合）や、終わりより前から始まっているときは、横から入る余地が無い。そのときは
+      前のバーの右から出て、b の上端（b が上にあれば下端）へ縦に入る。以前は b の手前へ
+      戻る小さな S 字の折れになり、矢じりが線より長く窮屈に見えていた。
+    - b の幅が足りず縦にも入れないときだけ、中間の横線を後のバーの段のすぐ上（下）の
+      隙間の中央に通して、b の左端へ戻る（バーの枠線と重ならない）。"""
     ya, yb = a.center().y(), b.center().y()
-    x1 = a.right() + step_x
     path = QPainterPath(QPointF(a.right(), ya))
-    path.lineTo(x1, ya)
-    if b.left() - step_x >= x1:
+    if b.left() - a.right() >= 2 * step_x:
+        x1 = a.right() + step_x
+        path.lineTo(x1, ya)
         path.lineTo(x1, yb)
-    else:
-        gap = b.top() - BAR_MARGIN if yb >= ya else b.bottom() + BAR_MARGIN
-        x2 = b.left() - step_x
-        path.lineTo(x1, gap)
-        path.lineTo(x2, gap)
-        path.lineTo(x2, yb)
+        path.lineTo(b.left(), yb)
+        return path, QPointF(b.left(), yb), HEAD_RIGHT
+    x_v = max(a.right(), b.left()) + step_x
+    if ya != yb and x_v <= b.right() - step_x / 2:
+        edge, head = (b.top(), HEAD_DOWN) if yb > ya else (b.bottom(), HEAD_UP)
+        path.lineTo(x_v, ya)
+        path.lineTo(x_v, edge)
+        return path, QPointF(x_v, edge), head
+    x1 = a.right() + step_x
+    gap = b.top() - BAR_MARGIN if yb >= ya else b.bottom() + BAR_MARGIN
+    x2 = b.left() - step_x
+    path.lineTo(x1, ya)
+    path.lineTo(x1, gap)
+    path.lineTo(x2, gap)
+    path.lineTo(x2, yb)
     path.lineTo(b.left(), yb)
-    return path
+    return path, QPointF(b.left(), yb), HEAD_RIGHT
 
 
 def dependency_stub_path(rect, outgoing, step_x):
@@ -383,15 +457,15 @@ class _DependencyLayer(QGraphicsItem):
         描き直すのは、前回から変わった矢印の範囲だけにする（選択を変えて色が変わった
         数本のために、チャート全体を描き直さない。大きな計画で選択が重くなるため）。"""
         bounds = QRectF()
-        for path, _color, _width, _dashed, _head in arrows:
+        for path, *_rest in arrows:
             bounds = bounds.united(path.boundingRect())
         bounds = bounds.adjusted(-margin_x, -margin_y, margin_x, margin_y) if arrows else QRectF()
 
         def signature(arrow):
-            path, color, width, dashed, head = arrow
+            path, color, width, dashed, head, direction = arrow
             r = path.boundingRect()
             return (r.x(), r.y(), r.width(), r.height(), path.elementCount(), color.rgba(), width, dashed,
-                    None if head is None else (head.x(), head.y()))
+                    None if head is None else (head.x(), head.y()), direction)
 
         before = {signature(a): a for a in self.arrows}
         after = {signature(a): a for a in arrows}
@@ -415,26 +489,31 @@ class _DependencyLayer(QGraphicsItem):
         # 線は縦・横だけなのでアンチエイリアスは要らない（数百本あると描画が重くなる）。
         # 画面に見えている範囲（exposedRect）に掛からない線は描かない。
         exposed = option.exposedRect
-        half = _DEP_HEAD_PX / 2
-        head = QPolygonF([QPointF(0, 0), QPointF(-_DEP_HEAD_PX, -half), QPointF(-_DEP_HEAD_PX, half)])
+        half, length = _DEP_HEAD_PX / 2, _DEP_HEAD_PX
+        # 矢じり（先端が原点）。向きごとに、根元の2点を先端の反対側に置く
+        shapes = {
+            HEAD_RIGHT: QPolygonF([QPointF(0, 0), QPointF(-length, -half), QPointF(-length, half)]),
+            HEAD_DOWN: QPolygonF([QPointF(0, 0), QPointF(-half, -length), QPointF(half, -length)]),
+            HEAD_UP: QPolygonF([QPointF(0, 0), QPointF(-half, length), QPointF(half, length)]),
+        }
         painter.setBrush(Qt.NoBrush)
         heads = []
-        for path, color, width, dashed, head_at in self.arrows:
+        for path, color, width, dashed, head_at, direction in self.arrows:
             if not path.boundingRect().adjusted(-1, -1, 1, 1).intersects(exposed):
                 continue
             painter.setPen(_dependency_pen(color, width, dashed))
             painter.drawPath(path)
             if head_at is not None:
-                heads.append((painter.worldTransform().map(head_at), color))
+                heads.append((painter.worldTransform().map(head_at), color, shapes[direction]))
         if not heads:
             return
         painter.save()
         painter.resetTransform()
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setPen(Qt.NoPen)
-        for device, color in heads:
+        for device, color, shape in heads:
             painter.setBrush(QBrush(color))
-            painter.drawPolygon(head.translated(device))
+            painter.drawPolygon(shape.translated(device))
         painter.restore()
 
 
@@ -517,26 +596,74 @@ class GanttGraphicsView(QGraphicsView):
         self.transformChanged.connect(self._on_transform_for_dependencies)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_A:
+        key, ctrl = event.key(), bool(event.modifiers() & Qt.ControlModifier)
+        if key == Qt.Key_Escape:
+            # ドラッグ中なら取りやめ（何も書き込まない）、そうでなければ選択を外す
+            if self._drag is not None:
+                self._cancel_drag()
+            elif self.scene() is not None:
+                self.scene().clearSelection()
+            event.accept()
+            return
+        if key == Qt.Key_A and ctrl:
+            # Ctrl+A はすべてのタスクを選ぶ（A だけなら全体表示）。1本ずつ選ぶと選択の変更の
+            # 通知がバーの数だけ出て（大きな計画では1万回以上）、そのたびに依存の矢印を描き
+            # 直すので、範囲選択と同じく1回の通知で済ませる（選べる部品はバーだけ）
+            scene = self.scene()
+            if scene is not None:
+                area = QPainterPath()
+                area.addRect(scene.itemsBoundingRect())
+                scene.setSelectionArea(area, Qt.ReplaceSelection, Qt.IntersectsItemShape)
+            event.accept()
+            return
+        if key == Qt.Key_A:
             self.fitAllRequested.emit()
             event.accept()
             return
-        if event.key() == Qt.Key_F:
+        if key == Qt.Key_F:
             self.fitSelectedRequested.emit()
             event.accept()
             return
         super().keyPressEvent(event)
 
     def wheelEvent(self, event):
-        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        """ホイールで拡大縮小する（Ctrl＝横のみ、Shift＝縦のみ）。マウスの位置を中心に
+        拡大し、拡大率は回した量に比例させる（タッチパッドの細かいスクロールでも急に
+        何倍にもならないように）。横ホイール（チルト・横スワイプ）は横スクロールにする
+        （以前は縦の回転量0を「縮小」と扱い、横に払うと縮小していた）。"""
+        dx, dy = event.angleDelta().x(), event.angleDelta().y()
         modifiers = event.modifiers()
+        if dy == 0 and dx != 0 and modifiers & Qt.ShiftModifier:
+            # macOS などは Shift＋ホイールを横ホイールに変えて送ってくる。縦の拡大縮小として扱う
+            dx, dy = 0, dx
+        if abs(dx) > abs(dy):
+            pixels = event.pixelDelta().x() or round(dx / _WHEEL_NOTCH * _WHEEL_SCROLL_PX)
+            bar = self.horizontalScrollBar()
+            bar.setValue(bar.value() - pixels)
+            event.accept()
+            return
+        if dy == 0:
+            event.accept()
+            return
+        factor = _WHEEL_ZOOM_STEP ** (dy / _WHEEL_NOTCH)
         if modifiers & Qt.ControlModifier:
-            self.scale(factor, 1.0)
+            fx, fy = factor, 1.0
         elif modifiers & Qt.ShiftModifier:
-            self.scale(1.0, factor)
+            fx, fy = 1.0, factor
         else:
-            self.scale(factor, factor)
+            fx, fy = factor, factor
+        self.zoom_at(event.position().toPoint(), fx, fy)
+        event.accept()
+
+    def zoom_at(self, view_pos, fx, fy):
+        """view_pos（ビューポート座標）の下にある日付・行を動かさずに拡大縮小する。"""
+        anchor = self.mapToScene(view_pos)
+        self.scale(fx, fy)
         self._clamp_scale()
+        moved = self.mapFromScene(anchor) - view_pos
+        h_bar, v_bar = self.horizontalScrollBar(), self.verticalScrollBar()
+        h_bar.setValue(h_bar.value() + moved.x())
+        v_bar.setValue(v_bar.value() + moved.y())
         self.transformChanged.emit()
 
     def resizeEvent(self, event):
@@ -601,6 +728,12 @@ class GanttGraphicsView(QGraphicsView):
             event.accept()
             return
         if self._drag is not None:
+            if not self._drag["started"]:
+                moved = event.position().toPoint() - self._drag["press_pos"]
+                if moved.manhattanLength() < QApplication.startDragDistance():
+                    event.accept()
+                    return
+                self._begin_drag()
             self._update_drag(event)
             event.accept()
             return
@@ -614,7 +747,13 @@ class GanttGraphicsView(QGraphicsView):
             event.accept()
             return
         if event.button() == Qt.LeftButton and self._drag is not None:
-            self._finish_drag()
+            if self._drag["started"]:
+                self._finish_drag()
+            else:
+                # 動かさずに離した（Shift＋クリック）: 選択を外さずにそのバーを選択に加える
+                anchor = self._drag["anchor"]
+                self._drag = None
+                anchor.setSelected(True)
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -701,7 +840,7 @@ class GanttGraphicsView(QGraphicsView):
         self._dep_layer.set_arrows(arrows, 2 * _DEP_HEAD_PX / sx, 2 * _DEP_HEAD_PX / sy)
 
     def _dependency_arrows(self, scene, overrides):
-        """描く矢印の一覧 [(線, 色, 太さ, 破線か, 矢じりの位置 or None)]。目立たせたいもの
+        """描く矢印の一覧 [(線, 色, 太さ, 破線か, 矢じりの位置 or None, 矢じりの向き)]。目立たせたいもの
         （選んでいるタスクにつながる・守られていない）を後に並べて前面に描く。"""
         bars = getattr(scene, "gantt_bars", {})
         selected = {bar.key for bar in _task_bars(scene)}
@@ -726,16 +865,15 @@ class GanttGraphicsView(QGraphicsView):
                 color, width = _DEP_COLOR, _DEP_WIDTH
             target = emphasized if focused or broken else normal
             if pred in bars and succ in bars:
-                a, b = rect_of(pred), rect_of(succ)
-                target.append((dependency_path(a, b, step_x), color, width, False,
-                               QPointF(b.left(), b.center().y())))
+                path, head, direction = dependency_path(rect_of(pred), rect_of(succ), step_x)
+                target.append((path, color, width, False, head, direction))
                 continue
             outgoing = pred in bars
             key, other = (pred, succ) if outgoing else (succ, pred)
             rect = rect_of(key)
             path, dot_at = dependency_stub_path(rect, outgoing, step_x)
             head = None if outgoing else QPointF(rect.left(), rect.center().y())
-            target.append((path, color, width, True, head))
+            target.append((path, color, width, True, head, HEAD_RIGHT))
             name = self._dep_names.get(other, "")
             tip = (tr("このタスクを待っているタスク: {name}（絞り込みで非表示）", name=name) if outgoing
                    else tr("このタスクが待っているタスク: {name}（絞り込みで非表示）", name=name))
@@ -743,7 +881,7 @@ class GanttGraphicsView(QGraphicsView):
         return normal + emphasized
 
     def dependency_arrows(self):
-        """今描いている矢印（テスト・確認用）。[(線, 色, 太さ, 破線か, 矢じりの位置)]"""
+        """今描いている矢印（テスト・確認用）。[(線, 色, 太さ, 破線か, 矢じりの位置, 矢じりの向き)]"""
         return list(self._dep_layer.arrows) if self._dep_layer is not None else []
 
     def _add_dep_dot(self, scene, point, color, width, z, tooltip):
@@ -767,24 +905,48 @@ class GanttGraphicsView(QGraphicsView):
         return None
 
     def _try_start_drag(self, event):
-        """指定キー（既定 Shift）を押しながらバーを掴んだら、ドラッグを始める。
-        キーを押していなければ何もしない（クリックは従来どおり選択だけ）。"""
+        """指定キー（既定 Shift）を押しながらバーを押したら、ドラッグの準備をする。
+        キーを押していなければ何もしない（クリックは従来どおり選択だけ）。
+
+        選択はまだ変えない。実際に動かし始めた時（_begin_drag）に、選ばれていないバーなら
+        そのバーだけを選んで動かす。動かさずに離したら（Shift＋クリック）、今の選択を
+        外さずにそのバーを選択に加える（以前は押した瞬間に選択を外していたので、複数
+        選んでから Shift＋クリックすると1件に戻っていた）。"""
         if not self.edit_enabled or self.calendar is None:
             return False
         if not (event.modifiers() & self.drag_modifier):
             return False
-        anchor = self._bar_at(event.position().toPoint())
+        pos = event.position().toPoint()
+        anchor = self._bar_at(pos)
         if anchor is None:
             return False
+        right_edge = self.mapFromScene(anchor.bar_rect.topRight()).x()
+        self._drag = {
+            "anchor": anchor,
+            "started": False,
+            "press_pos": pos,
+            "add_to_selection": bool(event.modifiers() & Qt.ControlModifier),
+            "resize": abs(pos.x() - right_edge) <= _RESIZE_HANDLE_PX,
+            "bars": [],
+            "ghosts": {},
+            "press_x": self.mapToScene(pos).x(),
+            "days": {},
+            "shift": 0,
+            "new_days": None,
+            "targets": {},
+        }
+        return True
+
+    def _begin_drag(self):
+        """押したまま動かし始めた。動かすバーを決め、影を置く。"""
+        drag = self._drag
+        anchor = drag["anchor"]
         scene = self.scene()
         if not anchor.isSelected():
-            if not (event.modifiers() & Qt.ControlModifier):
+            if not drag["add_to_selection"]:
                 scene.clearSelection()
             anchor.setSelected(True)
-        right_edge = self.mapFromScene(anchor.bar_rect.topRight()).x()
-        resize = abs(event.position().toPoint().x() - right_edge) <= _RESIZE_HANDLE_PX
-        bars = [anchor] if resize else _task_bars(scene)
-        ghosts = {}
+        bars = [anchor] if drag["resize"] else _task_bars(scene)
         for bar in bars:
             color = QColor(bar.brush().color())
             color.setAlpha(_GHOST_FILL_ALPHA)
@@ -795,21 +957,25 @@ class GanttGraphicsView(QGraphicsView):
             ghost.setPen(pen)
             ghost.setZValue(_GHOST_Z)
             scene.addItem(ghost)
-            ghosts[bar.key] = ghost
-        self._drag = {
-            "anchor": anchor,
-            "resize": resize,
-            "bars": bars,
-            "ghosts": ghosts,
-            "press_x": self.mapToScene(event.position().toPoint()).x(),
-            # 各バーの長さ（営業日）。移動してもこの日数を保つ
-            "days": {b.key: max(1, self.calendar.count(b.start, b.end, b.team_key)) for b in bars},
-            "shift": 0,
-            "new_days": None,
-            "targets": {},
-        }
-        self.setCursor(Qt.SizeHorCursor if resize else Qt.ClosedHandCursor)
-        return True
+            drag["ghosts"][bar.key] = ghost
+        drag["bars"] = bars
+        # 各バーの長さ（営業日）。移動してもこの日数を保つ
+        drag["days"] = {b.key: max(1, self.calendar.count(b.start, b.end, b.team_key)) for b in bars}
+        drag["started"] = True
+        self.setCursor(Qt.SizeHorCursor if drag["resize"] else Qt.ClosedHandCursor)
+
+    def _cancel_drag(self):
+        """ドラッグを取りやめる（Esc）。影を消し、何も書き込まない。"""
+        drag, self._drag = self._drag, None
+        if drag is None:
+            return
+        scene = self.scene()
+        for ghost in drag["ghosts"].values():
+            if scene is not None:
+                scene.removeItem(ghost)
+        self.refresh_dependencies()
+        QToolTip.hideText()
+        self.setCursor(Qt.ArrowCursor)
 
     def _update_drag(self, event):
         drag = self._drag
@@ -904,6 +1070,34 @@ class _FrozenPaneView(QGraphicsView):
         # GanttGraphicsView と同じ理由（ファイルドロップをMainWindowへ
         # 伝播させるため）で無効化する。
         self.setAcceptDrops(False)
+        # クリックしてもフォーカスを受け取らず、本体に渡す（ジョブ名をクリックして
+        # ジョブを選んだ直後に、F（選択へズーム）・A（全体表示）が効くように）
+        self.setFocusPolicy(Qt.NoFocus)
+        self.body_view = None  # FrozenGanttPane が本体（GanttGraphicsView）を入れる
+
+    def wheelEvent(self, event):
+        """見出し・左列の上でのホイールも、本体の上と同じ操作（拡大縮小・横スクロール）に
+        する。以前はこのペインだけがスクロールして、左列のジョブ名が本体の行とずれていた。
+        拡大の中心は、マウスの位置に対応する本体の位置（本体の外なら端）にする。"""
+        body = self.body_view
+        if body is None:
+            super().wheelEvent(event)
+            return
+        viewport = body.viewport()
+        pos = viewport.mapFromGlobal(event.globalPosition().toPoint())
+        pos = QPoint(min(max(pos.x(), 0), viewport.width() - 1), min(max(pos.y(), 0), viewport.height() - 1))
+        forwarded = QWheelEvent(QPointF(pos), event.globalPosition(), event.pixelDelta(), event.angleDelta(),
+                                event.buttons(), event.modifiers(), event.phase(), event.inverted())
+        QApplication.sendEvent(viewport, forwarded)
+        event.accept()
+
+    def mousePressEvent(self, event):
+        self._focus_body()
+        super().mousePressEvent(event)
+
+    def _focus_body(self):
+        if self.body_view is not None:
+            self.body_view.setFocus(Qt.MouseFocusReason)
 
 
 class GanttHeaderView(_FrozenPaneView):
@@ -930,6 +1124,7 @@ class GanttColumnView(_FrozenPaneView):
         self.setFixedWidth(LEFT_MARGIN + _PANE_PADDING)
 
     def mousePressEvent(self, event):
+        self._focus_body()
         scene = self.scene()
         if event.button() == Qt.LeftButton and scene is not None:
             y = self.mapToScene(event.position().toPoint()).y()
@@ -971,6 +1166,27 @@ class FrozenGanttPane(QWidget):
         grid.addWidget(self.body, 1, 1)
         grid.setColumnStretch(1, 1)
         grid.setRowStretch(1, 1)
+        self.header.body_view = self.body
+        self.column.body_view = self.body
+
+        # チャートが無いとき（絞り込みで0件・スケジューリングできない）も、本体を見出し・
+        # 左列と同じ明るい背景で塗る。シーンが無いと QGraphicsView は背景（backgroundBrush）を
+        # 描かずパレットの色で塗るため、ダークモードでは本体だけ暗くなり、明るい見出し・
+        # 左列とL字に食い違っていた。
+        viewport = self.body.viewport()
+        viewport.setAutoFillBackground(True)
+        pal = viewport.palette()
+        pal.setColor(QPalette.Base, _PANE_BG)
+        pal.setColor(QPalette.Window, _PANE_BG)
+        viewport.setPalette(pal)
+        # チャートが無い理由（set_placeholder）。キャンバスは常に明るいので文字色も固定。
+        self.placeholder = QLabel(viewport)
+        self.placeholder.setAlignment(Qt.AlignCenter)
+        self.placeholder.setWordWrap(True)
+        self.placeholder.setStyleSheet(
+            f"QLabel {{ color: {_PROJECT_START_COLOR.name()}; background: transparent; }}"
+        )
+        self.placeholder.setVisible(False)
 
         self.body.transformChanged.connect(self._sync_panes)
         # 本体の表示部分の大きさ・位置は、ウィンドウの大きさやスクロールバーの
@@ -981,10 +1197,23 @@ class FrozenGanttPane(QWidget):
         self.column.jobClicked.connect(self._select_job)
 
     def setScene(self, scenes):
+        # シーンを差し替えるとドラッグ中のバー・影は古いシーンと一緒に消えるので、取りやめる
+        self.body._cancel_drag()
+        # 本体のスクロールバーは、チャートがある間は常に出し、無いときは出さない。
+        # 全体表示の縮尺は内容がビューポートよりわずかに大きい境目にある（_clamp_scale）ので、
+        # 必要に応じて出し入れすると、作り直しの途中で一瞬消えてビューポートが広がり、
+        # その幅で縮尺を合わせた後にまた現れて、全体表示からずれていた。
+        policy = Qt.ScrollBarAlwaysOff if scenes is None else Qt.ScrollBarAlwaysOn
+        self.body.setHorizontalScrollBarPolicy(policy)
+        self.body.setVerticalScrollBarPolicy(policy)
         if scenes is None:
             self.header.setScene(None)
             self.column.setScene(None)
             self.body.setScene(None)
+            # 前のチャートのスクロール範囲（setSceneRect）を消す
+            for view in (self.header, self.column, self.body):
+                view.setSceneRect(QRectF())
+            self._update_placeholder()
             return
         self.header.setScene(scenes.header)
         self.column.setScene(scenes.column)
@@ -1000,7 +1229,20 @@ class FrozenGanttPane(QWidget):
             self.column.setSceneRect(column_rect)
         if body_rect is not None:
             self.body.setSceneRect(body_rect)
+        self._update_placeholder()
         self._sync_panes()
+
+    def set_placeholder(self, text):
+        """チャートが無いときに本体の中央に出す文言（チャートがあるときは出さない）。"""
+        self.placeholder.setText(text)
+        self._update_placeholder()
+
+    def _update_placeholder(self):
+        shown = self.body.scene() is None and bool(self.placeholder.text())
+        if shown:
+            viewport = self.body.viewport()
+            self.placeholder.setGeometry(viewport.rect().adjusted(24, 24, -24, -24))
+        self.placeholder.setVisible(shown)
 
     def scene(self):
         return self.body.scene()
@@ -1032,27 +1274,87 @@ class FrozenGanttPane(QWidget):
             self.body.ensureVisible(rect, 40, 40)
 
     def _select_job(self, job_key, add):
+        """ジョブ名のクリックで、そのジョブの全タスクを選ぶ。Ctrl＋クリック（add）なら今の
+        選択に加える。そのジョブのタスクがすべて選ばれていれば、Ctrl＋クリックで外す。"""
         scene = self.body.scene()
         if scene is None:
             return
+        job_bars = [bar for key, bar in self.bars().items() if key[0] == job_key]
+        if add and job_bars and all(bar.isSelected() for bar in job_bars):
+            for bar in job_bars:
+                bar.setSelected(False)
+            return
         if not add:
             scene.clearSelection()
-        for key, bar in self.bars().items():
-            if key[0] == job_key:
-                bar.setSelected(True)
+        for bar in job_bars:
+            bar.setSelected(True)
+        self.body.setFocus(Qt.MouseFocusReason)
 
     def view_state(self):
-        """本体の縮尺とスクロール位置。restore_view_state() で戻す。"""
-        transform = self.body.transform()
-        return (transform.m11(), transform.m22(),
-                self.body.horizontalScrollBar().value(), self.body.verticalScrollBar().value())
+        """本体の表示位置。restore_view_state() で戻す。
+
+        スクロール量だけでなく、左端の日付・一番上に見えているジョブと、縦横それぞれが
+        全体表示のままか、を覚える。作り直したチャートでは、軸の範囲（表示中のタスク
+        しだいで左端の日付が変わる）や行の顔ぶれ（絞り込み）が変わるため、スクロール量を
+        そのまま戻すと別の日付・別のジョブが出ていた。全体表示のままだった向きは、作り
+        直した後も全体表示にする（絞り込みを外して行が増えても、全体が収まるように）。"""
+        body = self.body
+        transform = body.transform()
+        sx, sy = transform.m11(), transform.m22()
+        h, v = body.horizontalScrollBar().value(), body.verticalScrollBar().value()
+        scene = body.scene()
+        rect = getattr(scene, "gantt_body_rect", None) if scene is not None else None
+        if rect is None or sx <= 0 or sy <= 0:
+            return ViewState(sx, sy, h, v, True, True, None, None, 0.0)
+        visible = body.mapToScene(body.viewport().rect()).boundingRect()
+        fit_x = visible.width() >= rect.width() - _FIT_TOLERANCE_PX / sx
+        fit_y = visible.height() >= rect.height() - _FIT_TOLERANCE_PX / sy
+        left_day = scene.gantt_axis_start.toordinal() + (visible.left() - LEFT_MARGIN) / DAY_WIDTH
+        top_job, top_offset = None, 0.0
+        column_scene = self.column.scene()
+        for y_top, y_bottom, job_key in getattr(column_scene, "gantt_job_rows", ()):
+            if y_bottom > visible.top():
+                top_job, top_offset = job_key, (visible.top() - y_top) * sy
+                break
+        return ViewState(sx, sy, h, v, fit_x, fit_y, left_day, top_job, top_offset)
 
     def restore_view_state(self, state):
-        sx, sy, h, v = state
-        self.body.setTransform(QTransform().scale(sx, sy))
-        self.body._clamp_scale()
-        self.body.horizontalScrollBar().setValue(h)
-        self.body.verticalScrollBar().setValue(v)
+        body = self.body
+        scene = body.scene()
+        rect = getattr(scene, "gantt_body_rect", None) if scene is not None else None
+        sx, sy = state.sx, state.sy
+        if rect is not None and not rect.isEmpty():
+            viewport = body.viewport().size()
+            # 全体表示のままだった向きは、作り直したチャートの全体が収まる縮尺にする。
+            # _clamp_scale と同じく内容をビューポートよりわずかに大きくしておく（ちょうどの
+            # 大きさにすると一瞬スクロールバーが消えてビューポートが広がり、その幅で補正
+            # した後にスクロールバーが戻って、全体表示からずれていた）
+            if state.fit_x:
+                sx = (viewport.width() + _SCALE_FLOOR_MARGIN_PX) / rect.width()
+            if state.fit_y:
+                sy = (viewport.height() + _SCALE_FLOOR_MARGIN_PX) / rect.height()
+        body.setTransform(QTransform().scale(sx, sy))
+        body._clamp_scale()
+        h_bar, v_bar = body.horizontalScrollBar(), body.verticalScrollBar()
+        if rect is None or state.left_day is None:
+            h_bar.setValue(state.h)
+            v_bar.setValue(state.v)
+            self._sync_panes()
+            return
+        sx, sy = body.transform().m11(), body.transform().m22()
+        if state.fit_x:
+            h_bar.setValue(h_bar.minimum())
+        else:
+            x = LEFT_MARGIN + (state.left_day - scene.gantt_axis_start.toordinal()) * DAY_WIDTH
+            h_bar.setValue(h_bar.value() + round((x - body.mapToScene(0, 0).x()) * sx))
+        rows = {job: y_top for y_top, _y_bottom, job in getattr(self.column.scene(), "gantt_job_rows", ())}
+        if state.fit_y:
+            v_bar.setValue(v_bar.minimum())
+        elif state.top_job in rows:
+            y = rows[state.top_job] + state.top_offset / sy
+            v_bar.setValue(v_bar.value() + round((y - body.mapToScene(0, 0).y()) * sy))
+        else:
+            v_bar.setValue(state.v)
         self._sync_panes()
 
     def fit_all(self):
@@ -1095,6 +1397,7 @@ class FrozenGanttPane(QWidget):
     def eventFilter(self, obj, event):
         if obj is self.body.viewport() and event.type() in (QEvent.Resize, QEvent.Move):
             self._sync_panes()
+            self._update_placeholder()
         return super().eventFilter(obj, event)
 
     def _align_frozen_viewports(self):
@@ -1132,6 +1435,7 @@ class FrozenGanttPane(QWidget):
         self._update_axis_density(sx)
         self._center_milestone_labels(sx)
         self._center_tick_labels(sx)
+        self._place_year_labels(sx)
         self._center_task_labels(sx, sy)
         self._layout_job_labels(sy)
 
@@ -1375,9 +1679,46 @@ class FrozenGanttPane(QWidget):
         scene = self.header.scene()
         if scene is None or sx <= 0:
             return
+        header_rect = getattr(scene, "gantt_header_rect", None)
+        left_limit = header_rect.left() if header_rect is not None else float("-inf")
+        shown = []
         for label, line_x in getattr(scene, "gantt_tick_labels", []):
-            width_px = label.boundingRect().width()
-            label.setPos(line_x - (width_px / 2) / sx, label.y())
+            width = label.boundingRect().width() / sx
+            # 軸の左端の目盛りは、中央揃えのままだと左半分が切れる。見出しの範囲に収める
+            left = max(line_x - width / 2, left_limit)
+            label.setPos(left, label.y())
+            if label.isVisible():
+                shown.append((left, left + width, label))
+        # 月初めが続く軸の左端などで、ラベル同士が重ならないようにする。右から順に置き、
+        # 右隣と重なるものを隠す（左端の目盛りは月の途中から始まることが多いので、右の
+        # 丸ごと1か月ぶんのラベルを残す）
+        gap = _TICK_LABEL_GAP_PX / sx
+        next_left = float("inf")
+        for left, right, label in sorted(shown, key=lambda e: e[0], reverse=True):
+            if right + gap > next_left:
+                label.setVisible(False)
+                continue
+            next_left = left
+
+    def _place_year_labels(self, sx):
+        """年のラベルを、その年のうち今見えている部分の中央に置く（年の外にははみ出さない。
+        見えている部分がラベルより狭ければ、年の端に寄せる）。以前は年の中央に固定して
+        いたため、拡大して年の途中を見ていると年がどこにも出ず、何年か分からなかった。"""
+        scene = self.header.scene()
+        if scene is None or sx <= 0:
+            return
+        visible = self.header.mapToScene(self.header.viewport().rect()).boundingRect()
+        for label, span_left, span_right in getattr(scene, "gantt_year_labels", []):
+            width = label.boundingRect().width() / sx
+            if span_right - span_left < width:
+                # 縮小して年の幅がラベルより狭い（年をまたぐ短い端など）: 年の幅に収まらない
+                label.setVisible(False)
+                continue
+            left, right = max(span_left, visible.left()), min(span_right, visible.right())
+            center = (left + right) / 2 if right > left else (span_left + span_right) / 2
+            x = min(max(center - width / 2, span_left), span_right - width)
+            label.setVisible(True)
+            label.setPos(x, label.y())
 
 
 def _pack_lanes(tasks):
@@ -1494,21 +1835,25 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
     job_font.setBold(True)
 
     # -- ジョブごとにレーン詰め、Y座標を決める --------------------------------------
+    # 行は最初に1回だけ辞書にして、ジョブごとのまとめ・並べ替えは Python 側で行う
+    # （ジョブごとに DataFrame を絞り込んで iterrows すると、ジョブ数×行数の手間が
+    # かかり、大きな計画（1,916ジョブ・16,230行）で描画に10秒かかっていた）。
+    rows_by_job = {}
+    for r in df.to_dict("records"):
+        rows_by_job.setdefault(r["Job_ID"], []).append(r)
     if job_order is None:
         job_order = df.groupby("Job_ID")["Start_Date"].min().sort_values().index.tolist()
     else:
-        present = set(df["Job_ID"])
-        job_order = [job_id for job_id in job_order if job_id in present]
+        job_order = [job_id for job_id in job_order if job_id in rows_by_job]
     y_cursor = TOP_MARGIN
     job_blocks = []  # (job_id, job_name, workflow_id, y_top, y_bottom, [(task_row, lane), ...])
     for job_id in job_order:
-        job_rows = df[df["Job_ID"] == job_id].sort_values("Start_Date")
-        tasks = [{"start": r["Start_Date"], "end": r["End_Date"]} for _, r in job_rows.iterrows()]
-        lanes, lane_count = _pack_lanes(tasks)
+        job_rows = sorted(rows_by_job[job_id], key=lambda r: r["Start_Date"])
+        lanes, lane_count = _pack_lanes([{"start": r["Start_Date"], "end": r["End_Date"]} for r in job_rows])
         y_top = y_cursor
         y_bottom = y_top + lane_count * ROW_HEIGHT
-        job_blocks.append((job_id, str(job_rows.iloc[0]["Job_Name"]), job_rows.iloc[0]["Workflow_ID"],
-                            y_top, y_bottom, list(zip(job_rows.to_dict("records"), lanes))))
+        job_blocks.append((job_id, str(job_rows[0]["Job_Name"]), job_rows[0]["Workflow_ID"],
+                            y_top, y_bottom, list(zip(job_rows, lanes))))
         y_cursor = y_bottom + JOB_GAP
 
     chart_bottom = y_cursor
@@ -1600,18 +1945,23 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
     year_font = QFont(task_font)
     year_font.setBold(True)
     year_metrics = QFontMetrics(year_font)
+    # 年のラベルは、その年のうち画面に見えている部分の中央に置く（拡大して年の途中を
+    # 見ているときも年が分かるように）。位置は拡縮率しだいなので
+    # FrozenGanttPane._place_year_labels が _sync_panes のたびに決める。
+    header_scene.gantt_year_labels = []  # (label, 年の左端x, 年の右端x)
     year_cursor = axis_start.replace(month=1, day=1)
     while year_cursor <= axis_end:
         year_end = year_cursor.replace(month=12, day=31)
         span_start = max(axis_start, year_cursor)
-        span_end = min(axis_end, year_end)
+        span_end = min(axis_end, year_end + timedelta(days=1))
         center_x = (x_of(span_start) + x_of(span_end)) / 2
         text = tr("{year}年", year=year_cursor.year)
         text_width = year_metrics.horizontalAdvance(text)
-        _add_fixed_size_label(
+        year_label = _add_fixed_size_label(
             header_scene, text, year_font,
             (center_x - text_width / 2, TOP_MARGIN - _YEAR_LABEL_OFFSET),
         )
+        header_scene.gantt_year_labels.append((year_label, x_of(span_start), x_of(span_end)))
         if year_cursor > axis_start:
             # 年の変わり目に区切り線を引く（軸の左端そのものは境目ではないため
             # 引かない）。チャート全体（本体・他の行）には伸ばさず、年のラベルを
@@ -1736,6 +2086,8 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
             job_font,
             (4 + _JOB_SWATCH_WIDTH + _JOB_SWATCH_GAP, (y_top + y_bottom) / 2 - 8),
         )
+        # 列の幅に収まらず省略したジョブ名も、マウスを乗せれば全体を読めるようにする
+        job_label.setToolTip(job_name)
         # 縦に縮小して行が文字より低くなると、等倍描画のジョブ名同士が重なって
         # 読めなくなる。表示倍率が分かるタイミング（FrozenGanttPane._sync_panes）で
         # 行の中央へ揃え直し、重なる分を間引くため、参照を残しておく。
