@@ -186,6 +186,31 @@ class ScheduleCache(QObject):
         distribution_ratio = self.db.get_project()["distribution_ratio"]
         self._start_worker(seq, frames, distribution_ratio, plan)
 
+    def compute_now(self):
+        """今のDBの内容に対する計算結果を、その場で返す（検証エラー・失敗なら None）。
+
+        最新の結果があればそれを、無ければGUIスレッドで同期的に計算する（キャッシュ
+        には入れない）。タスクを進行中・完了にしたとき、その時点の日程を実績として
+        記録するのに使う（gui/main.py の _displayed_task_rows）。以前は最後に描いた
+        結果だけを使っていたため、ガントチャートを一度も開かずにジョブ作成タブで完了に
+        すると何も記録されず、後の編集で完了のタスクが動いていた。"""
+        if self.is_fresh():
+            return self.result_df
+        if validate_for_generation(self.db):
+            return None
+        try:
+            frames = build_frames(self.db)
+            plan = build_plan(self.db, PlanState(self.db))
+            ratio = self.db.get_project()["distribution_ratio"]
+            if plan is None:
+                return compute_schedule_from_frames(frames, verbose=False, distribution_ratio=ratio)
+            result_df, _info = compute_schedule_with_plan(
+                frames, plan, verbose=False, distribution_ratio=ratio,
+            )
+            return result_df
+        except Exception:  # noqa: BLE001 - 記録できないだけで、編集そのものは止めない
+            return None
+
     def _set_error(self, message):
         self.result_df = None
         self.display = None

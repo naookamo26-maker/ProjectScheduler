@@ -708,8 +708,30 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
                     )
                 not_before_ord = not_before.toordinal()
 
+            # 実績（任意列 Start_Pin_Exact・Fixed_End_Date。GUIが進行中・完了のタスクに
+            # 付ける）。実際に作業した日なので、開始固定日と違い休業日でも次の稼働日へ
+            # 送らない（休業日に始めた分はその日を1日目と数える）。Fixed_End_Date
+            # （exclusive）があれば、日数・休業日に関係なく [開始, 終了) をそのまま使う。
+            pin_exact = str(override.get("Start_Pin_Exact") or "").strip().upper() == "Y"
+            fixed_end_raw = override.get("Fixed_End_Date")
+            fixed_end_ord = None
+            if pd.notna(fixed_end_raw) and str(fixed_end_raw).strip() != "":
+                fixed_end = pd.to_datetime(fixed_end_raw, errors="coerce")
+                if pd.isna(fixed_end):
+                    raise SchedulingError(
+                        tr("タスク「{task}」の終了日 '{value}' を解釈できません", task=task_label, value=fixed_end_raw)
+                    )
+                fixed_end_ord = fixed_end.toordinal()
+            if start_pin_ord is None:
+                pin_exact, fixed_end_ord = False, None
+            elif fixed_end_ord is not None:
+                pin_exact = True
+                fixed_end_ord = max(fixed_end_ord, start_pin_ord + 1)
+
             active_tasks[g_id] = {
                 "start_pin_ord": start_pin_ord,
+                "pin_exact": pin_exact,
+                "fixed_end_ord": fixed_end_ord,
                 "not_before_ord": not_before_ord,
                 "job_id": job_id, "job_name": job_name, "task_id": t_id,
                 "jitter_key": jitter_key,
@@ -1106,7 +1128,30 @@ def _pinned_start(t_info, cal, team_id):
     ため——「置けない」ではなく「置いた結果がこうなった」を返すほうが情報が多い。
     """
     pin = t_info["start_pin_ord"]
-    return None if pin is None else cal.next_working_day(pin, team_id)
+    if pin is None:
+        return None
+    # 実績の開始日（pin_exact）は実際に作業した日なので、休業日でもそのまま使う
+    return pin if t_info.get("pin_exact") else cal.next_working_day(pin, team_id)
+
+
+def _pinned_span(t_info, cal, team_id):
+    """固定したタスクの (開始, 終了exclusive)。固定が無ければ None、所要日数ぶんの
+    稼働日を確保できなければ (開始, None)。
+
+    実績の終了日（fixed_end_ord）があればそのまま使う。休業日に始めた実績
+    （pin_exact）は、その日を1日目と数えて残りを稼働日で数える。"""
+    start = _pinned_start(t_info, cal, team_id)
+    if start is None:
+        return None
+    if t_info.get("fixed_end_ord") is not None:
+        return start, t_info["fixed_end_ord"]
+    days = t_info["days"]
+    if cal.is_working_day(start, team_id):
+        return start, cal.business_end(start, days, team_id)
+    if days <= 1:
+        return start, start + 1
+    rest = cal.next_working_day(start + 1, team_id)
+    return start, None if rest is None else cal.business_end(rest, days - 1, team_id)
 
 
 def _build_work_calendar(active_tasks, successors, scheduling_order, project_start,
@@ -1159,7 +1204,7 @@ def _build_work_calendar(active_tasks, successors, scheduling_order, project_sta
     # 「カレンダーの範囲外です」で止まる。
     pin_ords = [
         t["start_pin_ord"] for t in active_tasks.values() if t["start_pin_ord"] is not None
-    ]
+    ] + [t["fixed_end_ord"] for t in active_tasks.values() if t.get("fixed_end_ord") is not None]
     start_ord = project_start.toordinal()
     anchors = [start_ord] + ms_ends + pin_ords
     lo = min(anchors) - (max_tail * _CALENDAR_MARGIN_FACTOR + _CALENDAR_MARGIN_DAYS)
@@ -1167,6 +1212,14 @@ def _build_work_calendar(active_tasks, successors, scheduling_order, project_sta
         (max_load + max_lag_tail) * _CALENDAR_MARGIN_FACTOR + _CALENDAR_MARGIN_DAYS
     )
 
+    if jp_holidays is None:
+        # 日本の祝日は、カレンダーが覆う期間の全年について求める。以前は開始日の年
+        # からだけ求めていたため、確定後に開始日を確定日・再計画の基準日まで引き上げ
+        # ると（gui/gantt_generator.py）、それより前の年にある実績・固定の期間から
+        # 祝日が抜け、終わった仕事の終了日が変わっていた。
+        jp_holidays = generate_jp_holidays(
+            date_cls.fromordinal(lo).year, date_cls.fromordinal(hi).year
+        ) if auto_exclude_jp_holidays else set()
     return _WorkCalendar(lo, hi, holidays_all, holidays_by_team, jp_holidays,
                          auto_exclude_weekends, auto_exclude_jp_holidays)
 
@@ -1182,9 +1235,9 @@ def _calc_raw_dates(active_tasks, successors, scheduling_order, cal):
 
         # 固定（START_ON）タスクは最遅日程も固定日そのもの。後続タスクの都合で
         # 前後させる余地は無いので、ここで確定して次へ進む。
-        pin = _pinned_start(t_info, cal, team_id)
-        if pin is not None:
-            pin_end = cal.business_end(pin, days, team_id)
+        span = _pinned_span(t_info, cal, team_id)
+        if span is not None:
+            pin, pin_end = span
             if pin_end is None:
                 raise SchedulingError(
                     tr("タスク「{task}」の固定開始日から所要日数ぶんの稼働日を確保できません", task=_task_label(t_info))
@@ -1241,13 +1294,15 @@ def _calc_asap_dates(active_tasks, leveling_order, project_start_ord, cal):
     for g_id in leveling_order:
         t_info = active_tasks[g_id]
         team_id = t_info["team_id"]
-        t_start = _pinned_start(t_info, cal, team_id)
-        if t_start is None:
+        span = _pinned_span(t_info, cal, team_id)
+        if span is not None:
+            t_start, t_end = span
+        else:
             dep_ends = _dep_lower_bounds(t_info, asap_dates, cal, team_id, g_id)
             t_start = cal.next_working_day(
                 max([project_start_ord, t_info.get("not_before_ord") or 0] + dep_ends), team_id
             )
-        t_end = None if t_start is None else cal.business_end(t_start, t_info["days"], team_id)
+            t_end = None if t_start is None else cal.business_end(t_start, t_info["days"], team_id)
         if t_end is None:
             raise SchedulingError(
                 tr("タスク「{task}」の最速日程を求められません。休業日の設定、または所要日数を見直してください。", task=_task_label(t_info))
@@ -1327,7 +1382,8 @@ def _calc_unpinned_dates(active_tasks, successors, scheduling_order, leveling_or
     if all(t["start_pin_ord"] is None for t in active_tasks.values()):
         return asap_dates, raw_dates
     unpinned = {
-        g_id: t if t["start_pin_ord"] is None else dict(t, start_pin_ord=None)
+        g_id: t if t["start_pin_ord"] is None
+        else dict(t, start_pin_ord=None, pin_exact=False, fixed_end_ord=None)
         for g_id, t in active_tasks.items()
     }
     try:
@@ -1502,10 +1558,10 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
     for g_id in leveling_order:
         t_info = active_tasks[g_id]
         team_id = t_info["team_id"]
-        pin = _pinned_start(t_info, cal, team_id)
-        if pin is None:
+        span = _pinned_span(t_info, cal, team_id)
+        if span is None:
             continue
-        end_ord = cal.business_end(pin, t_info["days"], team_id)
+        pin, end_ord = span
         if end_ord is None:
             raise SchedulingError(
                 tr(
@@ -2382,7 +2438,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
             "Job_ID", "Task_ID", "Job_Name", "Task_Name", "Team_ID", "Priority",
             "Workflow_ID", "Milestone_ID", "Start_Date", "End_Date",
             "Resource_Adjusted", "Deadline_Overrun_Days",
-            "Constraint_Violation_Days", "Constraint_Violation",
+            "Constraint_Violation_Days", "Constraint_Violation", "Constraint_Overbooked",
         ])
         if plotly_output_path:
             export_plotly_gantt(result_df, plotly_output_path, project_name,
@@ -2393,11 +2449,8 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
                                  title_note=plotly_title_note)
         return result_df
 
-    jp_holidays = set()
-    if auto_exclude_jp_holidays:
-        year_start = project_start.year
-        year_end = max([t["ms_end"].year for t in active_tasks.values()] + [year_start])
-        jp_holidays = generate_jp_holidays(year_start, year_end)
+    # 日本の祝日はカレンダーの範囲が決まってから求める（_build_work_calendar）
+    jp_holidays = None
 
     successors, scheduling_order = _build_scheduling_order(active_tasks, active_ids)
 
@@ -2455,6 +2508,9 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
             # 空文字なら固定は無い、または固定は問題なく守られている。
             "Constraint_Violation_Days": violation_days,
             "Constraint_Violation": violation_note,
+            # 違反のうちライン数の超過があるか（説明文は訳されるので、種類はこちらで
+            # 見分ける。依存の違反は Constraint_Violation_Days > 0）
+            "Constraint_Overbooked": g_id in overbooked_pins,
         })
 
     result_df = pd.DataFrame(rows).sort_values(["Start_Date", "Job_ID", "Task_ID"]).reset_index(drop=True)

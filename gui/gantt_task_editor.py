@@ -4,10 +4,14 @@
 ダブルクリック、または右クリック「編集…」で開くフローティングウィンドウ。
 常時は表示しない。開いている間はガントの選択に追従し、選択中のタスクを編集する。
 
-- 1件選択: 開始日（固定）・日数・チーム・マイルストーン・状態・有効・タグ
+- 1件選択: 開始日（固定）・日数・チーム・マイルストーン・状態・有効・タグ。
+  進行中・完了のタスクは実績の開始日（完了は終了日も）を直せる
 - 複数選択: まとめて変えても不都合のない項目だけ（開始日は「N営業日ずらす」、
   固定は解除のみ、タグは追加・削除のみ、日数は編集不可）。値が揃っていない
   項目は「（複数の値）」と表示し、触らなければ変えない
+- 進行中・完了のタスクでは、日程に効かない項目（開始固定日、完了のタスクの日数・
+  チーム）を編集できない。実績の日付で置くため、書いても何も起きず、未着手に
+  戻した瞬間にまとめて効いてタスクが動いていた
 
 書き込みは gui/tab_gantt.py の GanttTab.apply_task_fields / shift_tasks を通す
 （1回の変更が1つのUndo単位になり、終わると再計算が走る）。1文字ごとに
@@ -15,7 +19,9 @@
 選んだ時に確定する。
 """
 
-from PySide6.QtCore import QByteArray, Qt
+from datetime import date, timedelta
+
+from PySide6.QtCore import QByteArray, QDate, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -32,10 +38,26 @@ from PySide6.QtWidgets import (
 )
 
 from gui.db import normalize_tags, parse_tags
-from gui.widgets_common import DefaultAwareSpinBox, OptionalDateEdit
+from gui.widgets_common import DefaultAwareSpinBox, NoWheelDateEdit, OptionalDateEdit
 from i18n import N_, tr
 
 _STATUS_OPTIONS = [(None, N_("未着手")), ("in_progress", N_("進行中")), ("done", N_("完了"))]
+_STARTED = ("in_progress", "done")
+
+
+def _date_edit():
+    edit = NoWheelDateEdit()
+    edit.setCalendarPopup(True)
+    edit.setDisplayFormat("yyyy-MM-dd")
+    return edit
+
+
+def _to_qdate(d):
+    return QDate(d.year, d.month, d.day)
+
+
+def _from_qdate(q):
+    return date(q.year(), q.month(), q.day())
 
 
 def _status_options():
@@ -122,6 +144,21 @@ class TaskEditWindow(QWidget):
         self.status_combo.activated.connect(lambda _i: self._commit_combo(self.status_combo, "status"))
         form.addRow(tr("状態"), self.status_combo)
 
+        # 実績（進行中・完了のタスクだけ出す）。終了日は画面では最後の日（exclusive の前日）
+        self.fact_start_edit = _date_edit()
+        self.fact_start_edit.editingFinished.connect(self._commit_fact)
+        self.fact_start_edit.calendarWidget().clicked.connect(lambda _d: self._commit_fact())
+        form.addRow(tr("実績の開始日"), self.fact_start_edit)
+        self.fact_end_edit = _date_edit()
+        self.fact_end_edit.editingFinished.connect(self._commit_fact)
+        self.fact_end_edit.calendarWidget().clicked.connect(lambda _d: self._commit_fact())
+        form.addRow(tr("実績の終了日"), self.fact_end_edit)
+        self.started_note = QLabel()
+        self.started_note.setWordWrap(True)
+        self.started_note.setEnabled(False)  # 補足なので控えめな色にする（パレットの無効色）
+        form.addRow(self.started_note)
+        self._single_form = form
+
         self.active_check = QCheckBox(tr("このタスクを実行する"))
         self.active_check.clicked.connect(self._commit_active)
         form.addRow(tr("有効"), self.active_check)
@@ -156,6 +193,7 @@ class TaskEditWindow(QWidget):
         days_note = QLabel(tr("複数選択時は編集できません"))
         days_note.setEnabled(False)
         form.addRow(tr("日数"), days_note)
+        self._multi_form = form
 
         self.multi_team_combo = QComboBox()
         self.multi_team_combo.activated.connect(
@@ -188,6 +226,11 @@ class TaskEditWindow(QWidget):
         tags_row.addWidget(remove_tag)
         tags_row.addStretch(1)
         form.addRow(tr("タグ"), tags_row)
+
+        self.multi_started_note = QLabel()
+        self.multi_started_note.setWordWrap(True)
+        self.multi_started_note.setEnabled(False)
+        form.addRow(self.multi_started_note)
         return page
 
     # -- 表示 ---------------------------------------------------------------------
@@ -237,10 +280,71 @@ class TaskEditWindow(QWidget):
         self._fill_combo(self.status_combo, _status_options(), r["status"])
         self.active_check.setChecked(bool(r["is_active"]))
         self.tags_edit.setText(r["tags"])
+        self._load_started(r)
+
+    def _load_started(self, r):
+        """進行中・完了のタスク: 実績の欄を出し、日程に効かない欄を編集できなくする。"""
+        status = r["status"]
+        started = status in _STARTED
+        done = status == "done"
+        self.pin_edit.setEnabled(not started)
+        self.pin_now_button.setEnabled(not started and r["start"] is not None)
+        self.days_spin.setEnabled(not done)
+        self.team_combo.setEnabled(not done)
+        # 実行中・実行済みのタスクを「実行しない」にはできない（先に未着手に戻す）
+        self.active_check.setEnabled(not started)
+        self.active_check.setToolTip(
+            tr("進行中・完了のタスクは無効にできません（実行しないことにするときは、先に状態を未着手に戻してください）。")
+            if started else "")
+        self._single_form.setRowVisible(self.fact_start_edit, started)
+        self._single_form.setRowVisible(self.fact_end_edit, done)
+        self._single_form.setRowVisible(self.started_note, started)
+        if not started:
+            return
+        start, last_day = self._fact_dates(r)
+        for edit, value in ((self.fact_start_edit, start), (self.fact_end_edit, last_day)):
+            edit.blockSignals(True)
+            if value is not None:
+                edit.setDate(_to_qdate(value))
+            edit.blockSignals(False)
+        if done:
+            note = tr("完了のタスクは、実績の開始日〜終了日に置きます。開始固定日・日数・チームは使いません。")
+        else:
+            note = tr("進行中のタスクは、実績の開始日から始まり、今の日数・チームで終わりが決まります。"
+                      "開始固定日は使いません。")
+        holidays = [d for d in (start, last_day if done else None)
+                    if d is not None and not self.tab.is_working_day(d, r["team_key"])]
+        if holidays:
+            note += tr("（{days} は休業日です。実際に作業した日として、そのまま記録します）",
+                       days=tr("・").join(d.isoformat() for d in holidays))
+        self.started_note.setText(note)
+
+    @staticmethod
+    def _fact_dates(r):
+        """実績の (開始日, 最後の日)。記録が無い（古いファイル等）ときは計算上の日程。"""
+        fact = r.get("fact")
+        if fact is not None:
+            return (date.fromisoformat(fact["start_date"]),
+                    date.fromisoformat(fact["end_date"]) - timedelta(days=1))
+        return r["start"], r["last_day"]
 
     def _load_multi(self, rows):
         self.title_label.setText(tr("{n_rows}件のタスクを編集", n_rows=len(rows)))
-        self.unpin_button.setEnabled(any(r["start_pin_date"] for r in rows))
+        # 進行中・完了のタスクには、ずらす・固定の解除（完了はチームも）を適用しない
+        # （gui/tab_gantt.py の apply_task_fields・shift_tasks）。全件が当てはまるなら押せなくする
+        not_started = [r for r in rows if r["status"] not in _STARTED]
+        not_done = [r for r in rows if r["status"] != "done"]
+        self.unpin_button.setEnabled(any(r["start_pin_date"] for r in not_started))
+        self.shift_button.setEnabled(bool(not_started))
+        self.shift_spin.setEnabled(bool(not_started))
+        self.multi_team_combo.setEnabled(bool(not_done))
+        self.multi_active_check.setEnabled(bool(not_started))
+        started = len(rows) - len(not_started)
+        self._multi_form.setRowVisible(self.multi_started_note, bool(started))
+        if started:
+            self.multi_started_note.setText(tr(
+                "進行中・完了のタスク（{n}件）には、ずらす・固定の解除・有効／無効は適用しません"
+                "（実績の日付で置くため。完了のタスクはチームも変えません）。", n=started))
         self._fill_combo(self.multi_team_combo, [(None, tr("（既定を使用）"))] + self.tab.team_options(),
                          self._common(rows, "override_team_id"))
         self._fill_combo(self.multi_milestone_combo,
@@ -305,6 +409,26 @@ class TaskEditWindow(QWidget):
         r = self._current_single_row()
         if r is not None and r["start"] is not None:
             self._apply(tr("タスクの開始日を固定"), {"start_pin_date": r["start"].isoformat()})
+
+    def _commit_fact(self):
+        """実績の開始日・終了日の欄を書き込む（変わっていなければ何もしない）。"""
+        row = self._current_single_row()
+        if row is None or row["status"] not in _STARTED:
+            return
+        start = _from_qdate(self.fact_start_edit.date())
+        was_start, was_last = self._fact_dates(row)
+        if row["status"] == "done":
+            last_day = _from_qdate(self.fact_end_edit.date())
+            if last_day < start:
+                # 開始日を終了日より後ろにした（またはその逆）。1日の作業として揃える
+                last_day = start
+            if (start, last_day) == (was_start, was_last) and row.get("fact") is not None:
+                return
+            self.tab.update_task_fact(row["key"], start, last_day + timedelta(days=1))
+        else:
+            if start == was_start and row.get("fact") is not None:
+                return
+            self.tab.update_task_fact(row["key"], start)
 
     def _commit_days(self):
         row = self._current_single_row()

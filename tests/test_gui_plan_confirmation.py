@@ -25,6 +25,8 @@ from test_gui_gantt_edit import (  # noqa: E402,F401  (gantt/qapp はフィク�
     qapp,
 )
 
+from PySide6.QtCore import QDate  # noqa: E402
+
 from gui.plan_confirmation import CONFIRMED, DRAFT, UNCONFIRMED  # noqa: E402
 
 pytestmark = pytest.mark.gui
@@ -462,3 +464,237 @@ def test_marking_a_moved_task_in_progress_keeps_it_where_it_is(qapp, gantt):
     _wait_recomputed(qapp, tab)
     assert (tab.view.bars()[key].start, tab.view.bars()[key].end) == moved
     assert tab.view.bars()[key].status == "in_progress"
+
+
+# -- 実績と、進行中・完了のタスクの編集（v1.2.0） --------------------------------------
+
+
+def _next_weekday(day, weekday):
+    """day 以降で最初の曜日 weekday（0=月〜6=日）の日付。"""
+    return day + timedelta(days=(weekday - day.weekday()) % 7)
+
+
+def test_discard_asks_whether_to_revert_the_statuses_only_when_they_changed(qapp, gantt):
+    """「変更を破棄」は既定では進行中・完了にした状態と実績を残す。確定の後に状態を
+    変えたタスクがあるときだけ、戻すかどうかのチェックを出す。"""
+    w, tab, ids = gantt
+    _confirm(qapp, w)
+    boxes = []
+
+    def answer(check):
+        def exec_box(box):
+            boxes.append(box.checkBox())
+            if check and box.checkBox() is not None:
+                box.checkBox().setChecked(True)
+            return next(b for b in box.buttons() if b.text() == "変更を破棄")
+        return patch.object(tab, "_exec_message_box", side_effect=exec_box)
+
+    # 状態を変えていなければ、チェックは出さない
+    w.db.set_draft_move(ids["job1"], ids["t2"], "2026-06-01")
+    tab.refresh_choices()
+    assert _band_settled(qapp, w, DRAFT)
+    _wait_recomputed(qapp, tab)
+    assert _wait(qapp, lambda: w.plan_band.discard_button.isEnabled())
+    with answer(False):
+        w.plan_band.discard_button.click()
+    assert boxes[-1] is None
+    assert _band_settled(qapp, w, CONFIRMED)
+
+    # 状態を変えたら、チェックを出す。既定（外したまま）では状態が残る
+    for check, expected in ((False, "done"), (True, None)):
+        w.db.update_job_task_override_fields(ids["job1"], ids["t1"], status="done")
+        w.db.set_draft_move(ids["job2"], ids["t2"], "2026-06-01")
+        tab.refresh_choices()
+        assert _band_settled(qapp, w, DRAFT)
+        _wait_recomputed(qapp, tab)
+        assert _wait(qapp, lambda: w.plan_band.discard_button.isEnabled())
+        with answer(check):
+            w.plan_band.discard_button.click()
+        assert boxes[-1] is not None and "1件" in boxes[-1].text()
+        _wait_recomputed(qapp, tab)
+        assert _override(w.db, ids["job1"], ids["t1"])["status"] == expected
+        assert w.db.list_draft_moves() == []
+
+
+def test_editor_shows_the_actual_dates_and_locks_the_fields_a_started_task_does_not_use(qapp, gantt):
+    w, tab, ids = gantt
+    key = _key(ids, "job1", "t1")
+    tab.view.select_keys([key])
+    tab.open_editor()
+    editor = tab._editor
+    form = editor._single_form
+    assert not form.isRowVisible(editor.fact_start_edit)
+    assert editor.pin_edit.isEnabled() and editor.days_spin.isEnabled() and editor.active_check.isEnabled()
+
+    # 進行中: 実績の開始日だけ。開始固定日は使わないが、日数・チームは今の値が効く。
+    # 実行中のタスクを「実行しない」にはできない
+    editor.status_combo.setCurrentIndex(editor.status_combo.findData("in_progress"))
+    editor.status_combo.activated.emit(editor.status_combo.currentIndex())
+    _wait_recomputed(qapp, tab)
+    assert form.isRowVisible(editor.fact_start_edit) and not form.isRowVisible(editor.fact_end_edit)
+    assert not editor.pin_edit.isEnabled() and not editor.pin_now_button.isEnabled()
+    assert editor.days_spin.isEnabled() and editor.team_combo.isEnabled()
+    assert not editor.active_check.isEnabled()
+    start = tab.view.bars()[key].start
+
+    # 完了: 実績の開始日・終了日。日数・チームも使わない
+    editor.status_combo.setCurrentIndex(editor.status_combo.findData("done"))
+    editor.status_combo.activated.emit(editor.status_combo.currentIndex())
+    _wait_recomputed(qapp, tab)
+    assert form.isRowVisible(editor.fact_end_edit)
+    assert not editor.days_spin.isEnabled() and not editor.team_combo.isEnabled()
+    assert "完了のタスクは" in editor.started_note.text()
+
+    # 実績の終了日を直すと、バーがその日付で終わる（Undo で戻る）
+    before = tab.view.bars()[key].end
+    last_day = before + timedelta(days=6)  # 土日をまたいでも、そのまま使う
+    editor.fact_end_edit.setDate(QDate(last_day.year, last_day.month, last_day.day))
+    editor.fact_end_edit.editingFinished.emit()
+    _wait_recomputed(qapp, tab)
+    assert (tab.view.bars()[key].start, tab.view.bars()[key].end) == (start, last_day + timedelta(days=1))
+    assert w.undo_manager.undo_label() == "実績の日付を変更"
+    w.undo_manager.undo()
+    _wait_recomputed(qapp, tab)
+    assert tab.view.bars()[key].end == before
+
+
+def test_editor_warns_when_an_actual_date_is_a_holiday(qapp, gantt):
+    """実績は実際に作業した日なので休業日でもそのまま記録し、注意だけ出す。"""
+    w, tab, ids = gantt
+    key = _key(ids, "job1", "t1")
+    w.db.update_job_task_override_fields(ids["job1"], ids["t1"], status="in_progress")
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    saturday = _next_weekday(tab.view.bars()[key].start, 5)
+    tab.view.select_keys([key])
+    tab.open_editor()
+    editor = tab._editor
+    editor.fact_start_edit.setDate(QDate(saturday.year, saturday.month, saturday.day))
+    editor.fact_start_edit.editingFinished.emit()
+    _wait_recomputed(qapp, tab)
+    assert tab.view.bars()[key].start == saturday
+    assert "休業日です" in editor.started_note.text()
+
+
+def test_a_pin_on_a_holiday_moves_to_the_next_working_day_and_says_so(qapp, gantt):
+    w, tab, ids = gantt
+    key = _key(ids, "job2", "t1")
+    saturday = _next_weekday(tab.view.bars()[key].start + timedelta(days=7), 5)
+    tab.view.select_keys([key])
+    tab.open_editor()
+    editor = tab._editor
+    editor.pin_edit.set_value(saturday.isoformat())
+    editor.pin_edit.editingFinished.emit()
+    _wait_recomputed(qapp, tab)
+    monday = saturday + timedelta(days=2)
+    assert _override(w.db, ids["job2"], ids["t1"])["start_pin_date"] == monday.isoformat()
+    assert tab.view.bars()[key].start == monday
+    assert "休業日のため" in tab.summary_text
+
+
+def test_dragging_a_pinned_task_after_confirming_moves_its_pin(qapp, gantt):
+    """確定済みの計画で開始固定日のあるタスクを動かすと、移動の記録ではなく固定日ごと
+    動かす（固定日が古い日付のまま隠れて残らないように。後からした操作を優先）。"""
+    w, tab, ids = gantt
+    key = _key(ids, "job2", "t1")
+    start = tab.view.bars()[key].start
+    w.db.update_job_task_override_fields(ids["job2"], ids["t1"], start_pin_date=start.isoformat())
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    _confirm(qapp, w)
+    tab.shift_tasks([key], 3)
+    _wait_recomputed(qapp, tab)
+    moved = tab.view.bars()[key].start
+    assert moved != start
+    assert w.db.list_draft_moves() == []
+    assert _override(w.db, ids["job2"], ids["t1"])["start_pin_date"] == moved.isoformat()
+
+
+def test_jobs_tab_locks_the_fields_a_started_task_does_not_use(qapp, gantt):
+    from gui.tab_jobs import _INACTIVE_STATUS_LOCK_TIP, _STARTED_ACTIVE_LOCK_TIP, _STARTED_LOCK_TIP
+
+    w, _tab, ids = gantt
+    jobs = _open_jobs_tab(qapp, w, ids["job1"])
+    row = _override_row(jobs, ids["t1"])
+    table = jobs.override_table
+    active, pin, days, team, status = (table.cellWidget(row, c) for c in (1, 5, 2, 4, 6))
+    pin_tip = pin.toolTip()
+    assert pin.isEnabled() and days.isEnabled() and team.isEnabled() and active.isEnabled()
+
+    status.setCurrentIndex(status.findData("in_progress"))
+    _wait(qapp, lambda: False, timeout=0.1)
+    assert not pin.isEnabled() and pin.toolTip() == _STARTED_LOCK_TIP
+    assert days.isEnabled() and team.isEnabled()
+    # 実行中のタスクを「実行しない」にはできない
+    assert not active.isEnabled() and active.toolTip() == _STARTED_ACTIVE_LOCK_TIP
+
+    status.setCurrentIndex(status.findData("done"))
+    _wait(qapp, lambda: False, timeout=0.1)
+    assert not days.isEnabled() and not team.isEnabled() and not active.isEnabled()
+
+    status.setCurrentIndex(status.findData(None))
+    _wait(qapp, lambda: False, timeout=0.1)
+    assert pin.isEnabled() and days.isEnabled() and team.isEnabled() and active.isEnabled()
+    assert pin.toolTip() == pin_tip  # 元の説明に戻る
+
+    # 無効（実行しない）のタスクは、進行中・完了にできない
+    active.setChecked(False)
+    _wait(qapp, lambda: False, timeout=0.1)
+    assert not status.isEnabled() and status.toolTip() == _INACTIVE_STATUS_LOCK_TIP
+    active.setChecked(True)
+    _wait(qapp, lambda: False, timeout=0.1)
+    assert status.isEnabled()
+
+
+def test_jobs_tab_lets_an_inactive_started_task_be_fixed_either_way(qapp, gantt):
+    """既に食い違っている行（古いファイルで、無効なのに完了）は、有効に戻すことも、
+    未着手に戻すこともできる（身動きが取れなくならない）。"""
+    w, _tab, ids = gantt
+    w.db.update_job_task_override_fields(ids["job1"], ids["t2"], status="done")
+    w.db.update_job_task_override_fields(ids["job1"], ids["t2"], is_active=False)
+    jobs = _open_jobs_tab(qapp, w, ids["job1"])
+    row = _override_row(jobs, ids["t2"])
+    active, status = (jobs.override_table.cellWidget(row, c) for c in (1, 6))
+    assert active.isEnabled() and status.isEnabled()
+
+
+def test_jobs_tab_moves_a_pin_on_a_holiday_to_the_next_working_day(qapp, gantt):
+    """ジョブ作成タブでも、開始固定日を入れ終えたとき（フォーカスが外れる直前）に、
+    休業日なら次の稼働日へ直して知らせる。入力と同じ1回の Undo で戻る。"""
+    w, _tab, ids = gantt
+    jobs = _open_jobs_tab(qapp, w, ids["job1"])
+    row = _override_row(jobs, ids["t2"])
+    pin = jobs.override_table.cellWidget(row, 5)
+    saturday = _next_weekday(QDate.currentDate().toPython() + timedelta(days=30), 5)
+    w.db.begin_undo_group("タスクの開始固定日を変更")  # フォーカスが入ったときと同じ
+    pin.set_value(saturday.isoformat())
+    with patch("gui.tab_jobs.QMessageBox.information") as info:
+        jobs._snap_pin_to_working_day(ids["t2"])  # フォーカスが外れる直前と同じ
+        w.db.end_undo_group()
+        _wait(qapp, lambda: info.called, timeout=1)
+    monday = saturday + timedelta(days=2)
+    assert _override(w.db, ids["job1"], ids["t2"])["start_pin_date"] == monday.isoformat()
+    assert pin.value() == monday.isoformat()
+    assert "休業日のため" in info.call_args[0][2]
+    w.undo_manager.undo()
+    assert _override(w.db, ids["job1"], ids["t2"])["start_pin_date"] is None
+
+
+def test_marking_done_in_the_jobs_tab_after_editing_there_records_the_current_dates(qapp, gantt):
+    """回帰テスト: ガントチャートの計算結果が古い（または一度も計算していない）ままジョブ
+    作成タブで完了にすると、実績が記録されず、後の編集で完了のタスクが動いていた。その場で
+    計算して、今の日程を記録する。"""
+    w, _tab, ids = gantt
+    jobs = _open_jobs_tab(qapp, w, ids["job1"])
+    row = _override_row(jobs, ids["t1"])
+    jobs.override_table.cellWidget(row, 2).setValue(8)  # 日数を変える（ガントは再計算していない）
+    assert not w.schedule_cache.is_fresh()
+    status = jobs.override_table.cellWidget(_override_row(jobs, ids["t2"]), 6)
+    status.setCurrentIndex(status.findData("done"))
+    facts = {(f["job_id"], f["workflow_task_id"]): f for f in w.db.list_task_facts()}
+    fact = facts[(ids["job1"], ids["t2"])]
+    # 設計を8日に延ばした後の位置で記録する（設計の終わりより後に始まる）
+    design_end = w.schedule_cache.compute_now()
+    design_end = design_end[(design_end["Job_ID"] == _key(ids, "job1", "t1")[0])
+                            & (design_end["Task_ID"] == _key(ids, "job1", "t1")[1])].iloc[0]["End_Date"]
+    assert fact["start_date"] >= design_end.date().isoformat()

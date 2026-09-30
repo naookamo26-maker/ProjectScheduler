@@ -136,6 +136,18 @@ _ORDER_LABELS = {
 # オプション（gui/app_settings.py の gantt_drag_modifier）の値 → Qtの修飾キー
 _DRAG_MODIFIER_KEYS = {"shift": Qt.ShiftModifier, "alt": Qt.AltModifier}
 
+# 進行中・完了（実績の日付で置く状態）
+_STARTED = ("in_progress", "done")
+# 進行中・完了のタスクでは変えられない上書き。進行中は開始日が実績で決まり、完了は
+# 開始日〜終了日が実績で決まる（日数・チームも使わない）。有効／無効（「このタスクを
+# 実行する」）も、実行中・実行済みのタスクを「実行しない」にするのは矛盾するので変え
+# させない（実行しないことにするときは、先に未着手に戻す）。まとめて編集するときは
+# 該当するタスクに書き込まない（apply_task_fields）。
+_INEFFECTIVE_WHEN_STARTED = {
+    "in_progress": frozenset({"start_pin_date", "is_active"}),
+    "done": frozenset({"start_pin_date", "override_days", "team_id", "is_active"}),
+}
+
 
 class GanttTab(QWidget):
     # 選択が変わった（状態帯の「選択した変更を確定」を押せるかが変わりうる）
@@ -994,35 +1006,110 @@ class GanttTab(QWidget):
 
     def apply_task_fields(self, keys, label, fields):
         """keys の各タスクの上書き列を変える。fields は列→値の辞書、または
-        編集ウィンドウの行（editor_task_rows の1要素）を受け取って辞書を返す関数。"""
+        編集ウィンドウの行（editor_task_rows の1要素）を受け取って辞書を返す関数。
+
+        進行中・完了のタスクには、日程に効かない項目（_INEFFECTIVE_WHEN_STARTED）を
+        書き込まない。書いても実績の日付で置かれるので何も起きず、未着手に戻した瞬間に
+        まとめて効いてタスクが動いていたため。開始固定日は、休業日なら次の稼働日に
+        直して書き込む（バーの位置と欄の値をそろえる）。"""
         rows = {r["key"]: r for r in self.editor_task_rows(keys)}
         keys = [key for key in keys if key in rows]
         if not keys:
             if self._editor is not None and self._editor.isVisible():
                 self._editor.reload()
             return
+        planned = []
+        skipped = 0
+        notes = []
+        for key in keys:
+            values = dict(fields(rows[key]) if callable(fields) else fields)
+            if "status" not in values:
+                blocked = _INEFFECTIVE_WHEN_STARTED.get(rows[key]["status"], frozenset())
+                kept = {c: v for c, v in values.items() if c not in blocked}
+                skipped += len(kept) < len(values)
+                values = kept
+            if values.get("start_pin_date"):
+                pinned, note = self._working_pin(key, values["start_pin_date"])
+                values["start_pin_date"] = pinned
+                if note:
+                    notes.append(note)
+            if values:
+                planned.append((key, values))
+        if not planned:
+            QMessageBox.information(self, tr("タスクの編集"), tr(
+                "選んだタスクは進行中・完了のため、この項目は変えられません"
+                "（実績の日付はタスクの編集ウィンドウで直せます）。"))
+            if self._editor is not None and self._editor.isVisible():
+                self._editor.reload()
+            return
+        if skipped:
+            notes.append(tr("進行中・完了の{n}件には適用しませんでした。", n=skipped))
 
         def write():
             results = []
-            for key in keys:
+            for key, values in planned:
                 job_id, task_id = self._job_and_task_ids(key)
-                values = fields(rows[key]) if callable(fields) else fields
                 results.append(self.db.update_job_task_override_fields(job_id, task_id, **values))
             return results
-        self._write_tasks(keys, label, write)
+        self._write_tasks([key for key, _values in planned], label, write, note="".join(notes))
+
+    def _working_pin(self, key, iso_date):
+        """開始固定日 iso_date が休業日なら次の稼働日にした日付と、そのことを知らせる
+        文を返す（稼働日ならそのままと空文字）。スケジューラも休業日の固定日は次の
+        稼働日から始めるので、欄の値とバーの位置をそろえておく。"""
+        if self._calendar is None:
+            return iso_date, ""
+        day = date.fromisoformat(iso_date)
+        working = self._calendar.next_working(day, self._team_key(key))
+        if working == day:
+            return iso_date, ""
+        return working.isoformat(), tr(
+            "{day} は休業日のため、次の稼働日 {working} を開始固定日にしました。", day=day, working=working
+        )
+
+    def is_working_day(self, day, team_key=None):
+        """day（date）がそのチームの稼働日か（計算結果がまだ無ければ真）。"""
+        return self._calendar is None or self._calendar.is_working(day, team_key)
+
+    def update_task_fact(self, key, start, end=None):
+        """実績の日付を直す（編集ウィンドウの「実績の開始日」「実績の終了日」）。start /
+        end は date（end は exclusive＝最後の日の翌日。進行中のタスクは省略）。"""
+        if not self._existing_keys([key]):
+            return
+        job_id, task_id = self._job_and_task_ids(key)
+        days = None
+        if end is not None and self._calendar is not None:
+            days = max(1, self._calendar.count(start, end, self._team_key(key)))
+
+        def write():
+            self.db.update_task_fact(
+                job_id, task_id, start.isoformat(), end.isoformat() if end is not None else None, days,
+            )
+            return []
+        self._write_tasks([key], tr("実績の日付を変更"), write)
 
     def shift_tasks(self, keys, n):
-        """keys の各タスクの開始日を、そのチームの営業日で n 日ずらして固定する。"""
+        """keys の各タスクの開始日を、そのチームの営業日で n 日ずらして固定する
+        （編集ウィンドウの「ずらす」）。進行中・完了のタスクは、ドラッグと同じく
+        動かさない（実績の日付で置くため）。"""
         if self._calendar is None:
             return
+        statuses = {r["key"]: r["status"] for r in self.editor_task_rows(keys)}
+        started = [key for key in keys if statuses.get(key) in _STARTED]
         targets = []
         for key in keys:
             pos = self._task_positions.get(key)
-            if pos is None:
+            if pos is None or key in started:
                 continue
             team_key = self._team_key(key)
             targets.append((key, self._calendar.shift(pos[0], n, team_key)))
-        self._on_move_requested(targets, n)
+        if not targets and started:
+            QMessageBox.information(self, tr("タスクの編集"), tr(
+                "選んだタスクは進行中・完了のため、ずらせません"
+                "（実績の日付はタスクの編集ウィンドウで直せます）。"))
+            return
+        note = tr("進行中・完了の{n}件には適用しませんでした。", n=len(started)) if started else ""
+        self._on_move_requested(targets, n, note=note)
 
     def _team_key(self, key):
         bar = self.view.bars().get(key)
@@ -1032,22 +1119,30 @@ class GanttTab(QWidget):
         match = df[(df["Job_ID"] == key[0]) & (df["Task_ID"] == key[1])]
         return match.iloc[0]["Team_ID"] if not match.empty else None
 
-    def _on_move_requested(self, targets, shift):
+    def _on_move_requested(self, targets, shift, note=""):
         """ドラッグ（または編集ウィンドウの「ずらす」）で決まった新しい開始日を、
         手動ピン（開始固定日）として書き込む。"""
-        existing = self._existing_keys([key for key, _d in targets])
-        targets = [(key, new_start) for key, new_start in targets if key in existing]
+        rows = {r["key"]: r for r in self.editor_task_rows([key for key, _d in targets])}
+        targets = [(key, new_start) for key, new_start in targets if key in rows]
         if not targets:
             return
         keys = [key for key, _d in targets]
 
         if self.db.has_confirmation():
             # 確定済みのファイルでは、ドラッグした位置は変更案として記録する（手動ピン
-            # にはしない。「変更を確定」で確定行に書き込まれる。§8-8）。
+            # にはしない。「変更を確定」で確定行に書き込まれる。§8-8）。ただし開始固定日の
+            # あるタスクは、固定日ごと動かす——移動の記録だけにすると、固定日が古い日付の
+            # まま隠れて残り、未着手に戻す・未確定に戻すとその日付へ飛んでいたため。
             def write():
+                results = []
                 for key, new_start in targets:
-                    self.db.set_draft_move(*self._job_and_task_ids(key), new_start.isoformat())
-                return []
+                    job_id, task_id = self._job_and_task_ids(key)
+                    if rows[key]["start_pin_date"]:
+                        results.append(self.db.update_job_task_override_fields(
+                            job_id, task_id, start_pin_date=new_start.isoformat()))
+                    else:
+                        self.db.set_draft_move(job_id, task_id, new_start.isoformat())
+                return results
         else:
             def write():
                 return [
@@ -1057,7 +1152,7 @@ class GanttTab(QWidget):
                     for key, new_start in targets
                 ]
         label = tr("ガントでタスクを移動") if len(keys) == 1 else tr("ガントで{n}件のタスクを移動", n=len(keys))
-        self._write_tasks(keys, label, write)
+        self._write_tasks(keys, label, write, note=note)
 
     def _on_resize_requested(self, key, new_days):
         """バー右端のドラッグで決まった期間（営業日）を、日数上書きとして書き込む。
@@ -1126,6 +1221,7 @@ class GanttTab(QWidget):
         rows = []
         milestones = {m["id"]: m["name"] for m in self.db.list_milestones()}
         jobs = {j["id"]: j for j in self.db.list_jobs()}
+        facts = {(f["job_id"], f["workflow_task_id"]): f for f in self.db.list_task_facts()}
         for key in keys:
             job_id, task_id = self._job_and_task_ids(key)
             job = jobs.get(job_id)
@@ -1152,6 +1248,9 @@ class GanttTab(QWidget):
                 "last_day": (pos[1] - timedelta(days=1)) if pos else None,
                 "working_days": self._calendar.count(pos[0], pos[1], team_key)
                 if pos and self._calendar else None,
+                # 実績（進行中・完了のタスク。task_facts の行、無ければ None）
+                "fact": facts.get((job_id, task_id)) if r["status"] in _STARTED else None,
+                "team_key": team_key,
             })
         return rows
 
@@ -1177,7 +1276,6 @@ class GanttTab(QWidget):
         keys = self.view.selected_keys()
         if not keys:
             return
-        bars = self.view.bars()
         rows = self.editor_task_rows(keys)
         menu = QMenu(self)
         # 先頭に、メニューが何に効くかを出す（何も無い所を右クリックしたときも、画面の外に
@@ -1190,18 +1288,25 @@ class GanttTab(QWidget):
         menu.addSeparator()
         edit_action = menu.addAction(tr("編集…"))
         menu.addSeparator()
+        # 進行中・完了のタスクで日程に効かない項目は、選んだタスクすべてに効かないなら
+        # 押せなくする（一部に効くなら、効くタスクにだけ適用する。apply_task_fields）
+        not_started = [r for r in rows if r["status"] not in _STARTED]
+        not_done = [r for r in rows if r["status"] != "done"]
         pin_action = menu.addAction(tr("開始日を固定"))
+        pin_action.setEnabled(bool(not_started))
         unpin_action = menu.addAction(tr("固定を解除"))
-        unpin_action.setEnabled(any(bars[k].pinned for k in keys if k in bars))
+        unpin_action.setEnabled(any(r["start_pin_date"] for r in not_started))
         days_action = menu.addAction(tr("日数を増減…"))
+        days_action.setEnabled(bool(not_done))
         reset_days_action = menu.addAction(tr("既定の日数に戻す"))
-        reset_days_action.setEnabled(any(r["override_days"] is not None for r in rows))
+        reset_days_action.setEnabled(any(r["override_days"] is not None for r in not_done))
         status_menu = menu.addMenu(tr("状態"))
         status_actions = {
             status_menu.addAction(label): value
             for value, label in ((None, tr("未着手")), ("in_progress", tr("進行中")), ("done", tr("完了")))
         }
         team_menu = menu.addMenu(tr("チーム"))
+        team_menu.setEnabled(bool(not_done))
         team_actions = {team_menu.addAction(tr("（既定を使用）")): None}
         team_menu.addSeparator()
         for team_id, name in self.team_options():
@@ -1211,6 +1316,7 @@ class GanttTab(QWidget):
         self._check_current(team_actions, {r["override_team_id"] for r in rows})
         menu.addSeparator()
         disable_action = menu.addAction(tr("無効にする"))
+        disable_action.setEnabled(bool(not_started))
 
         chosen = self._exec_menu(menu, global_pos)
         if chosen is None:
@@ -1350,7 +1456,9 @@ class GanttTab(QWidget):
         else:
             parts.append(tr("計算中"))
         if state.global_changed:
-            parts.append(tr("全体設定の変更（全面再計画で反映）"))
+            # 休業日を足す・ライン数を減らす等で遅れる分は、すでに反映して表示している
+            # （影響の件数に出る）。ライン数を増やす等で早まる分だけが全面再計画待ち
+            parts.append(tr("全体設定の変更（早まる分は全面再計画で反映）"))
         return DRAFT, tr(" ｜ ").join(parts), ready
 
     def _replan_guidance(self, state):
@@ -1391,18 +1499,46 @@ class GanttTab(QWidget):
         ids = {self._job_and_task_ids(k) for k in keys}
         return bool(selected_targets(state, ids, successor_map(self.db)))
 
-    def _ask_plan_action(self, title, text, details, ok_label):
-        """取り消しの大きい操作の確認。ボタンは操作名と「キャンセル」（既定はキャンセル）。"""
+    def _plan_action_box(self, title, text, details, ok_label, checkbox=None):
+        """取り消しの大きい操作の確認ダイアログと、その実行ボタン。ボタンは操作名と
+        「キャンセル」（既定はキャンセル）。checkbox（QCheckBox）を渡すとボタンの上に出す。"""
         box = QMessageBox(QMessageBox.Question, title, text, parent=self)
         box.setInformativeText(details)
         ok = box.addButton(ok_label, QMessageBox.AcceptRole)
         cancel = box.addButton(tr("キャンセル"), QMessageBox.RejectRole)
         box.setDefaultButton(cancel)
+        if checkbox is not None:
+            # setCheckBox はレイアウトを作り直すので、幅を広げる余白より先に付ける
+            box.setCheckBox(checkbox)
         # QMessageBox は幅が狭く、1行の説明が途中で折り返されるので広げる
         layout = box.layout()
         layout.addItem(QSpacerItem(560, 0, QSizePolicy.Minimum, QSizePolicy.Expanding),
                        layout.rowCount(), 0, 1, layout.columnCount())
+        return box, ok
+
+    def _ask_plan_action(self, title, text, details, ok_label):
+        box, ok = self._plan_action_box(title, text, details, ok_label)
         return self._exec_message_box(box) is ok
+
+    def _ask_discard(self, status_changes):
+        """「変更を破棄」の確認。取りやめたら None、破棄するなら、進行中・完了にした
+        状態と実績も確定した時点に戻すか（bool）。
+
+        状態と実績は既定では残す（実際に起きたことの記録であって、計画の変更では
+        ないため）。確定した後に状態を変えたタスクがあるときだけ、戻すかどうかの
+        チェックを出す（status_changes はその件数）。"""
+        check = None
+        if status_changes:
+            check = QCheckBox(tr("進行中・完了にした状態と実績も、確定した時点に戻す（{n}件）", n=status_changes))
+        box, ok = self._plan_action_box(
+            tr("変更を破棄"), tr("変更案を破棄して、最後に確定した日程に戻しますか？"),
+            tr("消えるもの: 確定後の計画の変更すべて（ドラッグで動かした位置を含む）\n"
+               "残るもの: 「選択した変更を確定」で確定した分、進行中・完了にした状態と実績"),
+            tr("変更を破棄"), checkbox=check,
+        )
+        if self._exec_message_box(box) is not ok:
+            return None
+        return bool(check is not None and check.isChecked())
 
     def _exec_replan_dialog(self):
         """全面再計画ダイアログを出して、選んだ基準日を返す（キャンセルなら None。
@@ -1443,14 +1579,10 @@ class GanttTab(QWidget):
                     return
                 self.db.start_full_replan(base.isoformat(), date.today().isoformat())
             elif action == "discard":
-                if not self._ask_plan_action(
-                    tr("変更を破棄"), tr("変更案を破棄して、最後に確定した日程に戻しますか？"),
-                    tr("消えるもの: 確定後の変更すべて（ドラッグで動かした位置、タスクの状態の変更を含む）\n"
-                    "残るもの: 「選択した変更を確定」で確定した分"),
-                    tr("変更を破棄"),
-                ):
+                restore_statuses = self._ask_discard(self.db.status_changes_since_base())
+                if restore_statuses is None:
                     return
-                self.db.discard_draft()
+                self.db.discard_draft(restore_statuses=restore_statuses)
             elif action == "clear":
                 if not self._ask_plan_action(
                     tr("未確定に戻す"), tr("プロジェクト全体を未確定に戻しますか？"),

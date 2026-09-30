@@ -70,6 +70,8 @@ GUIの文言とメッセージを英語・ベトナム語・中国語（簡体�
 | 有効 / 無効 | enabled / disabled | bật / tắt | 启用 / 停用 |
 | 状態（タスクの進捗） | status | trạng thái | 状态 |
 | 未着手 / 進行中 / 完了 | Not started / In progress / Done | Chưa bắt đầu / Đang thực hiện / Hoàn thành | 未开始 / 进行中 / 已完成 |
+| 実績（進行中・完了のタスクの実際の日程） | actual dates | ngày thực tế | 实际日期 |
+| 実績の開始日 / 実績の終了日 | actual start date / actual end date | ngày bắt đầu thực tế / ngày kết thúc thực tế | 实际开始日 / 实际结束日 |
 
 ## 画面・操作
 

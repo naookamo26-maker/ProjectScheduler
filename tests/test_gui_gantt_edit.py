@@ -526,6 +526,22 @@ def test_context_menu_changes_days_by_a_delta_and_resets_them(qapp, gantt):
     assert _override(w.db, ids["job2"], ids["t1"])["override_days"] == 11
 
 
+def _menu_enabled(tab):
+    """右クリックメニューを出したことにして、{文言: 押せるか} を返す（何も選ばない）。
+    サブメニューはその見出しの文言で、サブメニュー自体が押せるかを返す。"""
+    seen = {}
+
+    def fake_exec(menu, *_args):
+        for action in menu.actions():
+            if action.text():
+                seen[action.text()] = action.isEnabled() and (
+                    action.menu() is None or action.menu().isEnabled())
+        return None
+    with patch.object(tab, "_exec_menu", fake_exec):
+        tab._show_context_menu(None)
+    return seen
+
+
 def test_context_menu_pins_sets_status_and_team(qapp, gantt):
     w, tab, ids = gantt
     key = _key(ids, "job1", "t2")
@@ -537,11 +553,6 @@ def test_context_menu_pins_sets_status_and_team(qapp, gantt):
     _wait_recomputed(qapp, tab)
     assert _override(w.db, ids["job1"], ids["t2"])["start_pin_date"] == start.isoformat()
 
-    with _choose_menu(tab, "完了"):
-        tab._show_context_menu(None)
-    _wait_recomputed(qapp, tab)
-    assert _override(w.db, ids["job1"], ids["t2"])["status"] == "done"
-
     with _choose_menu(tab, "チームB"):
         tab._show_context_menu(None)
     _wait_recomputed(qapp, tab)
@@ -552,7 +563,45 @@ def test_context_menu_pins_sets_status_and_team(qapp, gantt):
     _wait_recomputed(qapp, tab)
     row = _override(w.db, ids["job1"], ids["t2"])
     assert row["start_pin_date"] is None
-    assert row["status"] == "done"  # 他の列は消えない
+    assert row["override_team_id"] == ids["team_b"]  # 他の列は消えない
+
+    with _choose_menu(tab, "完了"):
+        tab._show_context_menu(None)
+    _wait_recomputed(qapp, tab)
+    assert _override(w.db, ids["job1"], ids["t2"])["status"] == "done"
+
+    # 完了のタスクは実績の日付で置くので、日程に効かない項目は押せない（押しても何も
+    # 起きず、未着手に戻した瞬間にまとめて効いてタスクが動いていたため）
+    # 実行済みのタスクを「実行しない」にするのも矛盾するので、無効にもできない
+    enabled = _menu_enabled(tab)
+    for text in ("開始日を固定", "固定を解除", "日数を増減…", "既定の日数に戻す", "チーム", "無効にする"):
+        assert enabled[text] is False, text
+    assert enabled["状態"] and enabled["編集…"]
+
+
+def test_context_menu_skips_started_tasks_in_a_mixed_selection(qapp, gantt):
+    """未着手と完了のタスクをまとめて選んだときは、日程に効かない項目を未着手のタスクに
+    だけ適用し、適用しなかった件数を知らせる。すべて完了なら何もせずに知らせる。"""
+    from gui.tab_gantt import QMessageBox
+
+    w, tab, ids = gantt
+    done, todo = _key(ids, "job1", "t1"), _key(ids, "job2", "t1")
+    w.db.update_job_task_override_fields(ids["job1"], ids["t1"], status="done")
+    tab.refresh_choices()
+    _wait_recomputed(qapp, tab)
+    tab.view.select_keys([done, todo])
+    with _choose_menu(tab, "チームB"):
+        tab._show_context_menu(None)
+    _wait_recomputed(qapp, tab)
+    assert _override(w.db, ids["job2"], ids["t1"])["override_team_id"] == ids["team_b"]
+    assert _override(w.db, ids["job1"], ids["t1"])["override_team_id"] is None
+    assert "進行中・完了の1件には適用しませんでした" in tab.summary_text
+
+    before = w.db.serialize_state()
+    with patch.object(QMessageBox, "information") as info:
+        tab.apply_task_fields([done], "チームを変更", {"team_id": ids["team_b"]})
+    assert info.called
+    assert w.db.serialize_state() == before
 
 
 def test_editor_window_single_selection_edits_status_and_days(qapp, gantt):
@@ -592,12 +641,17 @@ def test_editor_window_multi_selection_shows_mixed_values_and_edits_all(qapp, ga
     assert editor.pages.currentWidget() is editor.multi_page
     assert editor.multi_status_combo.currentText() == "（複数の値）"
 
+    # 完了のタスクは実績の日付で置くので、チームは変えない（未着手のタスクにだけ適用し、
+    # 適用しなかったことを知らせる）
+    assert not editor.multi_started_note.isHidden()
     combo = editor.multi_team_combo
+    assert combo.isEnabled()
     combo.setCurrentIndex(combo.findData(ids["team_b"]))
     combo.activated.emit(combo.currentIndex())
     _wait_recomputed(qapp, tab)
-    assert _override(w.db, ids["job1"], ids["t1"])["override_team_id"] == ids["team_b"]
+    assert _override(w.db, ids["job1"], ids["t1"])["override_team_id"] is None
     assert _override(w.db, ids["job2"], ids["t2"])["override_team_id"] == ids["team_b"]
+    assert "進行中・完了の1件には適用しませんでした" in tab.summary_text
     # 触っていない項目（状態）は変えない
     assert _override(w.db, ids["job1"], ids["t1"])["status"] == "done"
     assert _override(w.db, ids["job2"], ids["t2"])["status"] is None

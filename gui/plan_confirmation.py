@@ -112,11 +112,12 @@ class PlanState:
     - status: UNCONFIRMED / CONFIRMED / DRAFT
     - confirmed: {(job_id, workflow_task_id): 確定行}
     - changed: 変更の起点（指紋が食い違う、確定行の無い有効なタスク、変更案で
-      ドラッグしたタスク）
+      ドラッグしたタスク、実績が確定と違う進行中・完了のタスク）
     - global_changed: 全体設定が確定時から変わったか
     - started: 進行中・完了のタスク
     - draft_moves: {(job_id, workflow_task_id): 'YYYY-MM-DD'}
-    - facts: 進行中・完了のタスクの確定行（未確定でも、その日程で固定して計算する）
+    - facts: 進行中・完了のタスクの実績（task_facts の行。確定していなくても、その
+      日程で固定して計算する）
     - in_progress: 進行中のタスク（開始日だけ固定し、日数・チームは今の入力に従う）
     - inputs: {(job_id, workflow_task_id): 指紋の材料（実効の日数・チーム等）}
     - pending_replan: 全面再計画を実行中なら (基準日 D, 実行日 T)、そうでなければ None
@@ -147,10 +148,14 @@ class PlanState:
         self.in_progress = {
             (r["job_id"], r["workflow_task_id"]) for r in overrides if r["status"] == "in_progress"
         }
-        self.facts = {k: r for k, r in self.confirmed.items() if k in self.started}
+        # 実績（進行中・完了のタスクの実際の日程。確定とは別に持つ）
+        self.facts = {
+            (r["job_id"], r["workflow_task_id"]): r for r in db.list_task_facts()
+            if (r["job_id"], r["workflow_task_id"]) in self.started
+        }
         if not self.confirmed_at:
-            # 未確定（一度も確定していない、または「未確定に戻す」の後）。残っている
-            # 確定行は進行中・完了のタスクのもの（facts）だけを使う
+            # 未確定（一度も確定していない、または「未確定に戻す」の後）。進行中・完了の
+            # タスクは実績（facts）で固定し、それ以外は自由に計算する
             self.confirmed = {}
             self.draft_moves = {}
             self.status = UNCONFIRMED
@@ -172,6 +177,16 @@ class PlanState:
         # 確定行はあるが、もうジョブ／タスクとして存在しないもの（削除した）
         changed |= {key for key in self.confirmed if key not in self.active}
         changed |= set(self.draft_moves)
+        # 実績が確定した日程と違う（遅れて・早く始めた、変更案で動いていた位置で
+        # 始めた、実績の日付を直した）。確定済みと言いながら表示が確定と違う、に
+        # ならないよう「変更あり」にする（後続もこれに合わせて動く）
+        for key, fact in self.facts.items():
+            row = self.confirmed.get(key)
+            if row is None or not self.active.get(key, False):
+                continue
+            if fact["start_date"] != row["start_date"] or (
+                    key not in self.in_progress and fact["end_date"] != row["end_date"]):
+                changed.add(key)
         self.changed = changed
         self.global_changed = project["confirmed_global_signature"] != global_signature(db)
         if self.pending_replan:
@@ -229,6 +244,61 @@ def downstream(keys, successors):
                 seen.add(nxt)
                 stack.append(nxt)
     return seen
+
+
+def shared_change_companions(db, state, targets, base_shared):
+    """「選択した変更を確定」の対象（targets）と同じジョブ単位・ワークフロー単位の
+    変更（ジョブの優先度・ワークフロー内の依存）だけを受けた、他のタスク。
+
+    これらの入力はジョブ・ワークフロー全体で1つなので、1タスクだけ確定することは
+    できない（破棄用のスナップショットに書き込むと、同じジョブの他のタスクが確定
+    から変わったことになり、「変更を破棄」の直後から「変更あり」になる）。その変更
+    以外に変わっていないタスクは一緒に確定する。base_shared は
+    ProjectDatabase.draft_base_shared_inputs() の戻り値（None なら広げない）。"""
+    if not base_shared or not targets:
+        return set()
+    inputs, _active = _task_inputs(db)
+    task_workflow = {
+        r["id"]: r["workflow_id"] for r in db._conn.execute("SELECT id, workflow_id FROM workflow_tasks")
+    }
+
+    def wf_preds(key):
+        return [p for p in inputs[key]["preds"] if p[0] == "wf"]
+
+    def base_wf_preds(task_id):
+        return sorted(tuple(p) for p in base_shared["wf_preds"].get(task_id, []))
+
+    priority_jobs = {
+        k[0] for k in targets
+        if k in inputs and k[0] in base_shared["priority"]
+        and base_shared["priority"][k[0]] != inputs[k]["priority"]
+    }
+    dep_workflows = set()
+    for k in targets:
+        workflow = task_workflow.get(k[1])
+        if k not in inputs or workflow not in base_shared["workflows"]:
+            continue
+        tasks = [t for t, w in task_workflow.items() if w == workflow]
+        if any(sorted(tuple(p) for p in wf_preds(key)) != base_wf_preds(key[1])
+               for key in inputs if key[1] in tasks and key[0] == k[0]):
+            dep_workflows.add(workflow)
+    if not priority_jobs and not dep_workflows:
+        return set()
+    companions = set()
+    for key in state.changed - set(targets):
+        row = state.confirmed.get(key)
+        if row is None or key not in inputs:
+            continue
+        value = dict(inputs[key])
+        if key[0] in priority_jobs:
+            value["priority"] = base_shared["priority"].get(key[0], value["priority"])
+        if task_workflow.get(key[1]) in dep_workflows:
+            value["preds"] = [list(p) for p in base_wf_preds(key[1])] + [
+                p for p in inputs[key]["preds"] if p[0] != "wf"
+            ]
+        if value != inputs[key] and _digest(value) == row["input_signature"]:
+            companions.add(key)
+    return companions
 
 
 def release_set(state, successors):

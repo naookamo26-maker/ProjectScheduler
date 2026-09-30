@@ -45,7 +45,7 @@ def test_migrating_to_v17_keeps_every_scheduled_date(tmp_path):
     shutil.copy(SAMPLE, path)
     db = ProjectDatabase.open_existing(str(path))
     try:
-        assert SCHEMA_VERSION == "18"
+        assert SCHEMA_VERSION == "19"
         jobs = db.list_jobs()
         assert all(j["stable_key"] == f"JOB_{j['id']:03d}" for j in jobs)
 
@@ -327,8 +327,8 @@ def test_draft_moves_move_the_task_without_a_manual_pin(tmp_path):
 
 
 def test_discarding_the_draft_restores_everything_including_status_changes(tmp_path):
-    """「変更を破棄」は、最後に確定した時点へすべて戻す（タスクの状態の変更も戻す）。
-    以前は状態だけを残していたが、何が戻るのか分かりにくかった。"""
+    """「変更を破棄」で「状態も元に戻す」を選ぶと、最後に確定した時点へすべて戻す
+    （タスクの状態の変更も戻す）。"""
     from gui.plan_actions import confirm_all
     from gui.plan_confirmation import CONFIRMED, PlanState
 
@@ -340,12 +340,40 @@ def test_discarding_the_draft_restores_everything_including_status_changes(tmp_p
     db.update_job_task_override_fields(j1, ids["t2"], status="in_progress")
     db.add_job("追加ジョブ", db.list_workflows()[0]["id"], None, 3)
 
-    db.discard_draft()
+    db.discard_draft(restore_statuses=True)
 
     state = PlanState(db)
     assert state.status == CONFIRMED
     assert db.list_all_job_task_overrides() == []  # 日数・タグも状態も戻る
     assert all(j["name"] != "追加ジョブ" for j in db.list_jobs())
+
+
+def test_discarding_the_draft_keeps_the_statuses_and_actual_dates_by_default(tmp_path):
+    """「変更を破棄」は既定では計画の変更だけを戻し、進行中・完了にした状態と実績は
+    残す（実際に起きたことの記録であって、計画の変更ではないため）。破棄で消える
+    ジョブの状態は捨てる。"""
+    from gui.plan_actions import confirm_all
+    from gui.plan_confirmation import CONFIRMED, PlanState
+
+    db, ids = _plan_project(tmp_path)
+    _with_display(db)
+    confirm_all(db, _compute(db)[0])
+    j0, j1 = ids["jobs"][:2]
+    db.update_job_task_override_fields(j0, ids["t1"], override_days=9, tags="案")
+    db.update_job_task_override_fields(j1, ids["t1"], status="done")
+    extra = db.add_job("追加ジョブ", db.list_workflows()[0]["id"], None, 3)
+    db.update_job_task_override_fields(extra, ids["t1"], status="in_progress")
+    assert db.status_changes_since_base() == 2
+
+    db.discard_draft()
+
+    overrides = {(o["job_id"], o["workflow_task_id"]): o for o in db.list_all_job_task_overrides()}
+    assert set(overrides) == {(j1, ids["t1"])}
+    assert overrides[(j1, ids["t1"])]["status"] == "done"
+    assert overrides[(j1, ids["t1"])]["override_days"] is None
+    assert {(f["job_id"], f["workflow_task_id"]) for f in db.list_task_facts()} == {(j1, ids["t1"])}
+    assert PlanState(db).status == CONFIRMED  # 確定した日程どおりに完了した
+    assert db.status_changes_since_base() == 1
 
 
 def _with_display(db):
@@ -354,7 +382,8 @@ def _with_display(db):
 
     def provider(keys):
         df, _, _ = _compute(db)
-        return confirmed_rows_from_result(db, df, only_keys=set(keys), keep_done_facts=False)
+        only = None if keys is None else set(keys)
+        return confirmed_rows_from_result(db, df, only_keys=only, keep_done_facts=False)
     db.displayed_rows_provider = provider
 
 
@@ -442,25 +471,36 @@ def test_status_changes_in_an_unconfirmed_plan_do_not_jump_to_old_dates(tmp_path
     db.update_job_task_override_fields(j0, ids["t1"], status="done")
     assert _positions(_compute(db)[0]) == before
     db.update_job_task_override_fields(j0, ids["t1"], status=None)
-    assert all((r["job_id"], r["workflow_task_id"]) != (j0, ids["t1"]) for r in db.list_confirmed_schedule())
+    assert all((r["job_id"], r["workflow_task_id"]) != (j0, ids["t1"]) for r in db.list_task_facts())
 
 
 def test_discarding_also_reverts_the_dates_recorded_by_a_status_change(tmp_path):
-    """状態を変えたときに記録した日程も、「変更を破棄」で状態と一緒に確定した時点へ戻る。"""
+    """「状態も元に戻す」を選んで破棄すると、状態を変えたときに記録した実績も状態と
+    一緒に確定した時点へ戻る。選ばなければ、変更案の位置で始めた実績は残り、確定とは
+    違うので「変更あり」のままになる（確定済みと言いながら表示が違う、にならない）。"""
     from gui.plan_actions import confirm_all
+    from gui.plan_confirmation import DRAFT, PlanState
 
-    db, ids = _plan_project(tmp_path)
-    _with_display(db)
-    confirm_all(db, _compute(db)[0])
-    confirmed = _positions(_compute(db)[0])
-    j0 = ids["jobs"][0]
-    db.set_draft_move(j0, ids["t1"], "2026-04-20")
-    db.update_job_task_override_fields(j0, ids["t1"], status="in_progress")
+    for restore in (True, False):
+        db, ids = _plan_project(tmp_path / str(restore))
+        _with_display(db)
+        confirm_all(db, _compute(db)[0])
+        confirmed = _positions(_compute(db)[0])
+        j0 = ids["jobs"][0]
+        db.set_draft_move(j0, ids["t1"], "2026-04-20")
+        db.update_job_task_override_fields(j0, ids["t1"], status="in_progress")
+        moved = _positions(_compute(db)[0])[_k(j0, ids["t1"])]
 
-    db.discard_draft()
+        db.discard_draft(restore_statuses=restore)
 
-    assert db.list_all_job_task_overrides() == []
-    assert _positions(_compute(db)[0]) == confirmed
+        if restore:
+            assert db.list_all_job_task_overrides() == []
+            assert _positions(_compute(db)[0]) == confirmed
+        else:
+            state = PlanState(db)
+            assert state.status == DRAFT and (j0, ids["t1"]) in state.changed
+            assert _positions(_compute(db)[0])[_k(j0, ids["t1"])] == moved
+        db.close()
 
 
 def test_discarding_after_confirming_a_selection_reverts_later_edits_of_that_task(tmp_path):
@@ -501,8 +541,8 @@ def test_clearing_the_confirmation_returns_to_free_simulation(tmp_path):
 
 
 def test_clearing_the_confirmation_keeps_started_and_done_tasks_where_they_were(tmp_path):
-    """「未確定に戻す」でも、進行中・完了のタスクは実施した事実なので確定していた
-    日程のまま固定する。未着手のタスクだけが自由に計算し直される。"""
+    """「未確定に戻す」でも、進行中・完了のタスクは実施した事実なので実績の日程の
+    まま固定する。未着手のタスクだけが自由に計算し直される。"""
     from gui.plan_actions import confirm_all
     from gui.plan_confirmation import UNCONFIRMED, PlanState
 
@@ -516,7 +556,8 @@ def test_clearing_the_confirmation_keeps_started_and_done_tasks_where_they_were(
     db.update_job_task_override_fields(*started, status="in_progress")
     db.clear_confirmation()
     assert not db.has_confirmation()
-    assert {(r["job_id"], r["workflow_task_id"]) for r in db.list_confirmed_schedule()} == {done, started}
+    assert db.list_confirmed_schedule() == []
+    assert {(r["job_id"], r["workflow_task_id"]) for r in db.list_task_facts()} == {done, started}
 
     # 自由に計算すると、全体が最速側へ詰まる（未着手のタスクは動く）
     db.set_distribution_ratio(0.0)
@@ -527,7 +568,7 @@ def test_clearing_the_confirmation_keeps_started_and_done_tasks_where_they_were(
     assert after[_k(*started)] == before[_k(*started)]
     assert any(after[k] != before[k] for k in before if k not in (_k(*done), _k(*started)))
 
-    # 未着手に戻したタスクは、残っていた確定行を使わずに自由に置かれる
+    # 未着手に戻したタスクは、実績を消して自由に置かれる
     db.update_job_task_override_fields(*done, status=None)
     assert set(PlanState(db).facts) == {started}
 
