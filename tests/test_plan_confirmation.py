@@ -22,6 +22,7 @@ from gui.db_schema import SCHEMA_VERSION  # noqa: E402
 pytestmark = pytest.mark.scheduler
 
 SAMPLE = Path(__file__).resolve().parent.parent / "data" / "Project_Schedule_Sample_GameDev_v22.pschedule"
+GUIDE_NEW_TITLE = Path(__file__).resolve().parent.parent / "data" / "Guide_Sample_NewTitle.pschedule"
 
 
 def _schedule(frames, **kwargs):
@@ -720,3 +721,243 @@ def test_html_output_during_a_draft_can_choose_the_confirmed_or_the_draft_schedu
     assert title == "P スケジュール（変更案・未確定）"
     assert _positions(draft_df) == _positions(_compute(db)[0])
     assert f"JOB_{new_job:03d}" in set(draft_df["Job_ID"])
+
+
+# -- 確定後の変更で、収まらないタスクの扱い（押し下げ） ----------------------------------------
+
+
+def test_a_lengthened_task_pushes_the_tasks_behind_it_instead_of_jumping_to_a_gap(tmp_path):
+    """確定後に日数を延ばしたタスク（とその後続）が、同じチームの確定の位置に固定した
+    タスクに阻まれて元の場所に収まらないときは、阻んだタスクのほうを後ろへずらす。
+
+    以前は阻んだタスクを動かさず、日数ぶん連続して空いている最初の隙間へ置いていた
+    ため、日数を数日延ばしただけで後続が他のジョブの後ろ（数か月先になることもある）へ
+    飛んでいた。"""
+    db, ids, before = _confirmed_project(tmp_path)
+    j2, j3 = ids["jobs"][1], ids["jobs"][2]
+    db.update_job_task_override_fields(j2, ids["t1"], override_days=8)
+    df, _state, info = _compute(db)
+    after = _positions(df)
+    # 延ばしたタスクはその場で延び、後続はその分だけずれる（隙間へ飛ばない）
+    assert after[_k(j2, ids["t1"])][0] == before[_k(j2, ids["t1"])][0]
+    assert 0 <= (after[_k(j2, ids["t2"])][0] - after[_k(j2, ids["t1"])][1]).days <= 2
+    # 後ろに控えていた別のジョブのタスクを押し下げる（確定より前には出さない）
+    for task in ("t1", "t2"):
+        key = _k(j3, ids[task])
+        assert 0 < (after[key][0] - before[key][0]).days <= 7
+    for key in before:
+        assert after[key][0] >= before[key][0]
+    assert (df["Constraint_Violation"] != "").sum() == 0
+    assert set(info["pushed"]) == {_k(j3, ids["t1"]), _k(j3, ids["t2"])}
+    assert all(origins == {_k(j2, ids["t1"])} for origins in info["pushed"].values())
+
+
+def test_a_lengthened_task_keeps_its_place_before_a_higher_priority_job(tmp_path):
+    """延ばしたタスクがその場に残り、後ろに控えるタスクのほうがずれる——後ろのタスクの
+    ジョブのほうが優先度が高くても同じ（延ばしたタスクとその後続を先に置く）。
+
+    詰め直しを優先度の順に行うだけだと、後ろに控えていた優先度の高いタスクが先に
+    ラインを取り、延ばしたタスクのほうがその後ろへ回っていた。"""
+    from gui.plan_actions import confirm_all
+
+    db, ids = _plan_project(tmp_path, lines=1, jobs=2)
+    high, low = ids["jobs"]
+    db.set_distribution_ratio(0.0)
+    # 優先度の低いジョブを先に置いて確定する（開始固定日で並びを決めて確定し、固定を
+    # 外してもう一度確定する）
+    db.update_job_task_override_fields(low, ids["t1"], start_pin_date="2026-04-06")
+    db.update_job_task_override_fields(high, ids["t1"], start_pin_date="2026-04-20")
+    with patch("gui.plan_actions._now", return_value="2026-04-01T09:00:00"):
+        confirm_all(db, _compute(db)[0])
+        db.update_job_task_override_fields(low, ids["t1"], start_pin_date=None)
+        db.update_job_task_override_fields(high, ids["t1"], start_pin_date=None)
+        df = _compute(db)[0]
+        confirm_all(db, df)
+    before = _positions(df)
+    assert before[_k(low, ids["t2"])][1] <= before[_k(high, ids["t1"])][0]
+    assert _positions(_compute(db)[0]) == before
+
+    db.update_job_task_override_fields(low, ids["t2"], override_days=8)
+    after = _positions(_compute(db)[0])
+    assert after[_k(low, ids["t2"])][0] == before[_k(low, ids["t2"])][0]
+    assert after[_k(high, ids["t1"])][0] >= after[_k(low, ids["t2"])][1]
+    assert (after[_k(high, ids["t1"])][0] - before[_k(high, ids["t1"])][0]).days <= 7
+
+
+def test_lengthening_an_in_progress_task_pushes_the_next_job_on_the_same_line(tmp_path):
+    """進行中のタスクの日数を延ばして、同じチームの次の確定済みタスク（別のジョブ）に
+    重なったら、その次のタスクを押し下げる。進行中のタスクは実績の開始日で固定する
+    ので影響範囲には入らず、以前はライン数の超過のまま残っていた。"""
+    db, ids, before = _confirmed_project(tmp_path)
+    j1, j4 = ids["jobs"][0], ids["jobs"][3]
+    first = _k(j4, ids["t1"])
+    assert min(before, key=lambda k: before[k][0]) == first
+    db.update_job_task_override_fields(j4, ids["t1"], status="in_progress")
+    db.update_job_task_override_fields(j4, ids["t1"], override_days=12)
+    df, _state, info = _compute(db)
+    after = _positions(df)
+    assert after[first][0] == before[first][0]
+    assert after[first][1] > before[_k(j1, ids["t1"])][0]
+    nxt = _k(j1, ids["t1"])
+    assert after[nxt][0] >= after[first][1]
+    assert (after[nxt][0] - before[nxt][0]).days <= 7
+    for key in before:
+        assert after[key][0] >= before[key][0]
+    assert (df["Constraint_Violation"] != "").sum() == 0
+    assert info["pushed"][nxt] == {first}
+
+
+def test_tasks_added_after_confirming_do_not_take_the_line_from_pushed_tasks(tmp_path):
+    """押し下げのときも、確定していないタスク（確定の後に足したジョブ）はこれまでどおり
+    確定済みのタスクの空きに入る。
+
+    押し下げた計算で確定していないタスクを先に置いていたため、優先度の最も低い足した
+    ジョブが、押し下げた確定済みのタスクより先にラインを取り、関係の無いジョブ（旅立ち）の
+    タスクを40日以上押し出していた（利用者ガイドの6章の場面）。"""
+    from gui.plan_actions import confirm_all
+
+    path = tmp_path / "guide.pschedule"
+    shutil.copy(GUIDE_NEW_TITLE, path)
+    db = ProjectDatabase.open_existing(str(path))
+    try:
+        with patch("gui.plan_actions._now", return_value="2026-04-01T09:00:00"):
+            confirm_all(db, _compute(db)[0])
+        jobs = {j["name"]: j for j in db.list_jobs()}
+        maou = jobs["魔王"]
+        tasks = {t["name"]: t["id"] for t in db.list_workflow_tasks(maou["workflow_id"])}
+        master = next(m["id"] for m in db.list_milestones() if m["name"] == "マスターアップ")
+        villager = db.add_job("村人", maou["workflow_id"], master, 5, "サブ")
+        df = _compute(db)[0]
+        before = _positions(df)
+        names = dict(zip(df["Job_ID"], df["Job_Name"]))
+
+        db.update_job_task_override_fields(maou["id"], tasks["モーション制作"], override_days=30)
+        df, _state, info = _compute(db)
+        after = _positions(df)
+        motion = _k(maou["id"], tasks["モーション制作"])
+        assert after[motion][0] == before[motion][0]
+        for key in before:
+            if names[key[0]] in ("旅立ち",) or key[0] == f"JOB_{villager:03d}":
+                assert after[key] == before[key], key
+            assert after[key][0] >= before[key][0]
+            assert (after[key][0] - before[key][0]).days <= 14, key
+        assert info["pushed"]
+    finally:
+        db.close()
+
+
+def test_dragging_a_task_later_pushes_the_next_task_and_starting_it_moves_nothing(tmp_path):
+    """確定後にドラッグで後ろへ動かしたタスクが、同じチームの次の確定済みタスクに重なったら、
+    次のタスクを押し下げる（日数を延ばしたときと同じ）。その後にドラッグしたタスクを進行中
+    にしても、何も動かない。
+
+    以前はドラッグした位置で重なったまま（ライン数の超過）で、進行中にした途端に押し下げが
+    始まって、状態を変えただけで別のジョブのタスクが動いていた。"""
+    db, ids, before = _confirmed_project(tmp_path)
+    _with_display(db)
+    j2, j3 = ids["jobs"][1], ids["jobs"][2]
+    build, nxt = _k(j2, ids["t2"]), _k(j3, ids["t1"])
+    assert before[build][1] <= before[nxt][0]
+    db.set_draft_move(j2, ids["t2"], (before[build][0] + pd.Timedelta(days=2)).isoformat())
+    df, _state, info = _compute(db)
+    dragged = _positions(df)
+    assert dragged[build][1] > before[nxt][0]
+    assert dragged[nxt][0] >= dragged[build][1]
+    assert (df["Constraint_Violation"] != "").sum() == 0
+    assert info["pushed"][nxt] == {build}
+
+    db.update_job_task_override_fields(j2, ids["t2"], status="in_progress")
+    assert _positions(_compute(db)[0]) == dragged
+
+
+def test_confirming_the_selected_change_also_confirms_the_tasks_it_pushed(tmp_path):
+    """「選択した変更を確定」は、その変更が押し下げた他のジョブのタスクも一緒に確定する。
+    残すと、確定した変更がラインを取ったまま押し下げた側が確定の位置へ戻り、ライン数の
+    超過になる（確定した直後に表示が変わる）。別の変更とその影響は残す。"""
+    from gui.plan_actions import confirm_selected, pushed_tasks
+    from gui.plan_confirmation import DRAFT, successor_map
+
+    db, ids, before = _confirmed_project(tmp_path)
+    j2, j3, j4 = ids["jobs"][1:]
+    db.update_job_task_override_fields(j2, ids["t1"], override_days=8)
+    db.update_job_task_override_fields(j4, ids["t2"], override_days=6)
+    df, _state, info = _compute(db)
+    shown = _positions(df)
+    with patch("gui.plan_actions._now", return_value="2026-04-01T09:00:00"):
+        count = confirm_selected(db, df, {(j2, ids["t1"])}, successor_map(db), pushed_tasks(info))
+    assert count == 4  # J2 の設計・実装と、押し下げた J3 の設計・実装
+    df2, state, _info = _compute(db)
+    assert _positions(df2) == shown
+    assert state.status == DRAFT
+    assert state.changed == {(j4, ids["t2"])}
+    assert (df2["Constraint_Violation"] != "").sum() == 0
+
+
+def test_a_task_confirmed_against_its_dependency_stays_when_an_upstream_input_changes(tmp_path):
+    """確定した位置そのものが依存に反しているタスク（先行タスクより前へドラッグして確定
+    した等）は、先行タスクに位置の変わらない変更（ジョブ間の依存の追加など）があっても
+    確定の位置のまま。先行タスクが確定より遅れたときだけ置き直す。
+
+    以前は先行タスクの変更で影響範囲に入ると、依存に合わせて後ろへ押し出されていた
+    （「選択した変更を確定」した直後に、確定したタスクが動いていた）。"""
+    from gui.plan_actions import confirm_all
+    from gui.plan_confirmation import DRAFT
+
+    db = ProjectDatabase.create_new(str(tmp_path / "plan.pschedule"))
+    db.set_project("P", "2026-04-06")
+    db.set_distribution_ratio(0.0)
+    team_a, team_b = db.add_team("チームA", 1), db.add_team("チームB", 1)
+    wf = db.add_workflow("WF")
+    design_id = db.add_workflow_task(wf, "設計", team_a, 5)
+    build_id = db.add_workflow_task(wf, "実装", team_b, 5)
+    db.add_task_dependency(wf, design_id, build_id)
+    ms = db.add_milestone("リリース", "2026-12-25")
+    j1, j2 = db.add_job("ジョブ1", wf, ms, 1), db.add_job("ジョブ2", wf, ms, 2)
+    design, build = _k(j2, design_id), _k(j2, build_id)
+    with patch("gui.plan_actions._now", return_value="2026-04-01T09:00:00"):
+        confirm_all(db, _compute(db)[0])
+        before = _positions(_compute(db)[0])
+        # 実装を設計の最終日に重ねて（依存に反して）確定する
+        db.set_draft_move(j2, build_id, (before[design][1] - pd.Timedelta(days=1)).isoformat())
+        df = _compute(db)[0]
+        confirm_all(db, df)
+    confirmed = _positions(df)
+    assert confirmed[build][0] < confirmed[design][1]
+
+    # 設計に、位置の変わらない変更（先に終わっている J1 の設計への依存）を足す
+    db.add_external_dependency(j2, design_id, j1, design_id)
+    df, state, _info = _compute(db)
+    assert state.status == DRAFT
+    assert _positions(df) == confirmed
+
+    # 設計が確定より遅れたら、実装は設計の後ろへ置き直す
+    db.update_job_task_override_fields(j2, design_id, override_days=7)
+    after = _positions(_compute(db)[0])
+    assert after[build][0] >= after[design][1]
+
+
+def test_discarding_after_confirming_part_of_a_priority_change_returns_to_confirmed(tmp_path):
+    """ジョブの優先度を変えた後、そのジョブの一部のタスクだけを「選択した変更を確定」
+    してから「変更を破棄」すると、確定済みに戻る。
+
+    優先度はジョブ全体で1つなので、一部を確定した時点で確定した側の値になる。一緒に
+    確定しなかったタスク（優先度のほかにも変更があるもの）の確定行の指紋が古い優先度の
+    ままだったため、破棄した後もそのタスクだけ「変更あり」のままだった。"""
+    from gui.plan_actions import confirm_selected, pushed_tasks
+    from gui.plan_confirmation import CONFIRMED, DRAFT, successor_map
+
+    db, ids, before = _confirmed_project(tmp_path)
+    j1, j3 = ids["jobs"][0], ids["jobs"][2]
+    job = next(j for j in db.list_jobs() if j["id"] == j3)
+    db.update_job(j3, job["name"], job["workflow_id"], job["default_milestone_id"], 2, job["tags"])
+    db.add_external_dependency(j3, ids["t1"], j1, ids["t1"])
+    df, state, info = _compute(db)
+    assert state.changed == {(j3, ids["t1"]), (j3, ids["t2"])}
+    confirm_selected(db, df, {(j3, ids["t2"])}, successor_map(db), pushed_tasks(info))
+    state = _compute(db)[1]
+    assert state.status == DRAFT and state.changed == {(j3, ids["t1"])}
+
+    db.discard_draft()
+    df, state, _info = _compute(db)
+    assert state.status == CONFIRMED
+    assert state.changed == set()

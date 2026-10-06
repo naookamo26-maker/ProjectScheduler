@@ -6,6 +6,7 @@ DB（ProjectDatabase）の内容から project_scheduler.py を直接呼び出�
 変換はここで一度だけ行う（GUIの画面上にはこの文字列IDは一切表示されない）。
 """
 
+import bisect
 from datetime import date
 
 import pandas as pd
@@ -453,8 +454,8 @@ def generate_gantt(db, plotly_output_path=None, plan_output=PLAN_OUTPUT_DRAFT, *
 # ワーカースレッドで走るので、DBから組み立てた材料（plan）はGUIスレッドで
 # 先に作り、DB接続を持たない普通の辞書として渡す。
 
-# 違反による影響範囲の拡大は、この回数の計算で打ち切る（§8-7）。
-PLAN_MAX_RUNS = 3
+# 違反・押し下げによる影響範囲の拡大は、この回数の計算で打ち切る（§8-7）。
+PLAN_MAX_RUNS = 5
 
 
 def build_plan(db, state):
@@ -528,6 +529,18 @@ def build_plan(db, state):
         # 違反による影響範囲の拡大の判定用（compute_schedule_with_plan）
         "confirmed_end": {key(k): r["end_date"] for k, r in state.confirmed.items()},
         "global_changed": state.global_changed,
+        # 押し下げ・確定の位置へ戻す処理（compute_schedule_with_plan）を行うか。全面再計画は
+        # 未着手タスクを全体として組み直すので行わない
+        "push_down": not state.pending_replan,
+        # 変更の起点（押し下げたタスクがどの変更のせいで動いたかをたどる。「選択した
+        # 変更を確定」で一緒に確定するため）と、影響範囲のタスクの確定した位置（確定した
+        # ときから依存に反していた位置へ戻すため）
+        "changed": {key(k) for k in state.changed},
+        "confirmed_value": {
+            key(k): fixed_value(state.confirmed[k], k) for k in released_int
+            if k in state.confirmed and state.active.get(k, False)
+            and k not in state.started and k not in state.draft_moves
+        } if not state.pending_replan else {},
     }
 
 
@@ -564,7 +577,7 @@ def _apply_plan_to_frames(frames, fixed, plan):
     次の稼働日へ送らず（Start_Pin_Exact）、終了日があればそのまま使う（Fixed_End_Date）。"""
     frames = dict(frames)
     columns = ["Job_ID", "Task_ID", "Is_Active", "Override_Days", "Milestone_ID", "Team_ID",
-               "Start_Pin_Date", "Not_Before", "Start_Pin_Exact", "Fixed_End_Date"]
+               "Start_Pin_Date", "Not_Before", "Start_Pin_Exact", "Fixed_End_Date", "Level_Rank"]
     rows = {}
     if frames.get("job_tasks") is not None:
         for r in frames["job_tasks"].to_dict("records"):
@@ -594,6 +607,11 @@ def _apply_plan_to_frames(frames, fixed, plan):
             continue
         r = rows.setdefault(k, {"Job_ID": k[0], "Task_ID": k[1], "Is_Active": "Y"})
         r["Start_Pin_Date"] = start
+    for k, rank in plan.get("level_rank", {}).items():
+        if k in fixed:
+            continue
+        r = rows.setdefault(k, {"Job_ID": k[0], "Task_ID": k[1], "Is_Active": "Y"})
+        r["Level_Rank"] = rank
     frames["job_tasks"] = pd.DataFrame(list(rows.values()), columns=columns) if rows else None
     lower_bound = plan.get("lower_bound")
     if lower_bound:
@@ -620,19 +638,10 @@ def _quiet_past_violations(result_df, quiet_before):
     return result_df
 
 
-def _is_newly_broken(key, violation_days, overbooked, plan, predecessors, ends):
-    """確定の位置に固定したタスク key の違反が、確定した後の変化で起きたものか
-    （compute_schedule_with_plan。影響範囲に加えて置き直すか）。
-
-    plan に confirmed_end が無い（確定の位置を持たない材料）ときは、これまでどおり
-    どの違反も置き直す。"""
-    confirmed_end = plan.get("confirmed_end")
-    if confirmed_end is None:
-        return True
-    if overbooked and plan.get("global_changed"):
-        return True
-    if violation_days <= 0:
-        return False
+def _has_late_predecessor(key, plan, predecessors, ends):
+    """key の先行タスク（無効のタスクは飛ばしてその先行）に、確定した終了日より後ろで
+    終わるもの・確定した位置を持たないものがあるか。"""
+    confirmed_end = plan.get("confirmed_end") or {}
 
     def late(k, seen):
         for pred in predecessors.get(k, ()):
@@ -653,37 +662,179 @@ def _is_newly_broken(key, violation_days, overbooked, plan, predecessors, ends):
     return late(key, set())
 
 
+def _is_newly_broken(key, violation_days, overbooked, plan, predecessors, ends):
+    """確定の位置に固定したタスク key の違反が、確定した後の変化で起きたものか
+    （compute_schedule_with_plan。影響範囲に加えて置き直すか）。
+
+    plan に confirmed_end が無い（確定の位置を持たない材料）ときは、これまでどおり
+    どの違反も置き直す。"""
+    if plan.get("confirmed_end") is None:
+        return True
+    if overbooked and plan.get("global_changed"):
+        return True
+    if violation_days <= 0:
+        return False
+    return _has_late_predecessor(key, plan, predecessors, ends)
+
+
+def _release_origins(released, plan):
+    """{影響範囲のタスク: そのタスクを動かしうる変更の起点の集合}（依存でたどる）。"""
+    origins = {}
+    for root in plan.get("changed", ()):
+        for k in _downstream({root}, plan["successors"]):
+            if k in released:
+                origins.setdefault(k, set()).add(root)
+    return origins
+
+
+def _downstream(keys, successors):
+    from gui.plan_confirmation import downstream
+    return downstream(keys, successors)
+
+
+def _blocking_fixed_tasks(result_df, plan, fixed, started, released):
+    """確定の位置に固定したタスクのうち、ラインを空けるために押し下げるもの。
+    {押し下げるタスク: 押し下げる原因のタスクの集合} を返す。原因は次の2つ。
+
+    - 影響範囲のタスクが、チームのライン数が空いていなかったために着手可能日より後ろへ
+      ずれた: 同じチームで、着手可能日〜置いた終了日の間に始まるタスクを押し下げる。
+      着手可能日より前に始まっているものは、時間の上で先にある仕事なので押し下げない
+    - 開始日を決めて置いたタスク（進行中・完了の実績、変更案の移動、開始固定日）が、
+      確定した終了日より後ろで終わる（進行中のタスクの日数を延ばした、ドラッグで後ろへ
+      動かした等）: 同じチームで、確定した終了日（それより後ろに置いたなら置いた開始日）〜
+      今の終了日の間に始まるタスクを押し下げる。前へ動かして重なった分は押し下げない
+      （前にある仕事を後ろへ回すことになるので、ライン数の超過として見せる）
+
+    押し下げるのは、同じチームで確定の位置に固定している未着手のタスク。開始固定日・
+    変更案の移動（ドラッグ・ずらす）で置いたタスクと、進行中・完了のタスクは押し下げない
+    （利用者が置いた位置や実際に起きたことなので。前から押されたタスクがその手前に入り
+    きらなければ、その後ろへ回る）。"""
+    if "Earliest_Start" not in result_df.columns:
+        return {}
+    confirmed_end = plan.get("confirmed_end") or {}
+    by_team = {}
+    windows = []
+    for job, task, team, start, end, earliest in zip(
+        result_df["Job_ID"], result_df["Task_ID"], result_df["Team_ID"], result_df["Start_Date"],
+        result_df["End_Date"], result_df["Earliest_Start"],
+    ):
+        k = (job, task)
+        if k in fixed and k not in started:
+            by_team.setdefault(team, []).append((start, k))
+            continue
+        if pd.isna(earliest):
+            # 開始日を決めて置いたタスク（パス1）
+            if k in confirmed_end and end.date().isoformat() > confirmed_end[k]:
+                windows.append((k, team, max(start, pd.Timestamp(confirmed_end[k])), end))
+        elif k in released and k in plan["not_before"] and start > earliest:
+            windows.append((k, team, earliest, end))
+    if not windows:
+        return {}
+    for items in by_team.values():
+        items.sort()
+    blockers = {}
+    for k, team, window_start, window_end in windows:
+        items = by_team.get(team)
+        if not items:
+            continue
+        lo = bisect.bisect_left(items, (window_start,))
+        for start, b in items[lo:]:
+            if start >= window_end:
+                break
+            if b != k:
+                blockers.setdefault(b, set()).add(k)
+    return blockers
+
+
+def _back_to_confirmed(result_df, plan, values, released, started, changed, predecessors, ends):
+    """影響範囲のタスクのうち、確定した位置へ戻すもの。
+
+    確定した位置そのものが依存に反していた（先行タスクより前へドラッグして確定した、
+    一部だけ確定した等）タスクは、上流の別の変更で影響範囲に入ると、依存に合わせて
+    後ろへ押し出されていた（先行タスクは確定どおりなのに、確定した直後や無関係な変更の
+    後に動いた）。確定の位置に固定したタスクと同じく（_is_newly_broken）、先行タスクが
+    確定より遅れていない間は確定の位置に置き、違反として見せる。
+
+    対象は、自身の入力は変わっておらず（変更の起点でない）、移動の記録も無く、ライン数の
+    ためではなく（着手可能日どおりに置いた）確定より後ろへずれたもの。values は
+    {タスク: 確定の位置の値}。"""
+    if not values or "Earliest_Start" not in result_df.columns:
+        return set()
+    back = set()
+    for job, task, start, earliest in zip(
+        result_df["Job_ID"], result_df["Task_ID"], result_df["Start_Date"], result_df["Earliest_Start"],
+    ):
+        k = (job, task)
+        value = values.get(k)
+        if (value is None or k not in released or k in started or k in changed
+                or pd.isna(earliest) or start != earliest):
+            continue
+        if start.date().isoformat() <= value[0]:
+            continue
+        if not _has_late_predecessor(k, plan, predecessors, ends):
+            back.add(k)
+    return back
+
+
 def compute_schedule_with_plan(frames, plan, **scheduler_kwargs):
     """確定を踏まえて計算する（ワーカースレッドから呼んでよい。DBに触れない）。
 
-    影響範囲の外を確定の位置に固定して計算し、固定したタスクが固定どおりに
-    置けなくなった未着手のタスクがあれば、それとその後続を影響範囲に加えて計算し
-    直す。PLAN_MAX_RUNS 回で打ち切り、残った違反はそのまま返す。
+    影響範囲の外を確定の位置に固定して計算し、次のどれかに当たれば影響範囲を直して
+    計算し直す。PLAN_MAX_RUNS 回で打ち切り、残った違反はそのまま返す。
 
-    置けなくなった、とみなすのは次の場合だけ（_is_newly_broken）:
-    - 依存の違反で、先行タスクが確定した終了日より後ろへずれている（休業日を足して
-      延びた、進行中のタスクが遅れている等）
-    - ライン数の超過で、全体の設定（ライン数・休業日等）が確定から変わっている
-    確定した日程そのものが依存やライン数に反している（先行タスクより前へドラッグして
-    確定した、一部だけ確定した後に先行の変更を破棄した等）ときは、確定どおりに置いて
-    違反として見せる。以前はこれも影響範囲に加えていたため、確定した直後にタスクが
-    後ろへ飛び、「確定済み」なのに表示が確定した日程と違っていた。
+    1. 固定したタスクが固定どおりに置けなくなった（_is_newly_broken）: それとその後続を
+       影響範囲に加える。置けなくなった、とみなすのは次の場合だけ
+       - 依存の違反で、先行タスクが確定した終了日より後ろへずれている（休業日を足して
+         延びた、進行中のタスクが遅れている等）
+       - ライン数の超過で、全体の設定（ライン数・休業日等）が確定から変わっている
+       確定した日程そのものが依存やライン数に反している（先行タスクより前へドラッグして
+       確定した、一部だけ確定した後に先行の変更を破棄した等）ときは、確定どおりに置いて
+       違反として見せる。以前はこれも影響範囲に加えていたため、確定した直後にタスクが
+       後ろへ飛び、「確定済み」なのに表示が確定した日程と違っていた。
+    2. 影響範囲のタスクが、確定の位置に固定したタスクにラインを阻まれて着手可能日より
+       後ろへずれた、または開始日を決めて置いたタスクが確定より後ろへはみ出した
+       （_blocking_fixed_tasks）: 阻んだタスクとその後続も影響範囲に加えて詰め直す
+       （押し下げ）。以前は阻んだタスクを動かさず、日数ぶん連続して空いている最初の
+       隙間へ置いていたため、日数を5日延ばしただけのタスク（やその後続）が数か月先へ
+       飛んでいた。影響範囲のタスクは確定した開始日より前へは動かないので、押し下げた
+       タスクも確定より前には出ない
+    置き直す確定済みのタスクは、確定していた開始日の順にスケジューラに置かせる
+    （Level_Rank）。並びを保ったまま、阻まれた分だけ後ろへずれる
+    3. 影響範囲のタスクが、確定した位置そのものの依存の違反のために後ろへずれた
+       （_back_to_confirmed）: 確定の位置に戻す（1. と同じ考え方）
 
-    Returns: (result_df, info)。info は {"released": 影響範囲のキー集合, "runs": 計算回数}。
-    """
-    from gui.plan_confirmation import downstream
-
+    Returns: (result_df, info)。info は {"released": 影響範囲のキー集合（押し下げのために
+    加えたが動かなかったタスクは含めない）, "runs": 計算回数, "pushed": {押し下げで動いた
+    タスク: 動かした変更の起点の集合}}。"""
     fixed = dict(plan["fixed"])
     plan = dict(plan, not_before=dict(plan.get("not_before", {})))
     released = set(plan["released"])
     started = plan["started"]
+    changed = plan.get("changed") or set()
     predecessors = {}
     for pred, succs in plan["successors"].items():
         for succ in succs:
             predecessors.setdefault(succ, []).append(pred)
+    origins = _release_origins(released, plan)
+    for k in started & changed:
+        # 日数を延ばした進行中のタスク等が押し下げたタスクは、そのタスクの変更が起点
+        origins.setdefault(k, set()).add(k)
+    pushed_from = {}  # 押し下げで影響範囲に加えたタスク: 確定の位置の値
+    kept_back = set()  # 確定した位置へ戻したタスク
+    # 確定した位置へ戻すと、影響範囲のタスクのラインを阻んでしまうタスク（確定した日程
+    # そのものがライン数も超えていた等）。戻さずに置き直す
+    not_back = set()
     runs = 0
     while True:
         runs += 1
+        if plan.get("push_down", False):
+            # 置き直す確定済みのタスクは、確定していた開始日の順に置く（並びを保ったまま、
+            # 阻まれた分だけ後ろへずらす）。確定していないタスク（確定の後に足したジョブ等）
+            # は順位を付けず最後に置く——これまでどおり確定済みのタスクの空きに入る
+            plan["level_rank"] = {
+                k: date.fromisoformat(start).toordinal()
+                for k, start in plan["not_before"].items() if k in released and k not in fixed
+            }
         result_df = compute_schedule_from_frames(
             _apply_plan_to_frames(frames, fixed, plan), **scheduler_kwargs
         )
@@ -704,12 +855,48 @@ def compute_schedule_with_plan(frames, plan, **scheduler_kwargs):
             if k in fixed and k not in started
             and _is_newly_broken(k, days, overbooked, plan, predecessors, ends)
         }
-        if not violated:
+        added = {k for k in _downstream(violated, plan["successors"]) if k not in started}
+        push_down = plan.get("push_down", False)
+        blockers = _blocking_fixed_tasks(
+            result_df, plan, fixed, started, released,
+        ) if push_down else {}
+        not_back |= kept_back & set(blockers)
+        for b, by in blockers.items():
+            roots = set().union(*(origins.get(k, ()) for k in by))
+            for k in _downstream({b}, plan["successors"]):
+                if k in started:
+                    continue
+                added.add(k)
+                if k in fixed or k in pushed_from:
+                    origins.setdefault(k, set()).update(roots)
+                    if k in fixed:
+                        pushed_from[k] = fixed[k]
+        values = {**pushed_from, **(plan.get("confirmed_value") or {})}
+        back = _back_to_confirmed(
+            result_df, plan, values, released, started, changed, predecessors, ends,
+        ) - added - kept_back - not_back if push_down else set()
+        if not added - released and not back:
             break
-        added = {k for k in downstream(violated, plan["successors"]) if k not in started}
+        for k in back:
+            fixed[k] = values[k]
+            released.discard(k)
+            kept_back.add(k)
         for k in added:
             was = fixed.pop(k, None)
             if was is not None:
                 plan["not_before"][k] = was[0]
+            kept_back.discard(k)
         released |= added
-    return result_df, {"released": released, "runs": runs}
+    starts = {
+        k: (start.date().isoformat(), end.date().isoformat())
+        for k, start, end in zip(
+            zip(result_df["Job_ID"], result_df["Task_ID"]), result_df["Start_Date"], result_df["End_Date"],
+        )
+    } if not result_df.empty else {}
+    moved = {
+        k for k, was in pushed_from.items()
+        if k in starts and k in released and starts[k][0] != was[0]
+    }
+    pushed = {k: frozenset(origins.get(k, ())) for k in moved}
+    shown_released = {k for k in released if k not in pushed_from or k in moved}
+    return result_df, {"released": shown_released, "runs": runs, "pushed": pushed}

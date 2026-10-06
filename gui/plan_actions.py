@@ -4,8 +4,8 @@ gui/db.py のメソッドを通す（いずれも1つのUndo単位）。
 
 - confirm_all: 「確定する」「変更を確定」。今の計算結果で確定行を丸ごと置き換える
 - confirm_selected: 「選択した変更を確定」。選んだタスクと、その変更の影響で
-  動いた後続タスクだけを確定する（後続を残すと、確定した日程と後続の確定が
-  矛盾しうるため）
+  動いた後続タスク・押し下げたタスクだけを確定する（残すと、確定した日程と
+  それらの確定が矛盾しうるため）
 
 どちらも、画面に出ている計算結果（ScheduleCache の result_df）を確定する。
 呼び出し側は、その結果が今のDBの内容に対するもの（cache.is_fresh()）で
@@ -71,23 +71,42 @@ def confirm_all(db, result_df):
     )
 
 
-def selected_targets(state, keys, successors):
+def pushed_tasks(plan_info):
+    """確定を踏まえた計算の情報（compute_schedule_with_plan の info）から、押し下げで
+    動いたタスク {(job_id, workflow_task_id): {動かした変更の起点, ...}}。"""
+    def ids(key):
+        return (parse_entity_id(key[0]), parse_entity_id(key[1]))
+
+    return {
+        ids(k): {ids(o) for o in origins}
+        for k, origins in ((plan_info or {}).get("pushed") or {}).items()
+    }
+
+
+def selected_targets(state, keys, successors, pushed=None):
     """「選択した変更を確定」で確定するタスク: 選んだタスク（(job_id,
-    workflow_task_id) の集合）のうち変更のあるものと、その影響で動いた後続。
-    空なら、選んだタスクには確定していない変更が無い。"""
+    workflow_task_id) の集合）のうち変更のあるものと、その影響で動いた後続、
+    その変更が押し下げた他のタスク（pushed は pushed_tasks の戻り値）。
+    空なら、選んだタスクには確定していない変更が無い。
+
+    押し下げたタスクを残すと、確定した変更がそのラインを取ったまま、押し下げた側が
+    確定の位置へ戻ってライン数の超過になる（確定した直後に表示が変わる）。"""
     from gui.plan_confirmation import downstream
 
     changed_or_affected = downstream(state.changed, successors)
     targets = {k for k in downstream(set(keys), successors) if k in changed_or_affected}
     targets |= {k for k in keys if k in state.changed}
+    roots = {k for k in targets if k in state.changed}
+    targets |= {k for k, origins in (pushed or {}).items() if origins & roots}
     return targets
 
 
-def confirm_selected(db, result_df, keys, successors):
-    """選んだタスクの変更と、その影響で動いた後続を確定する（selected_targets）。
-    確定したタスクの数を返す。
+def confirm_selected(db, result_df, keys, successors, pushed=None):
+    """選んだタスクの変更と、その影響で動いた後続・押し下げたタスクを確定する
+    （selected_targets）。確定したタスクの数を返す。
 
-    successors は gui/plan_confirmation.successor_map(db) の戻り値。
+    successors は gui/plan_confirmation.successor_map(db) の戻り値、pushed は
+    pushed_tasks(result_df と同じ計算の info) の戻り値。
 
     ジョブの優先度・ワークフロー内の依存の変更（ジョブ・ワークフロー全体で1つの入力）は、
     その変更だけを受けた同じジョブ・ワークフローのタスクも一緒に確定する
@@ -95,12 +114,12 @@ def confirm_selected(db, result_df, keys, successors):
     from gui.plan_confirmation import PlanState, shared_change_companions
 
     state = PlanState(db)
-    targets = selected_targets(state, keys, successors)
+    targets = selected_targets(state, keys, successors, pushed)
     if not targets:
         return 0
     companions = shared_change_companions(db, state, targets, db.draft_base_shared_inputs())
     if companions:
-        targets = selected_targets(state, set(keys) | companions, successors)
+        targets = selected_targets(state, set(keys) | companions, successors, pushed)
     rows = confirmed_rows_from_result(db, result_df, only_keys=targets)
     written = {(r["job_id"], r["workflow_task_id"]) for r in rows}
     # 結果に載っていない（無効にした・削除した）タスクの確定行は消す
