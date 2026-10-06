@@ -1676,9 +1676,11 @@ class ProjectDatabase:
             return
         base = _open_snapshot(row["snapshot"])
         try:
+            before = _snapshot_signatures(base)
             merger = _DraftBaseMerger(self._conn, base)
             for key in sorted(set(keys)):
                 merger.merge_task(key)
+            self._follow_shared_inputs(base, before, set(keys))
             project = self._conn.execute(
                 "SELECT confirmed_at, confirmed_global_signature FROM project WHERE id = 1"
             ).fetchone()
@@ -1693,6 +1695,28 @@ class ProjectDatabase:
         self._conn.execute(
             "UPDATE draft_base SET snapshot = ? WHERE id = 1", (snapshot,)
         )
+
+    def _follow_shared_inputs(self, base, before, merged):
+        """一部だけ確定したときに破棄用のスナップショットへ書き込んだ、ジョブ単位・
+        ワークフロー単位の入力（ジョブの優先度・ワークフロー内の依存）に、一緒に確定
+        しなかった同じジョブ・ワークフローのタスクの確定行の指紋を合わせる。
+
+        これらの入力はジョブ・ワークフロー全体で1つなので、1タスクを確定した時点で
+        確定した側の値になる。指紋を古い値のままにしておくと、そのタスクに別の変更も
+        あって一緒に確定しなかった場合（gui/plan_confirmation.shared_change_companions
+        の対象外）、「変更を破棄」でスナップショットに戻しても指紋が合わず、確定済みに
+        戻らなかった。指紋がスナップショットの入力と合っていた確定行だけを書き換える
+        （今のDB・スナップショットの両方）。"""
+        after = _snapshot_signatures(base)
+        for key, was in before.items():
+            now = after.get(key)
+            if key in merged or now is None or now == was:
+                continue
+            where = "job_id = ? AND workflow_task_id = ? AND input_signature = ?"
+            for conn in (self._conn, base):
+                conn.execute(
+                    f"UPDATE confirmed_schedule SET input_signature = ? WHERE {where}", (now, *key, was)
+                )
 
     def draft_base_shared_inputs(self):
         """最後に確定した時点（draft_base）の、ジョブ単位・ワークフロー単位の入力。
@@ -2506,6 +2530,16 @@ def _upgrade_snapshot_schema(conn):
     row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
     if row is None or row["value"] != SCHEMA_VERSION:
         _migrate_schema(conn)
+
+
+def _snapshot_signatures(conn):
+    """接続 conn（破棄用のスナップショット等）の、全タスクの入力の指紋
+    （gui/plan_confirmation.task_signatures と同じもの）。"""
+    from types import SimpleNamespace
+
+    from gui.plan_confirmation import task_signatures
+
+    return task_signatures(SimpleNamespace(_conn=conn))
 
 
 def _open_snapshot(blob):

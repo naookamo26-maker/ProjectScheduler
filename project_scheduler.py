@@ -553,6 +553,24 @@ def _team_label(t_info):
     return t_info.get("team_name") or str(t_info["team_id"])
 
 
+def _date_ordinal(raw):
+    """タスクごとの日付の値（'YYYY-MM-DD' 等の文字列・Timestamp・date）の序数。解釈
+    できなければ None。
+
+    ISO形式の文字列は標準ライブラリで読む。pd.to_datetime は1件ごとに書式を推測する
+    ので遅く、確定済みの計画（全タスクに確定した開始日を渡す）では、大きな計画
+    （16,000タスク）で日付を読むだけに計算時間の大半（約10秒）を使っていた。"""
+    if isinstance(raw, date_cls):
+        return raw.toordinal()
+    text = str(raw).strip()
+    try:
+        return date_cls.fromisoformat(text).toordinal()
+    except ValueError:
+        pass
+    parsed = pd.to_datetime(text, errors="coerce")
+    return None if pd.isna(parsed) else parsed.toordinal()
+
+
 def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project_start):
     teams_dict = df_teams.set_index("Team_ID")["Max_Lines"].to_dict()
     team_names = (
@@ -688,12 +706,12 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
             start_pin_raw = override.get("Start_Pin_Date")
             start_pin_ord = None
             if pd.notna(start_pin_raw) and str(start_pin_raw).strip() != "":
-                start_pin = pd.to_datetime(start_pin_raw, errors="coerce")
-                if pd.isna(start_pin):
+                start_pin = _date_ordinal(start_pin_raw)
+                if start_pin is None:
                     raise SchedulingError(
                         tr("タスク「{task}」の開始固定日 '{start_pin_raw}' を解釈できません", task=task_label, start_pin_raw=start_pin_raw)
                     )
-                start_pin_ord = start_pin.toordinal()
+                start_pin_ord = start_pin
 
             # 着手の下限（任意列 Not_Before）。計画の確定（GUIの変更案）で、影響範囲の
             # タスクを確定した位置より前へ動かさないために使う。開始固定日と違い、
@@ -701,12 +719,12 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
             not_before_raw = override.get("Not_Before")
             not_before_ord = None
             if pd.notna(not_before_raw) and str(not_before_raw).strip() != "":
-                not_before = pd.to_datetime(not_before_raw, errors="coerce")
-                if pd.isna(not_before):
+                not_before = _date_ordinal(not_before_raw)
+                if not_before is None:
                     raise SchedulingError(
                         tr("タスク「{task}」の着手の下限 '{not_before_raw}' を解釈できません", task=task_label, not_before_raw=not_before_raw)
                     )
-                not_before_ord = not_before.toordinal()
+                not_before_ord = not_before
 
             # 実績（任意列 Start_Pin_Exact・Fixed_End_Date。GUIが進行中・完了のタスクに
             # 付ける）。実際に作業した日なので、開始固定日と違い休業日でも次の稼働日へ
@@ -716,21 +734,29 @@ def _parse_tasks(df_teams, df_ms, df_wf, df_jobs, df_jtasks, df_extdeps, project
             fixed_end_raw = override.get("Fixed_End_Date")
             fixed_end_ord = None
             if pd.notna(fixed_end_raw) and str(fixed_end_raw).strip() != "":
-                fixed_end = pd.to_datetime(fixed_end_raw, errors="coerce")
-                if pd.isna(fixed_end):
+                fixed_end = _date_ordinal(fixed_end_raw)
+                if fixed_end is None:
                     raise SchedulingError(
                         tr("タスク「{task}」の終了日 '{value}' を解釈できません", task=task_label, value=fixed_end_raw)
                     )
-                fixed_end_ord = fixed_end.toordinal()
+                fixed_end_ord = fixed_end
             if start_pin_ord is None:
                 pin_exact, fixed_end_ord = False, None
             elif fixed_end_ord is not None:
                 pin_exact = True
                 fixed_end_ord = max(fixed_end_ord, start_pin_ord + 1)
+            # 平準化の順位（任意列 Level_Rank。小さい順に先に置き、無いタスクはその後）。
+            # GUIの確定後の計算で、置き直す確定済みのタスクを確定していた開始日の順に
+            # （並びを保ったまま後ろへずらすように）、確定していないタスクより先に置くのに
+            # 使う（_run_leveling のパス2）
+            level_rank_raw = override.get("Level_Rank")
+            level_rank = (int(level_rank_raw) if pd.notna(level_rank_raw)
+                          and str(level_rank_raw).strip() != "" else None)
 
             active_tasks[g_id] = {
                 "start_pin_ord": start_pin_ord,
                 "pin_exact": pin_exact,
+                "level_rank": level_rank,
                 "fixed_end_ord": fixed_end_ord,
                 "not_before_ord": not_before_ord,
                 "job_id": job_id, "job_name": job_name, "task_id": t_id,
@@ -1475,7 +1501,7 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
     探索対象より先にラインを取らせるのが正しい順序になる。
 
     Returns:
-        (scheduled, adjusted, overbooked_pins) のタプル。
+        (scheduled, adjusted, overbooked_pins, earliest) のタプル。
         scheduled: {g_id: (開始日の序数, 終了日の序数)}
         adjusted: {g_id: bool}。実際の配置が分散の基準点(target_start)からずれた
             場合（＝チームのライン数不足で動かさざるを得なかった場合）に True。
@@ -1483,9 +1509,13 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
         overbooked_pins: 固定した結果、チームのライン数を超えて予約することに
             なったタスクの g_id の集合（診断結果として返すためのもの。
             固定を動かして辻褄を合わせることはしない）。
+        earliest: {g_id: 着手可能日の序数}（パス2で置いたタスクだけ。開始の下限・
+            依存から見て最も早く始められる日。これより後ろに置いたのは、チームの
+            ライン数が空いていなかったため）。
     """
     scheduled = {}
     adjusted = {}
+    earliest = {}
     usage = {}
     caps = {}
 
@@ -1582,9 +1612,7 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
         adjusted[g_id] = False
 
     # === パス2: 残りをリソース平準化する ==========================================
-    for g_id in leveling_order:
-        if g_id in scheduled:
-            continue  # パス1で固定済み
+    def place(g_id):
         t_info = active_tasks[g_id]
         team_id = t_info["team_id"]
         days = t_info["days"]
@@ -1596,6 +1624,7 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
         )
         if earliest_start is None:
             raise SchedulingError(tr("タスク「{task}」の着手可能日を求められません", task=_task_label(t_info)))
+        earliest[g_id] = earliest_start
 
         # 締切から逆算した、このタスク自身の最遅開始日（鎖全体の残り所要日数を
         # 織り込み済みの静的な値）。依存元の実際の終了が想定より遅れた場合に
@@ -1667,7 +1696,25 @@ def _run_leveling(active_tasks, leveling_order, team_capacity_schedule, project_
         # チームのライン数不足（リソース制約）によって動かさざるを得なかったことを示す
         adjusted[g_id] = (start_ord != target_start)
 
-    return scheduled, adjusted, overbooked_pins
+    # 平準化の順位（level_rank）を持つタスクを、順位の小さい順（同じ順位なら通常の順）に、
+    # 先行タスクが置き終わっているものだけ先に平準化する（先行が未配置のまま置くと依存を
+    # 無視してしまうので、そのタスクは残りと一緒に通常の順で置く）。GUIの確定後の計算で、
+    # 置き直す確定済みのタスクの並びを保つため（優先度の順に置くと、後ろに控えていた優先度の
+    # 高いタスクが先にラインを取り、前にあったタスクがその後ろへ飛んでいた）
+    position = {g_id: i for i, g_id in enumerate(leveling_order)}
+    ranked = sorted(
+        (t["level_rank"], position[g_id], g_id) for g_id, t in active_tasks.items()
+        if g_id not in scheduled and t.get("level_rank") is not None
+    )
+    for _rank, _pos, g_id in ranked:
+        if g_id not in scheduled and all(d in scheduled for d in active_tasks[g_id]["deps"]):
+            place(g_id)
+    for g_id in leveling_order:
+        if g_id in scheduled:
+            continue  # パス1で固定済み・先に置いた
+        place(g_id)
+
+    return scheduled, adjusted, overbooked_pins, earliest
 
 
 
@@ -2439,6 +2486,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
             "Workflow_ID", "Milestone_ID", "Start_Date", "End_Date",
             "Resource_Adjusted", "Deadline_Overrun_Days",
             "Constraint_Violation_Days", "Constraint_Violation", "Constraint_Overbooked",
+            "Earliest_Start",
         ])
         if plotly_output_path:
             export_plotly_gantt(result_df, plotly_output_path, project_name,
@@ -2472,7 +2520,7 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
         active_tasks, successors, scheduling_order, leveling_order, project_start_ord, cal,
         asap_dates, raw_dates,
     )
-    scheduled, adjusted_flags, overbooked_pins = _run_leveling(
+    scheduled, adjusted_flags, overbooked_pins, earliest_ords = _run_leveling(
         active_tasks, leveling_order, team_capacity_schedule, project_start_ord, cal,
         asap_dates=asap_dates, raw_dates=raw_dates, distribution_ratio=distribution_ratio,
         unpinned_dates=unpinned_dates,
@@ -2511,6 +2559,12 @@ def _run_scheduler_on_frames(df_project, df_teams, df_ms, df_wf, df_jobs, df_jta
             # 違反のうちライン数の超過があるか（説明文は訳されるので、種類はこちらで
             # 見分ける。依存の違反は Constraint_Violation_Days > 0）
             "Constraint_Overbooked": g_id in overbooked_pins,
+            # 着手可能日（開始の下限・依存から見て最も早く始められる日）。開始固定日で
+            # 置いたタスクは空（NaT）。開始日がこれより後ろなら、チームのライン数が
+            # 空いていなかったためにずらした（GUIの確定後の計算が、確定の位置に固定した
+            # タスクに阻まれたかを見分けるのに使う。gui/gantt_generator.py）
+            "Earliest_Start": (pd.Timestamp.fromordinal(earliest_ords[g_id])
+                               if g_id in earliest_ords else pd.NaT),
         })
 
     result_df = pd.DataFrame(rows).sort_values(["Start_Date", "Job_ID", "Task_ID"]).reset_index(drop=True)

@@ -86,7 +86,7 @@ from gui.gantt_view import (
     build_gantt_scenes,
     set_bar_baseline,
 )
-from gui.plan_actions import confirm_all, confirm_selected, selected_targets
+from gui.plan_actions import confirm_all, confirm_selected, pushed_tasks, selected_targets
 from gui.plan_confirmation import CONFIRMED, DRAFT, UNCONFIRMED, PlanState, successor_map
 from gui.replan_dialog import ReplanDialog
 from gui.widgets_common import (
@@ -1497,7 +1497,7 @@ class GanttTab(QWidget):
             # 全面再計画は全体として組み直した結果なので、一部だけは確定できない
             return False
         ids = {self._job_and_task_ids(k) for k in keys}
-        return bool(selected_targets(state, ids, successor_map(self.db)))
+        return bool(selected_targets(state, ids, successor_map(self.db), pushed_tasks(self.cache.plan_info)))
 
     def _plan_action_box(self, title, text, details, ok_label, checkbox=None):
         """取り消しの大きい操作の確認ダイアログと、その実行ボタン。ボタンは操作名と
@@ -1567,7 +1567,8 @@ class GanttTab(QWidget):
                         self, tr("選択した変更を確定"), tr("ガントチャートで、確定したいタスクを選んでください。")
                     )
                     return
-                count = confirm_selected(self.db, self.cache.result_df, keys, successor_map(self.db))
+                count = confirm_selected(self.db, self.cache.result_df, keys, successor_map(self.db),
+                                         pushed_tasks(self.cache.plan_info))
                 if count == 0:
                     QMessageBox.information(
                         self, tr("選択した変更を確定"), tr("選んだタスクには、確定していない変更がありません。")
