@@ -40,6 +40,10 @@ FALLBACK_LANGUAGE = "en"
 # 複数選択（Ctrl＋クリック）に使うため選べない。
 DRAG_MODIFIERS = ("shift", "alt")
 
+# ガントのバーに添える日数・締切までの余裕の数え方。"work" は営業日（休業日を
+# 除く。入力した期間と同じ数え方）、"calendar" は暦日。
+BAR_DAY_COUNTS = ("work", "calendar")
+
 
 def system_language(locale=None):
     """OSの言語から、対応4言語のどれを既定にするかを決める。
@@ -76,7 +80,9 @@ class _Option:
         return self.default() if callable(self.default) else self.default
 
     def is_valid(self, value):
-        # bool は int の派生型なので明示的に弾く（真偽値の項目は今のところ無い）
+        if self.kind is bool:
+            return isinstance(value, bool)
+        # bool は int の派生型なので明示的に弾く
         if isinstance(value, bool) or not isinstance(value, self.kind):
             return False
         if self.choices is not None and value not in self.choices:
@@ -101,6 +107,15 @@ OPTIONS = {
     "moved_bar_highlight_seconds": _Option(
         "gantt/moved_bar_highlight_seconds", 0, int, minimum=0, maximum=60,
     ),
+    # ガントのバーに出す項目（gui/gantt_view.py の BarLabelOptions）。タスク名の
+    # ほかの項目は、バーに余裕があるときだけ添える。
+    "gantt_bar_show_name": _Option("gantt/bar_show_name", True, bool),
+    "gantt_bar_show_days": _Option("gantt/bar_show_days", True, bool),
+    "gantt_bar_show_slack": _Option("gantt/bar_show_slack", False, bool),
+    "gantt_bar_show_period": _Option("gantt/bar_show_period", False, bool),
+    "gantt_bar_show_team": _Option("gantt/bar_show_team", False, bool),
+    "gantt_bar_show_milestone": _Option("gantt/bar_show_milestone", False, bool),
+    "gantt_bar_day_count": _Option("gantt/bar_day_count", "work", str, choices=BAR_DAY_COUNTS),
     # 全面再計画を案内する影響範囲の割合（%）。§8-7 で使う。
     "full_replan_threshold_percent": _Option(
         "plan/full_replan_threshold_percent", 20, int, minimum=1, maximum=100,
@@ -161,6 +176,15 @@ class AppSettings:
             try:
                 value = int(raw)
             except (TypeError, ValueError):
+                return option.default_value()
+        elif option.kind is bool:
+            # ini には "true" / "false" の文字列で保存される
+            text = str(raw).strip().lower()
+            if text in ("true", "1"):
+                value = True
+            elif text in ("false", "0"):
+                value = False
+            else:
                 return option.default_value()
         elif option.kind is str:
             value = str(raw)

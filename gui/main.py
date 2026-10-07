@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 
 from app_version import APP_VERSION
 from gui.app_settings import AppSettings
-from i18n import current_language, set_language, tr
+from i18n import N_, current_language, set_language, tr
 from gui.db import ProjectDatabase
 from gui.gantt_generator import (
     PLAN_OUTPUT_CONFIRMED,
@@ -743,16 +743,50 @@ _LANGUAGE_FONTS = {
 }
 
 
+# Qt の標準ボタン（QMessageBox.question の 保存／破棄／はい／いいえ 等）の文言。
+# Qt は QPlatformTheme の文脈で英語の原文を訳しに来る。日本語では Qt 同梱の翻訳を
+# 読み込まず、ベトナム語は Qt に翻訳が無いため、そのままでは英語のボタンが出る。
+_STANDARD_BUTTON_TEXTS = {
+    "Save": N_("保存(&S)"),
+    "Discard": N_("保存しない"),
+    "Don't Save": N_("保存しない"),  # macOS での Discard の原文
+    "Cancel": N_("キャンセル"),
+    "Close": N_("閉じる"),
+    "&Yes": N_("はい(&Y)"),
+    "&No": N_("いいえ(&N)"),
+}
+
+
+class StandardButtonTranslator(QTranslator):
+    """Qt の標準ボタンの文言を、アプリの翻訳（locales/）で訳す。
+
+    呼び出し側（QMessageBox.question 等）を変えずに、どの言語でも用語集どおりの
+    ボタン名にするため。Qt 同梱の翻訳より後に入れて優先させる（後に入れた翻訳器
+    から順に引かれる）。.exe に Qt の翻訳が同梱されていなくても効く。"""
+
+    def translate(self, context, source_text, disambiguation=None, n=-1):
+        if context == "QPlatformTheme" and source_text in _STANDARD_BUTTON_TEXTS:
+            return tr(_STANDARD_BUTTON_TEXTS[source_text])
+        return None  # 空の文字列＝訳さない（次の翻訳器・原文に任せる）
+
+
 def apply_language(app, language):
     """表示言語を決める（docs/roadmap.md §11）。再起動で反映する方式なので、
     ウィンドウを作る前に1回だけ呼ぶ。Qt 自身の標準ダイアログ（ファイル選択等）は
-    Qt 同梱の翻訳を読み込む（ベトナム語は Qt 同梱の翻訳が無く、英語で出る）。"""
+    Qt 同梱の翻訳を読み込む（ベトナム語は Qt 同梱の翻訳が無く、英語で出る）。
+    メッセージボックス等の標準ボタンの文言は、全言語でアプリの翻訳を使う
+    （StandardButtonTranslator）。"""
     set_language(language)
     language = current_language()
     if language != "ja":
         translator = QTranslator(app)
         if translator.load(f"qtbase_{language}", QLibraryInfo.path(QLibraryInfo.TranslationsPath)):
             app.installTranslator(translator)
+    # 標準ボタンの文言は全言語でアプリの翻訳を使う。Python 側の translate() が呼ばれるよう、
+    # 翻訳器のPythonオブジェクトをアプリに持たせて生かしておく。
+    if getattr(app, "_standard_button_translator", None) is None:
+        app._standard_button_translator = StandardButtonTranslator(app)
+        app.installTranslator(app._standard_button_translator)
     families = set(QFontDatabase.families())
     for family in _LANGUAGE_FONTS.get(language, []):
         if family in families:

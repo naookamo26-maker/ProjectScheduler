@@ -14,26 +14,41 @@ gui/app_settings.py の AppSettings を編集する。載せるのは、その�
 
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QLabel,
     QMessageBox,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
+    QWidget,
 )
 
-from gui.app_settings import DRAG_MODIFIERS, OPTIONS, SUPPORTED_LANGUAGES
-from i18n import LANGUAGES, tr
+from gui.app_settings import BAR_DAY_COUNTS, DRAG_MODIFIERS, OPTIONS, SUPPORTED_LANGUAGES
+from i18n import LANGUAGES, N_, tr
 
 # 言語の選択肢は、それぞれの言語での呼び名で出す（別の言語に切り替えた人が
 # 自分の言語を見つけられるように）。
 LANGUAGE_LABELS = dict(LANGUAGES)
 
 DRAG_MODIFIER_LABELS = {"shift": "Shift", "alt": "Alt"}
+
+# ガントのバーに出す項目（オプション名, 表示名）。並びはバーに添える順
+# （gui/gantt_view.py の BAR_LABEL_EXTRAS）と同じ。
+BAR_LABEL_CHECKS = (
+    ("gantt_bar_show_name", N_("タスク名")),
+    ("gantt_bar_show_days", N_("日数")),
+    ("gantt_bar_show_slack", N_("締切までの余裕")),
+    ("gantt_bar_show_period", N_("開始日〜終了日")),
+    ("gantt_bar_show_team", N_("チーム名")),
+    ("gantt_bar_show_milestone", N_("マイルストーン名")),
+)
+BAR_DAY_COUNT_LABELS = {"work": N_("営業日（休業日を除く）"), "calendar": N_("暦日（休業日を含む）")}
 
 
 class OptionsDialog(QDialog):
@@ -90,6 +105,27 @@ class OptionsDialog(QDialog):
         )
         self.highlight_spin.setValue(app_settings.get("moved_bar_highlight_seconds"))
         gantt_form.addRow(tr("編集で動いたバーを強調する時間"), self.highlight_spin)
+
+        # バーに出す項目。2列に並べる（縦に6行並べるとダイアログが縦に長くなる）
+        bar_items = QWidget()
+        bar_grid = QGridLayout(bar_items)
+        bar_grid.setContentsMargins(0, 0, 0, 0)
+        self.bar_label_checks = {}
+        for index, (name, label) in enumerate(BAR_LABEL_CHECKS):
+            check = QCheckBox(tr(label))
+            check.setChecked(app_settings.get(name))
+            bar_grid.addWidget(check, index // 2, index % 2)
+            self.bar_label_checks[name] = check
+        gantt_form.addRow(tr("バーに表示する項目"), bar_items)
+        self.bar_day_count_combo = QComboBox()
+        for code in BAR_DAY_COUNTS:
+            self.bar_day_count_combo.addItem(tr(BAR_DAY_COUNT_LABELS[code]), code)
+        self._select_data(self.bar_day_count_combo, app_settings.get("gantt_bar_day_count"))
+        gantt_form.addRow(tr("日数・余裕の数え方"), self.bar_day_count_combo)
+        bar_note = QLabel(tr("タスク名以外の項目は、バーに余裕があるときだけ表示します。"))
+        bar_note.setForegroundRole(QPalette.PlaceholderText)
+        bar_note.setWordWrap(True)
+        gantt_form.addRow(bar_note)
         layout.addWidget(gantt)
 
         plan = QGroupBox(tr("計画の確定"))
@@ -139,6 +175,9 @@ class OptionsDialog(QDialog):
         self.undo_memory_spin.setValue(self.app_settings.default("undo_memory_limit_mb"))
         self._select_data(self.drag_modifier_combo, self.app_settings.default("gantt_drag_modifier"))
         self.highlight_spin.setValue(self.app_settings.default("moved_bar_highlight_seconds"))
+        for name, check in self.bar_label_checks.items():
+            check.setChecked(self.app_settings.default(name))
+        self._select_data(self.bar_day_count_combo, self.app_settings.default("gantt_bar_day_count"))
         self.replan_threshold_spin.setValue(self.app_settings.default("full_replan_threshold_percent"))
 
     def accept(self):
@@ -146,6 +185,9 @@ class OptionsDialog(QDialog):
         self.app_settings.set("undo_memory_limit_mb", self.undo_memory_spin.value())
         self.app_settings.set("gantt_drag_modifier", self.drag_modifier_combo.currentData())
         self.app_settings.set("moved_bar_highlight_seconds", self.highlight_spin.value())
+        for name, check in self.bar_label_checks.items():
+            self.app_settings.set(name, check.isChecked())
+        self.app_settings.set("gantt_bar_day_count", self.bar_day_count_combo.currentData())
         self.app_settings.set("full_replan_threshold_percent", self.replan_threshold_spin.value())
         try:
             self.app_settings.sync()

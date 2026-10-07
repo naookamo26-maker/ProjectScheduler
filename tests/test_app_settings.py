@@ -175,6 +175,57 @@ def test_options_dialog_reset_button_restores_defaults_on_screen(qapp, settings_
     assert s.get("undo_memory_limit_mb") == 512
 
 
+def test_bar_label_options_round_trip_and_fall_back_when_broken(settings_path):
+    """ガントのバーに出す項目（真偽値）は ini に保存でき、壊れた値は既定に戻る。"""
+    s = AppSettings(settings_path)
+    assert s.get("gantt_bar_show_name") is True
+    assert s.get("gantt_bar_show_days") is True
+    assert s.get("gantt_bar_show_team") is False
+    assert s.get("gantt_bar_day_count") == "work"
+    s.set("gantt_bar_show_days", False)
+    s.set("gantt_bar_show_team", True)
+    s.set("gantt_bar_day_count", "calendar")
+    s.sync()
+
+    reopened = AppSettings(settings_path)
+    assert reopened.get("gantt_bar_show_days") is False
+    assert reopened.get("gantt_bar_show_team") is True
+    assert reopened.get("gantt_bar_day_count") == "calendar"
+
+    raw = QSettings(settings_path, QSettings.IniFormat)
+    raw.setValue("gantt/bar_show_days", "たぶん")
+    raw.setValue("gantt/bar_day_count", "weeks")
+    raw.sync()
+    broken = AppSettings(settings_path)
+    assert broken.get("gantt_bar_show_days") is True
+    assert broken.get("gantt_bar_day_count") == "work"
+    with pytest.raises(ValueError):
+        broken.set("gantt_bar_show_days", 1)
+
+
+def test_options_dialog_saves_bar_label_items(qapp, settings_path):
+    from gui.options_dialog import OptionsDialog
+    from gui.tab_gantt import bar_label_options
+
+    s = AppSettings(settings_path)
+    dialog = OptionsDialog(s)
+    dialog.bar_label_checks["gantt_bar_show_slack"].setChecked(True)
+    dialog.bar_label_checks["gantt_bar_show_name"].setChecked(False)
+    dialog._select_data(dialog.bar_day_count_combo, "calendar")
+    dialog.accept()
+
+    options = bar_label_options(AppSettings(settings_path))
+    assert options.show_name is False
+    assert options.extras == ("days", "slack")
+    assert options.day_count == "calendar"
+
+    dialog = OptionsDialog(s)
+    dialog.reset_button.click()
+    assert dialog.bar_label_checks["gantt_bar_show_name"].isChecked()
+    assert not dialog.bar_label_checks["gantt_bar_show_slack"].isChecked()
+    assert dialog.bar_day_count_combo.currentData() == "work"
+
+
 def test_main_window_applies_undo_memory_limit(qapp, settings_path):
     """起動時の値でUndo履歴の上限が決まり、オプション変更後は実行中の履歴にも反映される。"""
     import shiboken6

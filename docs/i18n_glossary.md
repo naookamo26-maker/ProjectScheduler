@@ -38,6 +38,8 @@ GUIの文言とメッセージを英語・ベトナム語・中国語（簡体�
 | 休業日 | non-working day | ngày nghỉ | 休息日 |
 | 締切 | deadline | hạn chót | 截止日期 |
 | 締切超過 | overrun | trễ hạn | 超期 |
+| 余裕（締切までの残り日数） | margin | dư | 余量 |
+| 暦日 | calendar day | ngày lịch | 日历日 |
 | 開始固定日 / 手動ピン | pinned start date / pin | ngày bắt đầu cố định / ghim | 固定开始日 / 固定 |
 | 配置 | Placement | Bố trí | 排布 |
 | 最速 / ギリギリ | Earliest / Latest | Sớm nhất / Muộn nhất | 最早 / 最晚 |
@@ -58,6 +60,7 @@ GUIの文言とメッセージを英語・ベトナム語・中国語（簡体�
 | 先行タスク / 後続タスク | predecessor / successor | tác vụ trước / tác vụ sau | 前置任务 / 后续任务 |
 | 依存先ジョブ | depended-on job | hạng mục phụ thuộc | 依赖的作业 |
 | 依存テンプレート | dependency template | mẫu phụ thuộc | 依赖模板 |
+| バー（ガントのタスクの棒） | bar | thanh | 条形 |
 | 依存の矢印（ガントでジョブ間の依存を示す線） | dependency arrows | mũi tên phụ thuộc | 依赖箭头 |
 | 依存のつながり（依存でつながったジョブのまとまり） | dependency chain | chuỗi phụ thuộc | 依赖链 |
 | ラグ | lag | độ trễ | 滞后 |
@@ -93,3 +96,5 @@ GUIの文言とメッセージを英語・ベトナム語・中国語（簡体�
 | ヘルプ | Help | Trợ giúp | 帮助 |
 | バージョン情報 / バージョン | About / Version | Giới thiệu / Phiên bản | 关于 / 版本 |
 | キャンセル | Cancel | Hủy | 取消 |
+| はい / いいえ | Yes / No | Có / Không | 是 / 否 |
+| 保存 / 保存しない | Save / Don't save | Lưu / Không lưu | 保存 / 不保存 |
