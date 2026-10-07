@@ -96,16 +96,11 @@ def _pane(scenes, day_px, row_scale=4.0):
 def _band_days(scenes, color):
     """本体の帯のうち color のものが覆う日付の集合。"""
     axis_start = scenes.body.gantt_axis_start
-    days = set()
-    for band in scenes.body.gantt_day_bands:
-        if band.brush().color() != color:
-            continue
-        for polygon in band.path().toFillPolygons():
-            rect = polygon.boundingRect()
-            first = round((rect.left() - LEFT_MARGIN) / DAY_WIDTH)
-            for offset in range(round(rect.width() / DAY_WIDTH)):
-                days.add(date.fromordinal(axis_start.toordinal() + first + offset))
-    return days
+    return {
+        date.fromordinal(axis_start.toordinal() + round((x - LEFT_MARGIN) / DAY_WIDTH))
+        for band in scenes.body.gantt_day_bands for x, band_color in band.days
+        if band_color == color
+    }
 
 
 def test_saturdays_get_a_blue_band_and_sundays_holidays_a_red_band(qapp):
@@ -145,6 +140,33 @@ def test_bands_appear_while_the_day_grid_is_shown(qapp):
 
     _zoom(pane, 50)
     assert all(band.isVisible() for band in bands)
+
+
+def test_bands_stop_short_of_the_day_lines(qapp):
+    """帯は日の区切り線から少し内側に描き、線の脇に背景のすき間を残す
+    （1行飛ばしの行背景がジョブの区切り線の手前で止まっているのと同じ見た目）。"""
+    from PySide6.QtCore import QPointF
+
+    scenes = build_gantt_scenes(_df(), _DISPLAY)
+    pane = _pane(scenes, day_px=50, row_scale=4.0)
+    pane.show()
+    QApplication.processEvents()
+    axis_start = scenes.body.gantt_axis_start
+    left = LEFT_MARGIN + (SAT.toordinal() - axis_start.toordinal()) * DAY_WIDTH
+    body = pane.body
+    body.centerOn(left + DAY_WIDTH / 2, scenes.body.gantt_body_rect.top() + 30)
+    QApplication.processEvents()
+    image = body.viewport().grab().toImage()
+    # バー（行の上から BAR_MARGIN〜ROW_HEIGHT-BAR_MARGIN）より下、ジョブの区切り線より上
+    y = body.mapFromScene(QPointF(left, scenes.body.gantt_body_rect.top() + 28)).y()
+
+    def color_at(scene_x, offset_px=0):
+        x = body.mapFromScene(QPointF(scene_x, 0)).x() + offset_px
+        return image.pixelColor(x, y)
+
+    assert color_at(left + DAY_WIDTH / 2) == _SATURDAY_BAND_COLOR
+    assert color_at(left, 2) != _SATURDAY_BAND_COLOR  # 区切り線のすぐ右はすき間
+    assert color_at(left + DAY_WIDTH, -2) != _SATURDAY_BAND_COLOR
 
 
 def test_day_labels_sit_between_the_day_lines(qapp):

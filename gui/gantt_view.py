@@ -26,6 +26,7 @@ QGraphicsView は setSceneRect() だけでは実際の描画をクリップし�
 縦方向のみ同期する（交差方向の縮尺は常に1.0固定）。
 """
 
+from bisect import bisect_left, bisect_right
 from collections import namedtuple
 from datetime import date, timedelta
 
@@ -161,13 +162,17 @@ _HOLIDAY_LABEL_COLOR = QColor("#c0392b")
 _SATURDAY_LABEL_COLOR = QColor("#1f5fbf")
 # 日付の目盛りラベルの既定の文字色（QGraphicsSimpleTextItem の既定と同じ黒）
 _TICK_LABEL_COLOR = QColor("#000000")
-# 日付ラベルが出るほど拡大したときに、土曜日・休日の列の背面に敷く縦の帯。
+# 日単位の補助線が出るほど拡大したときに、土曜日・休日の列の背面に敷く縦の帯。
 # 土曜日は薄い水色、日曜日・祝日・全チーム共通の休業日は薄い赤（土曜日の祝日は
 # 赤を優先）。チーム別の休業日は、1つのジョブに複数のチームが混ざるため帯に
 # せず、日付ラベルの赤字だけにする。キャンバスは常に明るい背景（_PANE_BG）
 # なので、色はライト／ダークで共通。
 _SATURDAY_BAND_COLOR = QColor("#eef4fb")
 _HOLIDAY_BAND_COLOR = QColor("#fcefed")
+# 帯と日の区切り線の間に残すすき間（片側、画面px）。日の幅が狭いときは、日の幅の
+# この割合までにする（帯が細くなりすぎないように）。
+_DAY_BAND_INSET_PX = 3
+_DAY_BAND_INSET_MAX_RATIO = 0.1
 _DEFAULT_BAR_COLOR = "#cbc9c2"
 # 1行飛ばしのジョブ行の背景（半透明の黒を薄く重ねるだけなので、背景色
 # （_PANE_BG）を変えても常に「少し暗い」効果になり色を合わせ直す必要がない）。
@@ -724,6 +729,46 @@ def dependency_stub_path(rect, outgoing, step_x):
         path.lineTo(x, y)
         path.lineTo(rect.left(), y)
     return path, QPointF(x, gap)
+
+
+class _DayBandLayer(QGraphicsItem):
+    """土曜日・休日の縦の帯をまとめて描く部品。days: [(日の左端のx, 色), ...]（xの昇順）。
+
+    帯は日の区切り線から左右に _DAY_BAND_INSET_PX（画面px。日の幅が狭いときは
+    その _DAY_BAND_INSET_MAX_RATIO まで）ずつ内側に描き、区切り線と帯の間に背景の
+    すき間を残す（1行飛ばしの行背景が、ジョブの区切り線の手前で止まっているのと同じ
+    見た目）。すき間を画面上の幅で決めるので、描くときの縮尺から求める。
+    形（shape）を持たないので、クリック・範囲選択・ツールチップの対象にならない。"""
+
+    def __init__(self, days, top, bottom):
+        super().__init__()
+        self.days = days
+        self._xs = [x for x, _color in days]
+        self._top = top
+        self._height = bottom - top
+        self._bounds = QRectF(days[0][0], top, days[-1][0] + DAY_WIDTH - days[0][0], bottom - top)
+        self.setAcceptedMouseButtons(Qt.NoButton)
+        self.setAcceptHoverEvents(False)
+        self.setZValue(_DAY_BAND_Z)
+        # paint() で exposedRect（描き直す範囲）を使うため
+        self.setFlag(QGraphicsItem.ItemUsesExtendedStyleOption)
+
+    def boundingRect(self):
+        return self._bounds
+
+    def shape(self):
+        return QPainterPath()
+
+    def paint(self, painter, option, widget=None):
+        sx = painter.worldTransform().m11()
+        if sx <= 0:
+            return
+        inset = min(_DAY_BAND_INSET_PX, DAY_WIDTH * sx * _DAY_BAND_INSET_MAX_RATIO) / sx
+        exposed = option.exposedRect
+        first = max(0, bisect_left(self._xs, exposed.left() - DAY_WIDTH))
+        last = bisect_right(self._xs, exposed.right())
+        for x, color in self.days[first:last]:
+            painter.fillRect(QRectF(x + inset, self._top, DAY_WIDTH - inset * 2, self._height), color)
 
 
 class _DependencyLayer(QGraphicsItem):
@@ -2391,39 +2436,29 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
             header_scene.gantt_day_ticks.append((header_line, body_line, label))
         day_cursor += timedelta(days=1)
 
-    # 土曜日・休日の帯。連続する同じ種類の日は1つの長方形にまとめ（境目に細い隙間が
-    # 見えないように）、種類ごとに1つの部品にする（日ごとに部品を作ると、長い計画で
-    # 拡大縮小のたびに数千個の表示を切り替えることになる）。既定では隠しておき、
-    # 日付ラベルを出すほど拡大したときだけ _update_axis_density が見せる。
-    band_paths = {"saturday": QPainterPath(), "holiday": QPainterPath()}
-    run_kind, run_start = None, None
+    # 土曜日・休日の帯。1日ずつ、日の区切り線から少し内側に描く（1行飛ばしの行背景が
+    # ジョブの区切り線の手前で止まっているのと同じ見た目）。ペインごとに1つの部品に
+    # まとめる（日ごとに部品を作ると、長い計画で拡大縮小のたびに数千個の表示を切り替える
+    # ことになる）。既定では隠しておき、日単位の補助線が出る縮尺で _update_axis_density が見せる。
+    band_days = []
     day_cursor = axis_start
-    while day_cursor <= axis_end + timedelta(days=1):
-        kind = day_kind(day_cursor.date()) if day_cursor <= axis_end else None
-        if kind != run_kind:
-            if run_kind is not None:
-                band_paths[run_kind].addRect(QRectF(x_of(run_start), 0, x_of(day_cursor) - x_of(run_start), 1))
-            run_kind, run_start = kind, day_cursor
+    while day_cursor <= axis_end:
+        kind = day_kind(day_cursor.date())
+        if kind is not None:
+            band_days.append((x_of(day_cursor), _HOLIDAY_BAND_COLOR if kind == "holiday" else _SATURDAY_BAND_COLOR))
         day_cursor += timedelta(days=1)
     header_scene.gantt_day_bands = []
     body_scene.gantt_day_bands = []
-    header_band_top = TOP_MARGIN - _TICK_LABEL_OFFSET - 2
-    for kind, color in (("saturday", _SATURDAY_BAND_COLOR), ("holiday", _HOLIDAY_BAND_COLOR)):
-        path = band_paths[kind]
-        if path.isEmpty():
-            continue
-        # 高さ1で作った長方形を、ペインごとの縦の範囲へ引き伸ばして置く
-        for scene, top, bottom, bands in (
-            (header_scene, header_band_top, header_stub_bottom, header_scene.gantt_day_bands),
-            (body_scene, TOP_MARGIN, chart_bottom, body_scene.gantt_day_bands),
+    if band_days:
+        header_band_top = TOP_MARGIN - _TICK_LABEL_OFFSET - 2
+        for scene, top, bottom in (
+            (header_scene, header_band_top, header_stub_bottom),
+            (body_scene, TOP_MARGIN, chart_bottom),
         ):
-            item = scene.addPath(
-                QTransform().translate(0, top).scale(1, bottom - top).map(path),
-                QPen(Qt.NoPen), QBrush(color),
-            )
-            item.setZValue(_DAY_BAND_Z)
-            item.setVisible(False)
-            bands.append(item)
+            layer = _DayBandLayer(band_days, top, bottom)
+            layer.setVisible(False)
+            scene.addItem(layer)
+            scene.gantt_day_bands.append(layer)
 
     # 週の目盛りラベル（"MM/DD"、幅5文字ぶん）が重ならずに収まる最小の週間隔
     # （画面px）。これを下回ったら _update_axis_density が間引きモードに切り替える。
