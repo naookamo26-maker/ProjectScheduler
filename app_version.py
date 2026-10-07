@@ -9,7 +9,7 @@
 番号は「メジャー.マイナー.パッチ」の3つの数字で書く。
 """
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 
 def windows_version_tuple(version=APP_VERSION):

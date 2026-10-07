@@ -60,7 +60,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.gantt_edit import to_date
+from gui.gantt_edit import WorkDayCalendar, to_date
 from i18n import tr
 
 DAY_WIDTH = 10
@@ -157,6 +157,17 @@ _TODAY_LINE_COLOR = QColor("#1a73e8")
 # 休業日の日付ラベル（日単位の個別表示時のみ）。マイルストーンと同じ赤系だが、
 # 別の要素であることが分かるよう独立した定数にしてある。
 _HOLIDAY_LABEL_COLOR = QColor("#c0392b")
+# 土曜日の日付ラベル（日単位の個別表示時のみ）。カレンダーの慣習に合わせて青。
+_SATURDAY_LABEL_COLOR = QColor("#1f5fbf")
+# 日付の目盛りラベルの既定の文字色（QGraphicsSimpleTextItem の既定と同じ黒）
+_TICK_LABEL_COLOR = QColor("#000000")
+# 日付ラベルが出るほど拡大したときに、土曜日・休日の列の背面に敷く縦の帯。
+# 土曜日は薄い水色、日曜日・祝日・全チーム共通の休業日は薄い赤（土曜日の祝日は
+# 赤を優先）。チーム別の休業日は、1つのジョブに複数のチームが混ざるため帯に
+# せず、日付ラベルの赤字だけにする。キャンバスは常に明るい背景（_PANE_BG）
+# なので、色はライト／ダークで共通。
+_SATURDAY_BAND_COLOR = QColor("#e4effc")
+_HOLIDAY_BAND_COLOR = QColor("#fbe6e4")
 _DEFAULT_BAR_COLOR = "#cbc9c2"
 # 1行飛ばしのジョブ行の背景（半透明の黒を薄く重ねるだけなので、背景色
 # （_PANE_BG）を変えても常に「少し暗い」効果になり色を合わせ直す必要がない）。
@@ -181,9 +192,10 @@ _BORDER_MIN_PX = 5
 # バーが小さいときは枠がバー全体を埋め、バーが青く塗られて見える。
 _SELECTION_COLOR = QColor("#1a5fd0")
 _SELECTION_WIDTH = 2.5
-# 本体シーンの重ね順: 1行飛ばしの行背景(-5) < 日単位の補助線(-3) <
+# 本体シーンの重ね順: 土曜日・休日の帯(-6) < 1行飛ばしの行背景(-5) < 日単位の補助線(-3) <
 # 週の目盛り・区切り線(-2〜-1) < 通常のバー(0) < 締切超過のバー(1) <
 # タスク名ラベル(2)
+_DAY_BAND_Z = -6
 _ROW_STRIPE_Z = -5
 _OVERRUN_BAR_Z = 1
 _TASK_LABEL_Z = 2
@@ -196,6 +208,27 @@ GanttScenes = namedtuple("GanttScenes", ["header", "column", "body"])
 # 横／縦が全体表示のままか、left_day は左端の日付（序数。小数あり）、top_job/top_offset は
 # 一番上に見えているジョブとその行の上端からのずれ（画面px）。
 ViewState = namedtuple("ViewState", ["sx", "sy", "h", "v", "fit_x", "fit_y", "left_day", "top_job", "top_offset"])
+
+# -- バーに出す項目（オプション。gui/app_settings.py の gantt_bar_*） -----------------
+# タスク名のほかに添えられる項目。並びは添える順で、バーに収まらないときは後ろから省く。
+BAR_LABEL_DAYS = "days"            # 日数
+BAR_LABEL_SLACK = "slack"          # 締切までの余裕（間に合わないときは超過日数）
+BAR_LABEL_PERIOD = "period"        # 開始日〜終了日
+BAR_LABEL_TEAM = "team"            # チーム名
+BAR_LABEL_MILESTONE = "milestone"  # マイルストーン名
+BAR_LABEL_EXTRAS = (BAR_LABEL_DAYS, BAR_LABEL_SLACK, BAR_LABEL_PERIOD, BAR_LABEL_TEAM, BAR_LABEL_MILESTONE)
+# 日数・余裕の数え方（gui/app_settings.py の BAR_DAY_COUNTS と同じ値）
+DAY_COUNT_WORK = "work"          # 営業日（チームの休業日も除く。入力した期間と同じ数え方）
+DAY_COUNT_CALENDAR = "calendar"  # 暦日
+# show_name: タスク名を出すか。extras: 添える項目（BAR_LABEL_EXTRAS の並び）。
+# day_count: DAY_COUNT_WORK / DAY_COUNT_CALENDAR。
+BarLabelOptions = namedtuple("BarLabelOptions", ["show_name", "extras", "day_count"])
+DEFAULT_BAR_LABEL_OPTIONS = BarLabelOptions(True, (BAR_LABEL_DAYS,), DAY_COUNT_WORK)
+# 添える項目同士の区切り
+_BAR_LABEL_SEPARATOR = " · "
+# 添える項目は、収まる幅にさらにこれ(px)の余白があるときだけ出す（バーいっぱいに
+# 詰め込むと読みにくいため）。タスク名だけのときは従来どおり省略（…）して出す。
+_BAR_EXTRA_SPARE_PX = 10
 
 # -- タスクの編集（docs/roadmap.md §9）用の見た目 ----------------------------------
 # 手動ピン（開始固定日）の印。バー左上に置く、📍と同じ形のピン（赤い丸の頭と針。
@@ -275,6 +308,124 @@ _STATUS_STRIP_PX = 4            # 記号を省いたときの帯の幅（画面p
 _STATUS_MIN_BAR_PX = 6          # バーがこの幅に満たなければ何も描かない
 
 
+class TaskLabelFacts:
+    """バーにタスク名と並べて添える項目（BAR_LABEL_EXTRAS）の文言を作る。
+
+    日数の数え方はオプションで変わり、営業日の数え上げは日数に比例して手間が
+    かかるため、シーンを作るときには求めず、文言が要ったとき（そのバーが画面に
+    見えていて、項目を添える余裕があるとき）に求めて覚えておく。
+    start / end は日付（end は exclusive）。deadline はマイルストーンの締切
+    （スケジューラの ms_end と同じく、終了日（exclusive）がこれ以下なら間に合う）。"""
+
+    __slots__ = ("start", "end", "team_key", "team_name", "milestone_name", "deadline",
+                 "overrun_days", "_calendar", "_cache")
+
+    def __init__(self, start, end, team_key=None, team_name=None, milestone_name=None,
+                 deadline=None, overrun_days=0, calendar=None):
+        self.start = start
+        self.end = end
+        self.team_key = team_key
+        self.team_name = team_name
+        self.milestone_name = milestone_name
+        self.deadline = deadline
+        self.overrun_days = overrun_days
+        self._calendar = calendar if calendar is not None else WorkDayCalendar()
+        self._cache = {}
+
+    def text(self, item, day_count):
+        """item の文言。該当が無い（マイルストーンが無い等）ときは None。"""
+        key = (item, day_count)
+        if key not in self._cache:
+            self._cache[key] = self._make(item, day_count)
+        return self._cache[key]
+
+    def _count(self, start, end, day_count):
+        if day_count == DAY_COUNT_CALENDAR:
+            return max(0, (end - start).days)
+        return self._calendar.count(start, end, self.team_key)
+
+    def _make(self, item, day_count):
+        work = day_count != DAY_COUNT_CALENDAR
+        if item == BAR_LABEL_DAYS:
+            n = self._count(self.start, self.end, day_count)
+            return tr("{days}営業日", days=n) if work else tr("{days}日", days=n)
+        if item == BAR_LABEL_SLACK:
+            if self.overrun_days > 0:
+                # 超過は数え方によらず暦日で出す（バーのツールチップ・状況表示の
+                # 「締切を{n}日超過」と同じ数。営業日で数えると、締切と終了日の
+                # 間が休日だけのとき「超過0」になり、赤い枠と食い違う）。
+                return tr("超過{days}日", days=self.overrun_days)
+            if self.deadline is None:
+                return None
+            n = self._count(self.end, self.deadline, day_count)
+            return tr("余裕{days}営業日", days=n) if work else tr("余裕{days}日", days=n)
+        if item == BAR_LABEL_PERIOD:
+            last = self.end - timedelta(days=1)
+            if last <= self.start:
+                return self.start.strftime("%m/%d")
+            return tr("{start:%m/%d}〜{end:%m/%d}", start=self.start, end=last)
+        if item == BAR_LABEL_TEAM:
+            return self.team_name or None
+        if item == BAR_LABEL_MILESTONE:
+            return self.milestone_name or None
+        return None
+
+
+def compose_bar_label(name, extras, avail_w, avail_h, metrics):
+    """バーの中に出す文言を決める。収まらなければ None（ラベルを隠す）。
+
+    name: タスク名（出さないなら空）。extras: 添える項目の文言（並び順）。
+    avail_w / avail_h: 文字を置ける画面上の幅・高さ(px)。
+
+    - タスク名が最優先。1行に収まらなければ従来どおり2行に折るか省略（…）し、
+      項目は添えない。
+    - タスク名が1行に収まるとき、項目は前から順に、丸ごと収まるものだけを添える
+      （途中で省略しない。収まらない項目から後ろは省く）。縦に2行ぶんの余裕が
+      あれば2行目に、無ければタスク名の後ろに続けて置く。
+    - 項目は _BAR_EXTRA_SPARE_PX の余白を残して収まるときだけ出す（詰め込まない）。"""
+    line_height = metrics.height()
+    if avail_w < metrics.averageCharWidth() or avail_h < line_height:
+        return None
+    two_lines = avail_h >= line_height * 2 + _TASK_LABEL_LINE_GAP_PX
+    extra_w = avail_w - _BAR_EXTRA_SPARE_PX
+
+    def fit_extras(prefix, width):
+        """prefix の後ろに、width に丸ごと収まるだけの項目を前から続けた文字列
+        （1つも収まらなければ None）。"""
+        text = None
+        for extra in extras:
+            candidate = (text + _BAR_LABEL_SEPARATOR if text else prefix) + extra
+            if metrics.horizontalAdvance(candidate) > width:
+                break
+            text = candidate
+        return text
+
+    if not name:
+        if not extras:
+            return None
+        return fit_extras("", extra_w)
+
+    if metrics.horizontalAdvance(name) <= avail_w:
+        if extras:
+            if two_lines:
+                second = fit_extras("", extra_w)
+                if second:
+                    return f"{name}\n{second}"
+            else:
+                joined = fit_extras(name + _BAR_LABEL_SEPARATOR, extra_w)
+                if joined:
+                    return joined
+        return name
+
+    single_line = metrics.elidedText(name, Qt.ElideRight, int(avail_w))
+    if not single_line or single_line == "…":
+        return None
+    if two_lines:
+        line1, line2 = _wrap_two_lines(name, metrics, avail_w)
+        return f"{line1}\n{line2}" if line2 else line1
+    return single_line
+
+
 class TaskBarItem(QGraphicsPathItem):
     """ガントのタスクバー。どのジョブのどのタスクかを持ち、ガント上での編集
     （選択・ドラッグ・編集ウィンドウ）の対象を特定できるようにする。
@@ -300,6 +451,8 @@ class TaskBarItem(QGraphicsPathItem):
         self.emphasized = emphasized
         self._emphasis_width = emphasis_width
         self.highlighted = False
+        # バーにタスク名と並べて添える項目の文言（TaskLabelFacts）。build_gantt_scenes が付ける
+        self.label_facts = None
         # 確定済みのファイルで、まだ確定行を持たないタスク（§8-9）
         self.unconfirmed = False
         # タスクの状態（STATUS_IN_PROGRESS / STATUS_DONE / None＝未着手）
@@ -1392,6 +1545,8 @@ class FrozenGanttPane(QWidget):
         grid.setRowStretch(1, 1)
         self.header.body_view = self.body
         self.column.body_view = self.body
+        # バーに出す項目（オプション）。set_bar_label_options で変える
+        self.bar_label_options = DEFAULT_BAR_LABEL_OPTIONS
 
         # チャートが無いとき（絞り込みで0件・スケジューリングできない）も、本体を見出し・
         # 左列と同じ明るい背景で塗る。シーンが無いと QGraphicsView は背景（backgroundBrush）を
@@ -1419,6 +1574,15 @@ class FrozenGanttPane(QWidget):
         self.body.fitAllRequested.connect(self.fit_all)
         self.body.fitSelectedRequested.connect(self.fit_selected)
         self.column.jobClicked.connect(self._select_job)
+
+    def set_bar_label_options(self, options):
+        """バーに出す項目（BarLabelOptions）を変え、今のチャートのラベルを置き直す
+        （シーンは作り直さない）。"""
+        if options == self.bar_label_options:
+            return
+        self.bar_label_options = options
+        transform = self.body.transform()
+        self._center_task_labels(transform.m11(), transform.m22())
 
     def setScene(self, scenes):
         # シーンを差し替えるとドラッグ中のバー・影は古いシーンと一緒に消えるので、取りやめる
@@ -1736,8 +1900,19 @@ class FrozenGanttPane(QWidget):
             body_line.setVisible(show_day_grid)
             label.setVisible(show_day_labels)
 
-        for header_line, body_line, label, is_month_boundary, full_text in \
+        # 土曜日・休日の帯は、日付ラベルと同じく1日の幅が十分に広がったときだけ見せる
+        body_scene = self.body.scene()
+        for band in getattr(scene, "gantt_day_bands", []) + getattr(body_scene, "gantt_day_bands", []):
+            if band.isVisible() != show_day_labels:
+                band.setVisible(show_day_labels)
+
+        for header_line, body_line, label, is_month_boundary, full_text, day_color in \
                 getattr(scene, "gantt_week_ticks", []):
+            # 週の目盛り（月曜日）のラベルも、日付ラベルを出している間は祝日なら赤字にする
+            # （日ごとのラベルと並べたときに、その日だけ色が抜けないように）
+            color = day_color if show_day_labels and day_color is not None else _TICK_LABEL_COLOR
+            if label.brush().color() != color:
+                label.setBrush(QBrush(color))
             if compact and not is_month_boundary:
                 visible = not hide_week_aux
                 header_line.setVisible(visible)
@@ -1774,7 +1949,8 @@ class FrozenGanttPane(QWidget):
         - 幅が足りなければ省略（…）表示にする
         - それでも表示に値する幅すら無ければ非表示にする
         - 縦方向にもう1行分の余裕があれば2行に分けて表示する
-        よう、その都度テキストを組み立て直す。"""
+        - オプションで選んだ項目（日数など。bar_label_options）は、丸ごと収まるときだけ添える
+        よう、その都度テキストを組み立て直す（compose_bar_label）。"""
         scene = self.body.scene()
         if scene is None or sx <= 0 or sy <= 0:
             return
@@ -1796,6 +1972,7 @@ class FrozenGanttPane(QWidget):
         # QFontMetricsをラベルごとに作り直さず使い回す（画面内に映っている分
         # だけとはいえ、数百件規模になりうるため、地味だが効く最適化）。
         metrics_cache = {}
+        options = self.bar_label_options
         for label, center_x, center_y, bar_width, bar_height, full_text, font, bar in \
                 getattr(scene, "gantt_task_labels", []):
             half_w, half_h = bar_width / 2, bar_height / 2
@@ -1828,20 +2005,18 @@ class FrozenGanttPane(QWidget):
                 avail_w -= status_px
                 shift_px -= status_px / 2
 
-            if avail_w < metrics.averageCharWidth() or avail_h < line_height:
+            name = full_text if options.show_name else ""
+            extras = []
+            facts = getattr(bar, "label_facts", None)
+            if facts is not None:
+                for item in options.extras:
+                    extra = facts.text(item, options.day_count)
+                    if extra:
+                        extras.append(extra)
+            text = compose_bar_label(name, extras, avail_w, avail_h, metrics)
+            if text is None:
                 label.setVisible(False)
                 continue
-
-            single_line = metrics.elidedText(full_text, Qt.ElideRight, int(avail_w))
-            if not single_line or single_line == "…":
-                label.setVisible(False)
-                continue
-
-            if single_line != full_text and avail_h >= line_height * 2 + _TASK_LABEL_LINE_GAP_PX:
-                line1, line2 = _wrap_two_lines(full_text, metrics, avail_w)
-                text = f"{line1}\n{line2}" if line2 else line1
-            else:
-                text = single_line
 
             label.setVisible(True)
             if label.text() != text:
@@ -2116,8 +2291,40 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
     # 週の目盛りのうち、月が変わった直後の1本（is_month_boundary）は「月初めの
     # 線」として扱い、間隔が詰まったズーム時にもラベルと主線の見た目を残す
     # （他の週の目盛りは補助線に格下げしてラベルを消す）。
+    # 日付ラベルの色と、土曜日・休日の帯（日付ラベルが出るほど拡大したときだけ見せる）。
+    # 帯（薄い赤）は日曜日・祝日・全チーム共通の休業日、土曜日（祝日でないもの）は
+    # 薄い水色。日付ラベルはそれぞれ赤字・青字にする。加えて、表示中のチーム
+    # （絞り込み後にdfへ実際に残っているチーム）に関係する休業日も赤字にする
+    # （関係の無い他チームの休業日まで赤くすると誤解を招くため）。チーム別の
+    # 休業日は1つのジョブに複数のチームが混ざるため帯にはしない。
+    common_holiday_dates = set(display.get("common_holiday_dates") or ())
+    off_band_dates = common_holiday_dates | set(display.get("jp_holiday_dates") or ())
+    relevant_team_ids = set(df["Team_ID"].unique()) if "Team_ID" in df.columns else set()
+    holiday_dates = set(common_holiday_dates)
+    holidays_by_team = display.get("holidays_by_team") or {}
+    for team_id in relevant_team_ids:
+        holiday_dates.update(holidays_by_team.get(team_id, ()))
+
+    def day_kind(d):
+        """"holiday"（日曜日・祝日・全チーム共通の休業日）／"saturday"／None"""
+        if d.weekday() == 6 or d in off_band_dates:
+            return "holiday"
+        if d.weekday() == 5:
+            return "saturday"
+        return None
+
+    def day_label_color(d):
+        kind = day_kind(d)
+        if kind == "holiday" or d in holiday_dates:
+            return _HOLIDAY_LABEL_COLOR
+        if kind == "saturday":
+            return _SATURDAY_LABEL_COLOR
+        return None
+
     header_scene.gantt_tick_labels = []  # 中央揃え用（_center_tick_labels）。週・日のラベルが対象。
-    header_scene.gantt_week_ticks = []   # (header_line, body_line, label, is_month_boundary, full_text)
+    # (header_line, body_line, label, is_month_boundary, full_text, day_color)。day_color は
+    # 日ごとの日付ラベルを出すほど拡大したときの文字色（休日の赤など。平日は None）。
+    header_scene.gantt_week_ticks = []
     header_scene.gantt_day_ticks = []    # (header_line, body_line, label)
 
     week_dates = set()
@@ -2139,17 +2346,10 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
             header_scene, full_text, task_font, (x, TOP_MARGIN - _TICK_LABEL_OFFSET),
         )
         header_scene.gantt_tick_labels.append((label, x))
-        header_scene.gantt_week_ticks.append((header_line, body_line, label, is_month_boundary, full_text))
+        header_scene.gantt_week_ticks.append(
+            (header_line, body_line, label, is_month_boundary, full_text, day_label_color(tick_date.date()))
+        )
         tick_date += timedelta(days=7)
-
-    # 表示中のチーム（対象コンボ・凡例チェックボックスの絞り込み後にdfへ実際に
-    # 残っているチーム）に関係する休業日だけを、日付ラベルの赤字対象にする
-    # （関係の無い他チームの休業日まで赤くすると誤解を招くため）。
-    relevant_team_ids = set(df["Team_ID"].unique()) if "Team_ID" in df.columns else set()
-    holiday_dates = set(display.get("common_holiday_dates") or ())
-    holidays_by_team = display.get("holidays_by_team") or {}
-    for team_id in relevant_team_ids:
-        holiday_dates.update(holidays_by_team.get(team_id, ()))
 
     # 日単位の補助線（週の目盛りと重なる日は除く）と、日ごとの日付ラベル
     # （日の数字のみ。休業日は赤字）。既定ではどちらも非表示にしておき、
@@ -2167,15 +2367,49 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
             body_line = body_scene.addLine(x, TOP_MARGIN, x, chart_bottom, day_pen)
             body_line.setZValue(-3)
             body_line.setVisible(False)
-            is_holiday = day_cursor.date() in holiday_dates
+            label_color = day_label_color(day_cursor.date())
             label = _add_fixed_size_label(
                 header_scene, str(day_cursor.day), task_font, (x, TOP_MARGIN - _TICK_LABEL_OFFSET),
-                brush=QBrush(_HOLIDAY_LABEL_COLOR) if is_holiday else None,
+                brush=QBrush(label_color) if label_color is not None else None,
             )
             label.setVisible(False)
             header_scene.gantt_tick_labels.append((label, x))
             header_scene.gantt_day_ticks.append((header_line, body_line, label))
         day_cursor += timedelta(days=1)
+
+    # 土曜日・休日の帯。連続する同じ種類の日は1つの長方形にまとめ（境目に細い隙間が
+    # 見えないように）、種類ごとに1つの部品にする（日ごとに部品を作ると、長い計画で
+    # 拡大縮小のたびに数千個の表示を切り替えることになる）。既定では隠しておき、
+    # 日付ラベルを出すほど拡大したときだけ _update_axis_density が見せる。
+    band_paths = {"saturday": QPainterPath(), "holiday": QPainterPath()}
+    run_kind, run_start = None, None
+    day_cursor = axis_start
+    while day_cursor <= axis_end + timedelta(days=1):
+        kind = day_kind(day_cursor.date()) if day_cursor <= axis_end else None
+        if kind != run_kind:
+            if run_kind is not None:
+                band_paths[run_kind].addRect(QRectF(x_of(run_start), 0, x_of(day_cursor) - x_of(run_start), 1))
+            run_kind, run_start = kind, day_cursor
+        day_cursor += timedelta(days=1)
+    header_scene.gantt_day_bands = []
+    body_scene.gantt_day_bands = []
+    header_band_top = TOP_MARGIN - _TICK_LABEL_OFFSET - 2
+    for kind, color in (("saturday", _SATURDAY_BAND_COLOR), ("holiday", _HOLIDAY_BAND_COLOR)):
+        path = band_paths[kind]
+        if path.isEmpty():
+            continue
+        # 高さ1で作った長方形を、ペインごとの縦の範囲へ引き伸ばして置く
+        for scene, top, bottom, bands in (
+            (header_scene, header_band_top, header_stub_bottom, header_scene.gantt_day_bands),
+            (body_scene, TOP_MARGIN, chart_bottom, body_scene.gantt_day_bands),
+        ):
+            item = scene.addPath(
+                QTransform().translate(0, top).scale(1, bottom - top).map(path),
+                QPen(Qt.NoPen), QBrush(color),
+            )
+            item.setZValue(_DAY_BAND_Z)
+            item.setVisible(False)
+            bands.append(item)
 
     # 週の目盛りラベル（"MM/DD"、幅5文字ぶん）が重ならずに収まる最小の週間隔
     # （画面px）。これを下回ったら _update_axis_density が間引きモードに切り替える。
@@ -2286,6 +2520,10 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
     # ここでは元のタスク名とバーサイズ（シーン座標）を後で拾えるよう
     # 参照だけ残しておく。
     body_scene.gantt_task_labels = []
+    # バーに添える項目（TaskLabelFacts）用。マイルストーンの名前と締切、営業日の数え方
+    milestones = {m_id: (name, to_date(m_date)) for m_id, name, m_date in milestone_markers
+                  if m_id != "PROJECT_START"}
+    work_calendar = WorkDayCalendar.from_display(display)
 
     job_metrics = QFontMetrics(job_font)
     swatch_height = job_metrics.height()
@@ -2365,6 +2603,13 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
                 status=task_status.get(key),
             )
             body_scene.gantt_bars[key] = rect
+            milestone_name, deadline = milestones.get(r.get("Milestone_ID"), (None, None))
+            rect.label_facts = TaskLabelFacts(
+                rect.start, rect.end, team_key=r["Team_ID"],
+                team_name=team_names.get(r["Team_ID"], str(r["Team_ID"])),
+                milestone_name=milestone_name, deadline=deadline,
+                overrun_days=overrun_days, calendar=work_calendar,
+            )
             rect.setBrush(QBrush(QColor(color_hex)))
             if overrun_days > 0:
                 # 両方に該当する場合は締切超過（赤の実線）を優先する。枠線は
@@ -2403,25 +2648,25 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
             )
             body_scene.addItem(rect)
 
-            task_name = str(r["Task_Name"])
-            if task_name:
-                center_x = start_x + width / 2
-                center_y = y + BAR_MARGIN + bar_height / 2
-                # 表示内容（省略・非表示・2行化）はバーの実際の画面上サイズ
-                # （拡縮率次第で変わる）に応じてFrozenGanttPane._sync_panesが
-                # その都度決めるため、ここでは仮の位置に元のタスク名をそのまま
-                # 置いておくだけにする。
-                task_label = _add_fixed_size_label(
-                    body_scene, task_name, task_font,
-                    (center_x, center_y),
-                    # バー（既定0、締切超過は赤枠を隣に隠されないよう1）より
-                    # 必ず前面に置く。同じ z だと描画順しだいでバーがラベルを
-                    # 覆ってしまう。
-                    z_value=_TASK_LABEL_Z,
-                )
-                body_scene.gantt_task_labels.append(
-                    (task_label, center_x, center_y, width, bar_height, task_name, task_font, rect)
-                )
+            # タスク名が空でも、添える項目（日数など）を出せるようラベルは作る
+            task_name = str(r["Task_Name"] or "")
+            center_x = start_x + width / 2
+            center_y = y + BAR_MARGIN + bar_height / 2
+            # 表示内容（省略・非表示・2行化）はバーの実際の画面上サイズ
+            # （拡縮率次第で変わる）に応じてFrozenGanttPane._sync_panesが
+            # その都度決めるため、ここでは仮の位置に元のタスク名をそのまま
+            # 置いておくだけにする。
+            task_label = _add_fixed_size_label(
+                body_scene, task_name, task_font,
+                (center_x, center_y),
+                # バー（既定0、締切超過は赤枠を隣に隠されないよう1）より
+                # 必ず前面に置く。同じ z だと描画順しだいでバーがラベルを
+                # 覆ってしまう。
+                z_value=_TASK_LABEL_Z,
+            )
+            body_scene.gantt_task_labels.append(
+                (task_label, center_x, center_y, width, bar_height, task_name, task_font, rect)
+            )
 
         column_scene.gantt_job_rows.append((y_top - JOB_GAP / 2, y_bottom + JOB_GAP / 2, job_id))
         column_boundary = column_scene.addLine(0, y_bottom + JOB_GAP / 2, column_stub_right, y_bottom + JOB_GAP / 2,

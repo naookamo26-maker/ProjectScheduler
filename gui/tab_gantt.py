@@ -78,10 +78,17 @@ from gui.gantt_row_order import (
 )
 from gui.gantt_task_editor import TaskEditWindow
 from gui.gantt_view import (
+    BAR_LABEL_DAYS,
+    BAR_LABEL_EXTRAS,
+    BAR_LABEL_MILESTONE,
+    BAR_LABEL_PERIOD,
+    BAR_LABEL_SLACK,
+    BAR_LABEL_TEAM,
     DEPENDENCY_ALL,
     DEPENDENCY_MODES,
     DEPENDENCY_OFF,
     DEPENDENCY_SELECTED,
+    BarLabelOptions,
     FrozenGanttPane,
     build_gantt_scenes,
     set_bar_baseline,
@@ -135,6 +142,24 @@ _ORDER_LABELS = {
 
 # オプション（gui/app_settings.py の gantt_drag_modifier）の値 → Qtの修飾キー
 _DRAG_MODIFIER_KEYS = {"shift": Qt.ShiftModifier, "alt": Qt.AltModifier}
+
+# バーに添える項目 → それを出すかのオプション（gui/app_settings.py の gantt_bar_show_*）
+_BAR_LABEL_OPTION_NAMES = {
+    BAR_LABEL_DAYS: "gantt_bar_show_days",
+    BAR_LABEL_SLACK: "gantt_bar_show_slack",
+    BAR_LABEL_PERIOD: "gantt_bar_show_period",
+    BAR_LABEL_TEAM: "gantt_bar_show_team",
+    BAR_LABEL_MILESTONE: "gantt_bar_show_milestone",
+}
+
+
+def bar_label_options(app_settings):
+    """オプションから、バーに出す項目（gui/gantt_view.py の BarLabelOptions）を作る。"""
+    return BarLabelOptions(
+        show_name=app_settings.get("gantt_bar_show_name"),
+        extras=tuple(item for item in BAR_LABEL_EXTRAS if app_settings.get(_BAR_LABEL_OPTION_NAMES[item])),
+        day_count=app_settings.get("gantt_bar_day_count"),
+    )
 
 # 進行中・完了（実績の日付で置く状態）
 _STARTED = ("in_progress", "done")
@@ -385,8 +410,9 @@ class GanttTab(QWidget):
                 self._editor.show()
 
     def apply_app_settings(self):
-        """オプション（ドラッグのキー等）を反映する。起動時とオプション変更時に呼ぶ。"""
+        """オプション（ドラッグのキー・バーに出す項目等）を反映する。起動時とオプション変更時に呼ぶ。"""
         self.view.body.drag_modifier = _DRAG_MODIFIER_KEYS[self.app_settings.get("gantt_drag_modifier")]
+        self.view.set_bar_label_options(bar_label_options(self.app_settings))
 
     def _sync_placement_widgets(self, ratio):
         """配置コントロールのスライダー・スピンボックスの表示をratioに合わせる
