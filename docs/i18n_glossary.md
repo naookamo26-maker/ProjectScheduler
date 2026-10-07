@@ -96,3 +96,5 @@ GUIの文言とメッセージを英語・ベトナム語・中国語（簡体�
 | ヘルプ | Help | Trợ giúp | 帮助 |
 | バージョン情報 / バージョン | About / Version | Giới thiệu / Phiên bản | 关于 / 版本 |
 | キャンセル | Cancel | Hủy | 取消 |
+| はい / いいえ | Yes / No | Có / Không | 是 / 否 |
+| 保存 / 保存しない | Save / Don't save | Lưu / Không lưu | 保存 / 不保存 |

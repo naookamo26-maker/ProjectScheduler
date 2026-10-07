@@ -135,3 +135,30 @@ def qapp_i18n():
     from PySide6.QtWidgets import QApplication
 
     return QApplication.instance() or QApplication(sys.argv)
+
+
+@pytest.mark.parametrize("language, expected", [
+    ("ja", ["保存(&S)", "保存しない", "キャンセル", "はい(&Y)", "いいえ(&N)"]),
+    ("en", ["&Save", "Don't save", "Cancel", "&Yes", "&No"]),
+    ("vi", ["Lưu(&S)", "Không lưu", "Hủy", "Có(&Y)", "Không(&N)"]),
+    ("zh_CN", ["保存(&S)", "不保存", "取消", "是(&Y)", "否(&N)"]),
+])
+def test_message_box_standard_buttons_follow_the_display_language(qapp_i18n, language, expected):
+    """保存の確認（QMessageBox.question の 保存／破棄／キャンセル）・はい／いいえの
+    ボタンが、表示言語の文言になる（Qt 同梱の翻訳の有無によらない）。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    from gui.main import StandardButtonTranslator
+
+    translator = StandardButtonTranslator()
+    qapp_i18n.installTranslator(translator)
+    try:
+        i18n.set_language(language)
+        box = QMessageBox(QMessageBox.Question, "t", "m",
+                          QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
+        texts = [box.button(b).text() for b in (QMessageBox.Save, QMessageBox.Discard, QMessageBox.Cancel)]
+        box = QMessageBox(QMessageBox.Question, "t", "m", QMessageBox.Yes | QMessageBox.No)
+        texts += [box.button(b).text() for b in (QMessageBox.Yes, QMessageBox.No)]
+        assert texts == expected
+    finally:
+        qapp_i18n.removeTranslator(translator)
