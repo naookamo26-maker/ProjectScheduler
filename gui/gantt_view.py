@@ -166,8 +166,8 @@ _TICK_LABEL_COLOR = QColor("#000000")
 # 赤を優先）。チーム別の休業日は、1つのジョブに複数のチームが混ざるため帯に
 # せず、日付ラベルの赤字だけにする。キャンバスは常に明るい背景（_PANE_BG）
 # なので、色はライト／ダークで共通。
-_SATURDAY_BAND_COLOR = QColor("#e4effc")
-_HOLIDAY_BAND_COLOR = QColor("#fbe6e4")
+_SATURDAY_BAND_COLOR = QColor("#eef4fb")
+_HOLIDAY_BAND_COLOR = QColor("#fcefed")
 _DEFAULT_BAR_COLOR = "#cbc9c2"
 # 1行飛ばしのジョブ行の背景（半透明の黒を薄く重ねるだけなので、背景色
 # （_PANE_BG）を変えても常に「少し暗い」効果になり色を合わせ直す必要がない）。
