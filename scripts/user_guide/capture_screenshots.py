@@ -452,6 +452,9 @@ SHOTS = [
     ("workflows_tab", NEW_TITLE, _show_tab(TAB_WORKFLOWS)),
     ("jobs_tab", NEW_TITLE, _show_tab(TAB_JOBS)),
     ("gantt_tab", NEW_TITLE, _show_tab(TAB_GANTT, needs_schedule=True)),
+    # 5章「表示の操作」: 拡大したときの日付の見出し（年月・日の数字）と土曜日・休日の帯。
+    # 年末年始の休業日・祝日・土日がそろう範囲を、日の数字が出る縮尺で見せる
+    ("gantt_days", NEW_TITLE, _zoom_to_bar("旅立ち", "絵コンテ", 4, -3), (0, 215, 1280, 340)),
     ("analysis_tab", NEW_TITLE, _analysis_section(0)),
     ("analysis_team", NEW_TITLE, _analysis_section(1)),
     ("workflows_table", NEW_TITLE, _select_workflow("キャラクター制作", view=1)),
@@ -494,10 +497,10 @@ SHOTS = [
 # バーの周りを切り出す: (見本の名前, 切り出し元の画像, (x, y, 幅, 高さ))。
 # 切り出し元の場面を変えたら、座標も合わせて直す。
 SWATCHES = [
-    ("swatch_normal", "gantt_legend", (522, 252, 102, 72)),
-    ("swatch_overrun", "gantt_legend", (522, 346, 102, 72)),
-    ("swatch_pin_conflict", "gantt_legend", (298, 520, 182, 70)),
-    ("swatch_pinned", "gantt_legend", (454, 615, 80, 72)),
+    ("swatch_normal", "gantt_legend", (514, 289, 106, 70)),
+    ("swatch_overrun", "gantt_legend", (514, 373, 106, 72)),
+    ("swatch_pin_conflict", "gantt_legend", (292, 529, 196, 70)),
+    ("swatch_pinned", "gantt_legend", (448, 615, 84, 70)),
     ("swatch_selected", "gantt_drag", (522, 76, 100, 100)),
     ("swatch_drag_shadow", "gantt_drag", (745, 76, 60, 100)),
     ("swatch_moved", "gantt_after_edit", (478, 545, 78, 100)),
