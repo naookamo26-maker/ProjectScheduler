@@ -126,17 +126,47 @@ def test_a_saturday_holiday_gets_the_red_band(qapp):
     assert SAT not in _band_days(scenes, _SATURDAY_BAND_COLOR)
 
 
-def test_bands_appear_only_when_day_labels_are_shown(qapp):
+def _zoom(pane, day_px):
+    pane.body.setTransform(QTransform.fromScale(day_px / DAY_WIDTH, 4.0))
+    pane.body.transformChanged.emit()
+
+
+def test_bands_appear_while_the_day_grid_is_shown(qapp):
     scenes = build_gantt_scenes(_df(), _DISPLAY)
     bands = scenes.body.gantt_day_bands + scenes.header.gantt_day_bands
     assert bands and not any(band.isVisible() for band in bands)
 
-    pane = _pane(scenes, day_px=20)  # 日の補助線は出るが、日付ラベルはまだ出ない
+    pane = _pane(scenes, day_px=10)  # 日の補助線がまだ出ない
     assert not any(band.isVisible() for band in bands)
 
-    pane.body.setTransform(QTransform.fromScale(50 / DAY_WIDTH, 4.0))
-    pane.body.transformChanged.emit()
+    _zoom(pane, 25)  # 日の補助線は出るが、日付ラベルはまだ出ない
     assert all(band.isVisible() for band in bands)
+    assert not any(label.isVisible() for _h, _b, label in scenes.header.gantt_day_ticks)
+
+    _zoom(pane, 50)
+    assert all(band.isVisible() for band in bands)
+
+
+def test_day_labels_sit_between_the_day_lines(qapp):
+    """日付ラベルが出ている間は、縦線の上ではなく日の中央（「| 1 |」）に置く。
+    出ていない間（週の目盛りだけ）は、従来どおり縦線の上に置く。"""
+    scenes = build_gantt_scenes(_df(), _DISPLAY)
+    pane = _pane(scenes, day_px=50)
+    sx = pane.body.transform().m11()
+
+    def center(label):
+        return label.x() + label.boundingRect().width() / sx / 2
+
+    lines = dict(scenes.header.gantt_tick_labels)
+    sat = next(label for _h, _b, label in scenes.header.gantt_day_ticks if label.text() == str(SAT.day))
+    holiday_mon = next(label for _h, _b, label, _m, full, _c in scenes.header.gantt_week_ticks
+                       if full == HOLIDAY_MON.strftime("%m/%d"))
+    for label in (sat, holiday_mon):
+        assert center(label) == pytest.approx(lines[label] + DAY_WIDTH / 2)
+
+    _zoom(pane, 25)
+    sx = pane.body.transform().m11()
+    assert center(holiday_mon) == pytest.approx(lines[holiday_mon])
 
 
 def test_day_labels_are_blue_on_saturdays_and_red_on_days_off(qapp):

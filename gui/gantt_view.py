@@ -1866,9 +1866,10 @@ class FrozenGanttPane(QWidget):
 
         拡大方向（詳細を見せる）:
         - 1週間の目盛り間隔が_DAY_GRID_MIN_WEEK_PX以上に広がったら、日単位の
-          補助線を表示する。
+          補助線と、土曜日・休日の帯を表示する。
         - さらに1日の幅が_DAY_LABEL_MIN_DAY_PX以上に広がったら、日ごとの
-          日付ラベル（日の数字のみ。休業日は赤字）も表示する。
+          日付ラベル（日の数字のみ。土曜日は青字、休日は赤字）も表示する
+          （ラベルは日の中央に置く。_center_tick_labels）。
 
         縮小方向（間引いて可視性を確保する）:
         - 1週間の目盛り間隔が"MM/DD"ラベルの幅より狭くなったら（compact）、
@@ -1889,8 +1890,7 @@ class FrozenGanttPane(QWidget):
         day_px = DAY_WIDTH * sx
         week_px = day_px * 7
         month_px = day_px * _DAYS_PER_MONTH_AVG
-        show_day_grid = week_px >= _DAY_GRID_MIN_WEEK_PX
-        show_day_labels = show_day_grid and day_px >= _DAY_LABEL_MIN_DAY_PX
+        show_day_grid, show_day_labels = _day_detail(sx)
         label_min_px = getattr(scene, "gantt_week_label_min_px", 0)
         compact = week_px < label_min_px
         hide_week_aux = compact and month_px < _WEEK_AUX_HIDE_MAX_MONTH_PX
@@ -1900,11 +1900,12 @@ class FrozenGanttPane(QWidget):
             body_line.setVisible(show_day_grid)
             label.setVisible(show_day_labels)
 
-        # 土曜日・休日の帯は、日付ラベルと同じく1日の幅が十分に広がったときだけ見せる
+        # 土曜日・休日の帯は、日単位の補助線が出ている間だけ見せる（日の区切りが
+        # 見えないほど縮小すると、細い帯が並ぶだけで読み取れないため）
         body_scene = self.body.scene()
         for band in getattr(scene, "gantt_day_bands", []) + getattr(body_scene, "gantt_day_bands", []):
-            if band.isVisible() != show_day_labels:
-                band.setVisible(show_day_labels)
+            if band.isVisible() != show_day_grid:
+                band.setVisible(show_day_grid)
 
         for header_line, body_line, label, is_month_boundary, full_text, day_color in \
                 getattr(scene, "gantt_week_ticks", []):
@@ -2088,17 +2089,22 @@ class FrozenGanttPane(QWidget):
     def _center_tick_labels(self, sx):
         """日付目盛りラベルを、その縦線を中心に左右均等になるよう配置し直す。
         _center_milestone_labelsと同じ理由で、中央揃えのオフセット（ラベル幅の
-        半分）は現在の横方向の拡縮率(sx)で割ってシーン座標に変換する必要がある。"""
+        半分）は現在の横方向の拡縮率(sx)で割ってシーン座標に変換する必要がある。
+
+        日ごとの日付ラベルを出すほど拡大しているときは、ラベル（週の目盛りの
+        "MM/DD"を含む）を縦線の上ではなく、その日の区切り線と区切り線の間（日の
+        中央）に置く（「| 1 |」。背面の土曜日・休日の帯と、どの日の数字かが揃う）。"""
         scene = self.header.scene()
         if scene is None or sx <= 0:
             return
+        center_offset = DAY_WIDTH / 2 if _day_detail(sx)[1] else 0
         header_rect = getattr(scene, "gantt_header_rect", None)
         left_limit = header_rect.left() if header_rect is not None else float("-inf")
         shown = []
         for label, line_x in getattr(scene, "gantt_tick_labels", []):
             width = label.boundingRect().width() / sx
             # 軸の左端の目盛りは、中央揃えのままだと左半分が切れる。見出しの範囲に収める
-            left = max(line_x - width / 2, left_limit)
+            left = max(line_x + center_offset - width / 2, left_limit)
             label.setPos(left, label.y())
             if label.isVisible():
                 shown.append((left, left + width, label))
@@ -2132,6 +2138,14 @@ class FrozenGanttPane(QWidget):
             x = min(max(center - width / 2, span_left), span_right - width)
             label.setVisible(True)
             label.setPos(x, label.y())
+
+
+def _day_detail(sx):
+    """横の拡縮率 sx での日付軸の細かさ。(日単位の補助線を出すか, 日ごとの日付ラベルを出すか)。
+    土曜日・休日の帯は前者、日付ラベルを日の中央に置くのは後者に合わせる。"""
+    day_px = DAY_WIDTH * sx
+    show_day_grid = day_px * 7 >= _DAY_GRID_MIN_WEEK_PX
+    return show_day_grid, show_day_grid and day_px >= _DAY_LABEL_MIN_DAY_PX
 
 
 def _pack_lanes(tasks):
