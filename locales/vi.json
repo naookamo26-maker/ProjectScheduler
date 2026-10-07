@@ -76,6 +76,7 @@
  "{week_start}\n同時 {value} 本{cap_text}": "{week_start}\nĐồng thời: {value}{cap_text}",
  "{week_start}\n同時タスク数 合計 {value:,} 本": "{week_start}\nTổng số tác vụ đồng thời: {value:,}",
  "{year}年": "{year}",
+ "{year}年{month}月": "{year}-{month:02d}",
  "、": ", ",
  "あり（リソース制約）": "Có (giới hạn nguồn lực)",
  "いいえ(&N)": "Không(&N)",

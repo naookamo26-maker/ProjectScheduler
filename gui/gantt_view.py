@@ -1945,6 +1945,10 @@ class FrozenGanttPane(QWidget):
             body_line.setVisible(show_day_grid)
             label.setVisible(show_day_labels)
 
+        for divider in getattr(scene, "gantt_month_dividers", []):
+            if divider.isVisible() != show_day_labels:
+                divider.setVisible(show_day_labels)
+
         # 土曜日・休日の帯は、日単位の補助線が出ている間だけ見せる（日の区切りが
         # 見えないほど縮小すると、細い帯が並ぶだけで読み取れないため）
         body_scene = self.body.scene()
@@ -1978,6 +1982,9 @@ class FrozenGanttPane(QWidget):
             label.setVisible(True)
             if compact:
                 text = full_text.split("/", 1)[0].lstrip("0") or "0"
+            elif show_day_labels:
+                # 日ごとの日付ラベルと同じく日の数字だけ（月は年の段の「2026年12月」に出す）
+                text = full_text.split("/", 1)[1].lstrip("0")
             else:
                 text = full_text
             if label.text() != text:
@@ -2167,22 +2174,28 @@ class FrozenGanttPane(QWidget):
     def _place_year_labels(self, sx):
         """年のラベルを、その年のうち今見えている部分の中央に置く（年の外にははみ出さない。
         見えている部分がラベルより狭ければ、年の端に寄せる）。以前は年の中央に固定して
-        いたため、拡大して年の途中を見ていると年がどこにも出ず、何年か分からなかった。"""
+        いたため、拡大して年の途中を見ていると年がどこにも出ず、何年か分からなかった。
+
+        日ごとの日付ラベルを出すほど拡大しているときは、年の代わりに年月（「2026年12月」）
+        のラベルを、同じ決め方でその月のうち見えている部分の中央に置く。"""
         scene = self.header.scene()
         if scene is None or sx <= 0:
             return
         visible = self.header.mapToScene(self.header.viewport().rect()).boundingRect()
-        for label, span_left, span_right in getattr(scene, "gantt_year_labels", []):
-            width = label.boundingRect().width() / sx
-            if span_right - span_left < width:
-                # 縮小して年の幅がラベルより狭い（年をまたぐ短い端など）: 年の幅に収まらない
-                label.setVisible(False)
-                continue
-            left, right = max(span_left, visible.left()), min(span_right, visible.right())
-            center = (left + right) / 2 if right > left else (span_left + span_right) / 2
-            x = min(max(center - width / 2, span_left), span_right - width)
-            label.setVisible(True)
-            label.setPos(x, label.y())
+        month_mode = _day_detail(sx)[1]
+        for labels, shown in ((getattr(scene, "gantt_year_labels", []), not month_mode),
+                              (getattr(scene, "gantt_month_labels", []), month_mode)):
+            for label, span_left, span_right in labels:
+                width = label.boundingRect().width() / sx
+                if not shown or span_right - span_left < width:
+                    # 縮小して年（月）の幅がラベルより狭い（年をまたぐ短い端など）: 収まらない
+                    label.setVisible(False)
+                    continue
+                left, right = max(span_left, visible.left()), min(span_right, visible.right())
+                center = (left + right) / 2 if right > left else (span_left + span_right) / 2
+                x = min(max(center - width / 2, span_left), span_right - width)
+                label.setVisible(True)
+                label.setPos(x, label.y())
 
 
 def _day_detail(sx):
@@ -2498,6 +2511,36 @@ def build_gantt_scenes(df, display, color_by="team", job_order=None):
             header_line = header_scene.addLine(x, row_top, x, row_bottom, year_pen)
             header_line.setZValue(-1)
         year_cursor = year_cursor.replace(year=year_cursor.year + 1)
+
+    # 日ごとの日付ラベルを出すほど拡大したときは、年の段に年ではなく年月
+    # （「2026年12月」）を出し、月の変わり目にも区切り線を引く（日付の段は日の数字
+    # だけにする。月曜日だけ「MM/DD」が混ざると、そこで月が変わるように見えるため）。
+    # 年のラベルと同じく、置く位置は FrozenGanttPane._place_year_labels が決め、
+    # どちらを出すかは拡縮率しだいで切り替える。既定（日付ラベルを出さない縮尺）は隠しておく。
+    header_scene.gantt_month_labels = []    # (label, 月の左端x, 月の右端x)
+    header_scene.gantt_month_dividers = []  # 月の変わり目の区切り線（1月1日は年の区切り線がある）
+    month_cursor = axis_start.replace(day=1)
+    while month_cursor <= axis_end:
+        next_month = (month_cursor + timedelta(days=32)).replace(day=1)
+        span_start = max(axis_start, month_cursor)
+        span_end = min(axis_end, next_month)
+        month_label = _add_fixed_size_label(
+            header_scene, tr("{year}年{month}月", year=month_cursor.year, month=month_cursor.month), year_font,
+            (x_of(span_start), TOP_MARGIN - _YEAR_LABEL_OFFSET),
+        )
+        month_label.setVisible(False)
+        header_scene.gantt_month_labels.append((month_label, x_of(span_start), x_of(span_end)))
+        if month_cursor > axis_start and month_cursor.month != 1:
+            x = x_of(month_cursor)
+            row_top = TOP_MARGIN - _YEAR_LABEL_OFFSET - _YEAR_DIVIDER_PADDING
+            row_bottom = TOP_MARGIN - _YEAR_LABEL_OFFSET + year_metrics.height() + _YEAR_DIVIDER_PADDING
+            month_pen = QPen(_YEAR_GRID_COLOR, 1)
+            month_pen.setCosmetic(True)
+            divider = header_scene.addLine(x, row_top, x, row_bottom, month_pen)
+            divider.setZValue(-1)
+            divider.setVisible(False)
+            header_scene.gantt_month_dividers.append(divider)
+        month_cursor = next_month
 
     # -- マイルストーン（プロジェクト開始日含む）を縦線で表示 ------------------------
     # ラベルは「◆」を付けず、縦線を中心に左右均等に配置する（線がどのマイル

@@ -309,3 +309,25 @@ def test_pane_redraws_labels_when_the_options_change(qapp):
     pane.body.setTransform(QTransform.fromScale(4 / DAY_WIDTH, 1.0))
     pane.body.transformChanged.emit()
     assert "営業日" not in label.text()
+
+
+def test_month_moves_up_to_the_year_row_when_day_labels_are_shown(qapp):
+    """日ごとの日付ラベルが出ている間は、年の段に年月（「2026年10月」）を出し、日付の段は
+    月曜日も日の数字だけにする。縮小して日付ラベルが消えたら、年と「MM/DD」に戻す。"""
+    scenes = build_gantt_scenes(_df(), _DISPLAY)
+    header = scenes.header
+    week = {full: label for _h, _b, label, _m, full, _c in header.gantt_week_ticks}
+    monday = week[HOLIDAY_MON.strftime("%m/%d")]
+
+    pane = _pane(scenes, day_px=50)
+    shown_months = [label.text() for label, _l, _r in header.gantt_month_labels if label.isVisible()]
+    assert "2026年10月" in shown_months
+    assert not any(label.isVisible() for label, _l, _r in header.gantt_year_labels)
+    assert monday.text() == str(HOLIDAY_MON.day)
+    assert any(divider.isVisible() for divider in header.gantt_month_dividers)
+
+    _zoom(pane, 25)
+    assert not any(label.isVisible() for label, _l, _r in header.gantt_month_labels)
+    assert any(label.isVisible() for label, _l, _r in header.gantt_year_labels)
+    assert monday.text() == HOLIDAY_MON.strftime("%m/%d")
+    assert not any(divider.isVisible() for divider in header.gantt_month_dividers)

@@ -76,6 +76,7 @@
  "{week_start}\n同時 {value} 本{cap_text}": "{week_start}\n并行 {value} 个{cap_text}",
  "{week_start}\n同時タスク数 合計 {value:,} 本": "{week_start}\n并行任务数 合计 {value:,} 个",
  "{year}年": "{year}年",
+ "{year}年{month}月": "{year}年{month}月",
  "、": "、",
  "あり（リソース制約）": "有（资源约束）",
  "いいえ(&N)": "否(&N)",
